@@ -3119,12 +3119,6 @@ public class Hooker {
         patched = copyIfNeeded(patched, values);
         patched.put("relative_path", mappedRelative);
         patchDirectoryColumns(patched, mappedRelative);
-        // 映射后的父目录已包含 display_name 中的子目录，不能再把该段拼接一次。
-        if (displayName != null && displayName.indexOf('/') >= 0) {
-          String mappedName = mappedPath.substring(mappedPath.lastIndexOf('/') + 1);
-          patched.put("_display_name", mappedName);
-          if (patched.containsKey("display_name")) patched.put("display_name", mappedName);
-        }
         relativeSource = patched;
         relativePath = mappedRelative;
       }
@@ -4433,6 +4427,9 @@ public class Hooker {
     else if (relative.startsWith("/" + absoluteRoot))
       relative = relative.substring(absoluteRoot.length() + 1);
     String name = displayName != null && displayName.length() > 0 ? displayName : ".srx_probe";
+    // DISPLAY_NAME 是文件名：系统把分隔符清洗为下划线，探测时也不能将其变成子目录。
+    // 保留原字段交由 MediaProvider 完成其余文件名清洗，只在探测路径中消除分隔符。
+    name = name.replace('/', '_').replace('\\', '_');
     return "/storage/emulated/" + userId + "/" + relative + "/" + name;
   }
 
