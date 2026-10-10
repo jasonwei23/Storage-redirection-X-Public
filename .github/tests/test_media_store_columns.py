@@ -1,4 +1,4 @@
-"""执行真实媒体字段方法，覆盖小红书目录重复与晚写入物理路径的回归。"""
+"""执行真实媒体字段方法，覆盖原保存层级与晚写入物理路径的回归。"""
 
 from pathlib import Path
 import shutil
@@ -124,12 +124,12 @@ public class ColumnsFixture {
       original.remove("_display_name"); original.put(key,"Camera/XHS.jpg");
     }
     ContentValues patched = patchContentValues(original,10355,null,true).values;
-    equal("Pictures/XHS/Camera/",patched.getAsString("relative_path"));
-    equal("XHS.jpg",patched.getAsString("_display_name"));
-    if (key.equals("display_name")) equal("XHS.jpg",patched.getAsString(key));
+    equal("Pictures/XHS/",patched.getAsString("relative_path"));
+    // 文件名里的 Camera/ 交由系统清洗，不能移入相对目录或删除前缀。
+    equal("Camera/XHS.jpg",patched.getAsString(key));
     String path = buildMediaStoreProbePath(patched.getAsString("relative_path"),
-        patched.getAsString("_display_name"),10355);
-    equal("/storage/emulated/0/Pictures/XHS/Camera/XHS.jpg",path);
+        firstString(patched,"_display_name","display_name"),10355);
+    equal("/storage/emulated/0/Pictures/XHS/Camera_XHS.jpg",path);
     equal(isolated ? path : null,patched.getAsString("_data"));
     equal("DCIM/",original.getAsString("relative_path"));
     equal("Camera/XHS.jpg",original.getAsString(key));
@@ -148,13 +148,32 @@ public class ColumnsFixture {
     equal(null,MEDIA_FILE_BUILD_CONTEXT.get());
   }
   public static void main(String[] args) throws Throwable {
+    // 真正的子目录只来自 RELATIVE_PATH；DISPLAY_NAME 的分隔符不是目录层级。
+    equal("/storage/emulated/0/DCIM/Camera_XHS.jpg",
+        buildMediaStoreProbePath("DCIM/","Camera/XHS.jpg",10355));
+    equal("/storage/emulated/0/DCIM/Camera/XHS.jpg",
+        buildMediaStoreProbePath("DCIM/Camera/","XHS.jpg",10355));
+    equal("/storage/emulated/0/DCIM/Camera_XHS.jpg",
+        buildMediaStoreProbePath("DCIM/","Camera\\XHS.jpg",10355));
+    equal("/storage/emulated/0/DCIM/..__XHS.jpg",
+        buildMediaStoreProbePath("DCIM/","..//XHS.jpg",10355));
     checkMapping(false,"_display_name"); checkMapping(true,"_display_name");
     checkMapping(false,"display_name"); checkMapping(true,"display_name");
+    // 串起映射和 Provider 列处理，确认文件名含 Camera/ 的图片仍在目标根目录。
+    sandbox = false; generatedName = "Camera_XHS.jpg";
+    MEDIA_PROVIDER_CALLER_UID.set(10355); MEDIA_PROVIDER_MUTATION_METHOD.set("insert");
+    ContentValues rootImage = patchContentValues(values("DCIM/","Camera/XHS.jpg"),10355,null,true).values;
+    new ColumnsFixture().providerMediaFileColumnCallback(new Object[]{null,rootImage});
+    equal("Pictures/XHS/",rootImage.getAsString("relative_path"));
+    equal("/storage/emulated/0/Pictures/XHS/Camera_XHS.jpg",rootImage.getAsString("_data"));
     mappingEnabled = false; sandbox = false;
     ContentValues plain = values("DCIM/Camera/","XHS.jpg");
     equal(plain,patchContentValues(plain,10355,null,true).values);
     equal(null,plain.getAsString("_data"));
     mappingEnabled = true;
+    ContentValues child = patchContentValues(values("DCIM/Camera/","XHS.jpg"),10355,null,true).values;
+    equal("Pictures/XHS/Camera/",child.getAsString("relative_path"));
+    equal("XHS.jpg",child.getAsString("_display_name"));
     for (String name : new String[]{".pending-123-XHS.jpg","XHS (1).jpg","Camera_XHS.jpg"}) {
       generatedName = name;
       checkColumns(false,true,"Pictures/XHS/Camera/",10355);
