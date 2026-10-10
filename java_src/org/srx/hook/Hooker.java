@@ -606,6 +606,9 @@ public class Hooker {
     Object[] actualArgs = unwrapArgs(args);
     ContentValues values = findContentValues(actualArgs);
     if (values == null) return callBackup(args);
+    Integer scopedUid = MEDIA_PROVIDER_CALLER_UID.get();
+    int callerUid = scopedUid == null ? android.os.Binder.getCallingUid() : scopedUid.intValue();
+    if (callerUid < ANDROID_APP_UID_START) return callBackup(args);
     MediaFileBuildContext pendingContext = MEDIA_FILE_BUILD_CONTEXT.get();
     if ("update".equals(mutationMethod)
         && pendingContext != null
@@ -617,12 +620,11 @@ public class Hooker {
         values.put(MediaStore.MediaColumns.RELATIVE_PATH, pendingRelative);
         patchDirectoryColumns(values, pendingRelative);
         logInfo("media pending column path patched to=" + pendingContext.publicPath);
-        return callBackup(args);
+        Object result = callBackup(args);
+        restoreMediaStoreVolumePrefix(values, callerUid);
+        return result;
       }
     }
-    Integer scopedUid = MEDIA_PROVIDER_CALLER_UID.get();
-    int callerUid = scopedUid == null ? android.os.Binder.getCallingUid() : scopedUid.intValue();
-    if (callerUid < ANDROID_APP_UID_START) return callBackup(args);
     String relativePath = values.getAsString(MediaStore.MediaColumns.RELATIVE_PATH);
     if (relativePath == null || relativePath.length() == 0) {
       relativePath = relativePathFromDirectoryColumns(values);
@@ -669,6 +671,8 @@ public class Hooker {
       return callBackup(args);
     } finally {
       restoreMediaFileBuildValues(args);
+      // FileUtils 的上下文可能已被消费；ensureFileColumns 最后一次写入仍需修正卷前缀。
+      restoreMediaStoreVolumePrefix(values, callerUid);
       restoreContentValue(
           values, MediaStore.MediaColumns.RELATIVE_PATH, hadRelative, originalRelative);
       restoreContentValue(values, "primary_directory", hadPrimary, originalPrimary);
@@ -740,8 +744,17 @@ public class Hooker {
       if (actualArgs.length == 0 || !(actualArgs[0] instanceof ContentValues)) return;
       if (context.publicPath == null || context.publicPath.length() == 0) return;
       ContentValues values = (ContentValues) actualArgs[0];
-      values.put(MediaStore.MediaColumns.DATA, context.publicPath);
-      String relativePath = mediaStoreRelativePath(context.publicPath);
+      String publicPath = context.publicPath;
+      String builtPath = values.getAsString(MediaStore.MediaColumns.DATA);
+      // 保留系统生成的 pending、重名避让和文件名清洗结果，只恢复逻辑父目录。
+      if (builtPath != null && builtPath.lastIndexOf('/') >= 0) {
+        int parentEnd = publicPath.lastIndexOf('/');
+        publicPath =
+            publicPath.substring(0, parentEnd + 1)
+                + builtPath.substring(builtPath.lastIndexOf('/') + 1);
+      }
+      values.put(MediaStore.MediaColumns.DATA, publicPath);
+      String relativePath = mediaStoreRelativePath(publicPath);
       if (relativePath != null) values.put(MediaStore.MediaColumns.RELATIVE_PATH, relativePath);
     } finally {
       MEDIA_FILE_BUILD_CONTEXT.remove();
@@ -3106,6 +3119,14 @@ public class Hooker {
         patched = copyIfNeeded(patched, values);
         patched.put("relative_path", mappedRelative);
         patchDirectoryColumns(patched, mappedRelative);
+        // 映射后的父目录已包含 display_name 中的子目录，不能再把该段拼接一次。
+        if (displayName != null && displayName.indexOf('/') >= 0) {
+          String mappedName = mappedPath.substring(mappedPath.lastIndexOf('/') + 1);
+          patched.put("_display_name", mappedName);
+          if (patched.containsKey("display_name")) patched.put("display_name", mappedName);
+        }
+        relativeSource = patched;
+        relativePath = mappedRelative;
       }
     }
     // insert 且未提供 _data 时补一个公共形态的 _data。MediaProvider 的 ensureFileColumns
