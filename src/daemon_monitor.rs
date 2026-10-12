@@ -16,8 +16,9 @@ use events::{
 };
 use roots::{
     build_private_owner_repair_roots, build_public_owner_repair_root, build_watch_roots,
-    dedup_roots, is_under_any_root, map_record_from_path, select_watch_start,
-    should_descend_into_child, should_record_display_path, sort_roots_by_monitor_priority,
+    dedup_roots, is_self_nested_redirect_path, is_under_any_root, map_record_from_path,
+    select_watch_start, should_descend_into_child, should_record_display_path,
+    sort_roots_by_monitor_priority,
 };
 use std::collections::{HashMap, HashSet, VecDeque};
 
@@ -25,8 +26,12 @@ const DUPLICATE_EVENT_WINDOW_MS: i64 = 1500;
 const MISSING_ROOT_RETRY_MS: i64 = 1000;
 const MAX_RECENT_EVENTS: usize = 512;
 const DEFAULT_MAX_WATCHES: usize = 8192;
-/// 防止设备把 inotify 配额调得过大后，监视器一次性递归展开整个共享存储。
-const MAX_WATCHES_CEILING: usize = 32768;
+/// 运行期监视上限的绝对封顶：即使内核配额被调得很大，也不允许监视器一次性
+/// 递归展开整个共享存储（防止单应用/全盘写入风暴把 daemon 拖死）。
+const MAX_WATCHES_CEILING: usize = 131072;
+/// 内核配额中允许监视器占用的比例上限，其余留给系统其它 inotify 用户。
+const MAX_WATCHES_KERNEL_SHARE_NUM: usize = 3;
+const MAX_WATCHES_KERNEL_SHARE_DEN: usize = 4;
 /// 单轮 `drain_events` 最多处理的事件数。
 ///
 /// 事件掩码包含 `IN_MODIFY`，持续写入会按写调用产生事件。若一直读到 EAGAIN 才返回，
@@ -67,7 +72,17 @@ fn runtime_max_watches() -> usize {
         .ok()
         .and_then(|value| value.trim().parse::<usize>().ok())
         .filter(|limit| *limit > 0)
-        .map(|limit| limit.min(MAX_WATCHES_CEILING))
+        .map(|limit| {
+            // 预算取「内核配额的 3/4」与「绝对封顶」中较小者，且不低于固定下限：
+            // 真机实测内核配额 78938 而旧上限 32768 被顶死，监视树每轮重建都在
+            // 容量受限状态下反复展开（每次全树展开都要穿过 FUSE 视图，是 CPU
+            // 突发的稳定来源）；按配额比例放宽后树可以一次建完，不再周期性重试。
+            let proportional = limit * MAX_WATCHES_KERNEL_SHARE_NUM / MAX_WATCHES_KERNEL_SHARE_DEN;
+            proportional
+                .min(MAX_WATCHES_CEILING)
+                .max(DEFAULT_MAX_WATCHES)
+                .min(limit)
+        })
         .unwrap_or(DEFAULT_MAX_WATCHES)
 }
 
@@ -867,7 +882,8 @@ impl RegularAppMonitor {
                         watcher.record_display_root.as_ref(),
                         &child_display_dir,
                     )
-                }) {
+                }) || is_self_nested_redirect_path(&child_backend_dir)
+                {
                     continue;
                 }
                 if self.watch_nodes.len() >= self.max_watches {
@@ -1190,12 +1206,27 @@ impl RegularAppMonitor {
                 }
             }
 
+            // 请求台账已记录的写入不再发观察记录：MediaProvider 请求侧
+            // （event_role=request）与 daemon inotify 观察侧（event_role=observation）
+            // 会对同一次创建/写入各写一条记录，管理器监视列表里同一文件因此出现
+            // 两条未合并的条目。命中近期请求记录的创建与写入观察事件直接跳过；
+            // 重命名/删除/属性事件不涉及该重复形态，保持原行为。查询按节点做一次，
+            // 不随 watcher 数量放大。
+            let request_record_recent = {
+                let user_id = paths::extract_user_id_from_storage_path(&display_path);
+                user_id >= 0
+                    && (inotify::is_created_or_moved_to(mask) || inotify::is_modify(mask))
+                    && crate::monitor::has_recent_public_path_request(&display_path, user_id)
+            };
             let operation_name = monitor_operation_from_mask(mask);
             for watcher in node.watchers.iter() {
                 if watcher.source == "public_owner" || watcher.source == "private_owner" {
                     continue;
                 }
 
+                if request_record_recent {
+                    continue;
+                }
                 if !should_record_display_path(&display_path, &watcher.record_display_root)
                     || should_filter_display_path(&display_path, operation_name)
                     || is_under_any_root(&display_path, &watcher.excluded_roots)

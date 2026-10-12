@@ -10,10 +10,10 @@ pub(crate) use download_owner::infer_download_owner_package_by_path;
 #[allow(unused_imports)]
 pub(crate) use source_hint::infer_public_path_package_name;
 pub(crate) use source_hint::{
-    infer_recent_path_caller_identity, remember_private_path_caller_hint,
-    remember_private_path_caller_hint_in_memory, remember_private_path_caller_uid_hint_in_memory,
-    remember_private_path_owner_hint, remember_public_path_caller_hint,
-    remember_saf_path_caller_hint,
+    has_recent_public_path_request, infer_recent_path_caller_identity,
+    remember_private_path_caller_hint, remember_private_path_caller_hint_in_memory,
+    remember_private_path_caller_uid_hint_in_memory, remember_private_path_owner_hint,
+    remember_public_path_caller_hint, remember_saf_path_caller_hint,
 };
 pub(crate) use stack_owner::infer_caller_package_by_stack;
 
@@ -257,16 +257,27 @@ impl AuditTrail {
         if correlation_id.is_empty() {
             return false;
         }
-        let mut state = self.state.lock().unwrap_or_else(|err| err.into_inner());
-        remember_query_access_locked(
-            &mut state,
-            normalized.clone(),
-            package_name.clone(),
-            caller_uid,
-            "provider_mkdir",
-            "high",
-        );
-        drop(state);
+        // 归因 hint 登记不依赖目录是否存在，先照常完成；台账记录则要在锁内做
+        // 短窗去重、锁外做已存在检查，避免同一目录重复记录。
+        let dedup_key = format!("provider_mkdir_record|{package_name}|{normalized}");
+        let dedup_hit = {
+            let mut state = self.state.lock().unwrap_or_else(|err| err.into_inner());
+            remember_query_access_locked(
+                &mut state,
+                normalized.clone(),
+                package_name.clone(),
+                caller_uid,
+                "provider_mkdir",
+                "high",
+            );
+            should_skip_duplicate_event_locked(&mut state, &dedup_key)
+        };
+        // MediaProvider 的 ensure-parents 与 DownloadProvider 对目标文件路径的
+        // mkdir 怪癖会对已存在的目录/文件反复发起 mkdir；这类调用不产生新的
+        // 文件系统条目，不应每次下载都写一条 MKDIR 台账。
+        if dedup_hit || std::path::Path::new(&normalized).exists() {
+            return true;
+        }
         let line = format!(
             "{}|{}|{}|MKDIR|{}|ret=0|errno=0|identify_method=provider_mkdir|identify_reliability=high|event_role=request|correlation_id={}|op=mkdir|op_filter=mkdir|source=media_provider_java|caller_uid={}",
             build_timestamp_locked(),
