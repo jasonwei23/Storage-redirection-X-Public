@@ -11,7 +11,7 @@
 //   内部的 umount 链路 / log / last_errno）用最小桩顶替。
 //
 // 被测修复点（来自主代理对 src 的修改）：
-//   1. live_mounts_at / capture_mount_identity / classify_mount 改用 normalize_syntax（保留存储别名、
+//   1. live_mounts_at / capture_explicit_mount_identity / classify_mount 改用 normalize_syntax（保留存储别名、
 //      大小写敏感），不再把 /data/media 折叠成 /storage/emulated；
 //   2. encode 写 schema=2，decode 拒绝旧 schema；
 //   3. clear_previous_mounts 改为按"已降序的目标列表"正向遍历（不再 .rev()）。
@@ -367,7 +367,7 @@ fn main() {
     set_mountinfo(
         "300 99 0:1 /Download/SrtProbe /data/media/0/Download/SrtProbe - fuse.srx srx_fuse_probe\n",
     );
-    match capture_mount_identity(0, "/data/media/0/Download/SrtProbe", "pkg") {
+    match capture_explicit_mount_identity(0, "/data/media/0/Download/SrtProbe") {
         Some(identity) if identity.mount_point == "/data/media/0/Download/SrtProbe"
             && identity.mount_id == 300 =>
         {
@@ -384,7 +384,7 @@ fn main() {
     set_mountinfo(
         "301 99 0:1 /Download/SrtProbe /storage/emulated/0/Download/SrtProbe - fuse.srx srx_fuse_probe\n",
     );
-    match capture_mount_identity(0, "/storage/emulated/0/Download/SrtProbe", "pkg") {
+    match capture_explicit_mount_identity(0, "/storage/emulated/0/Download/SrtProbe") {
         Some(identity) if identity.mount_point == "/storage/emulated/0/Download/SrtProbe" => {
             println!(
                 "PASS capture_preserves_storage_alias: 落盘 mount_point={}",
