@@ -324,6 +324,22 @@ pub fn save(ledger: &MountLedger) -> bool {
     true
 }
 
+/// 按调用方给定的显式挂载目标登记身份：不经归属谓词，直接取该目标的 topmost 事实。
+///
+/// 调用方刚在 `mount_point` 上完成挂载（或确认沿用既有挂载），target 上的 topmost 挂载
+/// 就是本模块的那一层。**不能**走 [`capture_mount_identity`] 的归属谓词：private-dir
+/// alias bind 的 `root` 形态与系统挂载完全同形（都止于 `Android/{data,media,obb}/<pkg>`），
+/// 谓词会把它当系统挂载漏掉，账本缺了这层，cleanup 判 foreign 就永远摘不净，
+/// 重挂循环不停（真机实测 wetype 等应用每次 reload 都触发 cleanup incomplete）。
+pub fn capture_explicit_mount_identity(pid: i32, mount_point: &str) -> Option<MountIdentity> {
+    let live = topmost_live_mount(pid, mount_point)?;
+    Some(MountIdentity {
+        mount_point: paths::normalize_syntax(mount_point),
+        mount_id: live.mount_id,
+        source: live.source,
+    })
+}
+
 /// 构造一条当前时刻的挂载身份记录。
 ///
 /// 两条挂载路径（daemon 与 companion）共用它：`pid <= 0` 读调用方自身命名空间，而两条路径
@@ -382,7 +398,9 @@ pub fn record_mount_identity(
         crate::platform::process_start_time_ticks(target_pid).unwrap_or_default();
     let mut mounts = Vec::new();
     for target in module_paths::normalize_mount_targets(targets) {
-        if let Some(identity) = capture_mount_identity(0, &target, package_name) {
+        // 显式目标是调用方本次挂载创建（或确认沿用）的路径，直接按 topmost 事实登记，
+        // 不走归属谓词（见 capture_explicit_mount_identity 的文档）。
+        if let Some(identity) = capture_explicit_mount_identity(0, &target) {
             mounts.push(identity);
         }
     }
