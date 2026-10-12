@@ -296,7 +296,7 @@ class LoggingArchitectureTest(unittest.TestCase):
         ledger = read("src/mount_ledger.rs")
         for entry in (
             "pub fn record_mount_identity(",
-            "pub fn capture_mount_identity(",
+            "pub fn capture_explicit_mount_identity(",
             "pub fn namespace_identity(",
             "pub fn load(",
             "pub fn save(",
