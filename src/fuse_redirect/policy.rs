@@ -219,6 +219,32 @@ impl SharedPolicyTable {
         }
         Some(self.by_uid.read().ok()?.len())
     }
+
+    /// 只登记 mount namespace 维度的策略，不写按 uid 的全局表。
+    ///
+    /// 供 daemon 自身（uid=0）的直通登记使用：按 [`PolicyRegistry::for_request`] 的查找
+    /// 顺序，uid=0 一旦进按 uid 表就会盖住**所有** root 调用方（任何 namespace 的 root
+    /// FUSE 请求都先按 uid 命中），破坏「未登记 uid 一律 deny_all」的 fail-closed 边界。
+    /// 只写 namespace 表时，其它 namespace 的 uid=0 请求仍然走 deny_all 回退。
+    /// 返回 namespace 表大小（>0 即登记成功，供控制通道应答）。
+    pub(crate) fn register_namespace_only(&self, config: FuseRedirectConfig) -> Option<usize> {
+        let namespace = registered_mount_namespace(&config)?;
+        let policy = Arc::new(RedirectPolicy::new(config)?);
+        let (ns_dev, ns_ino, package_name) =
+            (namespace.dev, namespace.ino, policy.package_name.clone());
+        let mut namespaces = self.by_namespace.0.write().ok()?;
+        namespaces.insert(namespace, policy);
+        drop(namespaces);
+        let table = self.by_namespace.0.read().ok()?.len();
+        log::info!(
+            "fuse policy namespace registered (ns-only) ns={}:{} pkg={} table={}",
+            ns_dev,
+            ns_ino,
+            package_name,
+            table
+        );
+        Some(table)
+    }
 }
 
 impl PolicyRegistry {
@@ -722,6 +748,18 @@ impl RedirectPolicy {
     pub(super) fn media_sqlite_view_root(&self) -> Option<&Path> {
         (!self.media_sqlite_real_root.as_os_str().is_empty())
             .then_some(self.media_sqlite_real_root.as_path())
+    }
+
+    /// 自有 media sqlite `-shm` 是否必须走宿主用户态通道（禁止 passthrough backing）。
+    ///
+    /// `-shm` 的毒化防御（ftruncate 钳制）只覆盖 FUSE SETATTR 通道；passthrough
+    /// backing fd 上的 ftruncate 绕过宿主直落 f2fs。应用的 WAL 能力探针恰以截小
+    /// `-shm` 判定介质可用性，放行 passthrough 会让每次建连的探针重新制造毒化
+    /// inode，自愈只能救到下一次打开——表现就是跨应用共享库反复掉登录。
+    /// 与 [`Self::should_heal_media_sqlite_shm_rel`] 同一判定集合（纯路径形态，
+    /// 不含尺寸）。
+    pub(super) fn should_exclude_media_sqlite_shm_passthrough_rel(&self, rel: &str) -> bool {
+        self.should_heal_media_sqlite_shm_rel(rel)
     }
 
     /// 是否应在共享 FUSE 中检查并自愈 SQLite `-shm` 边车路径。

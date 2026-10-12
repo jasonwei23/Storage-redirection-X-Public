@@ -95,6 +95,55 @@ pub fn should_capture_unconfigured_app(package_name: &str, uid: i32, enabled: bo
         && !crate::redirect::policy::is_file_monitor_ui_package(package_name)
 }
 
+/// 内核 FUSE passthrough 是否被逃生口关闭（`.fuse_passthrough_disabled` 标记文件）。
+///
+/// 默认（无标记）**自动开启**，设备兼容性由每次重启后的端到端探针判定
+/// （见 daemon 侧 passthrough probe）：探针发现内核缺陷（open/read EIO）则
+/// 设备级降级为关闭并重建宿主会话。标记文件是紧急排障通道，不是配置开关。
+pub fn is_fuse_passthrough_disabled() -> bool {
+    std::path::Path::new(module_paths::FUSE_PASSTHROUGH_DISABLE_FILE).exists()
+}
+
+fn fuse_passthrough_boot_id() -> String {
+    std::fs::read_to_string("/proc/sys/kernel/random/boot_id")
+        .map(|content| content.trim().to_string())
+        .unwrap_or_default()
+}
+
+/// passthrough 探测状态（仅当前 boot 有效）：`Some(true)`=探针通过，
+/// `Some(false)`=内核缺陷（设备级降级），`None`=未知（本 boot 尚未探测）。
+/// 绑定 boot_id：内核 OTA/重启后状态归零重新探测，避免一次性误判固化。
+pub fn fuse_passthrough_probe_state() -> Option<bool> {
+    let content = std::fs::read_to_string(module_paths::FUSE_PASSTHROUGH_STATE_FILE).ok()?;
+    let mut boot_matches = false;
+    let mut status = None;
+    for line in content.lines() {
+        if let Some(id) = line.strip_prefix("boot=") {
+            boot_matches = !id.is_empty() && id == fuse_passthrough_boot_id();
+        } else if let Some(value) = line.strip_prefix("status=") {
+            status = match value {
+                "ok" => Some(true),
+                "broken" => Some(false),
+                _ => None,
+            };
+        }
+    }
+    if boot_matches { status } else { None }
+}
+
+pub fn write_fuse_passthrough_probe_state(ok: bool) {
+    let boot_id = fuse_passthrough_boot_id();
+    if boot_id.is_empty() {
+        return;
+    }
+    let content = format!(
+        "boot={}\nstatus={}\n",
+        boot_id,
+        if ok { "ok" } else { "broken" }
+    );
+    let _ = std::fs::write(module_paths::FUSE_PASSTHROUGH_STATE_FILE, content);
+}
+
 // quality-allow(lint-suppression): 字段由 daemon 二进制读取，cdylib 构建目标不会直接读取。
 #[allow(dead_code)]
 pub struct DaemonReconcileConfigSnapshot {

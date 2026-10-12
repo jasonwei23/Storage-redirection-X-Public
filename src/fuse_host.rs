@@ -1591,6 +1591,7 @@ fn passthrough_host_config() -> crate::fuse_redirect::FuseRedirectConfig {
         is_monitor_only: false,
         // 宿主会话是直通会话：`redirect_target` 取存储根本身，策略侧据此跳过重定向根推导。
         is_passthrough_host: true,
+        namespace_policy_only: false,
     }
 }
 
@@ -1673,6 +1674,10 @@ pub fn set_global(host: FuseHost) {
         "host_session_ready",
         "srx_fuse_host",
     );
+    // daemon 自身的 mount namespace 直通登记：宿主换代后旧登记随之失效，每代会话
+    // 就绪时重新登记一次。失败不阻断（宿主刚就绪，控制通道理论上可用；失败只损失
+    // uid=0 请求的直通优化，保持原有 namespace miss 回退语义）。
+    crate::fuse_host_control::register_daemon_namespace_passthrough();
 }
 
 /// daemon 侧登记台账：当前宿主会话 pid + 已登记 uid 集合。

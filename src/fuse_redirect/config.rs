@@ -155,6 +155,14 @@ pub struct FuseRedirectConfig {
     /// 宿主会话把整个存储根以真实后端暴露出来，供各应用 namespace 复用同一份 FUSE 会话；
     /// 它不做任何重定向，`redirect_target` 因此就是存储根本身。普通应用配置恒为 `false`。
     pub is_passthrough_host: bool,
+    /// 只登记 mount namespace 维度的策略，不写按 uid 的全局表。
+    ///
+    /// 供 daemon 自身（uid=0）使用：文件监视等 root FUSE 请求按调用方 namespace 精确回查
+    /// 策略，而 uid=0 绝不允许进按 uid 表（否则任何 root 进程都会拿到这份策略，破坏
+    /// 「未登记 uid 一律 deny_all」的 fail-closed 边界）。序列化时恒缺席，普通应用配置
+    /// 与策略指纹不受影响。
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub namespace_policy_only: bool,
 }
 
 impl FuseRedirectConfig {
@@ -210,14 +218,27 @@ pub fn fuse_config_from_request<R: MountRequestFields + ?Sized>(
         is_mapping_mode_only: request.is_mapping_mode_only(),
         is_monitor_only: request.is_monitor_only(),
         is_passthrough_host: false,
+        namespace_policy_only: false,
     }
 }
 
 /// 计算单个 UID 策略的稳定指纹，供 daemon 与 companion 校验宿主策略新鲜度。
 pub fn request_policy_fingerprint<R: MountRequestFields + ?Sized>(request: &R) -> u64 {
+    let mut config = fuse_config_from_request(request, None, None);
+    config.app_pid = 0;
+    config.app_start_time_ticks = None;
+    fuse_config_policy_fingerprint(&config)
+}
+
+/// 对一份已归一的宿主策略配置计算内容指纹（与 [`request_policy_fingerprint`] 同一哈希核）。
+///
+/// 宿主侧用它给 [`RedirectPolicy`](super::policy::RedirectPolicy) 标注「本策略由哪份配置
+/// 构建」，在只读拒绝/ENOENT 等异常回包处打出该指纹，即可直接判定「当时生效的是旧策略
+/// 还是新策略」，不必再从指纹去重链路反推。
+pub fn fuse_config_policy_fingerprint(config: &FuseRedirectConfig) -> u64 {
     use std::hash::{Hash, Hasher};
 
-    let mut config = fuse_config_from_request(request, None, None);
+    let mut config = config.clone();
     config.app_pid = 0;
     config.app_start_time_ticks = None;
     if config.is_monitor_only {
