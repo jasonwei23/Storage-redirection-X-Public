@@ -44,6 +44,10 @@ const ROOT_INO: u64 = 1;
 const MAX_READ_SIZE: usize = 256 * 1024;
 const DIR_CANDIDATE_CACHE_TTL: Duration = Duration::from_millis(250);
 static INODE_POLICY_FALLBACKS: AtomicU64 = AtomicU64::new(0);
+/// 会话级 ENOENT 诊断限流：前 4 条带策略指纹落日志，用于定位「未登记 uid / 旧映射残留」。
+static OPEN_ENOENT_DIAG_COUNT: AtomicU64 = AtomicU64::new(0);
+/// create 入口的 ENOENT 诊断限流（与 open 分开计数）。
+static CREATE_ENOENT_DIAG_COUNT: AtomicU64 = AtomicU64::new(0);
 const INITIAL_DIR_CANDIDATE_CACHE_ENTRIES: usize = 64;
 const MEDIA_RW_UID: u32 = 1023;
 pub(super) const MEDIA_RW_GID: u32 = 1023;
@@ -471,6 +475,7 @@ impl FuseRedirectFs {
 
     fn reply_entry_for_rel(&self, policy: &RedirectPolicy, rel: &str, reply: ReplyEntry) {
         let Some(backend) = policy.backend_for_relative(rel, OperationKind::Read) else {
+            Self::log_new_entry_errno(policy, &OsStr::new(rel), Errno::ENOENT);
             reply.error(Errno::ENOENT);
             return;
         };
@@ -527,6 +532,86 @@ impl FuseRedirectFs {
     fn invalidate_dir_candidate_cache(&self) {
         let mut state = self.state.write().unwrap_or_else(|err| err.into_inner());
         state.clear_dir_candidate_cache();
+    }
+
+    /// open 失败回包留痕：EIO 这类「不该出现」的 errno 是宿主数据面故障的唯一直接
+    /// 痕迹（实测反馈设备 QQ 打开 chatpic 缩略图收到 EIO，且无其它任何日志）。
+    /// ENOENT 是常规探测、EACCES/EROFS 已有监视台账单独记录，均不重复留痕。
+    /// W 级日志不受 verbose 门禁，宿主进程必然落入 running.log。
+    /// create/mkdir 等新建入口的异常 errno 诊断：写路径 O_CREAT 走 create 回调而非 open，
+    /// 不补这个点则「未登记 uid / 旧映射残留」的 ENOENT 与旧只读策略的 EROFS 全部无痕。
+    fn log_new_entry_errno(policy: &RedirectPolicy, name: &OsStr, errno: Errno) {
+        let errno_value = i32::from(errno);
+        if !matches!(errno_value, libc::ENOENT | libc::EACCES | libc::EROFS) {
+            return;
+        }
+        if errno_value == libc::EROFS {
+            log::warn!(
+                "fuse create read-only deny pkg={} name={:?} errno={} policy_fp={:016x} monitor_only={}",
+                policy.package_name,
+                name,
+                errno_value,
+                policy.fingerprint,
+                policy.is_monitor_only
+            );
+            return;
+        }
+        let seen = CREATE_ENOENT_DIAG_COUNT.fetch_add(1, Ordering::Relaxed);
+        if seen >= 4 {
+            return;
+        }
+        log::warn!(
+            "fuse create enoent diag pkg={} name={:?} errno={} policy_fp={:016x} deny_all={} monitor_only={} seen={}",
+            policy.package_name,
+            name,
+            errno_value,
+            policy.fingerprint,
+            policy.is_deny_all(),
+            policy.is_monitor_only,
+            seen + 1
+        );
+    }
+
+    fn log_unexpected_open_errno(policy: &RedirectPolicy, rel: &str, errno: Errno) {
+        let errno_value = i32::from(errno);
+        if errno_value == libc::EROFS {
+            // 只读拒绝在正常场景只来自 read_only_paths；若出现的路径不在新配置的只读表里，
+            // 这个指纹就是「宿主仍持旧策略」的直接证据（全量场景跑的确定性 EROFS 排查锚点）。
+            log::warn!(
+                "fuse open read-only deny pkg={} rel={} errno={} policy_fp={:016x} monitor_only={}",
+                policy.package_name,
+                rel,
+                errno_value,
+                policy.fingerprint,
+                policy.is_monitor_only
+            );
+            return;
+        }
+        if matches!(errno_value, libc::ENOENT | libc::EACCES) {
+            // ENOENT 是 deny_all/旧映射残留的主要表象，量可能很大：会话级限 4 条，
+            // 带指纹即可判定「未登记 uid」与「旧映射残留」。
+            let seen = OPEN_ENOENT_DIAG_COUNT.fetch_add(1, Ordering::Relaxed);
+            if seen >= 4 {
+                return;
+            }
+            log::warn!(
+                "fuse open enoent diag pkg={} rel={} errno={} policy_fp={:016x} deny_all={} monitor_only={} seen={}",
+                policy.package_name,
+                rel,
+                errno_value,
+                policy.fingerprint,
+                policy.is_deny_all(),
+                policy.is_monitor_only,
+                seen + 1
+            );
+            return;
+        }
+        log::warn!(
+            "fuse open unexpected errno pkg={} rel={} errno={}",
+            policy.package_name,
+            rel,
+            errno_value
+        );
     }
 
     fn open_backend_file(path: &Path, flags: i32, mode: u32) -> Result<File, Errno> {

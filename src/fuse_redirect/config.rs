@@ -448,22 +448,28 @@ pub fn scoped_mount_allowed_for_scope(scope: &str, mode: StorageBackendMode) -> 
     };
     // 诊断：视图根上是否会有 scoped FUSE 层完全取决于这里的结论。Android 13 场景 29 的映射
     // 只落地后端别名，而通过的 Android 14 在视图根上多一层 FUSE（0:88 vs 254:40）。
+    // 该判定在每个挂载请求路径上都会执行（应用启动风暴期可达每秒数十次），正常放行
+    // （verdict=true 且无预算/失败信号）不产生任何新信息，全量打印会形成日志风暴并放大
+    // CPU 占用；只在否定或带失败信号时打印，保留排障所需的全部异常证据。
     let snapshot = load_fuse_capability_snapshot();
-    let capability_text = match snapshot.capability {
-        FuseCapability::Unknown => "unknown",
-        FuseCapability::Available => "available",
-        FuseCapability::Unavailable => "unavailable",
-    };
-    log::warn!(
-        "scoped gate diag scope={} mode={} verdict={} capability={} present={} budget_exhausted={} scope_failures={}",
-        scope,
-        mode.as_str(),
-        verdict,
-        capability_text,
-        snapshot.present,
-        snapshot.scope_budget_exhausted(scope),
-        snapshot.scope_failures_for(scope)
-    );
+    let budget_exhausted = snapshot.scope_budget_exhausted(scope);
+    if !verdict || budget_exhausted {
+        let capability_text = match snapshot.capability {
+            FuseCapability::Unknown => "unknown",
+            FuseCapability::Available => "available",
+            FuseCapability::Unavailable => "unavailable",
+        };
+        log::warn!(
+            "scoped gate diag scope={} mode={} verdict={} capability={} present={} budget_exhausted={} scope_failures={}",
+            scope,
+            mode.as_str(),
+            verdict,
+            capability_text,
+            snapshot.present,
+            budget_exhausted,
+            snapshot.scope_failures_for(scope)
+        );
+    }
     verdict
 }
 

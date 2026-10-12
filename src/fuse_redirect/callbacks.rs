@@ -181,7 +181,14 @@ impl Filesystem for FuseRedirectFs {
                 }
                 self.reply_entry_for_rel(&policy, &rel, reply)
             }
-            Err(errno) => reply.error(errno),
+            Err(errno) => {
+                Self::log_new_entry_errno(
+                    &self.policy_for_read_request(req, Some(parent), None),
+                    name,
+                    errno,
+                );
+                reply.error(errno)
+            }
         }
     }
 
@@ -478,11 +485,20 @@ impl Filesystem for FuseRedirectFs {
         let backend = match self.backend_for_ino(&policy, ino) {
             Ok(backend) => backend,
             Err(errno) => {
+                Self::log_unexpected_open_errno(&policy, "", errno);
                 reply.error(errno);
                 return;
             }
         };
         if backend.is_read_only && is_mutation {
+            log::warn!(
+                "fuse open read-only deny pkg={} rel={} policy_fp={:016x} monitor_only={} op={}",
+                policy.package_name,
+                backend.rel,
+                policy.fingerprint,
+                policy.is_monitor_only,
+                fuse_open_operation_name(flags.0)
+            );
             policy.emit_monitor_read_only_deny(fuse_open_operation_name(flags.0), &backend);
             reply.error(Errno::EROFS);
             return;
@@ -507,6 +523,7 @@ impl Filesystem for FuseRedirectFs {
         let file = match Self::open_backend_file(&backend.path, open_flags, 0) {
             Ok(file) => file,
             Err(errno) => {
+                Self::log_unexpected_open_errno(&policy, &backend.rel, errno);
                 reply.error(errno);
                 return;
             }
@@ -815,6 +832,7 @@ impl Filesystem for FuseRedirectFs {
         } = match self.route_new_entry(req, parent, name, "create") {
             Ok(route) => route,
             Err(errno) => {
+                Self::log_new_entry_errno(&self.policy_for_request(req), name, errno);
                 reply.error(errno);
                 return;
             }
@@ -963,6 +981,7 @@ impl Filesystem for FuseRedirectFs {
         ) {
             Ok(file) => file,
             Err(errno) => {
+                Self::log_unexpected_open_errno(&policy, &backend.rel, errno);
                 reply.error(errno);
                 return;
             }
