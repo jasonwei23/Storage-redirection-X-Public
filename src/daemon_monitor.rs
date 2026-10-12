@@ -78,10 +78,11 @@ fn runtime_max_watches() -> usize {
             // 容量受限状态下反复展开（每次全树展开都要穿过 FUSE 视图，是 CPU
             // 突发的稳定来源）；按配额比例放宽后树可以一次建完，不再周期性重试。
             let proportional = limit * MAX_WATCHES_KERNEL_SHARE_NUM / MAX_WATCHES_KERNEL_SHARE_DEN;
-            proportional
-                .min(MAX_WATCHES_CEILING)
-                .max(DEFAULT_MAX_WATCHES)
-                .min(limit)
+            // clamp 的上下界都不得高于内核配额（clamp 要求 min<=max）：配额异常小
+            // （低于默认下限）时收敛到配额本身。
+            let floor = DEFAULT_MAX_WATCHES.min(limit);
+            let ceiling = limit.max(floor);
+            proportional.min(MAX_WATCHES_CEILING).clamp(floor, ceiling)
         })
         .unwrap_or(DEFAULT_MAX_WATCHES)
 }

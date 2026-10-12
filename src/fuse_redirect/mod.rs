@@ -475,7 +475,7 @@ impl FuseRedirectFs {
 
     fn reply_entry_for_rel(&self, policy: &RedirectPolicy, rel: &str, reply: ReplyEntry) {
         let Some(backend) = policy.backend_for_relative(rel, OperationKind::Read) else {
-            Self::log_new_entry_errno(policy, &OsStr::new(rel), Errno::ENOENT);
+            Self::log_new_entry_errno(policy, OsStr::new(rel), Errno::ENOENT);
             reply.error(Errno::ENOENT);
             return;
         };

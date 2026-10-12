@@ -9,6 +9,9 @@ pub(crate) use download_owner::infer_download_owner_package_by_path;
 // quality-allow(lint-suppression): Android 平台的公共路径归属 re-export 由 Android hook 路径消费。
 #[allow(unused_imports)]
 pub(crate) use source_hint::infer_public_path_package_name;
+// quality-allow(lint-suppression): has_recent_public_path_request 仅由 bin 侧
+// daemon_monitor 消费，lib 视角未使用（源码被 bin #[path] 再编译的两侧差异）。
+#[allow(unused_imports)]
 pub(crate) use source_hint::{
     has_recent_public_path_request, infer_recent_path_caller_identity,
     remember_private_path_caller_hint, remember_private_path_caller_hint_in_memory,

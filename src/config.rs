@@ -131,6 +131,8 @@ pub fn fuse_passthrough_probe_state() -> Option<bool> {
     if boot_matches { status } else { None }
 }
 
+// quality-allow(lint-suppression): 调用方 daemon 侧探针位于 daemon_mount，仅由 bin #[path] 再编译。
+#[allow(dead_code)]
 pub fn write_fuse_passthrough_probe_state(ok: bool) {
     let boot_id = fuse_passthrough_boot_id();
     if boot_id.is_empty() {

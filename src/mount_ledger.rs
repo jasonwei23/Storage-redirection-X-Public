@@ -29,6 +29,9 @@ use crate::platform::paths;
 use std::fs;
 use std::path::PathBuf;
 
+// quality-allow(lint-suppression): 消费方 daemon_mount 仅由 bin #[path] 再编译，
+// lib 视角本 re-export 未使用（两侧编译差异）。
+#[allow(unused_imports)]
 pub use crate::module_mount_source::is_module_redirect_mount;
 
 /// 账本 schema 版本。字段增减时必须同步递增，旧版本账本按不可用处理。
@@ -327,42 +330,14 @@ pub fn save(ledger: &MountLedger) -> bool {
 /// 按调用方给定的显式挂载目标登记身份：不经归属谓词，直接取该目标的 topmost 事实。
 ///
 /// 调用方刚在 `mount_point` 上完成挂载（或确认沿用既有挂载），target 上的 topmost 挂载
-/// 就是本模块的那一层。**不能**走 [`capture_mount_identity`] 的归属谓词：private-dir
-/// alias bind 的 `root` 形态与系统挂载完全同形（都止于 `Android/{data,media,obb}/<pkg>`），
-/// 谓词会把它当系统挂载漏掉，账本缺了这层，cleanup 判 foreign 就永远摘不净，
-/// 重挂循环不停（真机实测 wetype 等应用每次 reload 都触发 cleanup incomplete）。
+/// 就是本模块的那一层。**不能**改回 [`is_module_redirect_mount`] 归属谓词判定：
+/// private-dir alias bind 的 `root` 形态与系统挂载完全同形（都止于
+/// `Android/{data,media,obb}/<pkg>`），谓词会把它当系统挂载漏掉，账本缺了这层，
+/// cleanup 判 foreign 就永远摘不净，重挂循环不停（真机实测 wetype 等应用每次
+/// reload 都触发 cleanup incomplete）。
 pub fn capture_explicit_mount_identity(pid: i32, mount_point: &str) -> Option<MountIdentity> {
     let live = topmost_live_mount(pid, mount_point)?;
     Some(MountIdentity {
-        mount_point: paths::normalize_syntax(mount_point),
-        mount_id: live.mount_id,
-        source: live.source,
-    })
-}
-
-/// 构造一条当前时刻的挂载身份记录。
-///
-/// 两条挂载路径（daemon 与 companion）共用它：`pid <= 0` 读调用方自身命名空间，而两条路径
-/// 在登记时都已经处于目标应用的命名空间里，因此归属判据一致。
-///
-/// 归属判据用 [`is_module_redirect_mount`]（挂载源 **或** `root` 沙箱路径）而不是只看挂载源：
-/// bind 会继承底层文件系统的源，真机上本模块每一层的 source 都是 `/dev/fuse`，只按源判断会
-/// 让账本**永远登记不到任何挂载明细**，恢复流程因此拿不到「哪一层是我的」，只能走按命名空间
-/// 身份的兜底判定，永远产不出 `Owned`。
-pub fn capture_mount_identity(
-    pid: i32,
-    mount_point: &str,
-    package_name: &str,
-) -> Option<MountIdentity> {
-    let live = topmost_live_mount(pid, mount_point)?;
-    if !is_module_redirect_mount(&live.source, &live.root, mount_point, package_name) {
-        // 最顶层不是本模块的挂载时不能登记身份，否则恢复流程会误以为可以摘除。
-        return None;
-    }
-    Some(MountIdentity {
-        // 保存真实目标（保留存储别名），而不是别名归一化后的形式：
-        // 否则 /data/media 后端挂载会被折叠成 /storage/emulated，使缺失的主入口
-        // 误以为拥有后端挂载的归属身份。
         mount_point: paths::normalize_syntax(mount_point),
         mount_id: live.mount_id,
         source: live.source,

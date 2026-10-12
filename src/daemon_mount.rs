@@ -225,7 +225,7 @@ fn log_remount_reason(
     const SAMPLE_HEAD: u64 = 8;
     const SAMPLE_INTERVAL: u64 = 64;
     let count = REMOUNT_REASON_LOG_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
-    if count > SAMPLE_HEAD && (count - SAMPLE_HEAD) % SAMPLE_INTERVAL != 0 {
+    if count > SAMPLE_HEAD && !(count - SAMPLE_HEAD).is_multiple_of(SAMPLE_INTERVAL) {
         return;
     }
     match fingerprints {
@@ -625,7 +625,6 @@ fn refresh_mount_state_fingerprint(request: &MountRequest) -> bool {
             .map(|index| index + 1)
             .unwrap_or(0);
         lines.insert(position, format!("policy_fp={policy_fingerprint}"));
-        policy_replaced = true;
     }
     if !replaced {
         return false;

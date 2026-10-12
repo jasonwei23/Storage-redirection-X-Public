@@ -211,15 +211,13 @@ fn mount_one_storage_view_barrier(request: &CompanionMountRequest, root: &str) -
                         continue;
                     }
                     let fstype = fields.next().unwrap_or("");
-                    let options = fields.next().unwrap_or("");
                     if source == "none" && fstype == "tmpfs" {
                         let Ok(c_root) = CString::new(root_norm) else {
                             break;
                         };
                         // SAFETY: c_root 是 NUL 结尾的合法路径；MNT_DETACH 延迟卸载，
                         // 即使屏障仍被引用也不阻塞挂载流程。
-                        let detached =
-                            unsafe { libc::umount2(c_root.as_ptr(), libc::MNT_DETACH) } == 0;
+                        let detached = libc::umount2(c_root.as_ptr(), libc::MNT_DETACH) == 0;
                         log::warn!("stale view barrier detached root={} ok={}", root, detached);
                     } else {
                         break;
@@ -311,7 +309,6 @@ fn detach_stale_barriers_not_in(scoped_fuse_roots: &[String]) {
                 .trim_end_matches('/')
                 .to_string();
             let fstype = fields.next().unwrap_or("");
-            let options = fields.next().unwrap_or("");
             (source == "none" && fstype == "tmpfs").then_some(mount_point)
         })
         .filter(|mount_point| !whitelisted(mount_point))
@@ -701,7 +698,7 @@ fn handle_child_process(
     // 共享宿主必须先于 namespace 重定向接管存储根，避免 SQLite 在接管前打开
     // 重定向沙盒中的旧副本。
     let preattached_host = preattach_shared_host(request, scoped_fuse_roots);
-    let mut is_success = if preattached_host.is_some() {
+    let is_success = if preattached_host.is_some() {
         true
     } else if request.is_monitor_only {
         mount_mgr.ensure_mount_namespace_prepared()

@@ -425,6 +425,9 @@ pub(crate) fn infer_recent_saf_caller_identity(
 /// 再发一条观察记录只会让同一次操作在监视记录里出现两条。窗口需覆盖「mkdir/open
 /// 先于 inotify 回调送达」的毫秒级时差与下载器批量打开的小幅延迟，但应明显短于
 /// hint 归因窗口（30s），避免把明显晚于请求的独立写入也一并吞掉。
+// quality-allow(lint-suppression): 消费方 daemon_monitor 仅被 bin #[path] 再编译，
+// lib 视角本组判定为死代码（两侧编译差异，非真实残留）。
+#[allow(dead_code)]
 const RECENT_REQUEST_RECORD_WINDOW_MS: i64 = 10_000;
 
 /// 判断路径是否存在窗口内的请求侧写记录（mkdir / 创建或写入类 provider open）。
@@ -432,6 +435,9 @@ const RECENT_REQUEST_RECORD_WINDOW_MS: i64 = 10_000;
 /// 只查持久化 hint 文件：请求记录由 MediaProvider 进程写入，daemon 进程的内存
 /// hint 队列不包含它们。`updated_ms` 取自系统级 CLOCK_MONOTONIC，跨进程可比。
 /// `provider_open:read` 与只读查询不算写请求，不抑制观察记录。
+// quality-allow(lint-suppression): 消费方 daemon_monitor 仅被 bin #[path] 再编译，
+// lib 视角死代码（与上方常量同组，两侧编译差异）。
+#[allow(dead_code)]
 pub(crate) fn has_recent_public_path_request(normalized_path: &str, user_id: i32) -> bool {
     if user_id < 0 || !is_public_storage_hint_path(normalized_path, user_id) {
         return false;
@@ -446,6 +452,8 @@ pub(crate) fn has_recent_public_path_request(normalized_path: &str, user_id: i32
     })
 }
 
+// quality-allow(lint-suppression): 与 has_recent_public_path_request 同组，仅 bin 侧 daemon_monitor 消费。
+#[allow(dead_code)]
 fn is_write_request_hint_op_filter(op_filter: &str) -> bool {
     matches!(
         op_filter,

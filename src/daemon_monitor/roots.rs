@@ -477,10 +477,10 @@ pub(super) fn is_self_nested_redirect_path(path: &str) -> bool {
             continue;
         }
         let remainder = &after_prefix[package_end + 1..];
-        if let Some(nested) = remainder.strip_prefix(REDIRECT_TAIL) {
-            if nested.starts_with(PRIVATE_PREFIX) {
-                return true;
-            }
+        if let Some(nested) = remainder.strip_prefix(REDIRECT_TAIL)
+            && nested.starts_with(PRIVATE_PREFIX)
+        {
+            return true;
         }
         search_from = prefix_start + PRIVATE_PREFIX.len();
     }

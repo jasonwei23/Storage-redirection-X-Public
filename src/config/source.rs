@@ -349,22 +349,21 @@ fn load_app_config_inner(
     // 加载结果落规则计数：全量场景跑的失败家族（ENOENT/EROFS）根因是
     // 「reload 时盘上内容 vs 请求构建时的规则快照」不一致，这里把每次加载
     // 解析出的规则数与字节数落到日志，即可直接判定盘上文件当时的内容形态。
-    if is_ok {
-        if let Some(profile) = state.apps.get(package_name) {
-            if let Some(user) = profile.user_profiles.get(&0) {
-                log::debug!(
-                    "app config rules pkg={} bytes={} allow={} excl={} sandbox={} ro={} map={} enabled={}",
-                    package_name,
-                    content.len(),
-                    user.allowed_real_paths.len(),
-                    user.excluded_real_paths.len(),
-                    user.sandboxed_paths.len(),
-                    user.read_only_paths.len(),
-                    user.path_mappings.len(),
-                    user.is_enabled
-                );
-            }
-        }
+    if is_ok
+        && let Some(profile) = state.apps.get(package_name)
+        && let Some(user) = profile.user_profiles.get(&0)
+    {
+        log::debug!(
+            "app config rules pkg={} bytes={} allow={} excl={} sandbox={} ro={} map={} enabled={}",
+            package_name,
+            content.len(),
+            user.allowed_real_paths.len(),
+            user.excluded_real_paths.len(),
+            user.sandboxed_paths.len(),
+            user.read_only_paths.len(),
+            user.path_mappings.len(),
+            user.is_enabled
+        );
     }
     log_app_config_perf(package_name, content.len(), started_ms, is_ok);
     is_ok
