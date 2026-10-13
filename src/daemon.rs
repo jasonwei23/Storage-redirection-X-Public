@@ -86,6 +86,7 @@ fn media_ce_storage_ready() -> bool {
     let rc = unsafe { libc::mkdir(PROBE_DIR.as_ptr(), 0o770) };
     if rc == 0 {
         // 目录本不该缺失：清掉探针，仍视为就绪（密钥已可用才会创建成功）。
+        // SAFETY: 仅传入 NUL 结尾的常量路径指针，不借用调用方数据。
         unsafe { libc::rmdir(PROBE_DIR.as_ptr()) };
         return true;
     }
