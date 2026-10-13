@@ -191,6 +191,42 @@ fn mount_one_storage_view_barrier(request: &CompanionMountRequest, root: &str) -
                 );
                 libc::_exit(1);
             }
+            // 死宿主层清理：daemon 重启/宿主换代后，应用命名空间可能残留指向已消亡
+            // 宿主进程的 srx FUSE 层（宿主 pid 已不存在）。死层盖在 scoped roots 的
+            // 祖先路径上，路径解析穿过死连接会让屏障挂载报 ENOTCONN（真机 2026-10-13
+            // 实测 errno=107），也让后续 FUSE 接入失效。挂屏障前把宿主已消亡的 srx 层
+            // 逐个 MNT_DETACH；宿主仍存活的层不动，交由既有摘栈路径处理。
+            if let Ok(mounts) = std::fs::read_to_string("/proc/self/mounts") {
+                for line in mounts.lines().rev() {
+                    let mut fields = line.split_whitespace();
+                    let source = fields.next().unwrap_or("");
+                    let mount_point = fields.next().unwrap_or("").replace("\\040", " ");
+                    let Some(host_pid) = source
+                        .strip_prefix("srx_fuse_host[")
+                        .and_then(|rest| rest.strip_suffix(']'))
+                        .and_then(|pid| pid.parse::<i32>().ok())
+                    else {
+                        continue;
+                    };
+                    if std::path::Path::new(&format!("/proc/{host_pid}")).exists() {
+                        // 宿主仍存活：可能是本代健康会话，交给既有摘栈路径。
+                        continue;
+                    }
+                    let Ok(c_mount_point) = CString::new(mount_point) else {
+                        continue;
+                    };
+                    // SAFETY: c_mount_point 是 NUL 结尾的合法路径；MNT_DETACH 延迟卸载，
+                    // 即使仍有引用也不阻塞后续流程。
+                    let detached = libc::umount2(c_mount_point.as_ptr(), libc::MNT_DETACH) == 0;
+                    log::warn!(
+                        "storage view dead layer detached mount_point={} host_pid={} ok={} pkg={}",
+                        c_mount_point.to_string_lossy(),
+                        host_pid,
+                        detached,
+                        request.package_name
+                    );
+                }
+            }
             // 残留屏障清理：挂载链路失败时屏障按设计常驻（fail-closed），但下一次挂载
             // 若读到的规则不同（如快照竞态下全零规则走 namespace/bind），残留屏障会把
             // 视图根盖死（空只读 tmpfs → 写入 ENOENT/EROFS，应用重启也无效——同一个
