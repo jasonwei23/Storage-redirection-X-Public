@@ -535,7 +535,7 @@ jobs:
             tests/storage-redirect-test/media-file-api/build/reports/
 
   test-flow:
-    name: Test-flow Android ${{ matrix.android.version }}
+    name: Test-flow Android ${{ matrix.android.version }} (shard ${{ matrix.shard }})
     needs:
       - quality
       - prepare
@@ -577,6 +577,11 @@ jobs:
       # 需要跨版本对比证据时，用不带 --failed 的完整重跑单独获取；探针模式统一仅验证 Android14 场景1，扩展组用于独立隔离四类 SQLite/透传 hook。
       fail-fast: true
       matrix:
+        # 场景分片：每个 Android 版本的场景列表按 round-robin 切成 4 片并行执行，
+        # 墙钟约从 32 分钟压到 18 分钟。分片列表由 job 内「Compute scenario shard」
+        # 步骤从 prepare outputs 统一推导（窄跑/全量同源），空分片直接跳过模拟器。
+        # 分片总数与 Compute 步骤里的常量必须同步修改。
+        shard: [1, 2, 3, 4]
         android:
           - api: 33
             version: 13
@@ -637,6 +642,25 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v5
 
+      - name: Compute scenario shard
+        id: shard
+        env:
+          SCENARIOS: ${{ needs.prepare.outputs.scenarios }}
+        run: |
+          set -euo pipefail
+          # 与 runner 的 build_scenario_list 同一来源：all 展开 1..37，窄跑按列表。
+          # round-robin 取模分片，均衡慢场景；分片总数 4 与 matrix.shard 同步。
+          if [ "$SCENARIOS" = "all" ]; then
+            items=$(seq 1 37)
+          else
+            items=$(printf '%s' "$SCENARIOS" | tr ',;' '\n')
+          fi
+          picked=$(printf '%s\n' "$items" | awk -v n="${{ matrix.shard }}" '$0 ~ /^[0-9]+$/ { i++; if ((i - 1) % 4 == n - 1) print }' | paste -sd, -)
+          count=$(printf '%s' "$picked" | tr ',' '\n' | grep -c . || true)
+          echo "count=$count" >> "$GITHUB_OUTPUT"
+          echo "list=$picked" >> "$GITHUB_OUTPUT"
+          echo "shard ${{ matrix.shard }}: count=$count list=$picked"
+
       - name: Download test-flow runtime
         env:
           GH_TOKEN: ${{ github.token }}
@@ -688,7 +712,9 @@ jobs:
           done
 
       - name: Run Android test-flow scenarios
-        if: ${{ (!contains(github.event.head_commit.message, '延迟全量探针') && !contains(github.event.head_commit.message, '全量组合比较探针') && !contains(github.event.head_commit.message, '全量组合探针') && !contains(github.event.head_commit.message, '核心组探针') && !contains(github.event.head_commit.message, '扩展组探针')) || matrix.android.api == 34 || matrix.android.api == 37 }}
+        if: ${{ ((!contains(github.event.head_commit.message, '延迟全量探针') && !contains(github.event.head_commit.message, '全量组合比较探针') && !contains(github.event.head_commit.message, '全量组合探针') && !contains(github.event.head_commit.message, '核心组探针') && !contains(github.event.head_commit.message, '扩展组探针')) || matrix.android.api == 34 || matrix.android.api == 37) && steps.shard.outputs.count != '0' }}
+        env:
+          SRT_SCENARIO_SHARD_LIST: ${{ steps.shard.outputs.list }}
         uses: reactivecircus/android-emulator-runner@v2.37.0
         with:
           api-level: ${{ matrix.android.api_level }}
@@ -703,6 +729,10 @@ jobs:
           emulator-options: -no-window -gpu swiftshader_indirect -no-snapshot-load -no-snapshot-save -noaudio -no-boot-anim -no-metrics -feature -Vulkan
           script: bash .github/tests/run-android-test-flow.sh
 
+      - name: Skip empty scenario shard
+        if: ${{ steps.shard.outputs.count == '0' }}
+        run: echo "分片 ${{ matrix.shard }} 无场景：跳过模拟器启动与测试"
+
       - name: Skip non-target probe shard
         if: ${{ (contains(github.event.head_commit.message, '延迟全量探针') || contains(github.event.head_commit.message, '全量组合比较探针') || contains(github.event.head_commit.message, '全量组合探针') || contains(github.event.head_commit.message, '核心组探针') || contains(github.event.head_commit.message, '扩展组探针')) && matrix.android.api != 34 && matrix.android.api != 37 }}
         run: echo "仅验证 Fuse 探针：跳过 Android ${{ matrix.android.version }} 测试分片"
@@ -711,7 +741,7 @@ jobs:
         if: always() && matrix.android.version != 17 && hashFiles('scenario-*-result.txt', 'scenario-2-mediastore-hook-diag.txt', 'test-flow-preflight.txt', 'test-flow-app-mountinfo.txt', 'test-flow-fuse-sample.txt', 'test-flow-logcat.txt', 'test-flow-module-state.txt', 'test-flow-backend-diagnostic.txt', 'test-flow-monitor-state.txt', 'media-health.txt') != ''
         uses: actions/upload-artifact@v7.0.1
         with:
-          name: test-flow-android${{ matrix.android.version }}-artifacts
+          name: test-flow-android${{ matrix.android.version }}-s${{ matrix.shard }}-artifacts
           if-no-files-found: ignore
           retention-days: 14
           path: |
@@ -730,7 +760,7 @@ jobs:
         if: always() && hashFiles('test-flow-shared-fuse-before.txt', 'test-flow-shared-fuse-after.txt') != ''
         uses: actions/upload-artifact@v7.0.1
         with:
-          name: test-flow-android${{ matrix.android.version }}-shared-fuse
+          name: test-flow-android${{ matrix.android.version }}-s${{ matrix.shard }}-shared-fuse
           if-no-files-found: ignore
           retention-days: 14
           compression-level: 0
