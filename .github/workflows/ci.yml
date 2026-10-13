@@ -649,13 +649,23 @@ jobs:
         run: |
           set -euo pipefail
           # 与 runner 的 build_scenario_list 同一来源：all 展开 1..37，窄跑按列表。
-          # round-robin 取模分片，均衡慢场景；分片总数 4 与 matrix.shard 同步。
+          # 场景套件有顺序依赖（前序场景安装应用/留下目录归属等前置状态），必须按
+          # 原始顺序连续分块（1-10/11-20/21-30/31-37），不能用 round-robin 交错——
+          # 交错会让每个场景丢失全部前序上下文（真机实测场景 5 归属校验因此失败）。
+          # 分片总数 4 与 matrix.shard 同步。
           if [ "$SCENARIOS" = "all" ]; then
             items=$(seq 1 37)
           else
             items=$(printf '%s' "$SCENARIOS" | tr ',;' '\n')
           fi
-          picked=$(printf '%s\n' "$items" | awk -v n="${{ matrix.shard }}" '$0 ~ /^[0-9]+$/ { i++; if ((i - 1) % 4 == n - 1) print }' | paste -sd, -)
+          picked=$(printf '%s\n' "$items" | awk -v n="${{ matrix.shard }}" '
+            $0 ~ /^[0-9]+$/ { total++ }
+            END {
+              chunk = int((total + 3) / 4)
+              for (i = 1; i <= total; i++) {
+                if (int((i - 1) / chunk) == n - 1) print i
+              }
+            }' | paste -sd, -)
           count=$(printf '%s' "$picked" | tr ',' '\n' | grep -c . || true)
           echo "count=$count" >> "$GITHUB_OUTPUT"
           echo "list=$picked" >> "$GITHUB_OUTPUT"

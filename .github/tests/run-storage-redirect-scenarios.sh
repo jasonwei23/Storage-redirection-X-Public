@@ -749,9 +749,9 @@ supports_fuse_backend_scenarios() {
 build_scenario_list() {
   scenarios=()
   # CI 分片模式：workflow 的 Compute scenario shard 步骤已按 prepare outputs 推导
-  # 出本分片的场景列表（round-robin），这里直接采用，保持单一分片来源。列表为空
-  # 时 scenarios 为空数组，主循环零场景直接以成功退出（workflow 侧空分片根本不会
-  # 启动模拟器，本分支仅是兜底）。
+  # 出本分片的场景列表（按原始顺序连续分块，保留场景间前置状态依赖），这里直接
+  # 采用，保持单一分片来源。列表为空时 scenarios 为空数组，主循环零场景直接以
+  # 成功退出（workflow 侧空分片根本不会启动模拟器，本分支仅是兜底）。
   if [ -n "${SRT_SCENARIO_SHARD_LIST:-}" ]; then
     local shard_scenario
     for shard_scenario in ${SRT_SCENARIO_SHARD_LIST//,/ }; do
