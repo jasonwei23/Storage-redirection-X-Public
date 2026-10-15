@@ -1251,7 +1251,7 @@ const Api = {
       'logcat -g > "$stage/logcat-buffers.txt" 2>&1 || true; ' +
       'logcat -b main,system,crash -d -t 10000 -v threadtime -s StorageRedirect:V SRX:V FileMonitorOp:I Stats:I AndroidRuntime:E DEBUG:F libc:F ActivityManager:I WindowManager:I MediaProvider:V ExternalStorage:V DocumentsUI:V Vold:V > "$stage/logcat-srx-filtered.txt" 2>&1 || true; ' +
       'logcat -b crash -d -v threadtime > "$stage/logcat-crash.txt" 2>&1 || true; ' +
-      'logcat -b main,system -d -t 8000 -v threadtime > "$stage/logcat-main-system-context.txt" 2>&1 || true; ' +
+      'logcat -b main,system -d -t 20000 -v threadtime > "$stage/logcat-main-system-context.txt" 2>&1 || true; ' +
       'logcat -b events -d -t 1500 -v threadtime > "$stage/logcat-events.txt" 2>&1 || true; ' +
       'echo "initial_capture_completed_at=$(date "+%Y-%m-%d %H:%M:%S %z" 2>/dev/null || date 2>/dev/null)" >> "$stage/state/logcat-capture.txt"; ' +
       diagnosticProgressCommand(progress, 18, "files", "正在复制模块日志和配置") +

@@ -70,6 +70,129 @@ static LAST_MEDIA_PROVIDER_PIDS: Mutex<Vec<i32>> = Mutex::new(Vec::new());
 /// MediaProvider 进程出现后补登记一次（幂等，已成功者跳过），覆盖首次失败的应用。
 static PRE_REGISTER_ALL_AFTER_MEDIA_READY: AtomicBool = AtomicBool::new(false);
 
+/// 开机全量预登记因 CE 密钥未就绪而挂起，待就绪后补跑。
+static BOOT_PRE_REGISTER_PENDING: AtomicBool = AtomicBool::new(false);
+
+/// 探测 /data/media 的用户 CE 密钥是否已就绪。
+///
+/// 开机全量预登记发生在 daemon 启动（post-fs-data/service 阶段），此时 /data/media
+/// 的用户 CE 密钥尚未安装，任何 mkdir/lookup 都返回 errno=126（Required key not
+/// available），整批预登记必然失败——真机实测是每次开机的确定性竞态。用一次 mkdir
+/// 探测代替几十次注定失败的登记：路径可达（返回成功或 EEXIST）即就绪，其余错误
+/// （ENOKEY/ENOENT 等）一律视为未就绪，交由挂起补跑与 media_ready 触发兜住。
+fn media_ce_storage_ready() -> bool {
+    const PROBE_DIR: &std::ffi::CStr = c"/data/media/0/Android/data";
+    // SAFETY: libc::mkdir/rmdir 只接收 NUL 结尾的合法路径常量，不借用调用方数据。
+    let rc = unsafe { libc::mkdir(PROBE_DIR.as_ptr(), 0o770) };
+    if rc == 0 {
+        // 目录本不该缺失：清掉探针，仍视为就绪（密钥已可用才会创建成功）。
+        // SAFETY: 仅传入 NUL 结尾的常量路径指针，不借用调用方数据。
+        unsafe { libc::rmdir(PROBE_DIR.as_ptr()) };
+        return true;
+    }
+    crate::platform::errno::last() == libc::EEXIST
+}
+
+/// 预登记失败重试条目。
+struct PendingPolicyRetry {
+    package_name: String,
+    uid: i32,
+    attempts: u32,
+}
+
+/// 预登记失败重试队列。
+///
+/// 开机全量预登记可能在 FBE 密钥未就绪的竞态窗口整批失败：沙箱目录 mkdir 返回
+/// errno=126（Required key not available），宿主整批拒绝策略（fuse host policy
+/// rejected + ack rejected），且此后没有任何重试——所有应用落入宿主 fail-closed
+/// deny_all，用户可见症状是所有应用视角 /storage/emulated/0 为空（真机 2026-10-13
+/// 事故）。media_ready 补登记只有一次机会，若那一刻密钥仍未就绪同样失效。失败
+/// 条目进入本队列，由周期 reconcile 逐轮限量重试；上限内成功或超限后移除。
+static PENDING_POLICY_RETRIES: Mutex<Vec<PendingPolicyRetry>> = Mutex::new(Vec::new());
+
+/// 单个应用的最大重试次数。30 秒周期下约覆盖 15 分钟的开机恢复窗口。
+const POLICY_RETRY_MAX_ATTEMPTS: u32 = 30;
+/// 每个 reconcile 周期最多重试的条目数：登记要 fork 子进程探测 media 视图并等待
+/// 宿主 ack（最坏秒级），限量保证重试不挤占同一循环内挂载计划的关键窗口（计划
+/// 本身单轮也只执行 1 个）。
+const POLICY_RETRY_PER_CYCLE: usize = 2;
+
+/// 把预登记失败的应用加入重试队列（按 uid 去重）。
+fn enqueue_policy_retry(package_name: &str, uid: i32) {
+    if uid < ANDROID_APP_UID_START {
+        return;
+    }
+    let mut queue = PENDING_POLICY_RETRIES
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if queue.iter().any(|entry| entry.uid == uid) {
+        return;
+    }
+    queue.push(PendingPolicyRetry {
+        package_name: package_name.to_string(),
+        uid,
+        attempts: 0,
+    });
+}
+
+/// 在 reconcile 周期内限量重试预登记失败的应用。
+///
+/// 复用与开机全量预登记完全相同的 build_request + pre_register_host_policy 路径；
+/// 幂等由指纹表保证，成功（含已登记）即出队，持续失败计满上限后放弃并告警。
+fn drain_pending_policy_retries(config_version: u64) {
+    let snapshot = SettingsHub::instance().get_daemon_reconcile_config_snapshot();
+    let mut retried = 0usize;
+    let mut queue = PENDING_POLICY_RETRIES
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let mut index = 0usize;
+    while index < queue.len() && retried < POLICY_RETRY_PER_CYCLE {
+        let (package_name, uid, attempts) = {
+            let entry = &mut queue[index];
+            entry.attempts += 1;
+            (entry.package_name.clone(), entry.uid, entry.attempts)
+        };
+        let proc = AppProcess {
+            pid: 0,
+            uid,
+            package_name,
+            is_uninterruptible: false,
+        };
+        let request = build_request(&proc, config_version, &snapshot);
+        if request.operation != MountOperation::Reload {
+            // 配置已不再产生 Reload 请求（应用被移除或关闭重定向）：无需重试，出队。
+            queue.remove(index);
+            continue;
+        }
+        retried += 1;
+        match crate::daemon_mount::pre_register_host_policy(&request) {
+            crate::daemon_mount::PreRegisterOutcome::Registered
+            | crate::daemon_mount::PreRegisterOutcome::AlreadyRegistered => {
+                log::info!(
+                    "policy retry registered uid={} pkg={} attempts={}",
+                    uid,
+                    request.package_name,
+                    attempts
+                );
+                queue.remove(index);
+            }
+            crate::daemon_mount::PreRegisterOutcome::NotApplicable => {
+                if attempts >= POLICY_RETRY_MAX_ATTEMPTS {
+                    log::warn!(
+                        "policy retry exhausted uid={} pkg={} attempts={}",
+                        uid,
+                        request.package_name,
+                        attempts
+                    );
+                    queue.remove(index);
+                } else {
+                    index += 1;
+                }
+            }
+        }
+    }
+}
+
 /// 周期 reconcile 摘要的记录状态。
 ///
 /// 每轮都按 info 记录摘要会让调试日志以秒级速度增长，把真正需要排查的挂载事件
@@ -456,11 +579,16 @@ pub fn main_entry() -> i32 {
     // 后续 reconcile 会在宿主子进程死亡后按需恢复，而不是继续使用失效句柄。
     if !crate::fuse_host::ensure_global() {
         log::warn!("fuse host session unavailable, scoped path remains active");
-    } else {
+    } else if media_ce_storage_ready() {
         // 宿主就绪后立即全量预登记所有已配置应用：让应用冷启动时无需等待 reconcile
         // 轮询到该进程，就能从宿主快照确认 uid 并接入共享会话，避免 scoped 竞态与
         // 启动窗口。宿主未就绪时跳过（此时预登记必然失败，逐个触发等待反而拖慢启动）。
         pre_register_all_configured_apps(config, config.config_version());
+    } else {
+        // CE 密钥未就绪的竞态窗口：整批登记必然失败（errno=126），跳过本次全量并
+        // 挂起，待密钥就绪后由 reconcile 补跑，避免几十次注定失败的 fork 与拒绝日志。
+        BOOT_PRE_REGISTER_PENDING.store(true, Ordering::Release);
+        log::warn!("boot pre-register deferred: media CE key not ready");
     }
 
     let mut last_version = 0;
@@ -480,6 +608,14 @@ pub fn main_entry() -> i32 {
             cleanup_all_mount_states();
             log::info!("daemon stop reason=runtime_disabled");
             return 0;
+        }
+        // 挂起的开机全量预登记：CE 密钥就绪后立即补跑。放在 should_reconcile 判定
+        // 之外，配合挂起态下 1 秒的 poll 上限，密钥就绪后 ~1 秒内完成补登记；
+        // 幂等由指纹表保证，未挂起时本块零开销。
+        if BOOT_PRE_REGISTER_PENDING.load(Ordering::Acquire) && media_ce_storage_ready() {
+            BOOT_PRE_REGISTER_PENDING.store(false, Ordering::Release);
+            log::warn!("boot pre-register resumed: media CE key ready");
+            pre_register_all_configured_apps(config, config.config_version());
         }
         let before = config.config_version();
         let (did_reload, changed_packages, full_change) =
@@ -632,6 +768,10 @@ fn wait_for_daemon_events(
 ) -> bool {
     let timeout_ms: libc::c_int = if reconcile_pending {
         RECONCILE_CONTINUE_WAIT_MS
+    } else if BOOT_PRE_REGISTER_PENDING.load(Ordering::Acquire) {
+        // 挂起的开机预登记等待 CE 密钥就绪：1 秒粒度轮询，密钥就绪后 ~1 秒内补跑，
+        // 避免 30 秒周期兜底带来的启动登记延迟。挂起态只存在于开机后一两分钟。
+        1_000
     } else {
         30_000
     };
@@ -895,9 +1035,7 @@ fn dump_malloc_info_if_requested() {
     // SAFETY: fopen/malloc_info/fclose 均为 bionic libc 导出的稳定接口；fp
     // 生命周期限定在本函数内，malloc_info 内部仅短暂持有分配器锁。
     unsafe {
-        let path = b"/data/local/tmp/srx-meminfo.xml\0".as_ptr() as *const libc::c_char;
-        let mode = b"w\0".as_ptr() as *const libc::c_char;
-        let fp = libc::fopen(path, mode);
+        let fp = libc::fopen(c"/data/local/tmp/srx-meminfo.xml".as_ptr(), c"w".as_ptr());
         if fp.is_null() {
             log::warn!("daemon meminfo dump fopen failed");
             let _ = std::fs::remove_file(TRIGGER);
@@ -1047,6 +1185,10 @@ fn reconcile_running_apps(
         if media_ready && !PRE_REGISTER_ALL_AFTER_MEDIA_READY.swap(true, Ordering::AcqRel) {
             pre_register_all_configured_apps(SettingsHub::instance(), config_version);
         }
+
+        // 预登记失败重试：开机/media_ready 两波全量登记在竞态窗口失败的应用，由
+        // 周期 reconcile 逐轮限量补登记（队列空时零开销）。
+        drain_pending_policy_retries(config_version);
 
         // companion 与 daemon 可能同时为同一应用发起挂载。全量路径先登记本轮 Auto 应用策略，
         // 让 companion 能从宿主快照确认 uid 后直接接入共享会话。单包增量路径由快速热更新或
@@ -1448,7 +1590,13 @@ fn pre_register_all_configured_apps(config: &SettingsHub, config_version: u64) {
         if request.operation != MountOperation::Reload {
             continue;
         }
-        crate::daemon_mount::pre_register_host_policy(&request);
+        if crate::daemon_mount::pre_register_host_policy(&request)
+            == crate::daemon_mount::PreRegisterOutcome::NotApplicable
+        {
+            // 竞态窗口失败（典型：FBE 密钥未就绪 errno=126 整批被拒）：进重试队列，
+            // 由周期 reconcile 逐轮补登记，避免应用永久落入 deny_all 空视图。
+            enqueue_policy_retry(&request.package_name, request.uid);
+        }
     }
 }
 

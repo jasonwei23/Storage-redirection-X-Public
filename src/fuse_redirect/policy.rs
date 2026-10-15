@@ -127,6 +127,13 @@ pub(super) struct RedirectPolicy {
     /// 为空表示宿主命名空间没有可用视图（scoped 会话、视图未绑定），保持直连行为。
     pub(super) media_sqlite_real_root: PathBuf,
     pub(super) redirect_root: PathBuf,
+    /// 重定向根的视图形态（相对存储根，如 `Android/data/<pkg>/sdcard`）。
+    ///
+    /// 应用视图对重定向根自身的再进入（视图里出现同名子树）与根下同后端路径内容一致，
+    /// 但决策路径不同，镜像子树会被反复再映射、逐层自嵌套（真机实测 70+ 层直到
+    /// ENAMETOOLONG）。`backend_for_relative` 用它把再进入路径折叠回根下解析。
+    /// 直通/监视会话的重定向根就是存储根，此处为空串，不折叠。
+    pub(super) redirect_view_rel: String,
     pub(super) rule_prefixes: Vec<RulePrefix>,
     pub(super) allowed_real_paths: Vec<String>,
     pub(super) excluded_real_paths: Vec<String>,
@@ -147,6 +154,10 @@ pub(super) struct RedirectPolicy {
     /// 只用于宿主共享会话的"未登记 uid"回退——宁可让调用方读不到、写不进，也不能让它
     /// 直接落到真实存储上。普通策略恒为 `false`。
     deny_all: bool,
+    /// 本策略由哪份配置构建（[`crate::fuse_redirect::config::fuse_config_policy_fingerprint`]）。
+    /// 宿主共享会话跨配置 reload 时，异常回包（EROFS/ENOENT）带上它即可直接判定
+    /// 「当时生效的是旧策略还是新策略」。
+    pub(super) fingerprint: u64,
 }
 
 /// 会话策略注册表：把「一个 FUSE 会话绑定单一应用」扩展为「按调用方 uid 解析」。
@@ -218,6 +229,32 @@ impl SharedPolicyTable {
             );
         }
         Some(self.by_uid.read().ok()?.len())
+    }
+
+    /// 只登记 mount namespace 维度的策略，不写按 uid 的全局表。
+    ///
+    /// 供 daemon 自身（uid=0）的直通登记使用：按 [`PolicyRegistry::for_request`] 的查找
+    /// 顺序，uid=0 一旦进按 uid 表就会盖住**所有** root 调用方（任何 namespace 的 root
+    /// FUSE 请求都先按 uid 命中），破坏「未登记 uid 一律 deny_all」的 fail-closed 边界。
+    /// 只写 namespace 表时，其它 namespace 的 uid=0 请求仍然走 deny_all 回退。
+    /// 返回 namespace 表大小（>0 即登记成功，供控制通道应答）。
+    pub(crate) fn register_namespace_only(&self, config: FuseRedirectConfig) -> Option<usize> {
+        let namespace = registered_mount_namespace(&config)?;
+        let policy = Arc::new(RedirectPolicy::new(config)?);
+        let (ns_dev, ns_ino, package_name) =
+            (namespace.dev, namespace.ino, policy.package_name.clone());
+        let mut namespaces = self.by_namespace.0.write().ok()?;
+        namespaces.insert(namespace, policy);
+        drop(namespaces);
+        let table = self.by_namespace.0.read().ok()?.len();
+        log::info!(
+            "fuse policy namespace registered (ns-only) ns={}:{} pkg={} table={}",
+            ns_dev,
+            ns_ino,
+            package_name,
+            table
+        );
+        Some(table)
     }
 }
 
@@ -324,6 +361,8 @@ fn request_mount_namespace(pid: u32) -> Option<NamespaceIdentity> {
 
 impl RedirectPolicy {
     pub(super) fn new(config: FuseRedirectConfig) -> Option<Self> {
+        // 指纹须在任何 config 字段被 move 前计算。
+        let fingerprint = super::config::fuse_config_policy_fingerprint(&config);
         let user_id = config.user_id();
         let storage_root = paths::storage_user_root_for_user(user_id);
         let mount_root = super::config::fuse_mount_point(&config, user_id);
@@ -370,19 +409,39 @@ impl RedirectPolicy {
             if !fs::create_directory(&redirect_root_string, redirect_root_uid)
                 && !fs::is_directory(&redirect_root_string)
             {
-                // errno 区分失败类别：EACCES/EPERM 多为开机期 sepolicy 未就绪的
-                // 竞态（30 秒周期重试可自愈），ENOTDIR/EEXIST 则是路径被普通
-                // 文件占用等配置或环境错误，需要用户侧介入。
-                log::error!(
-                    "fuse redirect target mkdir failed: {} errno={}",
-                    redirect_root_string,
-                    fs::last_create_directory_errno()
-                );
+                // errno 区分失败类别：EACCES/EPERM/ENOKEY/ENOTCONN 是开机竞态
+                // （sepolicy 未就绪、FBE CE 密钥未解锁，30 秒周期重试可自愈；
+                // 真机实测开机 +15s 曾 42 包同秒 ENOKEY 失败），ENOTDIR/EEXIST
+                // 则是路径被普通文件占用等配置或环境错误，需要用户侧介入。
+                let errno = fs::last_create_directory_errno();
+                if fs::errno_is_transient_boot_race(errno) {
+                    log::warn!(
+                        "fuse redirect target mkdir deferred (boot race): {} errno={} {}",
+                        redirect_root_string,
+                        errno,
+                        crate::platform::errno::text(errno)
+                    );
+                } else {
+                    log::error!(
+                        "fuse redirect target mkdir failed: {} errno={} {}",
+                        redirect_root_string,
+                        errno,
+                        crate::platform::errno::text(errno)
+                    );
+                }
                 return None;
             }
             fix_mapped_dir_metadata(&redirect_root_string, config.uid);
             redirect_root_string
         };
+
+        // 重定向根的视图形态（相对存储根）：sdcard 形态重定向时为
+        // Android/data/<pkg>/sdcard。直通/监视会话的重定向根就是存储根，此处为空串。
+        // 应用视图对重定向根自身的再进入由 backend_for_relative 折叠回根下解析。
+        let redirect_view_rel = paths::relative_child_path(&redirect_storage, &storage_root)
+            .unwrap_or_default()
+            .trim_matches('/')
+            .to_string();
 
         let mut path_mappings = resolve_path_mappings(
             &config.path_mappings,
@@ -433,6 +492,7 @@ impl RedirectPolicy {
             private_real_root: PathBuf::from(paths::data_media_user_root_for_user(user_id)),
             media_sqlite_real_root: media_sqlite_view_root_for_user(user_id),
             redirect_root: PathBuf::from(redirect_root_string),
+            redirect_view_rel,
             rule_prefixes,
             allowed_real_paths,
             excluded_real_paths,
@@ -449,6 +509,7 @@ impl RedirectPolicy {
             is_monitor_only: config.is_monitor_only,
             is_file_monitor_enabled: config.is_file_monitor_enabled,
             deny_all: false,
+            fingerprint,
         })
     }
 
@@ -478,6 +539,16 @@ impl RedirectPolicy {
             return None;
         }
         let rel = sanitize_relative(rel)?;
+        // 自嵌套折叠：应用视图对重定向根自身的再进入（如 sdcard 形态重定向下的
+        // Android/data/<pkg>/sdcard/<rest>）与根下 <rest> 指向同一后端，但决策路径不同，
+        // 镜像子树会被反复再映射、逐层自嵌套（真机实测 70+ 层直到 ENAMETOOLONG，
+        // 文件监视树修复预算反复打满）。剥掉重定向根的视图前缀后按剩余路径解析，
+        // 嵌套层与根层从此等价，物理层不再生长。
+        let full_rel = self.full_storage_rel(&rel);
+        let rel = match self.strip_redirect_view_prefix(&full_rel) {
+            Some(stripped) => self.rel_for_full_storage_rel(&stripped),
+            None => rel,
+        };
         let storage_path = self.storage_path_for_rel(&rel);
         let resolved_storage_path = paths::normalize(&storage_path);
         let decision = self.backend_decision(&resolved_storage_path, operation);
@@ -724,6 +795,18 @@ impl RedirectPolicy {
             .then_some(self.media_sqlite_real_root.as_path())
     }
 
+    /// 自有 media sqlite `-shm` 是否必须走宿主用户态通道（禁止 passthrough backing）。
+    ///
+    /// `-shm` 的毒化防御（ftruncate 钳制）只覆盖 FUSE SETATTR 通道；passthrough
+    /// backing fd 上的 ftruncate 绕过宿主直落 f2fs。应用的 WAL 能力探针恰以截小
+    /// `-shm` 判定介质可用性，放行 passthrough 会让每次建连的探针重新制造毒化
+    /// inode，自愈只能救到下一次打开——表现就是跨应用共享库反复掉登录。
+    /// 与 [`Self::should_heal_media_sqlite_shm_rel`] 同一判定集合（纯路径形态，
+    /// 不含尺寸）。
+    pub(super) fn should_exclude_media_sqlite_shm_passthrough_rel(&self, rel: &str) -> bool {
+        self.should_heal_media_sqlite_shm_rel(rel)
+    }
+
     /// 是否应在共享 FUSE 中检查并自愈 SQLite `-shm` 边车路径。
     ///
     /// 只圈定 `-shm`（不含 `.db`/`-wal`）：`-shm` 的合法形态只有「0 字节」与
@@ -793,6 +876,38 @@ impl RedirectPolicy {
         } else {
             self.redirect_root.join(rel)
         }
+    }
+
+    /// 折叠视图对重定向根自身的再进入：`<redirect_view_rel>/<rest>` → `<rest>`。
+    ///
+    /// 入参/出参都是全存储相对路径（含 mount_rel 前缀）。重定向根视图形态为空
+    /// （直通/监视会话）时不折叠。
+    fn strip_redirect_view_prefix(&self, full_rel: &str) -> Option<String> {
+        let prefix = self.redirect_view_rel.as_str();
+        if prefix.is_empty() {
+            return None;
+        }
+        if full_rel == prefix {
+            return Some(String::new());
+        }
+        let rest = full_rel.strip_prefix(prefix)?.strip_prefix('/')?;
+        Some(rest.to_string())
+    }
+
+    /// 把全存储相对路径还原为 FUSE 根相对路径（mount_rel 非空时剥掉其前缀）。
+    fn rel_for_full_storage_rel(&self, full_rel: &str) -> String {
+        if self.mount_rel.is_empty() {
+            return full_rel.to_string();
+        }
+        if full_rel.is_empty() {
+            return String::new();
+        }
+        paths::relative_child_path(
+            &paths::join(&self.storage_root, full_rel),
+            &paths::join(&self.storage_root, &self.mount_rel),
+        )
+        .map(str::to_string)
+        .unwrap_or_else(|| full_rel.to_string())
     }
 
     pub(super) fn backend_path_for_storage(

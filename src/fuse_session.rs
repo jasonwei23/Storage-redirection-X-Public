@@ -77,6 +77,7 @@ pub(crate) fn write_mount_state(
     uid: i32,
     package_name: &str,
     config_version: u64,
+    policy_fingerprint: u64,
     state_path: &str,
     temp_path: &str,
     targets: &[String],
@@ -102,6 +103,12 @@ pub(crate) fn write_mount_state(
         "fingerprint={}\n",
         crate::config::SettingsHub::instance().config_fingerprint()
     ));
+    // 包级策略指纹：只随本应用的规则与后端模式变化。幂等判定用它而不是全局目录指纹——
+    // 全局指纹覆盖整个配置目录，任何单个应用配置新增/变更都会让**所有**应用的状态失效，
+    // 触发全量重挂扫（真机实测：单个新应用被自动启用 → 59 应用全部重挂一轮，反复发生）。
+    // 该指纹由 request_policy_fingerprint 按请求内容算出，daemon 与 companion 对同一份
+    // 配置得到同一个值，跨进程可比性不变。
+    content.push_str(&format!("policy_fp={}\n", policy_fingerprint));
     content.push_str(&format!("package={}\n", package_name));
     content.push_str(&format!("uid={}\n", uid));
     if let Some(start_time_ticks) = crate::platform::process_start_time_ticks(pid) {

@@ -222,13 +222,16 @@ function Exit-DeviceRunLock {
 function Write-DeviceConfig {
     param([string]$Json)
     $encoded = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($Json))
-    Invoke-Su "mkdir -p /data/adb/modules/storage.redirect.x/config/apps; printf '%s' '$encoded' | base64 -d > '$Config'; chmod 644 '$Config'" | Out-Null
+    # 原子落盘（与 .sh 的 adb_write_file 同步）：truncate-then-write 的写入窗口会让
+    # daemon 的 reload 撞上半截内容，应用被误判未配置后整个场景保持该状态（EROFS/ENOENT，
+    # 应用重启救不回）。tmp 名不带 .json 后缀，避免进入指纹的 app 配置枚举。
+    Invoke-Su "mkdir -p /data/adb/modules/storage.redirect.x/config/apps; printf '%s' '$encoded' | base64 -d > '$Config.tmp.$PID'; mv -f '$Config.tmp.$PID' '$Config'; chmod 644 '$Config'" | Out-Null
 }
 
 function Write-CrossAppReadOnlyConfig {
     $json = '{"users":{"0":{"enabled":true,"read_only_paths":["DCIM","Pictures"]}}}'
     $encoded = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($json))
-    Invoke-Su "printf '%s' '$encoded' | base64 -d > '$ReadOnlyOwnerConfig'; chmod 644 '$ReadOnlyOwnerConfig'" | Out-Null
+    Invoke-Su "printf '%s' '$encoded' | base64 -d > '$ReadOnlyOwnerConfig.tmp.$PID'; mv -f '$ReadOnlyOwnerConfig.tmp.$PID' '$ReadOnlyOwnerConfig'; chmod 644 '$ReadOnlyOwnerConfig'" | Out-Null
 }
 
 function Clear-CrossAppReadOnlyConfig {
@@ -238,7 +241,7 @@ function Clear-CrossAppReadOnlyConfig {
 function Write-GlobalConfig {
     param([string]$Json)
     $encoded = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($Json))
-    Invoke-Su "mkdir -p /data/adb/modules/storage.redirect.x/config; printf '%s' '$encoded' | base64 -d > '$GlobalConfig'; chmod 644 '$GlobalConfig'" | Out-Null
+    Invoke-Su "mkdir -p /data/adb/modules/storage.redirect.x/config; printf '%s' '$encoded' | base64 -d > '$GlobalConfig.tmp.$PID'; mv -f '$GlobalConfig.tmp.$PID' '$GlobalConfig'; chmod 644 '$GlobalConfig'" | Out-Null
 }
 
 function Get-TestGlobalConfig {

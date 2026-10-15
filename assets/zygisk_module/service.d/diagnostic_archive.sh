@@ -345,7 +345,7 @@ collect_relevant_proc_state() {
   [ -f "$STATE_DIR/package-candidates.txt" ] || return 0
   : > "$STATE_DIR/package-pids.txt"
   detail_count=0
-  max_detail_pids=10
+  max_detail_pids=12
   matches="$STATE_DIR/package-pids.raw"
   sorted_matches="$STATE_DIR/package-pids.sorted"
   : > "$matches"
@@ -363,6 +363,11 @@ collect_relevant_proc_state() {
           print package_name "|" pid
         }
       }
+      # WebView 沙盒/隔离子进程不属于任何候选包名，但评论/网页图片加载失败时
+      # 它们的挂载视图正是需要观测的对象（此前 B 站日志完全缺失该进程）。
+      if (index(name, ":sandboxed_process") > 0 || index(name, ":isolated") > 0) {
+        print name "|" pid
+      }
     }
   ' "$STATE_DIR/package-candidates.txt" "$STATE_DIR/process-names.txt" >> "$matches" 2>/dev/null || true
 
@@ -373,6 +378,8 @@ collect_relevant_proc_state() {
     android.process.media \
     com.android.documentsui \
     com.google.android.documentsui \
+    com.google.android.webview \
+    com.android.webview \
     bin.mt.plus \
     com.bin.mt.plus; do
     pidof "$package_name" 2>/dev/null | tr ' ' '\n' |
@@ -430,6 +437,7 @@ collect_initial_logcat_state() {
     echo "filtered_line_limit=10000"
     echo "events_line_limit=1500"
     echo "delta_line_limit=3000"
+    echo "app_errors_line_limit=2500"
   } > "$STATE_DIR/logcat-capture.txt" 2>&1
 
   logcat -g > "$stage/logcat-buffers.txt" 2>&1 || true
@@ -438,7 +446,29 @@ collect_initial_logcat_state() {
     ActivityManager:I WindowManager:I MediaProvider:V ExternalStorage:V DocumentsUI:V Vold:V \
     > "$stage/logcat-srx-filtered.txt" 2>&1 || true
   logcat -b crash -d -v threadtime > "$stage/logcat-crash.txt" 2>&1 || true
-  logcat -b main,system -d -t 8000 -v threadtime \
+  # 应用侧图片加载失败（解码/网络缓存/WebView）只会在应用自己的日志里留痕，
+  # 且多为 Error 级。按全标签 E + 常见图片组件定向采集一份，避免排查时只有
+  # 模块侧日志、看不到调用方失败原因。抑制清单与常驻 app-error ring 保持一致
+  # （按真机实测噪声分布维护，见 debug_collectors.sh）；AndroidRuntime 故意
+  # 保留——真实崩溃信号。
+  logcat -b main,crash -d -t 6000 -v threadtime \
+    OPLUS_KEVENT_RECORD:S midasd:S statsd:S oiface:S PERFHAL-BOOSTCONFIG:S \
+    PerformanceService:S MIDASApplication:S metis_v2_FactManager:S \
+    AEC.h:S AEC.AudioxService:S AMC:S SettingsTelemetryUtils:S artd:S libEGL:S \
+    DynamicFramerate:S AppFeatureProviderUtils:S ThemeUtils:S ANDR-PWR-OPT:S \
+    Parcel:S PERFHAL-CLIENT:S LayerAvatar_masker_render:S BufferQueueProducer:S \
+    SDM:S HWUI:S SchedAssist:S CCodecBufferChannel:S NfcRegisteredServicesCache:S \
+    DeviceHalAidl:S QC2Comp:S PERFHAL-RESOURCEQS:S \
+    WeatherS_WeatherHttpDataSource:S UnionPermissionController:S \
+    NotificationBadgeManager:S LSPosedFramework:S OplusBracketLog:S \
+    OplusContextUtil:S OplusPredictiveBackController:S \
+    FastDynamicDrawable_CacheFrameProducer:S SettingsState:S \
+    ImageDecoder:V Bitmap:V chromium:V ImagePipeLine:V Glide:V Fresco:V Coil:V \
+    ImageLoader:V Skia:V SRX:V '*:E' \
+    > "$stage/logcat-app-errors.txt" 2>&1 || true
+  # 高频 OEM 日志会把 8000 行缓冲在半分钟内耗尽（实测 00:45:57 起才覆盖到），
+  # 复现后 1-2 分钟内导出时关键行已被冲掉；加大到 20000 行并放宽行宽上限。
+  logcat -b main,system -d -t 20000 -v threadtime \
     > "$stage/logcat-main-system-context.txt" 2>&1 || true
   logcat -b events -d -t 1500 -v threadtime \
     > "$stage/logcat-events.txt" 2>&1 || true
@@ -452,6 +482,22 @@ collect_logcat_delta() {
     StorageRedirect:V SRX:V FileMonitorOp:I Stats:I AndroidRuntime:E DEBUG:F libc:F \
     ActivityManager:I WindowManager:I MediaProvider:V ExternalStorage:V DocumentsUI:V Vold:V \
     2>&1 | tail -n 3000 > "$stage/logcat-export-period.txt" || true
+  # 复现窗口内的应用侧错误（图片解码失败等）同样需要留存，与模块侧日志对齐时间线。
+  logcat -b main,crash -d -T "$LOGCAT_CAPTURE_START" -v threadtime \
+    OPLUS_KEVENT_RECORD:S midasd:S statsd:S oiface:S PERFHAL-BOOSTCONFIG:S \
+    PerformanceService:S MIDASApplication:S metis_v2_FactManager:S \
+    AEC.h:S AEC.AudioxService:S AMC:S SettingsTelemetryUtils:S artd:S libEGL:S \
+    DynamicFramerate:S AppFeatureProviderUtils:S ThemeUtils:S ANDR-PWR-OPT:S \
+    Parcel:S PERFHAL-CLIENT:S LayerAvatar_masker_render:S BufferQueueProducer:S \
+    SDM:S HWUI:S SchedAssist:S CCodecBufferChannel:S NfcRegisteredServicesCache:S \
+    DeviceHalAidl:S QC2Comp:S PERFHAL-RESOURCEQS:S \
+    WeatherS_WeatherHttpDataSource:S UnionPermissionController:S \
+    NotificationBadgeManager:S LSPosedFramework:S OplusBracketLog:S \
+    OplusContextUtil:S OplusPredictiveBackController:S \
+    FastDynamicDrawable_CacheFrameProducer:S SettingsState:S \
+    ImageDecoder:V Bitmap:V chromium:V ImagePipeLine:V Glide:V Fresco:V Coil:V \
+    ImageLoader:V Skia:V SRX:V '*:E' \
+    2>&1 | tail -n 4000 > "$stage/logcat-app-errors.txt" || true
   echo "final_capture_completed_at=$(date '+%Y-%m-%d %H:%M:%S %z' 2>/dev/null || date 2>/dev/null)" \
     >> "$STATE_DIR/logcat-capture.txt"
 }
@@ -493,6 +539,8 @@ collect_diagnostic_summary() {
   [ -n "$monitor_capacity_limited" ] || monitor_capacity_limited=unknown
   media_hook_state_present=0
   [ -s "$LOGS_DIR/.media_hook_install_state" ] && media_hook_state_present=1
+  app_error_ring_present=0
+  [ -s "$LOGS_DIR/app-errors.log" ] && app_error_ring_present=1
   {
     printf '{\n'
     printf '  "schema": 1,\n'
@@ -516,7 +564,8 @@ collect_diagnostic_summary() {
     printf '  "fuse_capability_reason": "%s",\n' "$fuse_capability_reason"
     printf '  "mount_intent_count": %s,\n' "$mount_intent_count"
     printf '  "monitor_capacity_limited": "%s",\n' "$monitor_capacity_limited"
-    printf '  "media_hook_state_present": %s\n' "$media_hook_state_present"
+    printf '  "media_hook_state_present": %s,\n' "$media_hook_state_present"
+    printf '  "app_error_ring_present": %s\n' "$app_error_ring_present"
     printf '}\n'
   } > "$stage/diagnostic-summary.json"
 }

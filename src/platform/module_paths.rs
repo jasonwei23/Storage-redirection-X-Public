@@ -18,6 +18,15 @@ pub const REAL_STORAGE_TMP_PREFIX: &str = "/data/adb/modules/storage.redirect.x/
 pub const CONFIG_DIR: &str = "/data/adb/modules/storage.redirect.x/config";
 pub const RUNTIME_DISABLE_FILE: &str = "/data/adb/modules/storage.redirect.x/.runtime_disabled";
 pub const FUSE_PROBE_FILE: &str = "/data/adb/modules/storage.redirect.x/.fuse_probe";
+/// 存在即禁用内核 FUSE passthrough（所有会话回退纯用户态读写）。
+/// 用途：OEM 内核 passthrough 实现缺陷的 A/B 定位与逃生口——实测某 ColorOS 设备
+/// 上 QQ 打开 chatpic 文件收到 EIO，嫌疑集中在 passthrough backing 路径。
+pub const FUSE_PASSTHROUGH_DISABLE_FILE: &str =
+    "/data/adb/modules/storage.redirect.x/.fuse_passthrough_disabled";
+/// passthrough 端到端探针的结果快照（boot 绑定）：daemon 在首次共享宿主挂载后
+/// 以应用身份经 /proc/<pid>/root 做一次真实 open，EIO 即判定内核 passthrough 缺陷。
+pub const FUSE_PASSTHROUGH_STATE_FILE: &str =
+    "/data/adb/modules/storage.redirect.x/.fuse_passthrough_state";
 /// daemon 写入、普通应用只读的 FUSE 能力快照。
 pub const FUSE_CAPABILITY_FILE: &str = "/data/adb/modules/storage.redirect.x/.fuse_capability";
 /// daemon 写入、companion（Zygisk companion 进程，与 daemon 无共享内存）只读的

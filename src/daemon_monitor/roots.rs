@@ -453,12 +453,49 @@ fn strip_path_suffix(path: &str, suffix: &str) -> Option<String> {
     Some(normalized[..keep_len].trim_end_matches('/').to_string())
 }
 
+/// 自嵌套重定向伪影判定：后端/显示路径里出现
+/// `Android/data/<pkg>/sdcard/Android/data/...` 形态的重复。
+///
+/// 重定向把存储根映射到 `Android/data/<pkg>/sdcard` 之后，应用视图里的同名子树会在
+/// 后端再落一层，自相似目录一旦出现就会被监视展开、owner 修复与挂载准备逐层放大
+/// （真机实测嵌套 70+ 层直到 ENAMETOOLONG，文件监视线程单核烧满）。这类路径是
+/// 映射伪影而不是用户数据，展开与下载判定都应剪掉。
+pub(super) fn is_self_nested_redirect_path(path: &str) -> bool {
+    const PRIVATE_PREFIX: &str = "Android/data/";
+    const REDIRECT_TAIL: &str = "sdcard/";
+    let mut search_from = 0usize;
+    while let Some(offset) = path[search_from..].find(PRIVATE_PREFIX) {
+        let prefix_start = search_from + offset;
+        let after_prefix = &path[prefix_start + PRIVATE_PREFIX.len()..];
+        // 形态：<pkg>/sdcard/Android/data/...，<pkg> 为单段包名
+        let Some(package_end) = after_prefix.find('/') else {
+            break;
+        };
+        let package = &after_prefix[..package_end];
+        if package.is_empty() {
+            search_from = prefix_start + PRIVATE_PREFIX.len();
+            continue;
+        }
+        let remainder = &after_prefix[package_end + 1..];
+        if let Some(nested) = remainder.strip_prefix(REDIRECT_TAIL)
+            && nested.starts_with(PRIVATE_PREFIX)
+        {
+            return true;
+        }
+        search_from = prefix_start + PRIVATE_PREFIX.len();
+    }
+    false
+}
+
 pub(super) fn should_descend_into_child(
     source: &str,
     record_display_root: &str,
     child_display_dir: &str,
 ) -> bool {
     if source == "public_owner" && is_android_app_private_path(child_display_dir) {
+        return false;
+    }
+    if is_self_nested_redirect_path(child_display_dir) {
         return false;
     }
     paths::is_same_or_child(child_display_dir, record_display_root)
