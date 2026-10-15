@@ -234,8 +234,21 @@ public class Hooker {
         // 这里若继续尝试映射文件，可能把未配置应用的原图读取带入其它调用方
         // 的路径提示或映射目标，导致缩略图可见但原图打开失败。
         recordProviderOpenPath(this, args, actualArgs, callerUid);
-        Object result = callBackupPassthrough(args);
+        Object result;
+        try {
+          result = callBackupPassthrough(args);
+        } catch (Throwable passthroughFailure) {
+          // 与重定向分支同款的静默失败：未开启重定向的调用方（QQ/B 站图片走这里）
+          // open 被拒时应用侧只会看到空图，此前这里不留任何痕迹。
+          logOpenBackupFailure(callerUid, passthroughFailure);
+          throw passthroughFailure;
+        }
+        if (result == null) {
+          // MediaProvider 的 open 正常路径要么返回 fd 要么抛异常，null 属于异常信号。
+          logOpenBackupFailure(callerUid, null);
+        }
         if (result != null) recordProviderOpenSuccess(this, args, actualArgs, result, callerUid);
+        logOpenResult("passthrough", result);
         return result;
       }
       captureMediaSourceFileDescriptor(this, actualArgs, callerUid);
@@ -4750,6 +4763,7 @@ public class Hooker {
               + source
               + " class="
               + (result == null ? "null" : result.getClass().getName())
+              + describeOpenResultDetail(result)
               + " n="
               + OPEN_RESULT_LOG_COUNT);
     } catch (Throwable ignored) {
@@ -4757,13 +4771,43 @@ public class Hooker {
   }
 
   /**
+   * 给出 open 结果的关键观测量：fd 号、声明长度与起始偏移。
+   *
+   * <p>排查图片加载失败时，只有 class 名无法区分「fd 从未产出」（open 阶段就失败） 与「fd 已产出但后续读取/解码失败」（open 正常，问题在数据面）。 长度异常（0
+   * 或远小于图片体积）还能暴露 fd 指向了错误文件或被截断的文件。
+   */
+  private static String describeOpenResultDetail(Object result) {
+    try {
+      if (result instanceof ParcelFileDescriptor) {
+        ParcelFileDescriptor pfd = (ParcelFileDescriptor) result;
+        return " fd=" + pfd.getFd() + " len=" + pfd.getStatSize();
+      }
+      if (result instanceof AssetFileDescriptor) {
+        AssetFileDescriptor afd = (AssetFileDescriptor) result;
+        ParcelFileDescriptor pfd = afd.getParcelFileDescriptor();
+        return " fd="
+            + (pfd == null ? -1 : pfd.getFd())
+            + " len="
+            + afd.getLength()
+            + " start="
+            + afd.getStartOffset();
+      }
+    } catch (Throwable ignored) {
+    }
+    return "";
+  }
+
+  /**
    * 记录「原始 open 没有产出结果」。`failure == null` 表示原始调用返回了 null 而不是抛异常。
    *
    * <p>这条日志刻意不受 OPEN_RESULT_LOG_COUNT 之类的上限约束：它只在失败路径上产生，量很小；而一旦被
    * 上限截断就再也看不到失败原因——真机上排查时正是如此，普通请求在场景早期就把上限用完了。
+   *
+   * <p>同样刻意不受 shouldLog()（verbose 调试开关）约束：开关是进程内 AtomicBool， boot 早期 specialize 的进程可能因配置不可读而永久停在
+   * false（实测反馈设备上 MediaProvider 进程整个生命周期静默，open 失败完全不可见）。失败日志是排查
+   * 「图片加载不了」类问题的唯一线索，量又小（仅失败路径），必须始终落盘。
    */
   private static void logOpenBackupFailure(int callerUid, Throwable failure) {
-    if (!shouldLog()) return;
     try {
       android.util.Log.w(
           "SRX",

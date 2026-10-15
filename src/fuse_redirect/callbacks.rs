@@ -127,8 +127,17 @@ fn heal_poisoned_sqlite_shm_backend(
 
 impl Filesystem for FuseRedirectFs {
     fn init(&mut self, _req: &Request, config: &mut KernelConfig) -> std::io::Result<()> {
+        // 三层判定（自动开启，兼容性由端到端探针保障）：
+        // 1. 探测状态：broken（本 boot 探针发现内核缺陷）→ 关闭。daemon 在首次
+        //    共享宿主挂载后执行探针，发现缺陷会重建宿主，重建后的会话在此读到
+        //    broken；ok 或未知（尚未探测）→ 继续；
+        // 2. 内核能力协商：FUSE_PASSTHROUGH 不可用自动走纯用户态（不抛错给应用）；
+        // 3. `.fuse_passthrough_disabled` 逃生口：紧急排障时无条件关闭。
+        let probe_state = crate::config::fuse_passthrough_probe_state();
         let passthrough_supported = config.capabilities().contains(InitFlags::FUSE_PASSTHROUGH);
-        let passthrough_enabled = config.add_capabilities(InitFlags::FUSE_PASSTHROUGH).is_ok();
+        let passthrough_enabled = probe_state.unwrap_or(true)
+            && passthrough_supported
+            && !crate::config::is_fuse_passthrough_disabled();
         let stack_depth_enabled = config.set_max_stack_depth(2).is_ok();
         let max_background_enabled = config.set_max_background(32).is_ok();
         let congestion_enabled = config.set_congestion_threshold(24).is_ok();
@@ -136,11 +145,13 @@ impl Filesystem for FuseRedirectFs {
         self.passthrough_enabled
             .store(passthrough_enabled, Ordering::Relaxed);
         log::info!(
-            "fuse init pkg={} kernel_abi={} passthrough_supported={} passthrough_enabled={} stack_depth={} max_background={} congestion={} max_write={}",
+            "fuse init pkg={} kernel_abi={} passthrough_supported={} passthrough_enabled={} probe_state={:?} passthrough_disabled_by_marker={} stack_depth={} max_background={} congestion={} max_write={}",
             self.policy.session().package_name,
             config.kernel_abi(),
             passthrough_supported,
             passthrough_enabled,
+            probe_state,
+            crate::config::is_fuse_passthrough_disabled(),
             stack_depth_enabled,
             max_background_enabled,
             congestion_enabled,
@@ -170,7 +181,14 @@ impl Filesystem for FuseRedirectFs {
                 }
                 self.reply_entry_for_rel(&policy, &rel, reply)
             }
-            Err(errno) => reply.error(errno),
+            Err(errno) => {
+                Self::log_new_entry_errno(
+                    &self.policy_for_read_request(req, Some(parent), None),
+                    name,
+                    errno,
+                );
+                reply.error(errno)
+            }
         }
     }
 
@@ -467,11 +485,20 @@ impl Filesystem for FuseRedirectFs {
         let backend = match self.backend_for_ino(&policy, ino) {
             Ok(backend) => backend,
             Err(errno) => {
+                Self::log_unexpected_open_errno(&policy, "", errno);
                 reply.error(errno);
                 return;
             }
         };
         if backend.is_read_only && is_mutation {
+            log::warn!(
+                "fuse open read-only deny pkg={} rel={} policy_fp={:016x} monitor_only={} op={}",
+                policy.package_name,
+                backend.rel,
+                policy.fingerprint,
+                policy.is_monitor_only,
+                fuse_open_operation_name(flags.0)
+            );
             policy.emit_monitor_read_only_deny(fuse_open_operation_name(flags.0), &backend);
             reply.error(Errno::EROFS);
             return;
@@ -496,6 +523,7 @@ impl Filesystem for FuseRedirectFs {
         let file = match Self::open_backend_file(&backend.path, open_flags, 0) {
             Ok(file) => file,
             Err(errno) => {
+                Self::log_unexpected_open_errno(&policy, &backend.rel, errno);
                 reply.error(errno);
                 return;
             }
@@ -517,7 +545,12 @@ impl Filesystem for FuseRedirectFs {
         if is_mutation {
             policy.emit_monitor_mutation(fuse_open_operation_name(flags.0), &backend, None);
         }
-        if self.passthrough_enabled.load(Ordering::Relaxed) {
+        // `-shm` 禁止 passthrough：setattr 的 ftruncate 钳制只覆盖 FUSE SETATTR 通道，
+        // passthrough backing fd 上的 ftruncate 绕过宿主直落 f2fs，应用 WAL 能力探针
+        // 会借此反复制造毒化 inode（自愈只能救到下一次打开）。
+        let shm_userspace_only =
+            policy.should_exclude_media_sqlite_shm_passthrough_rel(&backend.rel);
+        if self.passthrough_enabled.load(Ordering::Relaxed) && !shm_userspace_only {
             match reply.open_backing(&file) {
                 Ok(backing) => {
                     let backing = Arc::new(backing);
@@ -799,6 +832,7 @@ impl Filesystem for FuseRedirectFs {
         } = match self.route_new_entry(req, parent, name, "create") {
             Ok(route) => route,
             Err(errno) => {
+                Self::log_new_entry_errno(&self.policy_for_request(req), name, errno);
                 reply.error(errno);
                 return;
             }
@@ -860,7 +894,12 @@ impl Filesystem for FuseRedirectFs {
             fh
         };
         policy.emit_monitor_create(&backend);
-        if self.passthrough_enabled.load(Ordering::Relaxed) {
+        // 与 open 同理：新建的 `-shm` 也不得给 passthrough backing，否则应用首个
+        // WAL 能力探针（自愈重建后必然紧随一次建连）就会把全新 inode 再次截成
+        // 毒化尺寸，自愈循环永不收敛。
+        let shm_userspace_only =
+            policy.should_exclude_media_sqlite_shm_passthrough_rel(&backend.rel);
+        if self.passthrough_enabled.load(Ordering::Relaxed) && !shm_userspace_only {
             match reply.open_backing(&file) {
                 Ok(backing) => {
                     let backing = Arc::new(backing);
@@ -942,6 +981,7 @@ impl Filesystem for FuseRedirectFs {
         ) {
             Ok(file) => file,
             Err(errno) => {
+                Self::log_unexpected_open_errno(&policy, &backend.rel, errno);
                 reply.error(errno);
                 return;
             }

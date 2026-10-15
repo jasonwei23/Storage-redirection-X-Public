@@ -123,7 +123,9 @@ class LoggingArchitectureTest(unittest.TestCase):
         slow_collection = script.index("collect_basic_files", main_flow)
         self.assertLess(initial_capture, slow_collection)
         self.assertIn("-t 10000", script)
-        self.assertIn("-t 8000", script)
+        # 高频 OEM Error 日志会在半分钟内耗尽 8000 行，主缓冲快照需 20000 行
+        # 才能覆盖「复现后 1-2 分钟内导出」的窗口。
+        self.assertIn("-t 20000", script)
         self.assertIn("-b crash -d -v threadtime", script)
         self.assertIn('-T "$LOGCAT_CAPTURE_START"', script)
         self.assertIn("tail -n 3000", script)
@@ -145,7 +147,7 @@ class LoggingArchitectureTest(unittest.TestCase):
         ):
             source = read(path)
             self.assertIn("-t 10000", source)
-            self.assertIn("-t 8000", source)
+            self.assertIn("-t 20000", source)
             self.assertIn("logcat-buffers.txt", source)
             self.assertIn("logcat-capture.txt", source)
             self.assertIn("tail -n 3000", source)
@@ -294,7 +296,7 @@ class LoggingArchitectureTest(unittest.TestCase):
         ledger = read("src/mount_ledger.rs")
         for entry in (
             "pub fn record_mount_identity(",
-            "pub fn capture_mount_identity(",
+            "pub fn capture_explicit_mount_identity(",
             "pub fn namespace_identity(",
             "pub fn load(",
             "pub fn save(",

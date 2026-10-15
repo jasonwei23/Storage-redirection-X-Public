@@ -31,6 +31,7 @@ use once_cell::sync::Lazy;
 use std::collections::{HashMap, HashSet};
 use std::ffi::{CStr, CString};
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 const PARENT_RECV_TIMEOUT_SEC: i64 = 5;
 const PARENT_RECV_GRACE_TIMEOUT_SEC: i64 = 1;
@@ -112,12 +113,21 @@ impl crate::fuse_redirect::MountRequestFields for MountRequest {
 }
 
 pub fn has_mount_state(request: &MountRequest) -> bool {
-    has_mount_state_internal(request, false)
+    !matches!(
+        has_mount_state_internal(request, false),
+        MountStateCheck::StateMissing
+    )
 }
 
 /// 周期 reconcile 使用更严格的状态判定，额外确认记录的目标仍存在于应用 namespace。
 pub fn has_healthy_mount_state(request: &MountRequest) -> bool {
-    has_mount_state_internal(request, true)
+    !matches!(
+        has_mount_state_internal(request, true),
+        MountStateCheck::StateMissing
+            | MountStateCheck::FuseChildDead
+            | MountStateCheck::TargetsMissing
+            | MountStateCheck::BackendUnresponsive
+    )
 }
 
 /// 判定「该应用的挂载已按**当前配置**建立，重挂只会叠加挂载层」。
@@ -137,16 +147,108 @@ pub fn has_current_mount_state(request: &MountRequest) -> bool {
     if request.operation != MountOperation::Reload {
         return false;
     }
-    if !has_mount_state_internal(request, true) {
+    let check = has_mount_state_internal(request, true);
+    if check != MountStateCheck::Current {
+        log_remount_reason(request, check, None);
         return false;
     }
-    let current = crate::config::SettingsHub::instance().config_fingerprint();
-    match mount_state_fingerprint(request) {
-        Some(recorded) => recorded == current,
-        // 旧版本模块写下的状态文件没有指纹字段：无法证明它对应当前配置，按需要重挂处理。
-        None => false,
+    // 幂等判定用包级策略指纹（policy_fp）：只随本应用的规则与后端模式变化。
+    // 全局目录指纹的耦合粒度是错的——任何单个应用配置新增/变更都会让所有应用的
+    // 状态失效，触发全量重挂扫（真机实测单应用自动启用 → 59 应用全部重挂）。
+    // 旧格式状态文件没有 policy_fp 字段：回退全局指纹比较，升级后首轮按需收敛。
+    match mount_state_policy_fingerprint(request) {
+        Some(recorded) => {
+            let current = request.policy_fingerprint;
+            if recorded == current {
+                true
+            } else {
+                log_remount_reason(
+                    request,
+                    MountStateCheck::FingerprintMismatch,
+                    Some((recorded, current)),
+                );
+                false
+            }
+        }
+        None => {
+            let current = crate::config::SettingsHub::instance().config_fingerprint();
+            match mount_state_fingerprint(request) {
+                Some(recorded) if recorded == current => true,
+                Some(recorded) => {
+                    log_remount_reason(
+                        request,
+                        MountStateCheck::FingerprintMismatch,
+                        Some((recorded, current)),
+                    );
+                    false
+                }
+                // 旧版本模块写下的状态文件没有指纹字段：无法证明它对应当前配置，按需要重挂处理。
+                None => {
+                    log_remount_reason(request, MountStateCheck::FingerprintMissing, None);
+                    false
+                }
+            }
+        }
     }
 }
+
+/// 挂载状态判定的结论分类。
+///
+/// 布尔语义之外携带原因，用于诊断「同一进程被反复重挂」的循环：真机实测曾出现
+/// 70 分钟的静默重挂轮转（单 pid 挂载代际累计 597+），无法从现有日志定位是
+/// 哪个子判定失效，本分类让幂等判据的失败可观测。
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum MountStateCheck {
+    /// 状态健康且指纹一致（或判定路径不要求指纹）。
+    Current,
+    /// 状态文件不存在。
+    StateMissing,
+    /// 记录的 FUSE 子进程/宿主会话已死。
+    FuseChildDead,
+    /// 状态记录的挂载目标已不在应用 namespace。
+    TargetsMissing,
+    /// 后端挂载点探测为断连。
+    BackendUnresponsive,
+    /// 状态健康但记录的配置指纹与当前不一致。
+    FingerprintMismatch,
+    /// 状态文件没有指纹字段（旧版本写入）。
+    FingerprintMissing,
+}
+
+/// 非当前判定的限频日志：首次 8 条全量采样，之后每 64 条采样一次，避免重挂循环
+/// 期间形成新日志风暴（该判定每个 reconcile 轮次对每个计划都会执行一次）。
+fn log_remount_reason(
+    request: &MountRequest,
+    reason: MountStateCheck,
+    fingerprints: Option<(u64, u64)>,
+) {
+    const SAMPLE_HEAD: u64 = 8;
+    const SAMPLE_INTERVAL: u64 = 64;
+    let count = REMOUNT_REASON_LOG_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
+    if count > SAMPLE_HEAD && !(count - SAMPLE_HEAD).is_multiple_of(SAMPLE_INTERVAL) {
+        return;
+    }
+    match fingerprints {
+        Some((recorded, current)) => log::warn!(
+            "daemon remount non-current reason={:?} pid={} pkg={} recorded_fp={:x} current_fp={:x} sample={}",
+            reason,
+            request.pid,
+            request.package_name,
+            recorded,
+            current,
+            count
+        ),
+        None => log::warn!(
+            "daemon remount non-current reason={:?} pid={} pkg={} sample={}",
+            reason,
+            request.pid,
+            request.package_name,
+            count
+        ),
+    }
+}
+
+static REMOUNT_REASON_LOG_COUNT: AtomicU64 = AtomicU64::new(0);
 
 /// 读取挂载状态文件里记录的配置指纹。
 fn mount_state_fingerprint(request: &MountRequest) -> Option<u64> {
@@ -154,21 +256,29 @@ fn mount_state_fingerprint(request: &MountRequest) -> Option<u64> {
     state_value(&content, "fingerprint=").and_then(|value| value.parse::<u64>().ok())
 }
 
-fn has_mount_state_internal(request: &MountRequest, check_mount_targets: bool) -> bool {
+/// 读取挂载状态文件里记录的包级策略指纹（policy_fp，新格式）。
+///
+/// 旧格式状态文件没有该字段，返回 None，调用方回退全局指纹比较。
+fn mount_state_policy_fingerprint(request: &MountRequest) -> Option<u64> {
+    let content = std::fs::read_to_string(state_file_path(request)).ok()?;
+    state_value(&content, "policy_fp=").and_then(|value| value.parse::<u64>().ok())
+}
+
+fn has_mount_state_internal(request: &MountRequest, check_mount_targets: bool) -> MountStateCheck {
     let state_path = state_file_path(request);
     if std::fs::metadata(&state_path).is_err() {
-        return false;
+        return MountStateCheck::StateMissing;
     }
     // Disable 的目标是清理残留，不能因为 FUSE 子进程或 mountinfo 已经不健康
     // 就把状态视为不存在，否则坏挂载会永久跳过卸载。
     if request.operation == MountOperation::Disable {
-        return true;
+        return MountStateCheck::Current;
     }
     // 记录过 FUSE 服务却已经死掉时，挂载点会留在目标 namespace 里变成 ENOTCONN 死挂载，
     // 应用访问会直接失败。此时把挂载状态视为无效，让周期 reconcile 重新执行挂载；
     // 若 FUSE 再次启动失败，启动阶段的 mount namespace 降级会接管。
     if has_dead_fuse_child(&state_path, request) {
-        return false;
+        return MountStateCheck::FuseChildDead;
     }
 
     // 状态文件只代表 daemon 曾经成功执行过挂载，进程的 mount namespace 可能随后被
@@ -177,13 +287,13 @@ fn has_mount_state_internal(request: &MountRequest, check_mount_targets: bool) -
     let targets = read_mount_targets(&state_path);
     if check_mount_targets {
         if !targets.is_empty() && !mount_targets_present(request.pid, &targets, request) {
-            return false;
+            return MountStateCheck::TargetsMissing;
         }
         if !backend_mount_targets_responsive(request) {
-            return false;
+            return MountStateCheck::BackendUnresponsive;
         }
     }
-    true
+    MountStateCheck::Current
 }
 
 fn mount_targets_present(pid: i32, targets: &[String], request: &MountRequest) -> bool {
@@ -487,22 +597,39 @@ fn refresh_mount_state_fingerprint(request: &MountRequest) -> bool {
         return false;
     };
     let fingerprint = crate::config::SettingsHub::instance().config_fingerprint();
+    let policy_fingerprint = request.policy_fingerprint;
     let mut replaced = false;
-    let updated = content
+    let mut policy_replaced = false;
+    let mut lines: Vec<String> = content
         .lines()
         .map(|line| {
             if line.starts_with("fingerprint=") {
                 replaced = true;
                 format!("fingerprint={fingerprint}")
+            } else if line.starts_with("policy_fp=") {
+                policy_replaced = true;
+                format!("policy_fp={policy_fingerprint}")
             } else {
                 line.to_string()
             }
         })
-        .collect::<Vec<_>>()
-        .join("\n");
+        .collect();
+    if policy_replaced && !replaced {
+        return false;
+    }
+    if !policy_replaced {
+        // 旧格式状态文件没有 policy_fp 行：插到 fingerprint= 行之后，保持字段序稳定。
+        let position = lines
+            .iter()
+            .position(|line| line.starts_with("fingerprint="))
+            .map(|index| index + 1)
+            .unwrap_or(0);
+        lines.insert(position, format!("policy_fp={policy_fingerprint}"));
+    }
     if !replaced {
         return false;
     }
+    let updated = lines.join("\n");
     let temp = format!("{path}.tmp");
     if std::fs::write(&temp, format!("{updated}\n")).is_err() {
         return false;
@@ -1182,12 +1309,153 @@ fn try_bind_to_fuse_host(
         attached.target,
         attached.host_pid
     );
+    maybe_probe_passthrough(request, attached.host_pid, mount_root);
     Some(FuseMountState {
         target: attached.target,
         child: 0,
         child_start_time_ticks: 0,
         host_session: Some((attached.host_pid, attached.host_start_time_ticks)),
     })
+}
+
+/// 探针文件名（视图根与后端根同名对射）。
+const PASSTHROUGH_PROBE_REL: &str = ".srx_passthrough_probe";
+
+/// 共享宿主挂载后的端到端 passthrough 探针。
+///
+/// 背景：部分 OEM 内核（实测 ColorOS）的 FUSE passthrough backing 实现有缺陷，
+/// 应用 open 返回 EIO，而失败发生在内核处理 open 回包的阶段——宿主对它完全
+/// 不可见，没有任何日志痕迹。因此无法被动发现，只能在挂载后主动踩一次：
+///
+/// 1. daemon 在后端根写入探针文件（重定向应用=沙盒根，未配置应用=真实存储根）；
+/// 2. 探针线程 `setfsuid(应用 uid)` 后经 `/proc/<应用 pid>/root/...` 打开视图内
+///    的探针文件——该 open 穿过应用命名空间里的 FUSE 挂载，以应用自己的 uid 和
+///    策略走完整条内核路径（包括 passthrough 绑定），与应用真实行为完全同构；
+/// 3. open/read 得 EIO → 判定内核缺陷：持久化设备级状态并终止宿主，由 reconcile
+///    重建成 passthrough 关闭的新宿主（宿主换代是既有恢复通路，应用短暂重挂）；
+///    成功 → 记 ok，本 boot 后续宿主直接开启；其它 errno（EACCES/ENOENT，
+///    多为 SELinux 或文件可见性时序）→ 不判定，保持开启并留痕。
+///
+/// **探针必须以 root（不 setfsuid）执行**：视图 attr 按 FUSE 请求 uid 动态改写，
+/// 且内核按 inode 缓存 DAC 判定结果——setfsuid(应用 uid) 的 open 会被其它 uid
+/// 视角缓存的 attr 卡成 EACCES（真机实测），既测不出 ok 也测不出 EIO。root 凭
+/// CAP_DAC_OVERRIDE 绕过 DAC 与缓存语义；而 passthrough backing 绑定发生在内核
+/// FUSE open 路径，与调用者 uid 无关，root 探测对内核缺陷完全等效。
+///
+/// 状态绑定 boot_id：每次重启重新探测，内核 OTA 修复后设备自动恢复开启。
+/// 探测在独立线程执行，绝不阻塞 daemon 挂载主循环（FUSE open 理论上可能阻塞）。
+fn maybe_probe_passthrough(request: &MountRequest, host_pid: i32, mount_root: &str) {
+    // 逃生口存在时不探测（用户已显式关闭，无降级意义）。
+    if crate::config::is_fuse_passthrough_disabled() {
+        return;
+    }
+    // 本 boot 已有判定（ok/broken）则无需再探；unknown 才探测。
+    if crate::config::fuse_passthrough_probe_state().is_some() {
+        return;
+    }
+    if request.pid <= 0 || request.uid < 10_000 {
+        return;
+    }
+    // 探针后端根：重定向应用=沙盒根（视图根直接对射），未配置应用=真实存储根。
+    let backend_root = if request.redirect_target.starts_with("/data/media/") {
+        request.redirect_target.trim_end_matches('/').to_string()
+    } else {
+        "/data/media/0".to_string()
+    };
+    let app_pid = request.pid;
+    let app_uid = request.uid;
+    let mount_root = mount_root.to_string();
+    let package_name = request.package_name.clone();
+    let spawn_result = std::thread::Builder::new()
+        .name("srx-pt-probe".into())
+        .spawn(move || {
+            run_passthrough_probe(
+                app_pid,
+                app_uid,
+                host_pid,
+                &mount_root,
+                &backend_root,
+                &package_name,
+            );
+        });
+    if let Err(error) = spawn_result {
+        log::warn!("passthrough probe spawn failed err={}", error);
+    }
+}
+
+fn run_passthrough_probe(
+    app_pid: i32,
+    app_uid: i32,
+    host_pid: i32,
+    mount_root: &str,
+    backend_root: &str,
+    package_name: &str,
+) {
+    use std::io::Read;
+
+    let probe_backend = format!(
+        "{}/{}",
+        backend_root.trim_end_matches('/'),
+        PASSTHROUGH_PROBE_REL
+    );
+    if let Err(error) = std::fs::write(&probe_backend, b"srx1") {
+        log::warn!(
+            "passthrough probe file create failed pkg={} path={} err={}",
+            package_name,
+            probe_backend,
+            error
+        );
+        return;
+    }
+    // 探针文件落盘后立即可经 FUSE 视图 open（按路径解析，不依赖 readdir 缓存）。
+    // 经应用命名空间（/proc/<pid>/root）解析视图根，保证 FUSE 挂载栈顶就是本模块
+    // 会话；open 以 root 执行（见函数级注释：setfsuid 方案被内核 DAC 缓存证伪）。
+    let probe_view = format!(
+        "/proc/{}/root{}/{}",
+        app_pid,
+        mount_root.trim_end_matches('/'),
+        PASSTHROUGH_PROBE_REL
+    );
+    let open_result = std::fs::File::open(&probe_view).and_then(|mut file| {
+        let mut buffer = [0u8; 4];
+        file.read_exact(&mut buffer)
+    });
+    let _ = std::fs::remove_file(&probe_backend);
+    match open_result {
+        Ok(()) => {
+            crate::config::write_fuse_passthrough_probe_state(true);
+            log::info!(
+                "passthrough probe ok pkg={} uid={} pid={}",
+                package_name,
+                app_uid,
+                app_pid
+            );
+        }
+        Err(error) if error.raw_os_error() == Some(libc::EIO) => {
+            crate::config::write_fuse_passthrough_probe_state(false);
+            log::warn!(
+                "passthrough probe EIO pkg={} uid={} pid={} host={} — kernel passthrough broken, demoting device and rebuilding host",
+                package_name,
+                app_uid,
+                app_pid,
+                host_pid
+            );
+            // 重建宿主：新会话 init 读到 broken 即关闭 passthrough。宿主换代与
+            // 应用重挂走既有的 health-check/invalidate 恢复通路。
+            crate::fuse_terminate::terminate_fuse_process(host_pid, None);
+        }
+        Err(error) => {
+            // 探针自身不可执行（SELinux/时序）：不判定，保持开启（与旧行为一致）。
+            log::warn!(
+                "passthrough probe inconclusive pkg={} uid={} pid={} path={} err={}",
+                package_name,
+                app_uid,
+                app_pid,
+                probe_view,
+                error
+            );
+        }
+    }
 }
 
 fn set_mount_namespace(ns_path: Option<&CStr>) -> bool {
@@ -1506,12 +1774,62 @@ fn clear_mount_target_stack_verified(target: &str, ledger: Option<&MountLedger>)
             }
             return true;
         };
-        if !mount_identity::is_module_redirect_mount(
-            &live.source,
-            &live.root,
-            target,
-            ledger.map_or("", |ledger| ledger.package_name.as_str()),
-        ) {
+        if let Some(ledger) = ledger {
+            // 账本成员判定优先于形态启发式：本模块登记过的 mount_id 一定是自己的层。
+            // private-dir alias bind 的 root 形态与系统挂载完全同形（都止于
+            // Android/{data,media,obb}/<pkg>），只靠 is_module_redirect_mount 会把它
+            // 误判成系统挂载而拒绝摘除，cleanup 永不完整、重挂循环不停。
+            let recorded_ids: Vec<u64> = ledger
+                .mounts
+                .iter()
+                .filter(|mount| mount.mount_point == normalized_target)
+                .map(|mount| mount.mount_id)
+                .collect();
+            if let Some(max_recorded) = recorded_ids.iter().max() {
+                if recorded_ids.contains(&live.mount_id) {
+                    // 账本在册：本模块的层，直接进入摘除。
+                } else if live.mount_id > *max_recorded {
+                    // 比账本记录更新：本模块的新会话已经接管这个挂载点，摘掉它会把
+                    // 正在服务的挂载打掉。
+                    log::warn!(
+                        "daemon unmount skipped superseded mount target={} mount_id={} recorded={} ledger_generation={}",
+                        target,
+                        live.mount_id,
+                        max_recorded,
+                        ledger.generation
+                    );
+                    return false;
+                }
+                // 比账本记录更旧且不在册：落到下方形态判定（可能是系统挂载）。
+            }
+        }
+        // 模块自己的 fail-closed 屏障（companion 在接入前挂的 tmpfs）：source=none、
+        // root=/、fs=tmpfs。存储子路径上不存在其它裸 tmpfs 形态，与系统挂载无重叠。
+        // 它必须随 cleanup 一并摘除：留在原地会让 disable 后的应用永远看到空只读目录。
+        let is_module_barrier = live.fs_type == "tmpfs" && live.root == "/";
+        if !is_module_barrier
+            && !mount_identity::is_module_redirect_mount(
+                &live.source,
+                &live.root,
+                target,
+                ledger.map_or("", |ledger| ledger.package_name.as_str()),
+            )
+        {
+            // 系统自己的应用专属 FUSE 视图（root 恰止于 Android/{data,media,obb}/<pkg>）：
+            // 必须保持原样。它出现在本模块目标上只可能有两种情况——系统视图先于本模块
+            // 挂载存在，或本模块的 alias bind 已在上一轮摘除后露出了系统视图。两者都不
+            // 属于"本模块残留"，把目标视为已清空（其余低层若确有本模块残留，也已被系统
+            // 视图覆盖，摘除要等系统视图消失）。此前这里返回 false，会让 cleanup 永不
+            // 完整、detach 账本持续累积、reload 被 poisoned 拒绝，形成重挂循环。
+            if crate::module_mount_source::root_is_app_private_directory(&live.root) {
+                log::debug!(
+                    "daemon unmount keep system app-private view target={} mount_id={} root={}",
+                    target,
+                    live.mount_id,
+                    live.root
+                );
+                return true;
+            }
             log::warn!(
                 "daemon unmount skipped foreign mount target={} mount_id={} source={} root={} fs={}",
                 target,
@@ -1803,8 +2121,22 @@ pub(crate) fn pre_register_host_policy(request: &MountRequest) -> PreRegisterOut
             && let Ok(registered) = PRE_REGISTERED_HOST_POLICIES.lock()
             && registered.get(&(request.uid as u32)) == Some(&fingerprint)
         {
+            log::debug!(
+                "fuse host preregister skip uid={} req_fp={:016x}",
+                request.uid,
+                request.policy_fingerprint
+            );
             return PreRegisterOutcome::AlreadyRegistered;
         }
+        log::info!(
+            "fuse host preregister refresh uid={} req_fp={:016x} view_fp={:016x}",
+            request.uid,
+            request.policy_fingerprint,
+            view.policy_fingerprints
+                .get(&(request.uid as u32))
+                .copied()
+                .unwrap_or(0)
+        );
         let config = fuse_config_from_request(request, None, None);
         if crate::fuse_host::register_app_policy(&config, request.policy_fingerprint) {
             if let Ok(mut registered) = PRE_REGISTERED_HOST_POLICIES.lock() {
@@ -1833,6 +2165,7 @@ fn write_mount_state(
         request.uid,
         &request.package_name,
         request.config_version,
+        request.policy_fingerprint,
         plan.state_path.as_str(),
         plan.temp_state_path.as_str(),
         targets,

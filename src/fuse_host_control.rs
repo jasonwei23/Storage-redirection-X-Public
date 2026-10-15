@@ -198,6 +198,93 @@ pub fn register_app_policy(
     }
 }
 
+/// 把 daemon 自身的 mount namespace 登记为共享宿主的直通策略（仅 namespace 维度）。
+///
+/// daemon 进程内的 root FUSE 请求（文件监视、挂载子进程的探测与 mkdir）以 uid=0 到达
+/// 共享宿主；宿主按调用方 namespace 精确回查后放行直通。未登记时这些请求持续落入
+/// namespace miss + deny_all 回退（真机实测稳态 ~10 req/s 的空转流量与计数告警）。
+/// 登记只写 namespace 表：uid=0 绝不进按 uid 表，否则任何 namespace 的 root 进程都会
+/// 命中这份策略，破坏「未登记 uid 一律 deny_all」的 fail-closed 边界。
+/// 每代宿主调用一次即可（宿主重建后由 [`crate::fuse_host::set_global`] 重新触发）。
+///
+/// 返回 `true` 表示宿主已确认登记。
+pub fn register_daemon_namespace_passthrough() -> bool {
+    let fd = HOST_CONTROL_FD.load(Ordering::Relaxed);
+    if fd < 0 {
+        return false;
+    }
+    let daemon_pid = std::process::id() as i32;
+    let Some(start_ticks) = crate::platform::process_start_time_ticks(daemon_pid) else {
+        log::warn!(
+            "daemon namespace passthrough start ticks unavailable pid={}",
+            daemon_pid
+        );
+        return false;
+    };
+    let user_id = 0;
+    let storage_root = crate::platform::paths::storage_user_root_for_user(user_id);
+    let config = crate::fuse_redirect::FuseRedirectConfig {
+        package_name: "srx_daemon".to_string(),
+        app_pid: daemon_pid,
+        app_start_time_ticks: Some(start_ticks),
+        uid: 0,
+        app_data_dir: String::new(),
+        // 直通会话：重定向根就是存储根本身，策略侧不做任何重定向、不创建目录。
+        redirect_target: storage_root.clone(),
+        mount_root: Some(storage_root.clone()),
+        real_root_override: None,
+        is_file_monitor_enabled: false,
+        allowed_real_paths: Vec::new(),
+        excluded_real_paths: Vec::new(),
+        sandboxed_paths: Vec::new(),
+        read_only_paths: Vec::new(),
+        path_mappings: Vec::new(),
+        is_mapping_mode_only: false,
+        is_monitor_only: false,
+        is_passthrough_host: true,
+        namespace_policy_only: true,
+    };
+    let Ok(payload) = serde_json::to_vec(&config) else {
+        log::warn!("daemon namespace passthrough encode failed");
+        return false;
+    };
+    if payload.len() > HOST_CONTROL_PAYLOAD_LIMIT {
+        log::warn!(
+            "daemon namespace passthrough payload too large bytes={} limit={}",
+            payload.len(),
+            HOST_CONTROL_PAYLOAD_LIMIT
+        );
+        return false;
+    }
+    // SAFETY: fd 是本模块保存的控制端 socket，payload 在调用期间保持存活。
+    let sent = unsafe {
+        libc::send(
+            fd,
+            payload.as_ptr() as *const libc::c_void,
+            payload.len(),
+            0,
+        )
+    };
+    if sent != payload.len() as isize {
+        let errno = crate::platform::errno::last();
+        log::warn!(
+            "daemon namespace passthrough send failed sent={} bytes={} errno={} {}",
+            sent,
+            payload.len(),
+            errno,
+            crate::platform::errno::text(errno)
+        );
+        return false;
+    }
+    let registered = await_policy_ack(fd, 0);
+    if registered {
+        log::info!("daemon namespace passthrough registered pid={}", daemon_pid);
+    } else {
+        log::warn!("daemon namespace passthrough rejected pid={}", daemon_pid);
+    }
+    registered
+}
+
 /// 在宿主会话内启动按 uid 策略控制通道的读取循环。
 ///
 /// 线程随会话存续：控制端被关闭（或会话结束）时 `recv` 返回 0，循环退出。读缓冲放在线程栈上，
@@ -229,13 +316,24 @@ pub(crate) fn spawn_host_control_loop(
                     Ok(config) => {
                         let uid = config.uid;
                         let package_name = config.package_name.clone();
-                        let size = policy_table.register(config).unwrap_or(0);
+                        let namespace_only = config.namespace_policy_only;
+                        let content_fp =
+                            crate::fuse_redirect::config::fuse_config_policy_fingerprint(&config);
+                        let size = if namespace_only {
+                            // daemon 自身（uid=0）的直通登记只进 namespace 表；
+                            // uid=0 绝不允许进按 uid 表（会盖住所有 root 调用方）。
+                            policy_table.register_namespace_only(config).unwrap_or(0)
+                        } else {
+                            policy_table.register(config).unwrap_or(0)
+                        };
                         if size > 0 {
                             log::info!(
-                                "fuse host policy registered uid={} pkg={} table={}",
+                                "fuse host policy registered uid={} pkg={} table={} ns_only={} content_fp={:016x}",
                                 uid,
                                 package_name,
-                                size
+                                size,
+                                namespace_only,
+                                content_fp
                             );
                         } else {
                             log::warn!(

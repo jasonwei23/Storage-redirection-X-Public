@@ -2071,8 +2071,10 @@ class ScenarioConsistencyTest(unittest.TestCase):
             source, "pub fn app_redirect_mounts_in(", "\n}\n")
         self.assertIn("is_module_redirect_mount(", app_mounts)
         # 三个调用点都要把挂载点传进去，漏一个就会在那条路径上失配。
+        # mount_ledger 的登记已改为 capture_explicit_mount_identity（不经归属谓词，
+        # 直接取显式目标的 topmost 事实），不再调用 is_module_redirect_mount；
+        # 谓词调用点只剩 daemon_mount 的摘除归属。
         for path, anchor, target_arg in (
-            ("src/mount_ledger.rs", "pub fn capture_mount_identity(", "mount_point,"),
             ("src/daemon_mount.rs", "fn clear_mount_target_stack_verified(", "target,"),
         ):
             body = section(read(path), anchor, "\n}\n")
@@ -2095,9 +2097,13 @@ class ScenarioConsistencyTest(unittest.TestCase):
         self.assertNotIn("is_module_mount_source(", clear)
 
         ledger = read("src/mount_ledger.rs")
-        capture = section(ledger, "pub fn capture_mount_identity(", "\n/// 按本次挂载的目标集合登记账本")
-        self.assertIn("is_module_redirect_mount(", capture)
-        self.assertIn("package_name: &str", capture)
+        capture = section(
+            ledger, "pub fn capture_explicit_mount_identity(", "\n/// 按本次挂载的目标集合登记账本"
+        )
+        # 登记必须走显式目标的 topmost 事实，不得经归属谓词：private-dir alias bind
+        # 的 root 形态与系统挂载完全同形，谓词会把它漏出账本，cleanup 判 foreign
+        # 永不完整、重挂循环不停（真机实测 wetype 等应用每次 reload 都触发）。
+        self.assertNotIn("is_module_redirect_mount(", capture)
         # `root` 是判据的唯一可靠依据，`LiveMount` 必须把它读出来。
         self.assertIn("pub root: String", ledger)
 

@@ -104,7 +104,7 @@ class MountIdentitySyntaxTest(unittest.TestCase):
             [
                 extract_fn(mount_ledger_src, "live_mounts_at"),
                 extract_fn(mount_ledger_src, "topmost_live_mount"),
-                extract_fn(mount_ledger_src, "capture_mount_identity"),
+                extract_fn(mount_ledger_src, "capture_explicit_mount_identity"),
                 extract_fn(mount_ledger_src, "encode"),
                 extract_fn(mount_ledger_src, "decode"),
                 extract_fn(mount_ledger_src, "field"),

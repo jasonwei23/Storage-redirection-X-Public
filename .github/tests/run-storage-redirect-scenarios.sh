@@ -249,7 +249,12 @@ adb_write_file() {
   local content="$2"
   local encoded
   encoded="$(printf '%s' "$content" | base64 | tr -d '\n')"
-  adb_root "printf '%s' '$encoded' | base64 -d > '$path'"
+  # 必须原子落盘：truncate-then-write 的写入窗口会让 daemon 的 reload 撞上半截内容，
+  # 应用配置被误判无效后整个场景保持未配置态（EROFS/ENOENT，应用重启救不回——共享宿主
+  # 策略与进程无关），直到下一次配置重写才恢复（真机全量跑 scenario-12 的 EROFS 即此机理）。
+  # 同目录 tmp + rename 原子替换，指纹只会看到完整的新文件或完整的旧文件。
+  # tmp 名不带 .json 后缀，避免进入指纹的 app 配置枚举。
+  adb_root "printf '%s' '$encoded' | base64 -d > '$path.tmp.$$'; mv -f '$path.tmp.$$' '$path'"
 }
 
 wait_boot_completed() {
@@ -1324,6 +1329,18 @@ request_android13_storage_mount() {
 }
 
 ensure_initial_storage_ready() {
+  # FBE CE 解锁等待：boot 后 15-25 秒内 /data/media/0 尚不可写（ENOTKEY=126），
+  # 共享宿主的策略登记与重定向根 mkdir 连续失败、宿主反复自退，应用回退 scoped
+  # 会话后 fresh-app 首操作大面积 ENOENT（与 scripts/verify-test-flow.ps1 同步）。
+  # CI 模拟器解锁时序不同所以未暴露，真机（MIUI+A14）必现。
+  local unlock_deadline=$((SECONDS + 180))
+  while [ "$SECONDS" -lt "$unlock_deadline" ]; do
+    if adb_su "test -w /data/media/0" >/dev/null 2>&1; then
+      break
+    fi
+    sleep 3
+  done
+
   if wait_storage_ready "initial" 60; then
     return 0
   fi

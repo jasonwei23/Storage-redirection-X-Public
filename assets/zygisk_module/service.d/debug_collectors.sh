@@ -79,6 +79,9 @@ start_debug_logcat_collector() {
             ;;
         esac
       done
+      # 管道退出到这里意味着 logcat/awk/读循环异常终止（正常情况下永不退出）。
+      # 留痕后由外层 while 重启——若反复出现，说明该设备环境持续杀死管道。
+      log_collector_status "debug pipeline exited; restarting pid=$debug_logcat_pid"
       sleep 1
     done
   ) &
@@ -88,6 +91,7 @@ start_debug_logcat_collector() {
     chmod 644 "$pid_file"
   done
   rm -f "$STATS_COLLECTOR_PID_FILE"
+  log_collector_status "debug_collector started pid=$debug_logcat_pid"
 }
 
 stop_debug_logcat_collector() {
@@ -104,6 +108,7 @@ stop_debug_logcat_collector() {
     esac
     rm -f "$pid_file"
   done
+  log_collector_status "debug_collector stopped"
 }
 
 start_debug_collectors() {
@@ -117,16 +122,89 @@ start_debug_collectors() {
   start_app_status_snapshot_collector
 }
 
+# 应用错误环形采集器：常驻、不受 verbose 门禁。
+#
+# 背景：反馈设备上「图片加载不了」的应用侧报错只存在于应用自己的日志里，且复现
+# 与导出之间往往隔着一两分钟——按需导出的 logcat 快照（哪怕 20000 行）在高频
+# OEM 日志下也覆盖不到复现瞬间。这里从开机起就把全标签 Error 级（含常见图片组件
+# 定向、OEM 遥测标签静默）落进 logs/app-errors.log 环形文件（logcat 自带轮转，
+# 上限约 24MB），诊断包采集时随 $LOGS_DIR 整体带走，导出时机不再敏感。
+# 抑制清单按真机 ring 实测的噪声分布维护（ColorOS 遥测/UI/编解码标签每分钟
+# 数百行）；AndroidRuntime 故意保留——它是真实崩溃信号，开机突发只有一分钟。
+start_app_error_ring_collector() {
+  if is_process_alive "$(cat "$APP_ERROR_RING_PID_FILE" 2>/dev/null)"; then
+    return 0
+  fi
+  rm -f "$APP_ERROR_RING_PID_FILE"
+  ( exec -a "$SRX_APP_ERROR_COLLECTOR_TAG" /system/bin/logcat -b main,crash \
+      -T 1 -v threadtime \
+      -f "$APP_ERROR_RING_LOG_FILE" -r 4096 -n 5 \
+      OPLUS_KEVENT_RECORD:S midasd:S statsd:S oiface:S PERFHAL-BOOSTCONFIG:S \
+      PerformanceService:S MIDASApplication:S metis_v2_FactManager:S \
+      AEC.h:S AEC.AudioxService:S AMC:S SettingsTelemetryUtils:S artd:S libEGL:S \
+      OPLUS_KEVENT_RECORD:S DynamicFramerate:S AppFeatureProviderUtils:S \
+      ThemeUtils:S ANDR-PWR-OPT:S Parcel:S PERFHAL-CLIENT:S \
+      LayerAvatar_masker_render:S BufferQueueProducer:S SDM:S HWUI:S \
+      SchedAssist:S CCodecBufferChannel:S NfcRegisteredServicesCache:S \
+      DeviceHalAidl:S QC2Comp:S PERFHAL-RESOURCEQS:S \
+      WeatherS_WeatherHttpDataSource:S UnionPermissionController:S \
+      NotificationBadgeManager:S LSPosedFramework:S OplusBracketLog:S \
+      OplusContextUtil:S OplusPredictiveBackController:S \
+      FastDynamicDrawable_CacheFrameProducer:S SettingsState:S \
+      ImageDecoder:V Bitmap:V chromium:V ImagePipeLine:V Glide:V Fresco:V Coil:V \
+      ImageLoader:V Skia:V SRX:V '*:E' ) 2>/dev/null &
+  echo "$!" > "$APP_ERROR_RING_PID_FILE"
+  chmod 644 "$APP_ERROR_RING_PID_FILE" 2>/dev/null || true
+  chmod 644 "$APP_ERROR_RING_LOG_FILE" 2>/dev/null || true
+  log_collector_status "app_error_ring started pid=$(cat "$APP_ERROR_RING_PID_FILE" 2>/dev/null)"
+}
+
+stop_app_error_ring_collector() {
+  stop_collector_by_pid_file "$APP_ERROR_RING_PID_FILE"
+}
+
 stop_debug_collectors() {
   stop_debug_logcat_collector
   stop_collector_by_pid_file "$MEDIA_STATE_COLLECTOR_PID_FILE"
   stop_collector_by_pid_file "$APP_STATUS_SNAPSHOT_PID_FILE"
 }
 
+# sync 收敛语义（幂等 + 自愈）：
+# - desired 与状态文件一致且进程存活 → 直接跳过（允许被周期性调用而不产生重启抖动）；
+# - desired=on 但采集器死亡 → 自动重启（自愈此前「boot 后首个 sync 判定 off、
+#   之后 verbose 翻转再无事件」导致的整个 boot 静默）；
+# - desired=off 且已停 → 跳过。
+# 状态文件是引导时序的安全网：boot 首个 sync 读到的 global.json 可能尚未反映
+# 用户当前设置，后续周期重试会把它收敛到最新判定。
 sync_debug_collectors() {
   if is_verbose_logging_enabled; then
-    start_debug_collectors
+    debug_collectors_sync_to "on"
   else
-    stop_debug_collectors
+    debug_collectors_sync_to "off"
   fi
+}
+
+debug_collectors_sync_to() {
+  desired="$1"
+  last_state=$(cat "$DEBUG_COLLECTORS_STATE_FILE" 2>/dev/null)
+  if [ "$desired" = "off" ]; then
+    if [ "$last_state" = "off" ]; then
+      return 0
+    fi
+    log_collector_status "sync: stopping debug collectors (verbose off)"
+    stop_debug_collectors
+    printf '%s' "off" > "$DEBUG_COLLECTORS_STATE_FILE" 2>/dev/null
+    return 0
+  fi
+  if [ "$last_state" = "on" ]; then
+    running_pid=$(cat "$RUNNING_COLLECTOR_PID_FILE" 2>/dev/null)
+    if is_process_alive "$running_pid"; then
+      return 0
+    fi
+    log_collector_status "sync: debug collector dead, restarting"
+  else
+    log_collector_status "sync: starting debug collectors (verbose on)"
+  fi
+  start_debug_collectors
+  printf '%s' "on" > "$DEBUG_COLLECTORS_STATE_FILE" 2>/dev/null
 }

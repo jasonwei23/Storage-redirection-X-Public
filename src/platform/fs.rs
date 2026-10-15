@@ -101,10 +101,23 @@ pub fn is_directory(path: &str) -> bool {
 // uid >= 0 时同步设置 owner，否则沿用默认
 //
 // 失败原因通过 [`last_create_directory_errno`] 暴露：调用方（如沙盒目标目录
-// 创建）需要把 errno 写进诊断日志，区分 SELinux 拒绝（开机竞态，稍后重试
-// 可自愈）与路径被普通文件占用（配置或环境错误）这两类完全不同的失败。
+// 创建）需要把 errno 写进诊断日志，区分两类完全不同的失败：
+// - 可自愈的开机竞态：SELinux 拒绝（EACCES/EPERM）与 FBE CE 密钥未就绪
+//   （ENOKEY，真机实测开机 +15s 批量出现 errno=126，密钥解锁后重试即愈）；
+// - 配置或环境错误：路径被普通文件占用（ENOTDIR/EEXIST 语义冲突）等，需要用户侧介入。
 static LAST_CREATE_DIRECTORY_ERRNO: std::sync::atomic::AtomicI32 =
     std::sync::atomic::AtomicI32::new(0);
+
+/// 目录创建失败中属于"开机竞态、稍后重试可自愈"的 errno 集合。
+///
+/// 与 [`last_create_directory_errno`] 配套使用：调用方据此把这类失败降级为
+/// 竞态告警而不是配置错误，避免把开机窗口的批量失败当成永久性故障处理。
+pub fn errno_is_transient_boot_race(errno: c_int) -> bool {
+    matches!(
+        errno,
+        libc::EACCES | libc::EPERM | libc::ENOKEY | libc::ENOTCONN
+    )
+}
 
 /// 最近一次 [`create_directory`] 失败的 errno；成功或尚未调用时为 0。
 pub fn last_create_directory_errno() -> c_int {
