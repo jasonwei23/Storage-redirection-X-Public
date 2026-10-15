@@ -1,4 +1,4 @@
-name: Fork 模块修复验证
+name: Fork 模块构建
 
 on:
   pull_request:
@@ -42,12 +42,13 @@ jobs:
         with:
           toolchain: nightly-2026-07-14
           targets: aarch64-linux-android
+          components: clippy, rustfmt
 
-      - name: 执行媒体保存回归
+      - name: 执行仓库回归与格式检查
         run: |
-          python -m unittest discover -s .github/tests -p 'test_media_store_columns.py' -v
-          python -m unittest discover -s .github/tests -p 'test_media_pending_lifecycle.py' -v
-          python -m unittest discover -s .github/tests -p 'test_scenario_consistency.py' -v
+          cargo fmt --all -- --check
+          python -m unittest discover -s .github/tests -p 'test_*.py' -v
+          node scripts/verify-webui-structure.js
           node scripts/verify-webui-config-fixtures.js
 
       - name: 检查增量代码质量
@@ -82,9 +83,10 @@ jobs:
       - name: 构建并打包 arm64 模块
         env:
           CXXFLAGS: "-Wno-error=unused-but-set-variable"
-          MODULE_VERSION: ${{ steps.version.outputs.version }}-xhsfix.${{ github.run_number }}
+          MODULE_VERSION: ${{ steps.version.outputs.version }}-fork.${{ github.run_number }}
           MODULE_VERSION_CODE: ${{ steps.version.outputs.version_code }}
         run: |
+          cargo clippy --locked --target aarch64-linux-android --release --all-targets -- -D warnings
           cargo build --locked --target aarch64-linux-android --release
           bash .github/scripts/package_module.sh \
             "$MODULE_VERSION" "$MODULE_VERSION_CODE" \
@@ -97,7 +99,7 @@ jobs:
       - name: 上传可安装模块包
         uses: actions/upload-artifact@v4
         with:
-          name: storage-redirect-x-xhs-fix-arm64
+          name: storage-redirect-x-arm64
           path: |
             build/storage.redirect.x-*.zip
             build/CHANGELOG.md
