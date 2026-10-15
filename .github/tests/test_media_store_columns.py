@@ -69,7 +69,9 @@ public class ColumnsFixture {
     String getAsString(String k) { Object v = get(k); return v == null ? null : v.toString(); }
   }
   static boolean sandbox, mappingEnabled = true, consumeContext = true, failBackup;
-  static String generatedName = ".pending-123-XHS.jpg";
+  static String generatedName = ".pending-123-Image.jpg";
+  static String mappingSource = "DCIM", mappingTarget = "Pictures/Saved";
+  static String appPackage = "com.example.media";
   Object target;
   static void logInfo(String s) {}
   static void rememberProviderRedirectSourceDirectory(String a,String b) {}
@@ -86,14 +88,14 @@ public class ColumnsFixture {
   // 外部依赖只模拟路由；目录拼接、字段修改和生命周期方法均从生产源码提取。
   static String rewriteStoragePathForValues(String p,int uid) {
     if (p == null) return null;
-    return mappingEnabled ? p.replace("/DCIM/", "/Pictures/XHS/") : p;
+    return mappingEnabled ? p.replace("/" + mappingSource + "/", "/" + mappingTarget + "/") : p;
   }
   static String resolveMediaStoreDirectPathForValues(String p,int uid) {
     String mapped = rewriteStoragePathForValues(p,uid);
     String root = "/storage/emulated/" + userIdFromUid(uid) + "/";
     String backend = "/data/media/" + userIdFromUid(uid) + "/";
     boolean needsSandbox = sandbox && !mapped.contains("/Android/data/");
-    return mapped.replace(root, backend + (needsSandbox ? "Android/data/com.xingin.xhs/sdcard/" : ""));
+    return mapped.replace(root, backend + (needsSandbox ? "Android/data/" + appPackage + "/sdcard/" : ""));
   }
   Object callBackup(Object[] args) throws Throwable {
     ContentValues v = findContentValues(unwrapArgs(args));
@@ -119,86 +121,110 @@ public class ColumnsFixture {
   }
   static void checkMapping(boolean isolated,String key) throws Throwable {
     sandbox = isolated;
-    ContentValues original = values("DCIM/","Camera/XHS.jpg");
+    ContentValues original = values("DCIM/","Camera/Image.jpg");
     if (key.equals("display_name")) {
-      original.remove("_display_name"); original.put(key,"Camera/XHS.jpg");
+      original.remove("_display_name"); original.put(key,"Camera/Image.jpg");
     }
     ContentValues patched = patchContentValues(original,10355,null,true).values;
-    equal("Pictures/XHS/",patched.getAsString("relative_path"));
+    equal("Pictures/Saved/",patched.getAsString("relative_path"));
     // 文件名里的 Camera/ 交由系统清洗，不能移入相对目录或删除前缀。
-    equal("Camera/XHS.jpg",patched.getAsString(key));
+    equal("Camera/Image.jpg",patched.getAsString(key));
     String path = buildMediaStoreProbePath(patched.getAsString("relative_path"),
         firstString(patched,"_display_name","display_name"),10355);
-    equal("/storage/emulated/0/Pictures/XHS/Camera_XHS.jpg",path);
+    equal("/storage/emulated/0/Pictures/Saved/Camera_Image.jpg",path);
     equal(isolated ? path : null,patched.getAsString("_data"));
     equal("DCIM/",original.getAsString("relative_path"));
-    equal("Camera/XHS.jpg",original.getAsString(key));
+    equal("Camera/Image.jpg",original.getAsString(key));
   }
   static void checkColumns(boolean isolated,boolean consume,String relative,int uid) throws Throwable {
     sandbox = isolated; consumeContext = consume; failBackup = false;
     MEDIA_PROVIDER_CALLER_UID.set(uid); MEDIA_PROVIDER_MUTATION_METHOD.set("insert");
-    ContentValues v = values(relative,"XHS.jpg");
+    ContentValues v = values(relative,"Image.jpg");
     equal("完成",new ColumnsFixture().providerMediaFileColumnCallback(new Object[]{null,v}));
     String expected = "/storage/emulated/" + userIdFromUid(uid) + "/";
-    if (isolated && consume) expected += "Android/data/com.xingin.xhs/sdcard/";
-    expected += relative.replace("DCIM/","Pictures/XHS/") + generatedName;
+    if (isolated && consume) expected += "Android/data/com.example.media/sdcard/";
+    expected += relative.replace("DCIM/","Pictures/Saved/") + generatedName;
     equal(expected,v.getAsString("_data"));
     equal(relative,v.getAsString("relative_path"));
     equal("DCIM",v.getAsString("primary_directory"));
     equal(null,MEDIA_FILE_BUILD_CONTEXT.get());
   }
+  static void checkGenericMapping(String source,String destination,int uid,String app) throws Throwable {
+    mappingSource = source; mappingTarget = destination; appPackage = app;
+    mappingEnabled = true; consumeContext = true; failBackup = false;
+    generatedName = "album_photo.jpg";
+    MEDIA_PROVIDER_CALLER_UID.set(uid); MEDIA_PROVIDER_MUTATION_METHOD.set("insert");
+    for (boolean isolated : new boolean[]{false,true}) {
+      sandbox = isolated;
+      for (String child : new String[]{"","旅行/"}) {
+        ContentValues original = values(source + "/" + child,"album/photo.jpg");
+        ContentValues patched = patchContentValues(original,uid,null,true).values;
+        new ColumnsFixture().providerMediaFileColumnCallback(new Object[]{null,patched});
+        String root = "/storage/emulated/" + userIdFromUid(uid) + "/";
+        if (isolated) root += "Android/data/" + app + "/sdcard/";
+        equal(destination + "/" + child,patched.getAsString("relative_path"));
+        equal(root + destination + "/" + child + generatedName,patched.getAsString("_data"));
+        equal("album/photo.jpg",patched.getAsString("_display_name"));
+        equal(source + "/" + child,original.getAsString("relative_path"));
+        equal(null,MEDIA_FILE_BUILD_CONTEXT.get());
+      }
+    }
+  }
   public static void main(String[] args) throws Throwable {
     // 真正的子目录只来自 RELATIVE_PATH；DISPLAY_NAME 的分隔符不是目录层级。
-    equal("/storage/emulated/0/DCIM/Camera_XHS.jpg",
-        buildMediaStoreProbePath("DCIM/","Camera/XHS.jpg",10355));
-    equal("/storage/emulated/0/DCIM/Camera/XHS.jpg",
-        buildMediaStoreProbePath("DCIM/Camera/","XHS.jpg",10355));
-    equal("/storage/emulated/0/DCIM/Camera_XHS.jpg",
-        buildMediaStoreProbePath("DCIM/","Camera\\XHS.jpg",10355));
-    equal("/storage/emulated/0/DCIM/..__XHS.jpg",
-        buildMediaStoreProbePath("DCIM/","..//XHS.jpg",10355));
+    equal("/storage/emulated/0/DCIM/Camera_Image.jpg",
+        buildMediaStoreProbePath("DCIM/","Camera/Image.jpg",10355));
+    equal("/storage/emulated/0/DCIM/Camera/Image.jpg",
+        buildMediaStoreProbePath("DCIM/Camera/","Image.jpg",10355));
+    equal("/storage/emulated/0/DCIM/Camera_Image.jpg",
+        buildMediaStoreProbePath("DCIM/","Camera\\Image.jpg",10355));
+    equal("/storage/emulated/0/DCIM/..__Image.jpg",
+        buildMediaStoreProbePath("DCIM/","..//Image.jpg",10355));
     checkMapping(false,"_display_name"); checkMapping(true,"_display_name");
     checkMapping(false,"display_name"); checkMapping(true,"display_name");
     // 串起映射和 Provider 列处理，确认文件名含 Camera/ 的图片仍在目标根目录。
-    sandbox = false; generatedName = "Camera_XHS.jpg";
+    sandbox = false; generatedName = "Camera_Image.jpg";
     MEDIA_PROVIDER_CALLER_UID.set(10355); MEDIA_PROVIDER_MUTATION_METHOD.set("insert");
-    ContentValues rootImage = patchContentValues(values("DCIM/","Camera/XHS.jpg"),10355,null,true).values;
+    ContentValues rootImage = patchContentValues(values("DCIM/","Camera/Image.jpg"),10355,null,true).values;
     new ColumnsFixture().providerMediaFileColumnCallback(new Object[]{null,rootImage});
-    equal("Pictures/XHS/",rootImage.getAsString("relative_path"));
-    equal("/storage/emulated/0/Pictures/XHS/Camera_XHS.jpg",rootImage.getAsString("_data"));
+    equal("Pictures/Saved/",rootImage.getAsString("relative_path"));
+    equal("/storage/emulated/0/Pictures/Saved/Camera_Image.jpg",rootImage.getAsString("_data"));
     mappingEnabled = false; sandbox = false;
-    ContentValues plain = values("DCIM/Camera/","XHS.jpg");
+    ContentValues plain = values("DCIM/Camera/","Image.jpg");
     equal(plain,patchContentValues(plain,10355,null,true).values);
     equal(null,plain.getAsString("_data"));
     mappingEnabled = true;
-    ContentValues child = patchContentValues(values("DCIM/Camera/","XHS.jpg"),10355,null,true).values;
-    equal("Pictures/XHS/Camera/",child.getAsString("relative_path"));
-    equal("XHS.jpg",child.getAsString("_display_name"));
-    for (String name : new String[]{".pending-123-XHS.jpg","XHS (1).jpg","Camera_XHS.jpg"}) {
+    ContentValues child = patchContentValues(values("DCIM/Camera/","Image.jpg"),10355,null,true).values;
+    equal("Pictures/Saved/Camera/",child.getAsString("relative_path"));
+    equal("Image.jpg",child.getAsString("_display_name"));
+    for (String name : new String[]{".pending-123-Image.jpg","Image (1).jpg","Camera_Image.jpg"}) {
       generatedName = name;
-      checkColumns(false,true,"Pictures/XHS/Camera/",10355);
+      checkColumns(false,true,"Pictures/Saved/Camera/",10355);
       checkColumns(false,true,"DCIM/Camera/",10355);
-      checkColumns(true,true,"Pictures/XHS/Camera/",10355);
-      checkColumns(true,false,"Pictures/XHS/Camera/",10355);
+      checkColumns(true,true,"Pictures/Saved/Camera/",10355);
+      checkColumns(true,false,"Pictures/Saved/Camera/",10355);
       checkColumns(false,true,"DCIM/Camera/",1010355);
     }
     // pending update 的提前返回分支也不能泄漏物理卷前缀。
-    sandbox = false; consumeContext = true; generatedName = ".pending-123-XHS.jpg";
+    sandbox = false; consumeContext = true; generatedName = ".pending-123-Image.jpg";
     MEDIA_PROVIDER_CALLER_UID.set(10355); MEDIA_PROVIDER_MUTATION_METHOD.set("update");
-    MEDIA_FILE_BUILD_CONTEXT.set(new MediaFileBuildContext("/storage/emulated/0/Pictures/XHS/Camera/XHS.jpg"));
-    ContentValues update = values("DCIM/Camera/","XHS.jpg");
+    MEDIA_FILE_BUILD_CONTEXT.set(new MediaFileBuildContext("/storage/emulated/0/Pictures/Saved/Camera/Image.jpg"));
+    ContentValues update = values("DCIM/Camera/","Image.jpg");
     new ColumnsFixture().providerMediaFileColumnCallback(new Object[]{null,update});
-    equal("/storage/emulated/0/Pictures/XHS/Camera/" + generatedName,update.getAsString("_data"));
+    equal("/storage/emulated/0/Pictures/Saved/Camera/" + generatedName,update.getAsString("_data"));
     equal(null,MEDIA_FILE_BUILD_CONTEXT.get());
     // 原方法异常照常传播，临时目录字段和线程上下文必须收尾。
     MEDIA_PROVIDER_MUTATION_METHOD.set("insert"); sandbox = true; consumeContext = false; failBackup = true;
-    ContentValues failing = values("Pictures/XHS/Camera/","XHS.jpg");
+    ContentValues failing = values("Pictures/Saved/Camera/","Image.jpg");
     try {
       new ColumnsFixture().providerMediaFileColumnCallback(new Object[]{null,failing});
       throw new AssertionError("原方法异常被吞掉");
     } catch (IOException expected) {}
-    equal("Pictures/XHS/Camera/",failing.getAsString("relative_path"));
+    equal("Pictures/Saved/Camera/",failing.getAsString("relative_path"));
     equal(null,MEDIA_FILE_BUILD_CONTEXT.get());
+    // 通用路径：不同应用、映射源、中文目标、用户与真实子目录均执行生产方法。
+    checkGenericMapping("DCIM","Pictures/相册",10355,"com.example.camera");
+    checkGenericMapping("Pictures","Movies/Archive/Images",1010423,"org.example.gallery");
   }
 '''
         with tempfile.TemporaryDirectory() as directory:
