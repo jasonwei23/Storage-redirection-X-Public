@@ -975,6 +975,50 @@ fn log_recv_failure(child: i32, n: isize, expected: isize, phase: &str) {
     }
 }
 
+fn cleanup_previous_companion_mounts(state_path: &str, request: &CompanionMountRequest) {
+    let Ok(content) = std::fs::read_to_string(state_path) else {
+        return;
+    };
+    let mut targets = content
+        .lines()
+        .filter_map(|line| line.strip_prefix("target="))
+        .filter(|target| !target.is_empty())
+        .map(str::to_owned)
+        .collect::<Vec<_>>();
+    targets.sort_by_key(|target| std::cmp::Reverse(target.len()));
+    targets.dedup();
+    for target in targets {
+        let Ok(c_target) = CString::new(target.as_str()) else {
+            continue;
+        };
+        // SAFETY: c_target 是合法的 NUL 结尾路径，当前子进程已进入目标应用挂载命名空间。
+        if unsafe { libc::umount2(c_target.as_ptr(), libc::MNT_DETACH) } == 0 {
+            log::info!(
+                "companion reload detached previous target={} pid={} pkg={}",
+                target,
+                request.pid,
+                request.package_name
+            );
+        }
+    }
+    for line in content.lines() {
+        let Some(value) = line.strip_prefix("fuse_child=") else {
+            continue;
+        };
+        let Some((pid_text, start_text)) = value.split_once(':') else {
+            continue;
+        };
+        let (Ok(pid), Ok(start_time_ticks)) = (pid_text.parse::<i32>(), start_text.parse::<u64>())
+        else {
+            continue;
+        };
+        if pid > 0 && crate::platform::is_process_instance_alive(pid, start_time_ticks) {
+            crate::fuse_terminate::terminate_fuse_process(pid, Some(start_time_ticks));
+        }
+    }
+    let _ = std::fs::remove_file(state_path);
+}
+
 // 子进程切换命名空间并执行实际挂载
 fn handle_child_process(
     request: &CompanionMountRequest,
@@ -991,6 +1035,12 @@ fn handle_child_process(
         unsafe { close(sock) };
         return false;
     }
+
+    // Companion 也会处理同一 PID 的热重载请求，必须先回收上一轮状态文件中的
+    // target/fuse_child。此前只有 daemon 路径执行 clear_previous_mounts，companion
+    // 会在旧视图根和新映射层之上继续叠挂，完整场景的前置 MediaStore 场景因此会
+    // 让 scenario 29 的旧进程同时命中请求路径与映射目标。
+    cleanup_previous_companion_mounts(&plan.state_path, request);
 
     let mut mount_mgr = MountPlanner::new(
         &request.package_name,
