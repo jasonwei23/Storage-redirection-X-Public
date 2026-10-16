@@ -906,6 +906,11 @@ fn wait_for_file_monitor_events(sync: &FileMonitorSync, monitor: &RegularAppMoni
         std::thread::sleep(Duration::from_secs(30));
         return;
     }
+    // 待裁决观察事件的到期点优先：延迟裁决最长数百毫秒，不能等 30 秒轮询。
+    let poll_timeout_ms = monitor
+        .pending_flush_delay_ms()
+        .map(|delay| delay.clamp(20, 30_000))
+        .unwrap_or(30_000);
     let mut fds = [
         libc::pollfd {
             fd: monitor.event_fd(),
@@ -918,10 +923,16 @@ fn wait_for_file_monitor_events(sync: &FileMonitorSync, monitor: &RegularAppMoni
             revents: 0,
         },
     ];
-    // inotify 是主事件源，eventfd 唤醒配置重建；30 秒超时只作为 runtime disable 的兜底。
-    // SAFETY: fds 是本栈帧上的合法 pollfd 数组，poll 只在其中写入 revents；
-    // nfds_t 转换不会截断（数组长度恒为 2）。
-    let result = unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as libc::nfds_t, 30_000) };
+    // inotify 是主事件源，eventfd 唤醒配置重建；超时兜底 runtime disable 与
+    // 延迟裁决到期（有待裁决事件时压到到期点）。
+    // SAFETY: fds 是本栈帧上的合法 pollfd 数组，poll 只在其中写入 revents；nfds_t 转换由调用方保证不截断。
+    let result = unsafe {
+        libc::poll(
+            fds.as_mut_ptr(),
+            fds.len() as libc::nfds_t,
+            poll_timeout_ms as libc::c_int,
+        )
+    };
     if result < 0 && std::io::Error::last_os_error().raw_os_error() == Some(libc::EINTR) {
         return;
     }
