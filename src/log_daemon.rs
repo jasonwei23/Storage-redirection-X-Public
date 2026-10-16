@@ -558,9 +558,10 @@ impl LogState {
 /// 生效。台账行本身经私有日志通道进入本进程（root），在此对请求侧写入类记录
 /// 补登记 hint：MediaProvider 侧直写保留为兜底，跨进程去重以本路径为准。
 ///
-/// 只处理写入类 op_filter（mkdir / provider_open 写形态），与请求侧 hint 原有
-/// 登记范围一致；行内字段带 `|` 的路径会被 hint 校验拒绝，天然安全。登记失败
-/// （包名无效、路径非公共存储等）时静默跳过，不影响台账落盘。
+/// 只处理写入类 op_filter（mkdir / provider_open 写形态 / 原生 open 写形态，
+/// open 写形态映射到 provider_open 对应值登记），与请求侧 hint 原有登记范围
+/// 一致；行内字段带 `|` 的路径会被 hint 校验拒绝，天然安全。登记失败（包名
+/// 无效、路径非公共存储、caller_uid 非应用 uid 等）时静默跳过，不影响台账落盘。
 fn register_request_path_hint(message: &str) {
     if !message.contains("event_role=request") {
         return;
@@ -582,6 +583,11 @@ fn register_request_path_hint(message: &str) {
         "provider_open" | "provider_open:create" | "provider_open:write" => {
             ("provider_open", op_filter)
         }
+        // 原生 hook 的写入类 open（映射路径等场景）：请求行本就是台账对这次
+        // 写入的记录，映射到 provider_open 写形态登记 hint，让纯映射路径的
+        // request/观察记录也走同一套 10 秒窗口去重。
+        "open:create" => ("provider_open", "provider_open:create"),
+        "open:write" => ("provider_open", "provider_open:write"),
         _ => return,
     };
     let caller_uid = fields
