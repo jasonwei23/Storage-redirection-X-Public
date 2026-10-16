@@ -207,7 +207,7 @@ impl Filesystem for FuseRedirectFs {
         let stack_depth_enabled = config.set_max_stack_depth(2).is_ok();
         let max_background_enabled = config.set_max_background(64).is_ok();
         let congestion_enabled = config.set_congestion_threshold(48).is_ok();
-        let max_write_enabled = config.set_max_write(1024 * 1024).is_ok();
+        let max_write_enabled = config.set_max_write(4 * 1024 * 1024).is_ok();
         // 内核写回缓存：小块写先落内核页缓存、按大块回传，砍掉每请求同步往返。
         // 真机 2026-10-15：同步往返模式下 4K 写 6.9MB/s（每请求 ~550μs），远低于系统
         // FUSE 的 353MB/s。注意 writeback_cache 不是 legacy mount data 选项（传了会
