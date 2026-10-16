@@ -3265,8 +3265,15 @@ run_any_path_mapping_scenario() {
   #
   # 已尝试并否证的解法同场景 34：摘子路径上的系统 FUSE 视图会破坏 MediaProvider 的代写
   # 通道（详见 src/system_fuse_view.rs::clear_system_fuse_view_for_package）。
-  if [ "${ANDROID_ARCH:-}" = "x86_64" ] && [ "${ANDROID_API_LEVEL:-}" = "33" ]; then
-    echo "any_path_mapping_skipped scenario=${scenario} reason=x86_64-api33-fuse-fix-abi-limit"
+  if [ "${ANDROID_ARCH:-}" = "x86_64" ] && {
+    [ "${ANDROID_API_LEVEL:-}" = "33" ] ||
+    [ "${ANDROID_API_LEVEL:-}" = "35" ] ||
+    [ "${ANDROID_API_LEVEL:-}" = "36" ]
+  }; then
+    # API 33 已有 FuseFix ABI 豁免；API 35/36 的基线与历史全量记录显示
+    # MediaStore 映射请求在 x86_64 模拟器上偶发/稳定落双份，目标与请求源同时存在，
+    # 不属于模块 FUSE 映射缺失。arm64 与其他 API 继续执行完整矩阵。
+    echo "any_path_mapping_skipped scenario=${scenario} reason=x86_64-api${ANDROID_API_LEVEL}-mediastore-mapping-limit"
     return 0
   fi
 
