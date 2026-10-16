@@ -741,8 +741,18 @@ impl Filesystem for FuseRedirectFs {
             };
             file
         };
+        let write_started = std::time::Instant::now();
         match file.write_at(data, offset) {
             Ok(n) => {
+                let elapsed = write_started.elapsed();
+                if elapsed.as_millis() >= 2 {
+                    // 慢写探针：定位大块回写在 handler 侧的真实耗时（debug 级）。
+                    log::debug!(
+                        "fuse write slow us={} bytes={offset}+{}",
+                        elapsed.as_micros(),
+                        data.len()
+                    );
+                }
                 // 监视关闭时跳过 ino→路径解析与规则匹配：这是写入热路径上唯一的
                 // 额外查找链，monitor 关闭时 emit_monitor_mutation 必然早退。
                 if policy.is_file_monitor_enabled

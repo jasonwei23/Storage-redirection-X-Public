@@ -790,6 +790,67 @@ fn big_core_cpu_mask() -> Option<u64> {
 ///
 /// spawn_mount2 派生的事件循环线程继承调用线程的亲和性掩码，因此在 mount 前设置
 /// 一次即可覆盖全部会话线程。绑定失败（mask 越界、权限）静默跳过。
+/// 挂载成功后放宽本 FUSE 连接的回写脏页配额。
+///
+/// 内核 fuse 默认把每个连接 BDI 的 `max_ratio` 限为 1：应用对挂载点的脏页被
+/// balance_dirty_pages 严厉限流，回写流水线长期缺请求（实测 daemon 侧 recv
+/// 平均阻塞 2.4ms 等内核提交下一个请求），大块顺序写吞吐被腰斩。MediaProvider
+/// 的系统 FUSE 由 AOSP 把该值调到 40，这就是两者持续写差距的主因。真机
+/// 2026-10-15：max_ratio 1→40 后 1M 持续写 461→1002MB/s、4K 写 559→934MB/s。
+/// 每个新连接默认回落为 1，因此必须在每次挂载成功后设置；失败只降级不影响功能。
+fn set_bdi_max_ratio(mount_point: &str, session_source: &str) {
+    const TARGET_RATIO: &str = "40";
+    let device = bdi_device_for_mount(mount_point, session_source);
+    let Some(device) = device else {
+        log::debug!("fuse session bdi device not found mp={mount_point} source={session_source}");
+        return;
+    };
+    let sysfs = format!("/sys/class/bdi/{device}/max_ratio");
+    if let Err(error) = std::fs::write(&sysfs, TARGET_RATIO) {
+        log::debug!("fuse session bdi max_ratio write failed path={sysfs} err={error}");
+    } else {
+        log::info!("fuse session bdi max_ratio set dev={device} ratio={TARGET_RATIO}");
+    }
+}
+
+/// 解析本会话挂载对应的 BDI 设备号（形如 0:142）。
+///
+/// 优先 `stat` 挂载点取 `st_dev`；但宿主会话存在孤儿挂载形态（mountinfo 里有记录、
+/// 底层挂载点目录已被清理，路径查找 ENOENT），此时回退为按挂载源匹配 `/proc/self/
+/// mountinfo`——源串含本进程 pid（`srx_fuse_host[<pid>]` / scoped 形式），唯一可归属。
+fn bdi_device_for_mount(mount_point: &str, session_source: &str) -> Option<String> {
+    if let Ok(c_path) = CString::new(mount_point) {
+        // SAFETY: c_path 为合法 NUL 结尾字符串，stat 写入 MaybeUninit 结构体。
+        let mut stat_buf = std::mem::MaybeUninit::<libc::stat>::uninit();
+        // SAFETY: 同上，参数均指向合法内存。
+        if unsafe { libc::stat(c_path.as_ptr(), stat_buf.as_mut_ptr()) } == 0 {
+            // SAFETY: stat 成功后结构体已初始化。
+            let stat = unsafe { stat_buf.assume_init() };
+            return Some(format!(
+                "{}:{}",
+                libc::major(stat.st_dev),
+                libc::minor(stat.st_dev)
+            ));
+        }
+    }
+    let content = std::fs::read_to_string("/proc/self/mountinfo").ok()?;
+    content.lines().find_map(|line| {
+        let separator = line.find(" - ")?;
+        let mut before = line[..separator].split_whitespace();
+        before.next()?;
+        before.next()?;
+        let dev = before.next()?;
+        let mut after = line[separator + 3..].split_whitespace();
+        let fs_type = after.next()?;
+        let source = after.next()?;
+        if fs_type == "fuse" && source == session_source {
+            Some(dev.to_string())
+        } else {
+            None
+        }
+    })
+}
+
 fn pin_current_thread_to_big_cores() {
     let Some(mask) = big_core_cpu_mask() else {
         log::warn!("fuse session big core detect failed — pin skipped");
@@ -929,6 +990,8 @@ pub fn mount_blocking_with_ready(
         session_mount_identity.mount_id,
         session_mount_identity.source
     );
+    // 本连接的 BDI 脏页配额默认被内核限为 1%，回写流水线会饿死；挂载稳定后放宽。
+    set_bdi_max_ratio(&mount_point, &session_mount_identity.source);
     send_ready_result(ready_sock, 0);
 
     loop {
@@ -1077,6 +1140,8 @@ pub fn mount_host_fuse(
         return false;
     };
     crate::fuse_host::host_stage("stable_ok");
+    // 与 scoped 会话同口径：宿主连接的 BDI 脏页配额同样默认被限为 1%。
+    set_bdi_max_ratio(host_mount_point, &identity.source);
 
     // 宿主挂载点必须显式设为 shared propagation：`MS_REC|MS_PRIVATE` 只切断向外传播，
     // 不会让子 namespace 得见该挂载；缺了 shared，应用侧的 MS_BIND 会静默失败。参考
