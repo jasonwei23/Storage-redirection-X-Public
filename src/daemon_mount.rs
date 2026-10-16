@@ -1706,7 +1706,16 @@ fn clear_previous_mounts(request: &MountRequest, plan: &MountForkPlan) -> ClearO
             );
             continue;
         }
-        if !clear_mount_target_stack_verified(target, ledger.as_ref()) {
+        // path_mappings 形态切换时旧 ledger 可能只登记上一层 mount_id；若继续用
+        // superseded 保护，会把新层误判为“更新的其它会话”而拒绝摘除，旧根与新映射
+        // 叠加后应用同时命中请求路径和目标。此时按当前挂载形态重新判定归属，清理
+        // 所有模块层；系统自有 app-private FUSE 层仍由形态判定保留。
+        let cleanup_ledger = request
+            .path_mappings
+            .is_empty()
+            .then_some(ledger.as_ref())
+            .flatten();
+        if !clear_mount_target_stack_verified(target, cleanup_ledger) {
             outcome = ClearOutcome::Unverified;
         }
     }
