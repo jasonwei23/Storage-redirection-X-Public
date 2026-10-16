@@ -470,6 +470,8 @@ su -c 'touch /data/adb/modules/storage.redirect.x/disable && reboot'
 
 更多日志和崩溃排查见 [排障说明](docs/troubleshooting.md)。
 
+公开仓库的问题反馈请使用 [问题反馈模板](https://github.com/z1298808165/Storage-redirection-X-Public/issues/new/choose)。提交前请先在管理应用中开启详细日志，完整复现问题，再导出日志包；不要用 `.srxbak.zip` 备份文件替代日志包。
+
 ## 开发文档
 
 - [构建环境](docs/build-environment.md)
