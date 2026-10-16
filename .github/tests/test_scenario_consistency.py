@@ -806,9 +806,10 @@ class ScenarioConsistencyTest(unittest.TestCase):
         self.assertNotIn("libc::MS_BIND", attach)
 
         # 登记必须有应答：只按 `send` 是否成功判断，会让应用在策略尚未进宿主会话时接入，
-        # 结果是整片 ENOENT（未登记即拒绝）。应答带 uid，因为控制通道被所有挂载 worker 共用。
+        # 结果是整片 ENOENT（未登记即拒绝）。应答带 uid，因为控制通道被所有挂载 worker 共用；
+        # 等待受 ack 预算约束（按父进程 deadline 派生的 ack_remaining_ms），不无界阻塞。
         self.assertIn("fn await_policy_ack(", host)
-        self.assertIn("await_policy_ack(fd, config.uid)", host)
+        self.assertIn("await_policy_ack(fd, config.uid, ack_remaining_ms)", host)
         ack = section(host, "fn await_policy_ack(", "/// 把某个应用的策略登记到共享宿主会话")
         self.assertIn("if ack_uid != uid {", ack)
 
@@ -837,7 +838,11 @@ class ScenarioConsistencyTest(unittest.TestCase):
             daemon_src, "pub(crate) fn pre_register_host_policy(", "fn write_mount_state("
         )
         self.assertIn("fuse_config_from_request(request,None,None)", "".join(pre_register.split()))
-        self.assertIn("register_app_policy(&config, request.policy_fingerprint)", pre_register)
+        # 登记必须带指纹与 ack 预算（8992240b 起签名含 ack_budget_ms），缺预算会把
+        # 开机风暴期的登记挂死在共享 dgram 上，被父进程误判 child stuck 后 SIGKILL。
+        self.assertIn("register_app_policy(", pre_register)
+        self.assertIn("request.policy_fingerprint,", pre_register)
+        self.assertIn("HOST_POLICY_ACK_BUDGET_MAX_MS", pre_register)
         self.assertIn("request.policy_fingerprint", pre_register)
         self.assertIn("view.policy_fingerprints.get(&(request.uid as u32))", pre_register)
         collapse = section(

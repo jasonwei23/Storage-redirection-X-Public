@@ -30,6 +30,7 @@ mod platform {
         // 数据类型的副本（非匹配实现）：字段与 src/platform/mountinfo.rs 一致。
         pub struct MountInfoEntry<'a> {
             pub mount_id: u64,
+            pub parent_mount_id: u64,
             pub root: &'a str,
             pub target: &'a str,
             pub fs_type: &'a str,
@@ -123,6 +124,7 @@ pub struct NamespaceIdentity {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct LiveMount {
     pub mount_id: u64,
+    pub parent_mount_id: u64,
     pub source: String,
     pub fs_type: String,
     pub root: String,
@@ -281,6 +283,7 @@ fn set_mountinfo(s: &str) {
 fn mk_live(mount_id: u64, source: &str, root: &str) -> LiveMount {
     LiveMount {
         mount_id,
+        parent_mount_id: 0,
         source: source.to_string(),
         fs_type: "fuse.srx".to_string(),
         root: root.to_string(),

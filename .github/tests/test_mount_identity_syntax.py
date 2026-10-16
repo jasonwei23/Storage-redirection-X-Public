@@ -83,7 +83,9 @@ class MountIdentitySyntaxTest(unittest.TestCase):
 
         template = HARNESS.read_text(encoding="utf-8")
 
-        # 真实 mountinfo 解析（parse_entry / unescape_field）与真实语法归一化（normalize_syntax）。
+        # 真实 mountinfo 解析（parse_entry / unescape_field / topmost_by_stack）与
+        # 真实语法归一化（normalize_syntax）。topmost_by_stack 是同挂载点叠层的栈顶
+        # 判定（按 parent_mount_id 父链），topmost_live_mount 抽取后依赖它。
         mountinfo_src = read("platform/mountinfo.rs")
         paths_src = read_paths_module()
         mount_ledger_src = read("mount_ledger.rs")
@@ -94,8 +96,12 @@ class MountIdentitySyntaxTest(unittest.TestCase):
         self.assertIsNotNone(schema)
         template = re.sub(r"const IDENTITY_SCHEMA_VERSION: u32 = \d+;", schema.group(0), template)
 
-        mountinfo_fns = extract_fn(mountinfo_src, "parse_entry") + "\n" + extract_fn(
-            mountinfo_src, "unescape_field"
+        mountinfo_fns = (
+            extract_fn(mountinfo_src, "parse_entry")
+            + "\n"
+            + extract_fn(mountinfo_src, "unescape_field")
+            + "\n"
+            + extract_fn(mountinfo_src, "topmost_by_stack")
         )
         paths_fns = extract_fn(paths_src, "normalize_syntax") + "\n" + extract_fn(
             paths_src, "collapse_redundant_slashes"
