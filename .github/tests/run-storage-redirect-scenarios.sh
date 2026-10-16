@@ -577,6 +577,9 @@ clean_targets() {
   # 仍保留显式列出的既有目录：通配只在目录名以 Srt 开头时才命中，历史目录名若不含该前缀
   # 需要靠这里兜住。
   adb_su "rm -rf '${REAL_ROOT}/Download/SrtProbe' '${REAL_ROOT}/Download/SrtOther' '${REAL_ROOT}/Download/SrtOtherMapped' '${REAL_ROOT}/Download/SrtMapOnlyMapped' '${REAL_ROOT}/Download/SrtReadOnly' '${REAL_ROOT}/Download/SrtMapRO' '${REAL_ROOT}/Download/SrtAllow' '${REAL_ROOT}/Pictures/SrtLocked' '${REAL_ROOT}/Pictures/SrtReadOnlyMedia' 2>/dev/null || true" >/dev/null
+  # Any-path 夹具也必须先从可见路径删除：后续 local REAL_ROOT 切到后端后，动态
+  # 函数会清理另一份目录树；漏掉这里会让 profileInstalled 等文件跨场景残留。
+  adb_su "rm -rf '${ANY_RELATIVE_PUBLIC_TARGET}' '${ANY_ABSOLUTE_PUBLIC_TARGET}' '${ANY_PUBLIC_TO_PRIVATE_REQUEST}' '${ANY_MEDIA_REQUEST}' '${ANY_MEDIA_TARGET}' '${NESTED_MAPPING_REQUEST_ROOT}' '${NESTED_MAPPING_STAGE_ROOT}' '${NESTED_MAPPING_TARGET_ROOT}' '${ANY_ABSOLUTE_USER_REQUEST}' '${ANY_USER_ID_REQUEST}' '${ANY_LEGACY_DATA_REQUEST}' '${ANY_USER_PRIVATE_TARGET}' '${ANY_LEGACY_PRIVATE_TARGET}' 2>/dev/null || true" >/dev/null
 
   # 其余夹具的预置与清理一律改走原始后端路径：/storage/emulated/0 是应用视图，刚落盘的
   # 场景配置（只读路径、映射父目录）会在这条视图上覆盖到夹具父目录，root shell
