@@ -2701,6 +2701,22 @@ run_config_hot_reload_scenario() {
   echo "config_hot_reload_update scenario=${scenario}: switch default redirect to path mapping without restarting app"
   write_config '{"users":{"0":{"enabled":true,"path_mappings":{"Download/SrtProbe":"Download/Test"}}}}'
   apply_config_and_wait "scenario-${scenario}-hot-reload"
+  # 配置文件 reload 只刷新进程内策略，不会自动让旧应用 PID 重新物化挂载。
+  # 显式走 srxctl remount-running，确保 daemon/companion 都按新 path_mappings
+  # 清理旧层并重建；单场景启动时之所以不暴露该缺口，是因为配置先于应用挂载。
+  adb_su "/data/adb/modules/storage.redirect.x/bin/srxctl remount-running" || {
+    echo "config_hot_reload_remount_request_failed scenario=${scenario}" >&2
+    return 1
+  }
+  if ! adb_su "grep -F 'running app remount completed request=' '$LOG_PATH' | tail -1 | grep -F 'request=' >/dev/null"; then
+    echo "config_hot_reload_remount_completion_missing scenario=${scenario}" >&2
+    return 1
+  fi
+  current_pid="$(app_pid)"
+  if [ -z "$current_pid" ] || [ "$current_pid" != "$initial_pid" ]; then
+    echo "config_hot_reload_pid_changed_after_remount scenario=${scenario} before=${initial_pid} after=${current_pid:-missing}" >&2
+    return 1
+  fi
 
   for attempt in $(seq 1 20); do
     current_pid="$(app_pid)"
