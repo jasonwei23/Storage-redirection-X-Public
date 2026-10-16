@@ -1,0 +1,126 @@
+name: 问题反馈
+description: 反馈模块在设备上的异常行为（请先开启详细日志、复现问题，再导出日志包）
+title: "[问题] "
+labels:
+  - bug
+body:
+  - type: markdown
+    attributes:
+      value: |
+        ## 反馈前必读：日志包导出三步
+
+        请严格按顺序操作，顺序颠倒会导致日志包缺少定位所需的信息：
+
+        1. **先开启详细日志**：设置页 → 「模块设置」→ 打开「详细日志」。
+        2. **再复现问题**：保持详细日志开启，完整执行一遍出问题的操作（例如保存文件、重命名文件、打开相册）。
+        3. **最后导出日志包**：点击设置页右上角的文件图标（「导出日志包」），等待导出完成。
+
+        > 详细日志默认关闭。未开启时普通 native 日志不会写入日志文件，此时导出的日志包无法用于定位问题。
+
+        - 日志包文件名形如 `storage-redirect-x-logs-<时间戳>.tar.gz`，默认保存到设备的 `Download` 目录（`/storage/emulated/0/Download/`）。
+        - 日志包已包含模块日志、轮转历史、关键配置、运行状态快照、最近的 logcat 与 dmesg，无需再附加其它材料。
+        - 请勿用备份文件（`.srxbak.zip`）代替日志包，备份只包含配置，不含运行日志。
+        - 复现并导出完成后，建议关闭「详细日志」，避免长期占用存储空间。
+
+  - type: textarea
+    id: log_archive
+    attributes:
+      label: 日志包
+      description: 将导出的 `storage-redirect-x-logs-*.tar.gz` 直接拖拽到此处上传。文件过大时请提供可长期访问的下载链接，并保留原文件名。
+      placeholder: 拖拽日志包文件到此处，或粘贴下载链接
+    validations:
+      required: true
+
+  - type: input
+    id: module_version
+    attributes:
+      label: 模块版本
+      description: 在概览页或管理应用中可以查看当前模块版本号。
+      placeholder: 例如 3.2.1 (ci.24)
+    validations:
+      required: true
+
+  - type: dropdown
+    id: root_solution
+    attributes:
+      label: Root 方案
+      options:
+        - KernelSU
+        - Magisk
+        - APatch
+        - 其它（请在问题描述中说明）
+    validations:
+      required: true
+
+  - type: input
+    id: device_info
+    attributes:
+      label: 设备与系统信息
+      description: 机型、Android 版本、系统版本号；厂商定制系统请一并注明。
+      placeholder: 例如 2304FPN6DC / Android 16 / HyperOS 3.0
+    validations:
+      required: true
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: 问题描述
+      description: 说明出现了什么异常，涉及哪个应用、哪条路径规则，以及问题的发生频率（必现／偶发）。
+      placeholder: 例如：在应用 A 中保存文件到 Download/WeChat 后，文件没有出现在预期位置，重新打开应用后仍不可见，必现。
+    validations:
+      required: true
+
+  - type: textarea
+    id: steps
+    attributes:
+      label: 复现步骤
+      description: 按顺序写出可稳定复现的操作步骤，并注明相关应用的路径规则配置（sandboxed_paths / path_mappings / allowed_real_paths 等）。
+      placeholder: |
+        1. 为应用 A 配置 sandboxed_paths = ...
+        2. 打开应用 A，执行 ...
+        3. 观察 ...
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected_actual
+    attributes:
+      label: 预期行为与实际行为
+      description: 分别说明你认为应该发生什么、实际发生了什么。
+      placeholder: |
+        预期：
+        实际：
+    validations:
+      required: true
+
+  - type: dropdown
+    id: disabled_module
+    attributes:
+      label: 关闭模块后问题是否消失
+      description: 关闭模块（或创建 disable 文件后重启）再按同样步骤操作，观察问题是否仍然存在。
+      options:
+        - 关闭模块后问题消失（问题与模块相关）
+        - 关闭模块后问题仍然存在（问题可能与本模块无关）
+        - 尚未验证
+    validations:
+      required: true
+
+  - type: textarea
+    id: extra
+    attributes:
+      label: 补充信息
+      description: 其它可能有帮助的信息，例如已尝试的排查手段、改动过的配置、出现问题的截图或录屏。
+    validations:
+      required: false
+
+  - type: checkboxes
+    id: checklist
+    attributes:
+      label: 提交前确认
+      options:
+        - label: 我已先开启「详细日志」，再复现问题，最后导出日志包（顺序未颠倒）
+          required: true
+        - label: 我已搜索现有 Issue，确认没有重复反馈
+          required: true
+        - label: 我已阅读排障说明文档，确认问题与其中已记录的结论不同
+          required: false
