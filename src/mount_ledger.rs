@@ -61,6 +61,8 @@ pub struct NamespaceIdentity {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct LiveMount {
     pub mount_id: u64,
+    /// 父挂载 ID：同挂载点叠放时即下面一层的挂载 ID，用于栈顶判定。
+    pub parent_mount_id: u64,
     pub source: String,
     pub fs_type: String,
     pub root: String,
@@ -149,11 +151,15 @@ pub fn namespace_identity(pid: i32) -> Option<NamespaceIdentity> {
     })
 }
 
-/// 读取指定命名空间内挂载点上的全部挂载记录，按挂载 ID 升序返回。
+/// 读取指定命名空间内挂载点上的全部挂载记录，保持 mountinfo 原始文件序。
 ///
 /// 直接读 `/proc/<pid>/mountinfo` 即可获得目标命名空间的视图，不需要切换调用方自身的
 /// 命名空间，也不会修改任何目录元数据。`pid <= 0` 表示读取调用方自身所在的命名空间，
 /// 用于挂载子进程在 `setns` 之后登记自己刚建立的挂载。
+///
+/// 顺序契约：必须保持文件序——栈顶兜底判定（[`mountinfo::topmost_by_stack`] 的并列
+/// 形态）与既有 /proc/mounts 约定都依赖「后挂的层在文件里靠后」；按挂载 ID 排序会
+/// 破坏该约定（detached tree 搬运的层 ID 与挂载顺序倒挂，真机 2026-10-15）。
 pub fn live_mounts_at(pid: i32, mount_point: &str) -> Vec<LiveMount> {
     let path = if pid > 0 {
         format!("/proc/{pid}/mountinfo")
@@ -167,7 +173,7 @@ pub fn live_mounts_at(pid: i32, mount_point: &str) -> Vec<LiveMount> {
     // 且大小写敏感。否则不同挂载别名会被归一化到同一字符串，使缺失的主入口
     // 误匹配到后端的 /data/media 挂载。见模块级文档中的场景 29 说明。
     let normalized = paths::normalize_syntax(mount_point);
-    let mut mounts = content
+    content
         .lines()
         .filter_map(|line| {
             let entry = mountinfo::parse_entry(line)?;
@@ -176,21 +182,28 @@ pub fn live_mounts_at(pid: i32, mount_point: &str) -> Vec<LiveMount> {
             }
             Some(LiveMount {
                 mount_id: entry.mount_id,
+                parent_mount_id: entry.parent_mount_id,
                 source: mountinfo::unescape_field(entry.source),
                 fs_type: entry.fs_type.to_string(),
                 root: mountinfo::unescape_field(entry.root),
             })
         })
-        .collect::<Vec<_>>();
-    mounts.sort_by_key(|mount| mount.mount_id);
-    mounts
+        .collect()
 }
 
-/// 挂载点上最顶层的一条记录（挂载 ID 最大）。
+/// 挂载点上最顶层的一条记录（按父挂载链判定叠放顺序）。
+///
+/// 挂载 ID 在 detached tree + `move_mount` 搬运形态下不随叠放顺序递增，按最大 ID
+/// 选取会把栈底层（如屏障 tmpfs）当成栈顶。叠层顺序只能按 `parent_mount_id`
+/// 父链判定，详见 [`mountinfo::topmost_by_stack`]。
 pub fn topmost_live_mount(pid: i32, mount_point: &str) -> Option<LiveMount> {
-    live_mounts_at(pid, mount_point)
-        .into_iter()
-        .max_by_key(|mount| mount.mount_id)
+    let mounts = live_mounts_at(pid, mount_point);
+    mountinfo::topmost_by_stack(
+        &mounts,
+        |mount: &LiveMount| mount.mount_id,
+        |mount: &LiveMount| mount.parent_mount_id,
+    )
+    .cloned()
 }
 
 /// 账本文件所在目录。

@@ -377,16 +377,40 @@ fn is_barrier_entry(entry: &MountInfoEntry) -> bool {
     entry.fstype == "tmpfs" && (entry.source == "none" || entry.source.is_empty())
 }
 
-// 同一 (父挂载, 挂载点) 上的栈顶取文件序最后一条（与 /proc/mounts 的既有约定一致）。
-fn topmost_at<'a>(
+// 从 current 出发取 exact_path 上的可达栈顶，含 over-mount 链吸收。
+//
+// mount(2) 在既有挂载点上再挂一层时，新层的 parent 就是下面那层的 ID（companion
+// 先挂屏障、随后 scoped FUSE 压在屏障之上即此形态）。只看 parent == current 的
+// 扁平层会把链顶（真正服务的层）漏掉，导致健康会话被误判 not stable / 屏障裸奔。
+// 链吸收：从直接压在 current 上的层出发，反复把 parent 指向链内成员的条目并入；
+// 栈顶取文件序最后一条（与 /proc/mounts 的既有约定一致）。
+fn topmost_reachable_at<'a>(
     entries: &'a [MountInfoEntry],
-    parent: u64,
-    mount_point: &str,
+    current_id: u64,
+    exact_path: &str,
 ) -> Option<&'a MountInfoEntry> {
-    entries
+    let mut stack: Vec<&MountInfoEntry> = entries
         .iter()
-        .rev()
-        .find(|entry| entry.parent == parent && entry.mount_point == mount_point)
+        .filter(|entry| entry.parent == current_id && entry.mount_point == exact_path)
+        .collect();
+    loop {
+        let stack_ids: std::collections::HashSet<u64> =
+            stack.iter().map(|entry| entry.id).collect();
+        let mut grew = false;
+        for entry in entries {
+            if entry.mount_point != exact_path || stack_ids.contains(&entry.id) {
+                continue;
+            }
+            if stack_ids.contains(&entry.parent) {
+                stack.push(entry);
+                grew = true;
+            }
+        }
+        if !grew {
+            break;
+        }
+    }
+    stack.last().copied()
 }
 
 // 遍历模拟的结果。
@@ -412,27 +436,53 @@ fn traverse_mountinfo<'a>(entries: &'a [MountInfoEntry], path: &str) -> Traversa
         }
         let prefix = &normalized[..index];
         if let Some(current_id) = current
-            && let Some(next) = topmost_at(entries, current_id, prefix)
+            && let Some(next) = topmost_reachable_at(entries, current_id, prefix)
         {
             current = Some(next.id);
         }
     }
     let (top_at_path, beneath_top_at_path, serving) = match current {
         Some(current_id) => {
-            let stack: Vec<&MountInfoEntry> = entries
+            // 同挂载点条目可达集合：直接压在 current 上的扁平层，加 over-mount 链吸收。
+            let mut stack: Vec<&MountInfoEntry> = entries
                 .iter()
                 .filter(|entry| entry.parent == current_id && entry.mount_point == normalized)
                 .collect();
+            loop {
+                let stack_ids: std::collections::HashSet<u64> =
+                    stack.iter().map(|entry| entry.id).collect();
+                let mut grew = false;
+                for entry in entries {
+                    if entry.mount_point != normalized || stack_ids.contains(&entry.id) {
+                        continue;
+                    }
+                    if stack_ids.contains(&entry.parent) {
+                        stack.push(entry);
+                        grew = true;
+                    }
+                }
+                if !grew {
+                    break;
+                }
+            }
             if stack.is_empty() {
                 let serving = entries.iter().find(|entry| Some(entry.id) == current);
                 (None, None, serving)
             } else {
                 let top = stack[stack.len() - 1];
-                let beneath = if stack.len() >= 2 {
-                    Some(stack[stack.len() - 2])
-                } else {
-                    None
-                };
+                // 链形态下「下面一层」= 链内父成员；扁平叠放退化为文件序前一条。
+                let beneath = stack
+                    .iter()
+                    .rev()
+                    .find(|entry| entry.id == top.parent && entry.id != top.id)
+                    .copied()
+                    .or_else(|| {
+                        if stack.len() >= 2 {
+                            Some(stack[stack.len() - 2])
+                        } else {
+                            None
+                        }
+                    });
                 (Some(top), beneath, Some(top))
             }
         }
@@ -499,13 +549,13 @@ fn barrier_dispose_decision(outcome: &TraversalOutcome<'_>) -> BarrierDispose {
 // 保持 fail-closed 交给裸奔检测判败。
 fn dispose_barriers_after_view_mount(barrier_roots: &[String], package_name: &str, pid: i32) {
     let Ok(mountinfo) = std::fs::read_to_string("/proc/self/mountinfo") else {
-        log::warn!("mountinfo read failed for barrier dispose pkg={}", package_name);
+        log::warn!(
+            "mountinfo read failed for barrier dispose pkg={}",
+            package_name
+        );
         return;
     };
-    let entries: Vec<MountInfoEntry> = mountinfo
-        .lines()
-        .filter_map(parse_mountinfo_line)
-        .collect();
+    let entries: Vec<MountInfoEntry> = mountinfo.lines().filter_map(parse_mountinfo_line).collect();
     for root in barrier_roots {
         let normalized = root.trim_end_matches('/');
         if normalized.is_empty() {
@@ -1120,7 +1170,11 @@ fn handle_child_process(
         // 坍缩形态的屏障处置：按遍历感知判定——被视图根 FUSE 遮蔽的兄弟屏障不可达
         // 且无害（Inert），只有压在同挂载点 srx FUSE 之上的残留屏障才真正回收。
         if !namespace_fallback_ok && !fuse_children.is_empty() {
-            dispose_barriers_after_view_mount(&plan.barrier_roots, &request.package_name, request.pid);
+            dispose_barriers_after_view_mount(
+                &plan.barrier_roots,
+                &request.package_name,
+                request.pid,
+            );
         }
         // 屏障裸奔检测：scoped_fuse_roots 非空时，成功判定必须包含「每个屏障根的
         // 栈顶已被 srx FUSE 覆盖」。存在过的失败形态：会话建立失败但 bind 链判
@@ -1442,6 +1496,9 @@ fn start_fuse_service_for_root(
             request.package_name
         );
         crate::fuse_terminate::terminate_fuse_process(service_child, None);
+        // 与 daemon 侧同口径：子进程可能在 mount(2) 已完成后才被判失败，终止后若目标
+        // 顶层残留本模块 scoped 死层，就地摘除，避免常驻应用命名空间留下 ENOTCONN 死挂载。
+        crate::fuse_session::detach_dead_scoped_layer_after_terminate(mount_root);
         return None;
     }
 
@@ -1611,8 +1668,8 @@ fn run_mount_in_forked_child(request: &CompanionMountRequest) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        barrier_dispose_decision, is_storage_path_served_by_srx_fuse_mountinfo_in,
-        traverse_mountinfo, BarrierDispose,
+        BarrierDispose, barrier_dispose_decision, is_storage_path_served_by_srx_fuse_mountinfo_in,
+        traverse_mountinfo,
     };
 
     // mountinfo 行构造辅助：id parent 前缀随机但要真实成对。
@@ -1655,10 +1712,7 @@ mod tests {
             .filter_map(super::parse_mountinfo_line)
             .collect();
         let outcome = traverse_mountinfo(&entries, "/storage/emulated/0/DCIM");
-        assert_eq!(
-            barrier_dispose_decision(&outcome),
-            BarrierDispose::Inert
-        );
+        assert_eq!(barrier_dispose_decision(&outcome), BarrierDispose::Inert);
     }
 
     // 屏障裸奔形态：子路径遍历栈顶是只读 tmpfs 屏障，即便视图根有 srx FUSE 也必须
@@ -1715,10 +1769,7 @@ mod tests {
             .filter_map(super::parse_mountinfo_line)
             .collect();
         let outcome = traverse_mountinfo(&entries, "/storage/emulated/0/Android");
-        assert_eq!(
-            barrier_dispose_decision(&outcome),
-            BarrierDispose::Detach
-        );
+        assert_eq!(barrier_dispose_decision(&outcome), BarrierDispose::Detach);
     }
 
     // 无任何 srx FUSE（连祖先都没有）时判未覆盖，保持 fail-closed 语义。

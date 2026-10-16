@@ -1252,8 +1252,11 @@ pub fn is_host_mount_source(source: &str) -> bool {
 }
 
 /// `/proc/self/mountinfo` 中一条挂载记录里用于判定挂载归属的字段。
+#[derive(Clone)]
 struct MountEntry {
     mount_id: u64,
+    /// 父挂载 ID：同挂载点叠放时即下面一层的挂载 ID，用于栈顶判定。
+    parent_mount_id: u64,
     fs_type: String,
     source: String,
 }
@@ -1318,7 +1321,7 @@ fn wait_for_stable_session_mount(mount_point: &str, source: &str) -> Option<Scop
 /// 读取当前挂载表中指定挂载点上的全部记录。
 ///
 /// 同一路径可能叠着多层挂载（daemon 重挂载期间旧会话与新会话并存），因此返回列表，由
-/// [`topmost_mount_entry`] 按挂载 ID 选出最顶层的一条。
+/// [`topmost_mount_entry`] 选出最顶层的一条。
 fn mount_entries_at(mount_point: &str) -> Vec<MountEntry> {
     let Ok(content) = std::fs::read_to_string("/proc/self/mountinfo") else {
         return Vec::new();
@@ -1336,6 +1339,7 @@ fn mount_entries_at(mount_point: &str) -> Vec<MountEntry> {
             }
             Some(MountEntry {
                 mount_id: entry.mount_id,
+                parent_mount_id: entry.parent_mount_id,
                 fs_type: entry.fs_type.to_string(),
                 source: mountinfo::unescape_field(entry.source),
             })
@@ -1343,11 +1347,21 @@ fn mount_entries_at(mount_point: &str) -> Vec<MountEntry> {
         .collect()
 }
 
-/// 返回挂载点上最顶层的挂载记录（挂载 ID 最大的一条）。
+/// 返回挂载点上最顶层的挂载记录（按父挂载链判定叠放顺序）。
+///
+/// 挂载 ID 在 detached tree + `move_mount` 搬运形态下不随叠放顺序递增（真机
+/// 2026-10-15：scoped FUSE 层 id=233 小于其下屏障层 id=10034，按最大 ID 选取把栈底
+/// 屏障当成栈顶，健康会话被误判 not stable 后终止，留下 ENOTCONN 死挂载导致应用商店
+/// 更新全部失败）。叠层顺序只能按 `parent_mount_id` 父链判定，详见
+/// [`mountinfo::topmost_by_stack`]。
 fn topmost_mount_entry(mount_point: &str) -> Option<MountEntry> {
-    mount_entries_at(mount_point)
-        .into_iter()
-        .max_by_key(|entry| entry.mount_id)
+    let entries = mount_entries_at(mount_point);
+    mountinfo::topmost_by_stack(
+        &entries,
+        |entry: &MountEntry| entry.mount_id,
+        |entry: &MountEntry| entry.parent_mount_id,
+    )
+    .cloned()
 }
 
 /// 判断挂载点当前由谁持有。

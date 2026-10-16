@@ -1263,6 +1263,9 @@ fn start_fuse_service_for_root(
             request.package_name
         );
         crate::fuse_terminate::terminate_fuse_process(service_child, None);
+        // 子进程可能在 mount(2) 已完成后才被判失败：终止后若目标顶层残留本模块 scoped
+        // 死层，就地摘除，避免常驻应用的命名空间留下无人清理的 ENOTCONN 死挂载。
+        crate::fuse_session::detach_dead_scoped_layer_after_terminate(mount_root);
         return None;
     }
 
