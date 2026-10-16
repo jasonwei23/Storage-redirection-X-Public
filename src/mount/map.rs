@@ -123,6 +123,13 @@ impl MountPlanner {
                 }
                 self.ensure_shared_mapping_parent_chain(&target_source);
             }
+            // 与 should_fix_target_permissions 无关：映射目标目录必须归调用应用所有
+            // （裸权限访问路径下的必要状态，FUSE 虚拟化设备无副作用），且元数据判定
+            // 在锚点路径上会漏判，故目标源解析成功后总是执行。
+            if !self.ensure_app_owned_mapping_target(&target_source, self.app_uid) {
+                log::warn!("map target app ownership fix failed: {}", target_source);
+                continue;
+            }
 
             if !self.ensure_mapping_request_mount_point(
                 &mapping.request_path,
@@ -239,8 +246,16 @@ impl MountPlanner {
         for root in target_source_roots {
             let candidate = paths::join(root, target_relative);
             if fs::is_directory(&candidate) {
+                // 元数据判定必须落在真实后端路径上：锚点路径（tmp/real_storage）不是
+                // /data/media 子路径，直接判定会得到 false，导致映射目标目录的属主与
+                // 模式从未被修正——在以真实后端为访问路径的设备上（锚点为 /data/media
+                // 直绑、或应用视图本身按裸权限检查），目标目录会保持创建时的 restrictive
+                // 模式，应用列目录/按名访问全部被拒。
+                let metadata_path = self
+                    .metadata_operations_path(&candidate)
+                    .unwrap_or_else(|| candidate.clone());
                 let should_fix_permissions =
-                    mapping_target_source_needs_app_writable_metadata(&candidate, self.user_id);
+                    mapping_target_source_needs_app_writable_metadata(&metadata_path, self.user_id);
                 return Some((candidate, should_fix_permissions));
             }
         }

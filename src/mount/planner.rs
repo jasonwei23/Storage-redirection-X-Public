@@ -241,6 +241,73 @@ impl MountPlanner {
         true
     }
 
+    /// 把映射目标目录归调用应用所有，并把模式收敛到 MAPPED_DIR_MODE。
+    ///
+    /// 以真实后端为访问路径的设备（锚点 /data/media 直绑等裸权限场景）由内核按真实
+    /// 属主与模式位裁决访问：media_rw 属主的目录对应用只剩 other 位，覆盖不了
+    /// 「应用创建文件 + 列目录 + 按名访问」的完整语义（真机实测：属主改为应用后
+    /// 全部可见）。FUSE 虚拟化设备的应用视图不经过真实属主与模式位，此修正无副作用。
+    /// 仅映射目标目录调用本方法；Download 等共享公共目录仍保持 media_rw 所有权。
+    /// 幂等：属主已是应用且模式已是 MAPPED_DIR_MODE 时不发任何元数据系统调用。
+    pub(super) fn ensure_app_owned_mapping_target(&self, path: &str, owner_uid: i32) -> bool {
+        if path.is_empty() || owner_uid < 0 {
+            return true;
+        }
+        let Some(metadata_path) = self.metadata_operations_path(path) else {
+            return true;
+        };
+        if !fs::is_directory(&metadata_path) {
+            // 目录尚不存在时由通用修复负责创建，这里不做补建。
+            return true;
+        }
+        let Ok(c_path) = CString::new(metadata_path.as_str()) else {
+            return false;
+        };
+        let mut st = std::mem::MaybeUninit::<c_stat>::uninit();
+        // SAFETY: c_path 由 CString 保证以 NUL 结尾；st 是栈上有效存储，stat 只写入该结构。
+        if unsafe { c_stat(c_path.as_ptr(), st.as_mut_ptr()) } != 0 {
+            return true;
+        }
+        // SAFETY: 上一步返回 0 表示 st 已被完整初始化。
+        let st = unsafe { st.assume_init() };
+        let current_mode = st.st_mode & 0o7777;
+        if st.st_uid == owner_uid as u32 && current_mode == MAPPED_DIR_MODE {
+            return true;
+        }
+        // SAFETY: chown 只依赖 c_path 指向的有效 NUL 结尾字符串，无借用指针参数。
+        let chown_ret = unsafe { chown(c_path.as_ptr(), owner_uid as u32, MEDIA_RW_GID) };
+        if chown_ret != 0 {
+            let error_no = last_errno();
+            log::warn!(
+                "mount dir: mapping target chown failed errno={} {} path={} metadata_path={}",
+                error_no,
+                errno_text(error_no),
+                path,
+                metadata_path
+            );
+        }
+        // SAFETY: chmod 只依赖 c_path 指向的有效 NUL 结尾字符串，无借用指针参数。
+        let chmod_ret = unsafe { chmod(c_path.as_ptr(), MAPPED_DIR_MODE) };
+        if chmod_ret != 0 {
+            let error_no = last_errno();
+            log::warn!(
+                "mount dir: mapping target chmod failed errno={} {} path={} metadata_path={}",
+                error_no,
+                errno_text(error_no),
+                path,
+                metadata_path
+            );
+        }
+        log::debug!(
+            "mount dir: mapping target app ownership fixed path={} metadata_path={} uid={} mode={:o}",
+            path,
+            metadata_path,
+            owner_uid,
+            current_mode
+        );
+        true
+    }
+
     fn monitor_display_path_for_backend(&self, backend_path: &str) -> String {
         let normalized = paths::normalize(backend_path);
         let storage_root = paths::storage_user_root_for_user(self.user_id);
@@ -1088,7 +1155,9 @@ impl MountPlanner {
         }
     }
 
-    fn metadata_operations_path(&self, path: &str) -> Option<String> {
+    // 映射目标源以锚点路径形式返回时，map 侧也需要经此换算到真实后端再做元数据
+    // 判定，因此对同层模块可见。
+    pub(super) fn metadata_operations_path(&self, path: &str) -> Option<String> {
         if path.is_empty() {
             return None;
         }
