@@ -205,6 +205,11 @@ impl Filesystem for FuseRedirectFs {
             && passthrough_supported
             && !crate::config::is_fuse_passthrough_disabled();
         let stack_depth_enabled = config.set_max_stack_depth(2).is_ok();
+        // 并发额度是**连接级**的，而共享宿主会话只有一条连接。曾据此推测开机风暴时额度
+        // 打满导致 fuse_get_req 排队，实测把额度提到 512/384 后该类卡死并未消失
+        // （真机 2026-10-16 三轮开机采样均仍有），说明不是队列拥塞，而是挂载子进程解析到
+        // 了连接已中止的死 FUSE 层（fc->blocked 常驻，只有 SIGKILL 能打断）。因此额度维持
+        // 原值，根因另案处理：子进程不应在 FUSE 路径上做元数据操作。
         let max_background_enabled = config.set_max_background(128).is_ok();
         let congestion_enabled = config.set_congestion_threshold(96).is_ok();
         let max_write_enabled = config.set_max_write(4 * 1024 * 1024).is_ok();

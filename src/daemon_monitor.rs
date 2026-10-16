@@ -14,11 +14,12 @@ use events::{
     should_skip_ambiguous_allowed_real_path_event, should_skip_ambiguous_read_only_path_event,
     should_skip_public_root_event_identity,
 };
+pub(crate) use events::{maybe_sweep_android_data_owners, repair_app_private_owners};
 use roots::{
-    build_private_owner_repair_roots, build_public_owner_repair_root, build_watch_roots,
-    dedup_roots, is_self_nested_redirect_path, is_under_any_root, map_record_from_path,
-    select_watch_start, should_descend_into_child, should_record_display_path,
-    sort_roots_by_monitor_priority,
+    build_private_category_owner_roots, build_private_owner_repair_roots,
+    build_public_owner_repair_root, build_watch_roots, dedup_roots, is_self_nested_redirect_path,
+    is_under_any_root, map_record_from_path, select_watch_start, should_descend_into_child,
+    should_record_display_path, sort_roots_by_monitor_priority,
 };
 use std::collections::{HashMap, HashSet, VecDeque};
 
@@ -383,6 +384,9 @@ impl RegularAppMonitor {
                 roots.extend(build_watch_roots(spec));
             }
         }
+        // 类别级私有属主 watch 与应用配置无关：只要存储用户目录存在就登记，
+        // 覆盖未开启重定向/未配置应用的属主异常发现。
+        roots.extend(build_private_category_owner_roots());
         dedup_roots(&mut roots);
         sort_roots_by_monitor_priority(&mut roots);
         self.public_owner_roots = roots
@@ -425,10 +429,9 @@ impl RegularAppMonitor {
                             .iter()
                             .any(|watcher| watcher.source == "private_owner"));
                 let recurse_existing_tree = overflow_resync
-                    || node
-                        .watchers
-                        .iter()
-                        .any(|watcher| watcher.source != "public_owner");
+                    || node.watchers.iter().any(|watcher| {
+                        !matches!(watcher.source, "public_owner" | "private_category_owner")
+                    });
                 self.expand_watch_tree_from(node, repair_existing_files, recurse_existing_tree);
                 if self.capacity_limited {
                     break;
@@ -509,10 +512,9 @@ impl RegularAppMonitor {
                         .watchers
                         .iter()
                         .any(|watcher| watcher.source == "private_owner");
-                let recurse_existing_tree = node
-                    .watchers
-                    .iter()
-                    .any(|watcher| watcher.source != "public_owner");
+                let recurse_existing_tree = node.watchers.iter().any(|watcher| {
+                    !matches!(watcher.source, "public_owner" | "private_category_owner")
+                });
                 self.expand_watch_tree_from(node, repair_existing_files, recurse_existing_tree);
                 if self.capacity_limited {
                     break;
@@ -661,6 +663,9 @@ impl RegularAppMonitor {
                 roots.extend(build_watch_roots(spec));
             }
         }
+        // 与全量 reconfigure 相同：类别级属主 watch 独立于应用配置，增量重建也要补上
+        //（inotify_add_watch 幂等复用已有 wd，重复登记零成本）。
+        roots.extend(build_private_category_owner_roots());
         dedup_roots(&mut roots);
         sort_roots_by_monitor_priority(&mut roots);
 
@@ -687,10 +692,9 @@ impl RegularAppMonitor {
                         .watchers
                         .iter()
                         .any(|watcher| watcher.source == "private_owner");
-                let recurse_existing_tree = node
-                    .watchers
-                    .iter()
-                    .any(|watcher| watcher.source != "public_owner");
+                let recurse_existing_tree = node.watchers.iter().any(|watcher| {
+                    !matches!(watcher.source, "public_owner" | "private_category_owner")
+                });
                 self.expand_watch_tree_from(node, repair_existing_files, recurse_existing_tree);
                 if self.capacity_limited {
                     break;
@@ -908,6 +912,20 @@ impl RegularAppMonitor {
                     )
                 }) || is_self_nested_redirect_path(&child_backend_dir)
                 {
+                    // 类别级属主 watch 不下钻，但登记/重建时的存量包目录仍要做
+                    // 属主异常检查——这是它「登记即普查」语义的一半（另一半是
+                    // 运行期 IN_ATTRIB/CREATE 事件）。
+                    if node
+                        .watchers
+                        .iter()
+                        .any(|watcher| watcher.source == "private_category_owner")
+                    {
+                        repair_monitored_backend_owner_for_watchers_dir(
+                            &node.watchers,
+                            &child_display_dir,
+                            &child_backend_dir,
+                        );
+                    }
                     continue;
                 }
                 if self.watch_nodes.len() >= self.max_watches {

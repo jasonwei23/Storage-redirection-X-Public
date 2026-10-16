@@ -1533,7 +1533,15 @@ fn try_bind_to_fuse_host(
     request: &CompanionMountRequest,
     mount_root: &str,
 ) -> Option<FuseMountState> {
-    let attached = crate::fuse_host::attach_app_to_host(view, mount_root)?;
+    // companion 挂载子进程同样受父进程固定预算约束（primary 5s + 4s×根数，另有 1s 宽限）。
+    // 接入平时亚秒完成；开机风暴期 FUSE 路径遍历可能远慢于平时，等待上限必须为 scoped
+    // 回退留出完整的 FUSE_READY 周期，否则接入超时会顶穿父进程预算，子进程被 SIGKILL，
+    // 这一轮挂载作废。按单根最坏预算取值（根数增加时预算同步增长，单根值始终安全）。
+    let attach_timeout_sec = mount_timing::companion_parent_recv_budget_sec(1)
+        .saturating_sub(mount_timing::FUSE_READY_TIMEOUT_SEC)
+        .saturating_sub(1)
+        .clamp(1, crate::fuse_host::HOST_ATTACH_TIMEOUT_SEC);
+    let attached = crate::fuse_host::attach_app_to_host(view, mount_root, attach_timeout_sec)?;
     log::info!(
         "fuse host attach ok pid={} pkg={} target={} host={}",
         request.pid,

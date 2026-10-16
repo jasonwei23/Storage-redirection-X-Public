@@ -24,7 +24,7 @@ const HOST_READY_TIMEOUT_SEC: i64 = 30;
 ///
 /// 接入子进程只做几次本地系统调用（取句柄、mkdir、bind、复核），正常在毫秒级完成；
 /// 这里给的时间只用于兜住内核里卡住的 `mount`，避免挂载 worker 被长期阻塞。
-const HOST_ATTACH_TIMEOUT_SEC: i64 = 10;
+pub(crate) const HOST_ATTACH_TIMEOUT_SEC: i64 = 10;
 /// 宿主恢复失败后的最短重试间隔，避免每个 reconcile 周期重复 fork。
 const HOST_RECOVERY_BACKOFF_MS: u64 = 5_000;
 /// 应用接入共享宿主会话的**关闭开关**环境变量。
@@ -389,10 +389,19 @@ fn host_endpoint_alive(view: &HostSessionView) -> bool {
 ///
 /// 子进程在附着成功后立即退出：挂载归 mount namespace 所有，不随创建它的进程消失，
 /// 而常驻只会白占一个进程并拖住应用命名空间的引用计数（应用退出后残留挂载）。
-pub fn attach_app_to_host(view: &HostSessionView, target_root: &str) -> Option<HostAttach> {
+pub fn attach_app_to_host(
+    view: &HostSessionView,
+    target_root: &str,
+    timeout_sec: i64,
+) -> Option<HostAttach> {
     if target_root.is_empty() {
         return None;
     }
+    // 接入子进程要对 target_root 做 open_tree + move_mount，这条路径遍历应用命名空间里的
+    // FUSE 挂载；共享会话只有一条连接，开机风暴时 fuse_get_req 可能把子进程卡在 D 态，
+    // 只有 SIGKILL 能打断。因此等待窗口必须由调用方（挂载子进程）按自己的剩余预算给出，
+    // 而不是固定 10 秒——固定值比父进程的等待预算还长时，挂载子进程必然先被判卡死杀掉。
+    let timeout_sec = timeout_sec.clamp(1, HOST_ATTACH_TIMEOUT_SEC);
     let mut ready_sockets = [0; 2];
     // SAFETY: ready_sockets 是本地数组，长度合法，socketpair 填充两个 fd。
     if unsafe {
@@ -440,7 +449,7 @@ pub fn attach_app_to_host(view: &HostSessionView, target_root: &str) -> Option<H
 
     // SAFETY: 父进程关闭子端 fd 后等待就绪。
     unsafe { libc::close(ready_sockets[1]) };
-    let ready = recv_host_ready(ready_sockets[0], HOST_ATTACH_TIMEOUT_SEC);
+    let ready = recv_host_ready(ready_sockets[0], timeout_sec);
     // SAFETY: ready_sockets[0] 是父进程持有的有效端点。
     unsafe { libc::close(ready_sockets[0]) };
     // 子进程正常会立刻退出，因此这里以阻塞回收为准；异常路径改用强制回收，两者都不能留下僵尸。
@@ -506,7 +515,7 @@ pub fn attach_app_to_host(view: &HostSessionView, target_root: &str) -> Option<H
             log::warn!(
                 "fuse host attach unavailable child={} timeout_sec={} {}",
                 child,
-                HOST_ATTACH_TIMEOUT_SEC,
+                timeout_sec,
                 reason
             );
             false
@@ -550,7 +559,11 @@ fn reap_attach_child(pid: libc::pid_t) {
 ///
 /// 幂等：目标用户子树已可寻址即视为就绪，直接返回。失败不阻断登记：
 /// 策略构造时探测不到视图会自动回退直连后端的既有行为。
-pub fn ensure_host_media_fuse_view(user_id: i32) -> bool {
+pub fn ensure_host_media_fuse_view(user_id: i32, timeout_sec: i64) -> bool {
+    // 调用方（挂载子进程）受父进程固定预算约束，这里的等待必须随之收敛：
+    // 孙进程在开机风暴期做 FUSE 搬运可能远慢于平时，若仍等满上限会把调用方
+    // 拖过父进程 deadline，被子进程守卫 SIGKILL，本轮挂载整个作废。
+    let timeout_sec = timeout_sec.clamp(1, HOST_ATTACH_TIMEOUT_SEC);
     // 落盘开关：现场排障时创建该文件即可关闭视图绑定（不用重刷模块），删除后恢复。
     if std::path::Path::new("/data/adb/modules/storage.redirect.x/.media_view_disabled").exists() {
         return false;
@@ -644,7 +657,7 @@ pub fn ensure_host_media_fuse_view(user_id: i32) -> bool {
 
     // SAFETY: 父进程关闭子端 fd 后等待就绪。
     unsafe { libc::close(ready_sockets[1]) };
-    let ready = recv_host_ready(ready_sockets[0], HOST_ATTACH_TIMEOUT_SEC);
+    let ready = recv_host_ready(ready_sockets[0], timeout_sec);
     // SAFETY: ready_sockets[0] 是父进程持有的有效端点。
     unsafe { libc::close(ready_sockets[0]) };
     let ok = match ready {
@@ -670,7 +683,7 @@ pub fn ensure_host_media_fuse_view(user_id: i32) -> bool {
             log::warn!(
                 "fuse host media view unavailable child={} timeout_sec={} stage={} {}",
                 child,
-                HOST_ATTACH_TIMEOUT_SEC,
+                timeout_sec,
                 stage,
                 reason
             );

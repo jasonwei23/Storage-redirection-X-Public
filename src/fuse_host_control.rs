@@ -25,6 +25,15 @@ const HOST_CONTROL_STACK_SIZE: usize = 256 * 1024;
 const HOST_POLICY_ACK_TIMEOUT_MS: i64 = 2_000;
 /// 一次登记最多容忍几条不属于自己的应答，避免通道异常时无限空转。
 const HOST_POLICY_ACK_SKIP_LIMIT: usize = 8;
+/// 等待应答的总预算上限（毫秒），等于「单轮超时 × 可容忍条数」的最坏值。
+///
+/// 控制通道是 daemon 与所有挂载 worker 共用的同一条 socket：并发登记时先到的应答可能
+/// 属于别的调用方，本方只能继续等自己那条。没有预算约束时，最坏情况会阻塞
+/// `HOST_POLICY_ACK_TIMEOUT_MS × HOST_POLICY_ACK_SKIP_LIMIT`，而挂载 worker 的父进程只等
+/// 5 秒（外加每个挂载根 4 秒）——子进程会在等应答时被父进程超时判定卡死并 SIGKILL，
+/// 这一轮挂载彻底失败，只能靠后续 reconcile 重挂。调用方必须按自己还能等多久给预算。
+pub(crate) const HOST_POLICY_ACK_BUDGET_MAX_MS: i64 =
+    HOST_POLICY_ACK_TIMEOUT_MS * HOST_POLICY_ACK_SKIP_LIMIT as i64;
 
 /// 宿主会话控制端 fd（daemon 侧）；`-1` 表示当前没有可用宿主会话。
 static HOST_CONTROL_FD: AtomicI32 = AtomicI32::new(-1);
@@ -82,10 +91,26 @@ fn decode_policy_ack(buffer: &[u8]) -> Option<(i32, i32)> {
     Some((uid, size))
 }
 
-/// 等待宿主会话对本次登记的应答。
-fn await_policy_ack(fd: libc::c_int, uid: i32) -> bool {
+/// 等待宿主会话对本次登记的应答，总耗时不超过 `budget_ms`。
+///
+/// `budget_ms` 由调用方按「自己还能等多久」给出：挂载 worker 用父进程等待预算的剩余量，
+/// 常驻 daemon 用 [`HOST_POLICY_ACK_BUDGET_MAX_MS`]。剩余预算不足一轮超时时直接放弃——
+/// 与其等到超时后被父进程 SIGKILL（这一轮挂载彻底作废，还要留下死层待清理），不如立刻
+/// 返回失败让父进程拿到确定结果并回退 scoped 路径。
+fn await_policy_ack(fd: libc::c_int, uid: i32, budget_ms: i64) -> bool {
     let mut buffer = [0u8; 8];
+    let deadline_ms = crate::platform::paths::monotonic_ms().saturating_add(budget_ms.max(0));
     for _ in 0..HOST_POLICY_ACK_SKIP_LIMIT {
+        let remaining_ms = deadline_ms.saturating_sub(crate::platform::paths::monotonic_ms());
+        if remaining_ms < HOST_POLICY_ACK_TIMEOUT_MS {
+            log::warn!(
+                "fuse host policy ack budget exhausted uid={} budget_ms={} remaining_ms={}",
+                uid,
+                budget_ms,
+                remaining_ms
+            );
+            return false;
+        }
         // SAFETY: fd 是本模块持有的控制端 socket，buffer 是本地可写数组。
         let read = unsafe {
             libc::recv(
@@ -109,11 +134,13 @@ fn await_policy_ack(fd: libc::c_int, uid: i32) -> bool {
             continue;
         };
         if ack_uid != uid {
-            // 属于并发登记的另一次调用：不能代它消费，继续等自己那条。
-            log::debug!(
-                "fuse host policy ack for other uid={} expected={}",
+            // 属于并发登记的另一次调用：不能代它消费，继续等自己那条。数据报已被本次
+            // recv 取走，对方只能再等一轮；留下告警让这种串扰在日志里可观测。
+            log::warn!(
+                "fuse host policy ack for other uid={} expected={} remaining_ms={}",
                 ack_uid,
-                uid
+                uid,
+                deadline_ms.saturating_sub(crate::platform::paths::monotonic_ms())
             );
             continue;
         }
@@ -138,6 +165,7 @@ fn await_policy_ack(fd: libc::c_int, uid: i32) -> bool {
 pub fn register_app_policy(
     config: &crate::fuse_redirect::FuseRedirectConfig,
     policy_fingerprint: u64,
+    ack_budget_ms: i64,
 ) -> bool {
     let fd = HOST_CONTROL_FD.load(Ordering::Relaxed);
     if fd < 0 {
@@ -145,15 +173,25 @@ pub fn register_app_policy(
     }
     // 策略构造会探测宿主命名空间里的 MediaProvider FUSE 视图（自有 Android/media/<pkg>
     // 下 sqlite 三件套统一缓存层的前置条件），因此绑定必须先于登记完成。失败不阻断：
-    // 策略探测不到视图会自动回退直连后端的既有行为。
+    // 策略探测不到视图会自动回退直连后端的既有行为。绑定平时亚秒完成，等待上限取
+    // 登记预算的一半：剩余留给后续应答等待与 scoped 回退，避免调用方（挂载子进程）
+    // 被 media 视图绑定拖过父进程 deadline 后遭到 SIGKILL。
     let user_id = crate::platform::user_id_from_uid(config.uid);
-    if !crate::fuse_host::ensure_host_media_fuse_view(user_id) {
+    let view_timeout_sec =
+        (ack_budget_ms / 2000).clamp(1, crate::fuse_host::HOST_ATTACH_TIMEOUT_SEC);
+    let view_start_ms = crate::platform::paths::monotonic_ms();
+    if !crate::fuse_host::ensure_host_media_fuse_view(user_id, view_timeout_sec) {
         log::debug!(
             "fuse host media view unavailable uid={} pkg={}",
             config.uid,
             config.package_name
         );
     }
+    // media 视图绑定与应答等待共享同一份预算：绑定实际消耗掉的时间必须从应答
+    // 预算里扣除，否则两段相加会把调用方（挂载子进程）拖过父进程 deadline，
+    // 子进程守卫会把它 SIGKILL，本轮挂载作废（真机 2026-10-16 开机期实测）。
+    let ack_remaining_ms = ack_budget_ms
+        .saturating_sub(crate::platform::paths::monotonic_ms().saturating_sub(view_start_ms));
     let Ok(payload) = serde_json::to_vec(config) else {
         log::warn!("fuse host policy encode failed pkg={}", config.package_name);
         return false;
@@ -188,7 +226,7 @@ pub fn register_app_policy(
         );
         return false;
     }
-    if await_policy_ack(fd, config.uid) {
+    if await_policy_ack(fd, config.uid, ack_remaining_ms) {
         // 登记结果必须同步进快照：companion 据此判断"我的 uid 已登记"才敢接入，
         // 否则未登记 uid 的请求会被宿主 fail-closed 拒绝（整片 ENOENT）。
         record_registered_policy(config.uid as u32, policy_fingerprint);
@@ -276,7 +314,8 @@ pub fn register_daemon_namespace_passthrough() -> bool {
         );
         return false;
     }
-    let registered = await_policy_ack(fd, 0);
+    // daemon 常驻路径，不在挂载 worker 的父进程等待预算内，用最坏值即可。
+    let registered = await_policy_ack(fd, 0, HOST_POLICY_ACK_BUDGET_MAX_MS);
     if registered {
         log::info!("daemon namespace passthrough registered pid={}", daemon_pid);
     } else {

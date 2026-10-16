@@ -851,7 +851,13 @@ impl MountPlanner {
                     );
                     continue;
                 }
-                if !fs::is_directory(&sandboxed_path) {
+                // 目标是否存在必须用后端路径判定：视图路径的 stat 在挂载子进程里会
+                // 遍历系统 FUSE，开机风暴期 MediaProvider FUSE 响应慢，进程会卡在
+                // fuse_get_req（D 态，仅 SIGKILL 可打断，真机 2026-10-16 boot 期实测
+                // com.miui.voiceassist map_only 子进程即卡在此）。/data/media 与
+                // FUSE 视图内容同源，后端判定语义等价且不经过 FUSE。
+                let sandbox_target_backend = self.to_data_media_backend_path(&sandboxed_path);
+                if sandbox_target_backend.is_empty() || !fs::is_directory(&sandbox_target_backend) {
                     log::warn!(
                         "sandbox mount target missing, skip namespace bind to avoid public placeholder: {}",
                         sandboxed_path
@@ -885,7 +891,13 @@ impl MountPlanner {
                 ) else {
                     continue;
                 };
-                if paths::contains_wildcards(&excluded_path) || !fs::is_directory(&excluded_path) {
+                if paths::contains_wildcards(&excluded_path) {
+                    continue;
+                }
+                // 与 sandbox include 同理：存在性判定走 /data/media 后端路径，
+                // 避免挂载子进程在系统 FUSE 上做 stat（开机风暴期 D 态卡死）。
+                let excluded_backend = self.to_data_media_backend_path(&excluded_path);
+                if excluded_backend.is_empty() || !fs::is_directory(&excluded_backend) {
                     continue;
                 }
                 let Some(relative) = paths::relative_child_path(&excluded_path, &storage_path)

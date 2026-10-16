@@ -357,6 +357,10 @@ pub(super) fn repair_monitored_backend_owner(
     if !crate::metadata_repair::enabled() {
         return;
     }
+    if source == "private_category_owner" {
+        repair_private_category_owner(backend_path);
+        return;
+    }
     if source == "public_owner" {
         repair_public_directory_owner(display_path, backend_path);
         return;
@@ -658,6 +662,321 @@ fn should_skip_android_private_cache_file_chmod(
 
 pub(super) fn path_is_same_or_child(path: &str, root: &str) -> bool {
     paths::is_same_or_child(path, root)
+}
+
+/// 属主清扫的最小间隔。属主异常是历史损伤（旧版本在重定向开启期把应用私有子树
+/// chown 成 media_rw，或系统代写留下的陈旧状态），低频修复即可，不值得更高频率。
+const OWNER_SWEEP_INTERVAL_MS: i64 = 30 * 60 * 1000;
+/// 单轮最多**访问**的条目数（含 lstat）。既封顶修复次数也封顶干净大树的扫描
+/// 成本：预算耗尽立即返回，剩余部分等下一个间隔自动续扫，保证单轮对 daemon
+/// 主循环的阻塞有界。
+const OWNER_SWEEP_ENTRY_BUDGET: usize = 8192;
+/// 上次属主清扫的单调时刻；0 表示从未跑过（启动后第一个间隔点即执行）。
+static LAST_OWNER_SWEEP_MS: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
+/// 清扫轮转游标：keys 向量中的下一个起始下标（预算耗尽时停在该包，下一轮续扫）。
+static SWEEP_CURSOR: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// 周期性清扫 `/data/media/*/Android/{data,media,obb}/<pkg>` 的 media_rw 属主异常。
+///
+/// 背景（真机 2026-10-16 实证）：应用私有子树的正确属主是应用 uid——顶层目录组为
+/// ext_data_rw、内容目录组为 media_rw 都属正常形态，唯独**属主**不能是 media_rw：
+/// 原生 FUSE 对属主非本应用的 Android/data/<pkg> 只给 others 位（通常 --x），
+/// 应用读写全部被拒，Unity 类应用表现为存档不可读写并回退内部存储。现有的
+/// [`repair_monitored_backend_owner`] 只覆盖 `should_redirect` 通过的受监视应用
+/// （且依赖 inotify 事件触发），关闭重定向/未配置的应用无人看护、无人修复。
+/// 这里对存储后端做低频全量普查：只把「属主 == media_rw」的异常条目修回应用
+/// uid（`lchown` 仅改属主，组与模式位保持原样）；应用未安装或无法解析 uid 的
+/// 陈旧目录一律不碰。
+pub(crate) fn maybe_sweep_android_data_owners() {
+    if !crate::metadata_repair::enabled() {
+        return;
+    }
+    let now = crate::platform::paths::monotonic_ms();
+    let last = LAST_OWNER_SWEEP_MS.load(std::sync::atomic::Ordering::Relaxed);
+    // 触发文件用于现场取证：创建即立即执行一次（无论间隔），跑完自动删除。
+    let forced =
+        std::path::Path::new("/data/adb/modules/storage.redirect.x/.owner_sweep_now").exists();
+    if !forced && last != 0 && now - last < OWNER_SWEEP_INTERVAL_MS {
+        return;
+    }
+    LAST_OWNER_SWEEP_MS.store(now, std::sync::atomic::Ordering::Relaxed);
+    if forced {
+        let _ = std::fs::remove_file("/data/adb/modules/storage.redirect.x/.owner_sweep_now");
+    }
+
+    let mut repaired = 0usize;
+    let mut visited = 0usize;
+    let mut scanned = 0usize;
+    // 先收集再按固定顺序轮转：read_dir 顺序不稳定，且单棵大树可能吃满预算，
+    // 固定从头开始会让排序靠后的包永远轮不到（真机实测微信镜像树现象）。
+    // 游标记录本轮推进到的位置，下一轮从这里继续，保证所有包轮转覆盖。
+    let mut keys: Vec<String> = Vec::new();
+    let Ok(user_entries) = std::fs::read_dir("/data/media") else {
+        return;
+    };
+    let mut user_paths: Vec<String> = user_entries
+        .flatten()
+        .map(|entry| entry.path().display().to_string())
+        .collect();
+    user_paths.sort();
+    for user_path in user_paths {
+        for kind in ["data", "media", "obb"] {
+            let category_dir = format!("{user_path}/Android/{kind}");
+            let Ok(packages) = std::fs::read_dir(&category_dir) else {
+                continue;
+            };
+            let mut package_paths: Vec<String> = packages
+                .flatten()
+                .map(|entry| entry.path().display().to_string())
+                .collect();
+            package_paths.sort();
+            for package_path in package_paths {
+                keys.push(format!("{kind}|{package_path}"));
+            }
+        }
+    }
+    if keys.is_empty() {
+        return;
+    }
+    let start = SWEEP_CURSOR.load(std::sync::atomic::Ordering::Relaxed) % keys.len();
+    let mut stop = start;
+    for offset in 0..keys.len() {
+        let index = (start + offset) % keys.len();
+        let key = &keys[index];
+        let Some((_, package_path)) = key.split_once('|') else {
+            continue;
+        };
+        scanned += 1;
+        let Ok(meta) = std::fs::symlink_metadata(package_path) else {
+            continue;
+        };
+        // 深层损伤（如 files/saves 属主异常而包目录顶层正常）是实测的主要
+        // 形态，顶层属主正常不代表子树干净——每个包目录都下钻扫描，由
+        // repair_media_rw_owner_tree 内部只修属主精确等于 media_rw 的条目。
+        if !meta.is_dir() {
+            continue;
+        }
+        let package_name = package_path.rsplit('/').next().unwrap_or_default();
+        if policy::is_media_intermediate_package(package_name)
+            || policy::is_system_writer_package(package_name)
+        {
+            continue;
+        }
+        let owner_uid = policy::get_fresh_uid_for_package(package_name);
+        if owner_uid < ANDROID_APP_UID_START {
+            continue;
+        }
+        if visited >= OWNER_SWEEP_ENTRY_BUDGET {
+            log::warn!(
+                "daemon owner sweep budget exhausted visited={} repaired={} scanned={}",
+                visited,
+                repaired,
+                scanned
+            );
+            stop = index;
+            break;
+        }
+        repaired += repair_media_rw_owner_tree(
+            package_path,
+            owner_uid,
+            package_name,
+            OWNER_SWEEP_ENTRY_BUDGET,
+            &mut visited,
+        );
+        stop = (index + 1) % keys.len();
+    }
+    SWEEP_CURSOR.store(stop, std::sync::atomic::Ordering::Relaxed);
+    // 无条件记录汇总：这是低频操作（30 分钟一次或触发文件），留一条执行证据
+    // 便于现场判断普查是否真的跑过、扫到了哪里。
+    log::warn!(
+        "daemon owner sweep done visited={} repaired={} scanned={} cursor={}",
+        visited,
+        repaired,
+        scanned,
+        stop
+    );
+}
+
+/// 应用退出重定向（Disable）时的属主交接修复。
+///
+/// 关闭重定向意味着模块要把存储视图交还原生 FUSE：原生模型要求应用私有子树
+/// 属主是应用 uid，而重定向开启期可能留下属主为 media_rw 的条目（系统代写、
+/// 旧版本损伤）。交还前就地修干净，应用关掉重定向的瞬间即可正常读写存档，
+/// 不必等类别 watch 事件或低频普查。预算与普查共用，超支部分由后续机制兜底。
+pub(crate) fn repair_app_private_owners(package_name: &str, user_id: i32) -> usize {
+    if !crate::metadata_repair::enabled() || package_name.is_empty() || user_id < 0 {
+        return 0;
+    }
+    if policy::is_media_intermediate_package(package_name)
+        || policy::is_system_writer_package(package_name)
+    {
+        return 0;
+    }
+    let owner_uid = policy::get_fresh_uid_for_package(package_name);
+    if owner_uid < ANDROID_APP_UID_START {
+        return 0;
+    }
+    let mut repaired = 0usize;
+    let mut visited = 0usize;
+    for kind in ["data", "media", "obb"] {
+        if visited >= OWNER_SWEEP_ENTRY_BUDGET {
+            break;
+        }
+        let root = format!("/data/media/{user_id}/Android/{kind}/{package_name}");
+        if !std::path::Path::new(&root).is_dir() {
+            continue;
+        }
+        repaired += repair_media_rw_owner_tree(
+            &root,
+            owner_uid,
+            package_name,
+            OWNER_SWEEP_ENTRY_BUDGET,
+            &mut visited,
+        );
+    }
+    if repaired > 0 {
+        log::warn!(
+            "daemon disable owner repair pkg={} uid={} entries={}",
+            package_name,
+            owner_uid,
+            repaired
+        );
+    }
+    repaired
+}
+
+/// 类别级私有属主事件的修复入口：backend_path 形如
+/// `/data/media/<user>/Android/<data|media|obb>/<pkg>`。
+///
+/// 只在包目录存在、是目录且属主精确等于 media_rw 时修复（这正是损坏形态：
+/// 正常状态下包目录属主是应用 uid，组才是 media_rw/ext_data_rw）。应用未安装
+/// 或 uid 无法解析的陈旧目录不动。watch 登记时的存量检查与运行期 IN_ATTRIB /
+/// IN_CREATE / IN_MOVED_TO 事件都走这里。
+fn repair_private_category_owner(backend_path: &str) {
+    let mut parts = backend_path.split('/').filter(|part| !part.is_empty());
+    // 形状校验：…/Android/<kind>/<pkg>，防止其它来源的事件误入。
+    let Some(package_name) = parts.next_back() else {
+        return;
+    };
+    let Some(kind) = parts.next_back() else {
+        return;
+    };
+    if !matches!(kind, "data" | "media" | "obb") || parts.next_back() != Some("Android") {
+        return;
+    }
+    // 倒数第四段必须是用户号（纯数字）：把类别目录自身（…/Android/<kind>）挡在外面。
+    let Some(user_segment) = parts.next_back() else {
+        return;
+    };
+    if user_segment.is_empty() || !user_segment.bytes().all(|byte| byte.is_ascii_digit()) {
+        return;
+    }
+    if package_name.is_empty() || package_name.contains('/') {
+        return;
+    }
+    let Ok(meta) = std::fs::symlink_metadata(backend_path) else {
+        return;
+    };
+    if !meta.is_dir() || meta.uid() != MEDIA_RW_UID {
+        return;
+    }
+    if policy::is_media_intermediate_package(package_name)
+        || policy::is_system_writer_package(package_name)
+    {
+        return;
+    }
+    let owner_uid = policy::get_fresh_uid_for_package(package_name);
+    if owner_uid < ANDROID_APP_UID_START {
+        return;
+    }
+    let mut visited = 0usize;
+    repair_media_rw_owner_tree(
+        backend_path,
+        owner_uid,
+        package_name,
+        OWNER_SWEEP_ENTRY_BUDGET,
+        &mut visited,
+    );
+}
+
+/// 把目录树里属主为 media_rw 的条目修回应用 uid，返回实际修正数。
+///
+/// 只在条目属主精确等于 media_rw 时动手（其余属主一律不动），组与模式位保持
+/// 原样（`lchown` 传 -1 保留组）。`budget` 为本轮剩余的**访问条目**预算（含
+/// lstat），既限制修复次数也限制干净大树的扫描成本；超支立即返回，剩余部分
+/// 留给下轮。`visited` 由调用方累计用于跨包预算。
+fn repair_media_rw_owner_tree(
+    root: &str,
+    owner_uid: i32,
+    package_name: &str,
+    budget: usize,
+    visited: &mut usize,
+) -> usize {
+    let mut repaired = 0usize;
+    let mut stack = vec![root.to_string()];
+    while let Some(current) = stack.pop() {
+        if *visited >= budget {
+            log::debug!(
+                "daemon owner repair scan budget exhausted pkg={} path={}",
+                package_name,
+                current
+            );
+            return repaired;
+        }
+        *visited += 1;
+        let Some(c_path) = cstring_path(&current) else {
+            continue;
+        };
+        let mut st = std::mem::MaybeUninit::<libc::stat>::uninit();
+        // SAFETY: c_path 以 NUL 结尾，st 指向可供 lstat 写入的存储空间。
+        if unsafe { libc::lstat(c_path.as_ptr(), st.as_mut_ptr()) } != 0 {
+            continue;
+        }
+        // SAFETY: lstat 已成功返回并完整初始化 stat 值。
+        let st = unsafe { st.assume_init() };
+        if st.st_uid == MEDIA_RW_UID {
+            // SAFETY: c_path 在调用期间保持有效；gid 传 u32::MAX（即 -1）保留组不变。
+            let ret = unsafe { libc::lchown(c_path.as_ptr(), owner_uid as u32, u32::MAX) };
+            if ret == 0 {
+                repaired += 1;
+            } else {
+                log::warn!(
+                    "daemon owner repair failed pkg={} path={} errno={}",
+                    package_name,
+                    current,
+                    last_errno()
+                );
+            }
+        }
+        if st.st_mode & libc::S_IFMT as mode_t == libc::S_IFDIR as mode_t {
+            let Ok(children) = std::fs::read_dir(&current) else {
+                continue;
+            };
+            for child in children.flatten() {
+                let child_path = child.path().display().to_string();
+                // 重定向目标是模块管理的镜像树（`<pkg>/sdcard`，其中还有自嵌套
+                // 复制）：真机实测微信的镜像树足以单独吃满整轮预算，且关闭重定向
+                // 后该子树不再被原生视图访问，属主修复对它没有意义。剪掉。
+                if current == root && child.file_name().to_string_lossy() == "sdcard" {
+                    continue;
+                }
+                if super::roots::is_self_nested_redirect_path(&child_path) {
+                    continue;
+                }
+                stack.push(child_path);
+            }
+        }
+    }
+    if repaired > 0 {
+        log::warn!(
+            "daemon owner repair pkg={} uid={} repaired={} root={}",
+            package_name,
+            owner_uid,
+            repaired,
+            root
+        );
+    }
+    repaired
 }
 
 fn raw_parent(path: &str) -> String {
