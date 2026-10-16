@@ -3370,6 +3370,16 @@ run_scenario() {
       prepare_read_only_media_image
       targets_prepared_before_start=1
       ;;
+    29)
+      # 场景 24-28 会驱动 MediaStore/系统代写链路；只 force-stop 测试应用不足以
+      # 清掉 MediaProvider 进程内上一批 pending/path 状态。场景 29 的热重载要求
+      # provider 与应用同时从干净状态开始，否则旧 provider 状态会在请求路径留下
+      # 文件，掩盖映射目标已正确落盘的结果（run 38899801989 / 38907088922）。
+      echo "step 2/7: 清理并重启 MediaProvider，隔离前置场景状态"
+      clean_targets
+      restart_media_provider_with_hook_ready "scenario-${scenario}-provider-reset" || return 1
+      targets_prepared_before_start=1
+      ;;
     20|21|22)
       echo "step 2/7: 清理并预置 mount namespace 回退目标"
       clean_targets
