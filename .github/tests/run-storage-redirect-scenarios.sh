@@ -2704,11 +2704,16 @@ run_config_hot_reload_scenario() {
   # 配置文件 reload 只刷新进程内策略，不会自动让旧应用 PID 重新物化挂载。
   # 显式走 srxctl remount-running，确保 daemon/companion 都按新 path_mappings
   # 清理旧层并重建；单场景启动时之所以不暴露该缺口，是因为配置先于应用挂载。
+  local remount_watermark
+  remount_watermark="$(adb_su "wc -l < '$LOG_PATH' 2>/dev/null || echo 0" 2>/dev/null | tr -d '[:space:]' || echo 0)"
+  case "$remount_watermark" in
+    ''|*[!0-9]*) remount_watermark=0 ;;
+  esac
   adb_su "/data/adb/modules/storage.redirect.x/bin/srxctl remount-running" || {
     echo "config_hot_reload_remount_request_failed scenario=${scenario}" >&2
     return 1
   }
-  if ! adb_su "grep -F 'running app remount completed request=' '$LOG_PATH' | tail -1 | grep -F 'request=' >/dev/null"; then
+  if ! adb_su "tail -n +$((remount_watermark + 1)) '$LOG_PATH' 2>/dev/null | grep -F 'running app remount completed request=' >/dev/null"; then
     echo "config_hot_reload_remount_completion_missing scenario=${scenario}" >&2
     return 1
   fi
