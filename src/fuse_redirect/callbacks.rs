@@ -205,8 +205,8 @@ impl Filesystem for FuseRedirectFs {
             && passthrough_supported
             && !crate::config::is_fuse_passthrough_disabled();
         let stack_depth_enabled = config.set_max_stack_depth(2).is_ok();
-        let max_background_enabled = config.set_max_background(32).is_ok();
-        let congestion_enabled = config.set_congestion_threshold(24).is_ok();
+        let max_background_enabled = config.set_max_background(64).is_ok();
+        let congestion_enabled = config.set_congestion_threshold(48).is_ok();
         let max_write_enabled = config.set_max_write(1024 * 1024).is_ok();
         // 内核写回缓存：小块写先落内核页缓存、按大块回传，砍掉每请求同步往返。
         // 真机 2026-10-15：同步往返模式下 4K 写 6.9MB/s（每请求 ~550μs），远低于系统
@@ -215,14 +215,22 @@ impl Filesystem for FuseRedirectFs {
         let writeback_enabled = config
             .add_capabilities(InitFlags::FUSE_WRITEBACK_CACHE)
             .is_ok();
+        // passthrough 必须在 INIT 应答里申请能力位，否则内核拒绝所有 backing 注册，
+        // open_backing 首败即触发会话级关闭，数据面永远走 daemon 往返（真机 2026-10-15：
+        // 大文件 1.9GB 写期间宿主会话 daemon CPU 124%，487MB/s 封顶；内核直通后大 IO
+        // 绕过 daemon，接近原生吞吐）。probe_state ok 只代表内核数据面可用，不代表
+        // 本会话协商过能力位。
+        let passthrough_negotiated =
+            passthrough_enabled && config.add_capabilities(InitFlags::FUSE_PASSTHROUGH).is_ok();
         self.passthrough_enabled
-            .store(passthrough_enabled, Ordering::Relaxed);
+            .store(passthrough_negotiated, Ordering::Relaxed);
         log::info!(
-            "fuse init pkg={} kernel_abi={} passthrough_supported={} passthrough_enabled={} probe_state={:?} passthrough_disabled_by_marker={} stack_depth={} max_background={} congestion={} max_write={} writeback={}",
+            "fuse init pkg={} kernel_abi={} passthrough_supported={} passthrough_enabled={} passthrough_negotiated={} probe_state={:?} passthrough_disabled_by_marker={} stack_depth={} max_background={} congestion={} max_write={} writeback={}",
             self.policy.session().package_name,
             config.kernel_abi(),
             passthrough_supported,
             passthrough_enabled,
+            passthrough_negotiated,
             probe_state,
             crate::config::is_fuse_passthrough_disabled(),
             stack_depth_enabled,

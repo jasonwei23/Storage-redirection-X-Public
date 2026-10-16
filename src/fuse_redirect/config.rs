@@ -809,7 +809,7 @@ pub fn mount_blocking_with_ready(
         MountOption::Async,
     ];
     mount_options.acl = SessionACL::All;
-    mount_options.n_threads = Some(4);
+    mount_options.n_threads = Some(8);
     mount_options.clone_fd = true;
 
     // 挂载点日志描述的是会话绑定策略，与调用方 uid 无关，因此固定取注册表的会话项。
@@ -979,7 +979,7 @@ pub fn mount_host_fuse(
         MountOption::Async,
     ];
     mount_options.acl = SessionACL::All;
-    mount_options.n_threads = Some(4);
+    mount_options.n_threads = Some(8);
     mount_options.clone_fd = true;
 
     let background = match fuser::spawn_mount2(fs, host_mount_point, &mount_options) {
