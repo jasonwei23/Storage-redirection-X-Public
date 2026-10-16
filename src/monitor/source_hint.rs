@@ -432,9 +432,12 @@ const RECENT_REQUEST_RECORD_WINDOW_MS: i64 = 10_000;
 
 /// 判断路径是否存在窗口内的请求侧写记录（mkdir / 创建或写入类 provider open）。
 ///
-/// 只查持久化 hint 文件：请求记录由 MediaProvider 进程写入，daemon 进程的内存
-/// hint 队列不包含它们。`updated_ms` 取自系统级 CLOCK_MONOTONIC，跨进程可比。
-/// `provider_open:read` 与只读查询不算写请求，不抑制观察记录。
+/// 同时查内存 hint 队列与持久化 hint 文件：hint 登记方（daemon 日志线程）先更新
+/// 内存队列再落盘文件，监视线程处理 inotify 事件时查内存可以消除「请求行已送达
+/// 而 hint 文件尚未写完」的毫秒级竞态——该竞态会让首批观察 CREATE 抢在抑制生效
+/// 前漏出。文件查询仍保留，覆盖跨进程写入方（兜底直写）。`updated_ms` 取自系统
+/// 级 CLOCK_MONOTONIC，跨进程可比。`provider_open:read` 与只读查询不算写请求，
+/// 不抑制观察记录。
 // quality-allow(lint-suppression): 消费方 daemon_monitor 仅被 bin #[path] 再编译，
 // lib 视角死代码（与上方常量同组，两侧编译差异）。
 #[allow(dead_code)]
@@ -443,13 +446,34 @@ pub(crate) fn has_recent_public_path_request(normalized_path: &str, user_id: i32
         return false;
     }
     let now_ms = paths::monotonic_ms();
-    read_path_hint_file().iter().any(|hint| {
-        hint.user_id == user_id
-            && hint.path == normalized_path
-            && is_write_request_hint_op_filter(hint.op_filter)
-            && (0..=RECENT_REQUEST_RECORD_WINDOW_MS)
-                .contains(&now_ms.saturating_sub(hint.updated_ms))
-    })
+    if RECENT_PATH_CALLER_HINT
+        .lock()
+        .map(|hints| {
+            hints
+                .iter()
+                .any(|hint| is_recent_write_request_hint(hint, user_id, normalized_path, now_ms))
+        })
+        .unwrap_or(false)
+    {
+        return true;
+    }
+    read_path_hint_file()
+        .iter()
+        .any(|hint| is_recent_write_request_hint(hint, user_id, normalized_path, now_ms))
+}
+
+// quality-allow(lint-suppression): 与 has_recent_public_path_request 同组，仅 bin 侧 daemon_monitor 消费。
+#[allow(dead_code)]
+fn is_recent_write_request_hint(
+    hint: &PathCallerHint,
+    user_id: i32,
+    normalized_path: &str,
+    now_ms: i64,
+) -> bool {
+    hint.user_id == user_id
+        && hint.path == normalized_path
+        && is_write_request_hint_op_filter(hint.op_filter)
+        && (0..=RECENT_REQUEST_RECORD_WINDOW_MS).contains(&now_ms.saturating_sub(hint.updated_ms))
 }
 
 // quality-allow(lint-suppression): 与 has_recent_public_path_request 同组，仅 bin 侧 daemon_monitor 消费。
