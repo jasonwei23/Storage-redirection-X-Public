@@ -1309,15 +1309,25 @@ impl RegularAppMonitor {
 
         let event_key = format!("{}|{}|{}|{}", package_name, operation_name, path, from_path);
         if inotify::is_modify(mask) {
-            if self
-                .recent_event_ms
-                .insert(event_key.clone(), now_ms)
-                .is_none()
-            {
-                self.recent_event_order.push_back(event_key);
+            // IN_MODIFY 随每个写入块逐次触发，持续下载会在同一文件上产生大量
+            // 事件；按 (包名, 操作, 路径) 节流：窗口内跳过，窗口过期后重记一条，
+            // 长下载仍保留活动痕迹且不刷屏。窗口从上次「记账」时刻起算而非上次
+            // 事件时刻，避免连续写入把窗口无限顺延、整段写入只留首条记录。
+            match self.recent_event_ms.get_mut(&event_key) {
+                Some(last_ms) => {
+                    if now_ms.saturating_sub(*last_ms) < DUPLICATE_EVENT_WINDOW_MS {
+                        return true;
+                    }
+                    *last_ms = now_ms;
+                    return false;
+                }
+                None => {
+                    self.recent_event_ms.insert(event_key.clone(), now_ms);
+                    self.recent_event_order.push_back(event_key);
+                    self.trim_recent_events();
+                    return false;
+                }
             }
-            self.trim_recent_events();
-            return false;
         }
         if let Some(last_ms) = self.recent_event_ms.get_mut(&event_key) {
             if now_ms.saturating_sub(*last_ms) < DUPLICATE_EVENT_WINDOW_MS {
