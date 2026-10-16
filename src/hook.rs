@@ -36,7 +36,8 @@ pub(crate) use jni_query::{
     storage_path_exists_by_syscall,
 };
 pub(crate) use media_fuse::{
-    record_read_only_fuse_operation, should_allow_public_mapping_target_access,
+    record_read_only_fuse_operation, should_allow_own_android_private_path_access,
+    should_allow_public_mapping_target_access,
 };
 pub(crate) use ops::mutation::{
     cleanup_provider_redirect_source_directory, remember_provider_redirect_source_directory,

@@ -2026,6 +2026,8 @@ public class Hooker {
 
   private static native boolean allowsPublicMappingTarget(String path, int callerUid);
 
+  private static native boolean allowsOwnAndroidPrivatePath(String path, int callerUid);
+
   private static native boolean isRedirectEnabledForCallerUid(int callerUid);
 
   private static native void captureBinderCaller(int callerUid, int callerPid);
@@ -2248,8 +2250,22 @@ public class Hooker {
     // 映射目标由该应用的 path_mappings 明确产生。MediaProvider 在 FUSE 层仍按目标
     // 公共目录做权限校验时，写入请求也要沿用映射授权，否则 QQ 的分片临时文件会被
     // 误判为“无权写入公共目录”。
+    // 应用自身 Android/data、obb 私有目录的读写是 Android 语义本来就允许的操作，
+    // 但 MediaProvider 的身份判定在调用方解析高压失效时可能误拒，导致应用读不到
+    // 自己的媒体文件；放行口径与其自身 bypass 判定一致（路径属主包与调用 UID 匹配）。
     return allowsPublicMappingTargetSafe(request.path, request.callerUid)
-        || allowsPublicMappingTargetSafe(request.ioPath, request.callerUid);
+        || allowsPublicMappingTargetSafe(request.ioPath, request.callerUid)
+        || allowsOwnAndroidPrivatePathSafe(request.path, request.callerUid)
+        || allowsOwnAndroidPrivatePathSafe(request.ioPath, request.callerUid);
+  }
+
+  private static boolean allowsOwnAndroidPrivatePathSafe(String path, int callerUid) {
+    if (path == null || path.length() == 0) return false;
+    try {
+      return allowsOwnAndroidPrivatePath(path, callerUid);
+    } catch (Throwable ignored) {
+      return false;
+    }
   }
 
   private static boolean allowsPublicMappingTargetSafe(String path, int callerUid) {
