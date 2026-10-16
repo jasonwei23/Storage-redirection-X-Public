@@ -503,6 +503,12 @@ impl LogState {
                     && let Ok(mut slot) = policy_register_request_slot().lock()
                 {
                     *slot = Some(token);
+                    // 必须唤醒主循环：应用刚启动、companion 的宿主视图等待预算只有秒级，
+                    // 若只入队不唤醒，token 要等下一个无关事件（配置写入/宿主事件/周期
+                    // reconcile 唤醒点）才被取走，真机实测可积压 13-28s——期间应用要么
+                    // 被测试流杀掉（token 永远落在 process gone），要么在裸屏障上撞出
+                    // ENOENT。与上方 reconcile-running 分支的唤醒语义保持一致。
+                    wake_daemon();
                 }
             }
             _ => {}

@@ -1287,6 +1287,18 @@ fn shared_host_preattach_candidate(
     if !is_auto && !is_monitor_only {
         return false;
     }
+    // 与 daemon 侧同源（crate::daemon_mount::shared_host_preattach_candidate）：存在
+    // 私有 fs 侧映射时 preattach 成功会短路 planner，私有映射的命名空间 bind 挂载
+    // 会被整体丢弃（真机实证：scenario 35 映射矩阵全失效）。命中时必须回落
+    // planner 流程，由 planner 一边宿主接入一边物化私有映射。
+    if crate::domain::mappings_need_namespace_mount(
+        request.uid,
+        &request.app_data_dir,
+        &request.redirect_target,
+        &request.path_mappings,
+    ) {
+        return false;
+    }
     let user_id = platform::user_id_from_uid(request.uid);
     let storage_root = platform::paths::storage_user_root_for_user(user_id);
     scoped_fuse_roots.len() == 1
@@ -1319,6 +1331,19 @@ fn scoped_fuse_mount_roots(request: &CompanionMountRequest) -> Vec<String> {
     // 等待"宿主在位 + 本 uid 已被 daemon 预登记"；等待发生在挂载应答返回之前，应用进程
     // 尚未恢复运行，一次挂载到位，没有"先 scoped 后迁移"的 fail-open 中间态。快照缺失、
     // 等待超时或处于失败冷却期时保持旧规划，scoped 数据面照常服务。
+    //
+    // 存在私有 fs 侧映射时保持按目录规划（与 daemon 侧同源判定）：宿主策略层只覆盖
+    // 存储视图，target 在视图外的映射会被宿主忽略，写入穿透到默认重定向根（真机实证：
+    // scenario 35 的 Download/X → /data/user/0/<pkg>/no_backup 在收敛路径下落到
+    // sdcard 沙盒）。按目录 scoped 会话与命名空间 bind 才能完整表达这类映射。
+    if crate::domain::mappings_need_namespace_mount(
+        request.uid,
+        &request.app_data_dir,
+        &request.redirect_target,
+        &request.path_mappings,
+    ) {
+        return roots;
+    }
     if roots.is_empty()
         || !matches!(
             request.storage_backend_mode,

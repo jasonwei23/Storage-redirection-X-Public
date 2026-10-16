@@ -1631,16 +1631,33 @@ fn register_policy_for_pid_token(token: &str, config_version: u64) {
         log::warn!("register-policy token invalid token={}", token);
         return;
     };
-    let Some(proc) = list_app_processes()
+    let proc = match list_app_processes()
         .into_iter()
         .find(|proc| proc.pid == pid && proc.package_name == package_name)
-    else {
-        log::debug!(
-            "register-policy process gone pkg={} pid={}",
-            package_name,
-            pid
-        );
-        return;
+    {
+        Some(proc) => proc,
+        None => {
+            // companion 在 specialize 早期就发 token，此时进程尚未 setArgV0，
+            // /proc/<pid>/cmdline 还是 zygote——按 cmdline 匹配必然 miss（真机实测：
+            // token 秒达时 100% 命中这条路径）。token 本身来自模块注入的可信通道，
+            // 包名与 pid 语义以 token 为准，这里只从 status 复核 uid 归属即可。
+            match read_process_status(pid) {
+                Some((uid, _)) if uid >= ANDROID_APP_UID_START => AppProcess {
+                    pid,
+                    uid,
+                    package_name: package_name.to_string(),
+                    is_uninterruptible: false,
+                },
+                _ => {
+                    log::debug!(
+                        "register-policy process gone pkg={} pid={}",
+                        package_name,
+                        pid
+                    );
+                    return;
+                }
+            }
+        }
     };
     if should_skip_process(&proc) {
         return;

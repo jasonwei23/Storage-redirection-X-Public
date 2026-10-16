@@ -1160,6 +1160,14 @@ fn shared_host_preattach_candidate(request: &MountRequest, scoped_fuse_roots: &[
     if !is_auto && !is_monitor_only {
         return false;
     }
+    if crate::domain::mappings_need_namespace_mount(
+        request.uid,
+        &request.app_data_dir,
+        &request.redirect_target,
+        &request.path_mappings,
+    ) {
+        return false;
+    }
     let user_id = crate::platform::user_id_from_uid(request.uid);
     let storage_root = crate::platform::paths::storage_user_root_for_user(user_id);
     scoped_fuse_roots.len() == 1
@@ -1204,6 +1212,19 @@ fn scoped_fuse_mount_roots(request: &MountRequest) -> Vec<String> {
     // 先卸旧 scoped 层、再挂新层，中间应用对该路径的访问会穿透到真实存储（fail-open
     // 窗口）；等待发生在挂载应答返回之前，应用进程尚未恢复运行，一次挂载到位。
     // 接入被显式关闭、等待超时或处于失败冷却期时保持原规划——旧数据面照常服务。
+    //
+    // 存在私有 fs 侧映射时保持按目录规划：宿主策略层只覆盖存储视图，target 在视图外
+    // 的映射会被宿主忽略，写入穿透到默认重定向根（真机实证：scenario 35 的
+    // Download/X → /data/user/0/<pkg>/no_backup 在收敛路径下落到 sdcard 沙盒）。
+    // 按目录 scoped 会话与命名空间 bind 才能完整表达这类映射。
+    if crate::domain::mappings_need_namespace_mount(
+        request.uid,
+        &request.app_data_dir,
+        &request.redirect_target,
+        &request.path_mappings,
+    ) {
+        return roots;
+    }
     if roots.is_empty()
         || !matches!(
             request.storage_backend_mode,
