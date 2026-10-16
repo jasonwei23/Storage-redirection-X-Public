@@ -42,6 +42,14 @@ mod platform {
 
     pub mod paths {
         // __INJECT_PATHS__
+
+        pub fn storage_alias_roots_for_user(_user_id: i32) -> Vec<String> {
+            vec!["/storage/emulated/0".to_string()]
+        }
+    }
+
+    pub fn user_id_from_uid(uid: i32) -> i32 {
+        if uid >= 0 { uid / 100000 } else { 0 }
     }
 
     pub mod module_paths {
@@ -200,7 +208,9 @@ pub struct MountRequest {
     pub operation: MountOperation,
     pub package_name: String,
     pub pid: i32,
+    pub uid: i32,
     pub redirect_target: String,
+    pub path_mappings: Vec<String>,
 }
 
 pub struct MountForkPlan {
@@ -507,7 +517,9 @@ fn main() {
         operation: MountOperation::Reload,
         package_name: "pkg".to_string(),
         pid: 1,
+        uid: 10000,
         redirect_target: String::new(),
+        path_mappings: Vec::new(),
     };
     let plan = MountForkPlan {
         state_path: "/x".to_string(),

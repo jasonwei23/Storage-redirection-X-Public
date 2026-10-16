@@ -1665,6 +1665,18 @@ fn clear_previous_mounts(request: &MountRequest, plan: &MountForkPlan) -> ClearO
     let fuse_children = read_fuse_children(state_path);
     let mut targets = read_mount_targets(state_path);
     targets.extend(plan.overlay_targets.iter().cloned());
+    // path_mappings 热重载必须显式覆盖全部存储别名根：旧状态文件可能来自 companion
+    // 或上一轮部分失败，只记录了子映射目标；若漏掉视图根，旧沙箱层会继续压在新映射层上。
+    // 仅在挂载形态发生变化时扩大清理集合，普通 reload 仍按状态文件精确清理。
+    if request.operation == MountOperation::Reload
+        && !request.path_mappings.is_empty()
+        && request.uid >= 0
+    {
+        let user_id = crate::platform::user_id_from_uid(request.uid);
+        targets.extend(crate::platform::paths::storage_alias_roots_for_user(
+            user_id,
+        ));
+    }
     let targets = module_paths::normalize_mount_targets(&targets);
     if targets.is_empty() && fuse_children.is_empty() {
         return if std::fs::remove_file(state_path).is_ok() || std::fs::metadata(state_path).is_err()

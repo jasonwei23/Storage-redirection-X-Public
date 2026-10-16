@@ -985,6 +985,13 @@ fn cleanup_previous_companion_mounts(state_path: &str, request: &CompanionMountR
         .filter(|target| !target.is_empty())
         .map(str::to_owned)
         .collect::<Vec<_>>();
+    // path_mappings 形态切换时旧 state 可能只记录子映射目标；把全部存储别名根
+    // 纳入清理，避免旧视图根继续压在新映射层上。
+    if !request.path_mappings.is_empty() && request.uid >= 0 {
+        targets.extend(crate::platform::paths::storage_alias_roots_for_user(
+            crate::platform::user_id_from_uid(request.uid),
+        ));
+    }
     targets.sort_by_key(|target| std::cmp::Reverse(target.len()));
     targets.dedup();
     for target in targets {
