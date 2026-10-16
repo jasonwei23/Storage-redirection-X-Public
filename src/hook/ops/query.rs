@@ -3,8 +3,10 @@ use super::super::path as path_utils;
 use super::super::runtime;
 use super::super::stats::InterceptHub;
 use super::super::util::c_str_to_string;
-use crate::platform::paths;
-use crate::redirect::{policy, process_redirect_path, writer};
+use crate::platform::{self, paths};
+use crate::redirect::{
+    policy, process_redirect_path, resolve_mapping_request_owner_for_path, writer,
+};
 use libc::{AT_FDCWD, c_char, c_int, c_uint, c_void};
 use std::ffi::CString;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -69,12 +71,13 @@ where
     if ret == 0 || !is_retryable_system_writer_query_error(error_no) {
         return ret;
     }
-    if !should_attempt_system_writer_query_fallback(hub) {
+    let query_path = resolve_system_writer_query_path(dirfd, pathname);
+    if !should_attempt_system_writer_query_fallback(hub, query_path.as_deref()) {
         runtime::set_errno(error_no);
         return ret;
     }
 
-    if let Some(redirected) = writer_fallback_redirect(hub, dirfd, pathname)
+    if let Some(redirected) = writer_fallback_redirect(hub, query_path.as_deref().unwrap_or(""))
         && let Ok(c_path) = CString::new(redirected)
     {
         return call_path(c_path.as_ptr());
@@ -109,12 +112,13 @@ where
     if !ret.is_null() || !is_retryable_system_writer_query_error(error_no) {
         return ret;
     }
-    if !should_attempt_system_writer_query_fallback(hub) {
+    let query_path = resolve_system_writer_query_path(AT_FDCWD, pathname);
+    if !should_attempt_system_writer_query_fallback(hub, query_path.as_deref()) {
         runtime::set_errno(error_no);
         return ret;
     }
 
-    if let Some(redirected) = writer_fallback_redirect(hub, AT_FDCWD, pathname)
+    if let Some(redirected) = writer_fallback_redirect(hub, query_path.as_deref().unwrap_or(""))
         && let Ok(c_path) = CString::new(redirected)
     {
         return call_path(c_path.as_ptr());
@@ -132,7 +136,7 @@ fn should_fix_system_writer_private_owner_for_query_error(error_no: c_int) -> bo
     error_no == libc::EACCES || error_no == libc::EPERM
 }
 
-fn should_attempt_system_writer_query_fallback(hub: &InterceptHub) -> bool {
+fn should_attempt_system_writer_query_fallback(hub: &InterceptHub, path: Option<&str>) -> bool {
     if context::is_current_caller_scope_active() {
         return true;
     }
@@ -142,7 +146,41 @@ fn should_attempt_system_writer_query_fallback(hub: &InterceptHub) -> bool {
         hub.get_current_caller_uid(),
         context::get_current_caller_age_ms(),
         context::is_current_caller_from_external_signal(),
-    )
+    ) || has_recent_mapping_request_owner_signal_for_query_fallback(hub)
+        || has_mapping_request_path_signal_for_query_fallback(hub, path)
+}
+
+/// 冷查询（前面没有同线程写操作）时的放行判据：查询路径本身就落在某应用的映射
+/// 请求侧/映射目标，那么这次查询必须按该应用的映射视图回答。
+///
+/// 典型场景是 MediaProvider 的 FuseDaemon 在没有任何写操作的情况下对请求侧子树做
+/// LOOKUP/stat：请求侧目录在后端不存在，不放行就一律 ENOENT，映射子树对宿主视图
+/// 完全不可见（MT 浏览、删除都失败）。
+fn has_mapping_request_path_signal_for_query_fallback(
+    hub: &InterceptHub,
+    path: Option<&str>,
+) -> bool {
+    let Some(path) = path else {
+        return false;
+    };
+    if path.is_empty() {
+        return false;
+    }
+    let mut caller_uid = hub.get_current_caller_uid();
+    let user_id = writer::resolve_system_writer_user_id(path, &mut caller_uid);
+    user_id >= 0 && !resolve_mapping_request_owner_for_path(user_id, path).is_empty()
+}
+
+/// 映射重定向后的 attr 回查：MediaProvider 的 FuseDaemon 在 create/mkdir 成功后
+/// 用原始路径 lstat，此时没有外部调用方信号，只有写路径留下的「映射请求侧归属」。
+/// 该归属必须能触发同一套回退，否则重定向后的应答一律 ENOENT（真机 MT 移动失败）。
+fn has_recent_mapping_request_owner_signal_for_query_fallback(hub: &InterceptHub) -> bool {
+    if !hub.is_current_caller_from_mapping_request_owner() {
+        return false;
+    }
+    let caller_uid = hub.get_current_caller_uid();
+    (0..=QUERY_FALLBACK_CALLER_MAX_AGE_MS).contains(&context::get_current_caller_age_ms())
+        && caller_uid >= writer::ANDROID_APP_UID_START
 }
 
 fn has_recent_external_caller_signal_for_query_fallback(
@@ -985,19 +1023,66 @@ fn reverse_mapping_readlink_path_for_visible_caller(path: &str) -> String {
 }
 
 // 系统写入进程查询遇到 ENOENT 时，通过重定向决策重试。
-unsafe fn writer_fallback_redirect(
-    hub: &InterceptHub,
-    dirfd: c_int,
-    pathname: *const c_char,
-) -> Option<String> {
-    let path_text = resolve_system_writer_query_path(dirfd, pathname)?;
+fn writer_fallback_redirect(hub: &InterceptHub, path_text: &str) -> Option<String> {
+    if path_text.is_empty() {
+        return None;
+    }
+    register_mapping_request_owner_for_query_fallback(hub, path_text);
     let _no_path_owner_infer = crate::hook::enter_path_owner_inference_disabled();
-    let decision = process_redirect_path_for_query_fallback(hub, &path_text);
+    let decision = process_redirect_path_for_query_fallback(hub, path_text);
     if decision.is_redirect() && !decision.new_path.is_empty() {
         Some(decision.new_path)
     } else {
         None
     }
+}
+
+/// 冷查询没有「同线程近期写过」信号可用，改由**查询路径本身**确定映射请求侧归属
+/// 并登记为调用方，使随后的重定向决策能解析到映射目标。
+///
+/// 已有真实应用归属时不覆盖：那种情况下归属比路径推断更可信。
+fn register_mapping_request_owner_for_query_fallback(hub: &InterceptHub, path_text: &str) {
+    let caller_package = hub.get_current_caller_package();
+    let caller_uid = hub.get_current_caller_uid();
+    if caller_uid >= writer::ANDROID_APP_UID_START
+        && !caller_package.is_empty()
+        && !policy::is_system_writer_package(&caller_package)
+    {
+        return;
+    }
+
+    let mut uid_for_user = caller_uid;
+    let user_id = writer::resolve_system_writer_user_id(path_text, &mut uid_for_user);
+    if user_id < 0 {
+        return;
+    }
+    let owner = resolve_mapping_request_owner_for_path(user_id, path_text);
+    if owner.is_empty() {
+        return;
+    }
+    let mut owner_uid = policy::get_fresh_uid_for_package(&owner);
+    if owner_uid < writer::ANDROID_APP_UID_START {
+        // 启动早期 uid 缓存文件可能还没有该应用的条目，此时拿不到真实 uid。
+        // 归属的作用是让重定向决策按包名解析映射，user_id 与真实值一致即可，
+        // 因此退到同用户的合成 uid，避免这一窗口内请求侧查询全部落到 ENOENT。
+        owner_uid = user_id
+            .saturating_mul(platform::ANDROID_USER_ID_OFFSET)
+            .saturating_add(writer::ANDROID_APP_UID_START);
+        log::debug!(
+            "query fallback mapping owner synthetic uid caller={} uid={} path={}",
+            owner,
+            owner_uid,
+            path_text
+        );
+    } else {
+        log::debug!(
+            "query fallback mapping owner caller={} uid={} path={}",
+            owner,
+            owner_uid,
+            path_text
+        );
+    }
+    hub.set_current_caller_from_mapping_request_owner(&owner, owner_uid);
 }
 
 fn process_redirect_path_for_query_fallback(

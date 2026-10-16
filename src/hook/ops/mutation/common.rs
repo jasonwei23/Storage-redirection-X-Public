@@ -9,9 +9,11 @@ use crate::hook::util::c_str_to_string;
 use crate::monitor::OpKind;
 use crate::platform::paths;
 use crate::redirect::{
-    RedirectDecision, policy, process_dir_create_redirect_path, process_write_redirect_path, writer,
+    RedirectDecision, policy, process_dir_create_redirect_path, process_write_redirect_path,
+    record_redirect_hit, writer,
 };
 use libc::{c_char, c_int};
+use std::ffi::CString;
 
 pub(super) struct SinglePathAuditRequest<'a> {
     pub(super) kind: OpKind,
@@ -20,6 +22,11 @@ pub(super) struct SinglePathAuditRequest<'a> {
     pub(super) pathname: *const c_char,
     pub(super) log_flags: i32,
     pub(super) extra_tail: Option<String>,
+    /// 是否按写路径决策把操作重定向到映射/沙箱目标。
+    ///
+    /// 仅 rmdir 需要：它此前只做审计、不参与重定向，导致映射请求侧与沙箱目标下
+    /// 的目录删除落到请求侧原始路径而 ENOENT（unlink 早已走重定向，两者不一致）。
+    pub(super) redirect_mutation: bool,
 }
 
 pub(super) struct LinkAuditRequest<'a> {
@@ -79,19 +86,120 @@ where
         return -1;
     }
     fix_system_writer_private_owner_for_mutation(hub, &path_for_decision);
-    let result = call_original(request.pathname);
+
+    // rmdir 等需要落到映射/沙箱目标的删除操作，按写路径决策改写调用目标：
+    // 请求侧目录在后端并不存在，不改写就必然 ENOENT。
+    let redirect = if request.redirect_mutation && should_apply_mutation_policy(hub) {
+        resolve_mutation_redirect_target(hub, &request, path_for_decision.as_ref())
+    } else {
+        None
+    };
+    if let Some(redirect) = redirect.as_ref()
+        && redirect.is_denied
+    {
+        return -1;
+    }
+
+    let mut call_ptr = request.pathname;
+    let mut call_c_path: Option<CString> = None;
+    if let Some(redirect) = redirect.as_ref()
+        && let Some(new_path) = redirect.new_path.as_ref()
+        && let Ok(c_path) = CString::new(new_path.as_str())
+    {
+        call_c_path = Some(c_path);
+    }
+    if let Some(c_path) = call_c_path.as_ref() {
+        call_ptr = c_path.as_ptr();
+    }
+
+    let result = call_original(call_ptr);
     let current_errno = runtime::current_errno();
+    let (record_path, extra_tail) = match redirect.as_ref() {
+        Some(redirect) => {
+            let path = redirect
+                .new_path
+                .as_deref()
+                .unwrap_or_else(|| path_for_decision.as_ref());
+            (
+                path,
+                redirect_target_extra_tail(
+                    path_for_decision.as_ref(),
+                    request.extra_tail.as_deref(),
+                ),
+            )
+        }
+        None => (
+            path_for_decision.as_ref(),
+            request.extra_tail.as_deref().map(|tail| tail.to_string()),
+        ),
+    };
     monitor::record_path_operation_result(
         hub,
         request.kind,
         request.op_name,
-        path_for_decision.as_ref(),
+        record_path,
         result,
         if result < 0 { current_errno } else { 0 },
-        request.extra_tail.as_deref(),
+        extra_tail.as_deref(),
     );
     runtime::set_errno(current_errno);
     result
+}
+
+struct MutationRedirectTarget {
+    new_path: Option<String>,
+    is_denied: bool,
+}
+
+fn resolve_mutation_redirect_target(
+    hub: &InterceptHub,
+    request: &SinglePathAuditRequest<'_>,
+    path_for_decision: &str,
+) -> Option<MutationRedirectTarget> {
+    let decision = process_redirect_path_for_mutation(hub, path_for_decision);
+    diagnostic::log_diag_redirect_decision(hub, request.op_name, path_for_decision, &decision);
+    if decision.is_denied() {
+        let read_only_tail = read_only_extra_tail(
+            path_for_decision,
+            &decision.new_path,
+            request.extra_tail.as_deref(),
+        );
+        monitor::record_read_only_path_operation_result(
+            hub,
+            request.kind,
+            request.op_name,
+            path_for_decision,
+            read_only_tail.as_deref(),
+        );
+        log::debug!(
+            "{} denied for redirect mutation path={}",
+            request.op_name,
+            path_for_decision
+        );
+        return Some(MutationRedirectTarget {
+            new_path: None,
+            is_denied: true,
+        });
+    }
+    if !decision.is_redirect() || decision.new_path.is_empty() {
+        return None;
+    }
+    record_redirect_hit(hub, request.op_name, path_for_decision, &decision.new_path);
+    Some(MutationRedirectTarget {
+        new_path: Some(decision.new_path),
+        is_denied: false,
+    })
+}
+
+fn redirect_target_extra_tail(original_path: &str, extra_tail: Option<&str>) -> Option<String> {
+    let mut tail = format!("from={original_path}");
+    if let Some(extra) = extra_tail
+        && !extra.is_empty()
+    {
+        tail.push('|');
+        tail.push_str(extra);
+    }
+    Some(tail)
 }
 
 pub(super) fn should_apply_mutation_policy(hub: &InterceptHub) -> bool {

@@ -181,6 +181,7 @@ pub unsafe extern "C" fn hooked_rmdir(pathname: *const c_char) -> c_int {
                     pathname,
                     log_flags: 0,
                     extra_tail: None,
+                    redirect_mutation: true,
                 },
                 |call_path| {
                     runtime::call_prev(
