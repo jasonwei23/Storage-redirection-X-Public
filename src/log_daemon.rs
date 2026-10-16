@@ -419,6 +419,7 @@ impl LogState {
             TAG_FILE_MONITOR => {
                 if self.allow_from_sender(sender_uid) {
                     self.monitor.append(message);
+                    register_request_path_hint(message);
                 }
             }
             TAG_STATS => {
@@ -546,6 +547,63 @@ impl LogState {
             self.flush_pending();
         }
     }
+}
+
+/// 从台账行登记请求侧 path hint。
+///
+/// `.recent_path_caller_hint` 此前设计为由 MediaProvider 进程在记录台账时直写
+/// （temp+rename），但 logs 目录为 root 属主且 SELinux 标签对 MediaProvider 域
+/// 不可写，直写始终静默失败，daemon 监视侧
+/// `has_recent_public_path_request` 的「请求已记录则抑制观察记录」去重因此从未
+/// 生效。台账行本身经私有日志通道进入本进程（root），在此对请求侧写入类记录
+/// 补登记 hint：MediaProvider 侧直写保留为兜底，跨进程去重以本路径为准。
+///
+/// 只处理写入类 op_filter（mkdir / provider_open 写形态），与请求侧 hint 原有
+/// 登记范围一致；行内字段带 `|` 的路径会被 hint 校验拒绝，天然安全。登记失败
+/// （包名无效、路径非公共存储等）时静默跳过，不影响台账落盘。
+fn register_request_path_hint(message: &str) {
+    if !message.contains("event_role=request") {
+        return;
+    }
+    // 行格式：时间戳|进程包名|目标包名|OP|路径|ret=..|k=v...；额外字段从下标 5 起。
+    let fields: Vec<&str> = message.split('|').collect();
+    if fields.len() < 6 {
+        return;
+    }
+    let Some(op_filter) = fields
+        .iter()
+        .skip(5)
+        .find_map(|field| field.strip_prefix("op_filter="))
+    else {
+        return;
+    };
+    let (source, hint_op_filter) = match op_filter {
+        "mkdir" => ("provider_mkdir", "mkdir"),
+        "provider_open" | "provider_open:create" | "provider_open:write" => {
+            ("provider_open", op_filter)
+        }
+        _ => return,
+    };
+    let caller_uid = fields
+        .iter()
+        .skip(5)
+        .find_map(|field| field.strip_prefix("caller_uid="))
+        .and_then(|value| value.parse::<i32>().ok())
+        .unwrap_or(-1);
+    let correlation_id = fields
+        .iter()
+        .skip(5)
+        .find_map(|field| field.strip_prefix("correlation_id="))
+        .unwrap_or("");
+    crate::monitor::remember_public_path_caller_hint_with_op_filter(
+        fields[4],
+        fields[2],
+        caller_uid,
+        source,
+        "high",
+        hint_op_filter,
+        correlation_id,
+    );
 }
 
 struct RollingLog {
