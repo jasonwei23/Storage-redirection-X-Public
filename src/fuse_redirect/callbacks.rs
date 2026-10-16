@@ -62,6 +62,12 @@ const SQLITE_SHM_MIN_SIZE_BYTES: u64 = 32 * 1024;
 /// 失效该名称，供管理器等经 MP FUSE 的读取方保持一致），再删 f2fs 真实文件兜底
 /// （保证毒化数据消失）——与人工删除 shm 的治愈路径一致。对任何消费方都无损：
 /// 文件内容本就是无效垃圾，SQLite 下次打开会从 `-wal` 重建 wal-index。
+///
+/// 满尺寸（≥32KiB）的 `-shm` 也可能毒化：wal-index 头 salt 与同级 `-wal` 文件头
+/// 失配（跨 FUSE 视图 inode 分裂、异常会话残留）。SQLite 信任已初始化的 shm 头
+/// 而不复查 `-wal` 文件，会把未 checkpoint 的 WAL 数据整体判无效，应用静默回滚到
+/// 旧检查点（跨应用共享库掉登录），随后的写入覆写 WAL 造成不可逆数据丢失。此类
+/// 毒化按 [`sqlite_shm_wal_index_stale`] 内容级判定，删除同样无损。
 fn heal_poisoned_sqlite_shm_backend(
     user_id: i32,
     view_root: Option<&Path>,
@@ -77,7 +83,12 @@ fn heal_poisoned_sqlite_shm_backend(
         return false;
     }
     let size = metadata.len();
-    if size == 0 || size >= SQLITE_SHM_MIN_SIZE_BYTES {
+    if size == 0 {
+        return false;
+    }
+    let stale_wal_index =
+        size >= SQLITE_SHM_MIN_SIZE_BYTES && sqlite_shm_wal_index_stale(&real_path);
+    if size >= SQLITE_SHM_MIN_SIZE_BYTES && !stale_wal_index {
         return false;
     }
 
@@ -104,10 +115,11 @@ fn heal_poisoned_sqlite_shm_backend(
 
     if removed_real || removed_view {
         log::info!(
-            "fuse sqlite shm poisoned backend removed real={} view={} size={} pkg={} rel={}",
+            "fuse sqlite shm poisoned backend removed real={} view={} size={} stale_wal_index={} pkg={} rel={}",
             removed_real,
             removed_view,
             size,
+            stale_wal_index,
             package_name,
             rel
         );
@@ -115,14 +127,68 @@ fn heal_poisoned_sqlite_shm_backend(
     }
     let errno = last_errno();
     log::warn!(
-        "fuse sqlite shm poisoned backend unlink failed errno={} {} size={} pkg={} rel={}",
+        "fuse sqlite shm poisoned backend unlink failed errno={} {} size={} stale_wal_index={} pkg={} rel={}",
         errno,
         crate::platform::errno::text(errno),
         size,
+        stale_wal_index,
         package_name,
         rel
     );
     false
+}
+
+/// 由 `-shm` 边车路径推出同级 `-wal` 路径：后缀按小写不敏感识别，替换为小写
+/// `-wal`，库名主干保持原样。
+fn sqlite_sidecar_wal_path(shm_path: &Path) -> Option<std::path::PathBuf> {
+    let file_name = shm_path.file_name()?.to_str()?;
+    let lower = file_name.to_ascii_lowercase();
+    let stem_len = lower.len().checked_sub("-shm".len())?;
+    if stem_len == 0 || !lower.ends_with("-shm") {
+        return None;
+    }
+    let mut wal_path = shm_path.to_path_buf();
+    wal_path.set_file_name(std::ffi::OsString::from(format!(
+        "{}-wal",
+        &file_name[..stem_len]
+    )));
+    Some(wal_path)
+}
+
+/// 读取文件前 `len` 字节；文件不足 `len` 字节或不可读时返回 `None`。
+fn read_file_prefix(path: &Path, len: usize) -> Option<Vec<u8>> {
+    use std::io::Read;
+    let mut file = File::open(path).ok()?;
+    let mut buf = vec![0u8; len];
+    file.read_exact(&mut buf).ok()?;
+    Some(buf)
+}
+
+/// 满尺寸 `-shm` 的内容级毒化判定：wal-index 头与同级 `-wal` 文件头 salt 失配。
+///
+/// SQLite 恢复 wal-index 时按 `memcpy` 原样拷贝 `-wal` 文件头（大端字节模式）的
+/// 8 字节 salt 到 wal-index 头偏移 32..40，不做字节序转换，因此毒化判定用原始
+/// 字节比对即可。两者失配说明 wal-index 停留在旧一代 WAL 或来自分裂视图。
+/// `-shm` 头未初始化（isInit≠1）或 `-wal` 头缺失/魔数非法时 SQLite 自己会重建，
+/// 一律不判定为毒化，保持保守。
+fn sqlite_shm_wal_index_stale(real_shm_path: &Path) -> bool {
+    let Some(wal_path) = sqlite_sidecar_wal_path(real_shm_path) else {
+        return false;
+    };
+    let Some(shm) = read_file_prefix(real_shm_path, 48) else {
+        return false;
+    };
+    if shm[12] != 1 {
+        return false;
+    }
+    let Some(wal) = read_file_prefix(&wal_path, 32) else {
+        return false;
+    };
+    let wal_magic = u32::from_be_bytes([wal[0], wal[1], wal[2], wal[3]]);
+    if wal_magic != 0x377f_0682 && wal_magic != 0x377f_0683 {
+        return false;
+    }
+    shm[32..40] != wal[16..24]
 }
 
 impl Filesystem for FuseRedirectFs {
