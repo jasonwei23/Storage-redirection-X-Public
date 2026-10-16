@@ -1501,6 +1501,21 @@ pub fn scoped_mount_roots_for_hybrid_rules(
             .chain(sandbox_include_rules)
             .chain(mapping_wildcard_rules),
     );
+    // 请求侧在共享存储之外、目标侧在共享存储之内的映射不会成为通配根，但其目标侧
+    // 正是应用实际访问的路径，必须显式成为 scoped FUSE 根，否则该路径不在 FUSE
+    // 视图内：规则表里查不到映射、目标侧目录也不会被创建，应用一律 ENOENT。
+    for (request, final_path) in &scoped_path_mappings {
+        if paths::contains_wildcards(request) || paths::is_same_or_child(request, &storage_root) {
+            continue;
+        }
+        if paths::contains_wildcards(final_path)
+            || paths::eq_ignore_case(final_path, &storage_root)
+            || !paths::is_child(final_path, &storage_root)
+        {
+            continue;
+        }
+        roots.push(final_path.clone());
+    }
     // 诊断：混合规则下是否产生 scoped FUSE 根，直接决定视图根上会不会多一层 FUSE bind。
     // Android 13 场景 29 的映射只落地后端别名，而通过的 Android 14 在视图根上多一层
     // FUSE（设备号 0:88 vs 视图根的 254:40），因此需要确认该平台是否本就走不到 FUSE。
@@ -1581,6 +1596,37 @@ pub fn scoped_mount_roots_for_hybrid_rules(
     compacted
 }
 
+/// 一条映射在 scoped FUSE 侧是否可用，以及它为挂载根贡献的路径。
+///
+/// 两侧都在共享存储之内的映射按常规处理，由请求侧承接（请求侧本身在 FUSE
+/// 视图内）。请求侧在共享存储之外、但目标侧落在共享存储之内的映射（典型形态：
+/// `/data/user/0/<pkg>/cache` → `Android/data/<pkg>/cache`）不能整条丢弃——应用
+/// 访问的是目标侧路径，丢弃后目标侧目录不会进入 FUSE 视图，应用读目标侧得到
+/// ENOENT（真机：TG 读不到 `Android/data/nu.gpu.nagram/cache/*.jpg`，全部
+/// open failed: ENOENT）。这类映射由目标侧提供挂载根，使目标侧路径进入 FUSE
+/// 视图并解析到真实后端。
+///
+/// 目标侧在共享存储之外的映射一律返回 `None`（维持既有丢弃行为）：scoped FUSE
+/// 的后端以共享存储为根，无法表达存储外目标，策略层的 `resolve_storage_rule`
+/// 同样会拒绝；若在这里放行，带通配的请求侧会经通配根推导在公共目录上扩大
+/// FUSE 接管范围，而策略表里却没有对应规则。这类映射仍由挂载层 namespace bind
+/// 直接承接（`mount/map.rs` 不做存储内归属过滤），行为与改动前一致。
+///
+/// 返回 `None` 表示该映射无法由 scoped FUSE 承接。
+fn scoped_mapping_mount_contribution(
+    request_path: &str,
+    final_path: &str,
+    storage_root: &str,
+) -> Option<Option<String>> {
+    let request_in_storage = paths::is_same_or_child(request_path, storage_root);
+    let final_in_storage = paths::is_same_or_child(final_path, storage_root);
+    match (request_in_storage, final_in_storage) {
+        (true, true) => Some(Some(request_path.to_string())),
+        (false, true) => Some(Some(final_path.to_string())),
+        (true, false) | (false, false) => None,
+    }
+}
+
 fn resolve_scoped_path_mappings(
     path_mappings: &[crate::domain::PathMapping],
     user_id: i32,
@@ -1588,14 +1634,17 @@ fn resolve_scoped_path_mappings(
 ) -> Vec<(String, String)> {
     let mut resolved = Vec::with_capacity(path_mappings.len());
     for mapping in path_mappings {
-        let request_path = resolve_scoped_rule_path(&mapping.request_path, user_id, storage_root);
+        let request_path = resolve_scoped_rule_path_allowing_private_data(
+            &mapping.request_path,
+            user_id,
+            storage_root,
+        );
         let final_path = resolve_scoped_rule_path(&mapping.final_path, user_id, storage_root);
         if request_path.is_empty()
             || final_path.is_empty()
             || paths::is_application_private_root(&request_path)
             || paths::eq_ignore_case(&request_path, &final_path)
-            || !paths::is_same_or_child(&request_path, storage_root)
-            || !paths::is_same_or_child(&final_path, storage_root)
+            || scoped_mapping_mount_contribution(&request_path, &final_path, storage_root).is_none()
         {
             continue;
         }
@@ -1622,16 +1671,34 @@ fn resolve_concrete_scoped_rule_parent(path: &str, user_id: i32, storage_root: &
 }
 
 fn resolve_scoped_rule_path(path: &str, user_id: i32, storage_root: &str) -> String {
+    let resolved = resolve_scoped_rule_path_allowing_private_data(path, user_id, storage_root);
+    if resolved.is_empty() {
+        return String::new();
+    }
+    if !paths::is_child(&resolved, storage_root) && !paths::eq_ignore_case(&resolved, storage_root)
+    {
+        return String::new();
+    }
+    resolved
+}
+
+/// 与 [`resolve_scoped_rule_path`] 相同，但允许解析结果落在共享存储之外。
+///
+/// 用于「请求侧在应用私有数据目录、目标侧在共享存储」的映射：请求侧
+/// （`/data/user/0/<pkg>/<sub>`）本就必须在存储外才有意义，若沿用要求结果
+/// 落在存储根之内的解析，规则会在进入挂载根判定之前就被清空，映射被整条
+/// 丢弃。这里只放宽归属要求，不放宽路径安全检查。
+fn resolve_scoped_rule_path_allowing_private_data(
+    path: &str,
+    user_id: i32,
+    storage_root: &str,
+) -> String {
     let mut resolved = paths::resolve_user_path(&paths::normalize(path), user_id);
     if resolved.is_empty() || paths::has_unsafe_segments(&resolved) {
         return String::new();
     }
     if !paths::is_absolute(&resolved) {
         resolved = paths::normalize(&paths::join(storage_root, &resolved));
-    }
-    if !paths::is_child(&resolved, storage_root) && !paths::eq_ignore_case(&resolved, storage_root)
-    {
-        return String::new();
     }
     resolved
 }
