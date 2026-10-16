@@ -226,13 +226,12 @@ class ScenarioConsistencyTest(unittest.TestCase):
         self.assertIn("let removed_backend =", media)
 
     def test_kernelsu_zygisk_next_default_uses_existing_release_tag(self) -> None:
+        # KernelSU 实验 workflow 已于 2026-10-16 移除，Zygisk Next 的默认地址只剩
+        # 安装脚本一处；A17 分片在正式矩阵里仍按 root_method=ksu 调用该脚本。
         installer = read(".github/tests/install-storage-redirect-module-ksu.sh")
-        workflow = read(".github/workflows/ci-kernelsu-a17.yml")
         expected = "https://github.com/LSPosed/ZygiskNext/releases/download/v1.5.0/Zygisk-Next-1.5.0-843-5217106-release.zip"
         self.assertIn(expected, installer)
-        self.assertIn(expected, workflow)
         self.assertNotIn("releases/download/1.5.0/", installer)
-        self.assertNotIn("releases/download/1.5.0/", workflow)
 
     def test_shared_host_precedes_namespace_redirect(self) -> None:
         daemon = read("src/daemon_mount.rs")
