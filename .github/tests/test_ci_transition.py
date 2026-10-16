@@ -1,9 +1,13 @@
+import contextlib
 import importlib.util
+import io
 import json
+import os
 import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 
 SCRIPTS_DIR = Path(__file__).parents[1] / "scripts"
@@ -33,6 +37,33 @@ class CiTransitionTest(unittest.TestCase):
         self.assertTrue(CI_TRANSITION.should_skip_ci("维护：更新规则 [skip ci]"))
         self.assertTrue(CI_TRANSITION.should_skip_ci("Releases: 发布 1.2.58"))
         self.assertFalse(CI_TRANSITION.should_skip_ci("修复：稳定保存链路"))
+
+    def test_dispatch_events_never_skip_version_resolution(self) -> None:
+        # 单场景 dispatch 落在 [skip ci] 提交上时仍必须解析版本，否则 prepare
+        # 输出空版本号，下游构建拿到空版本。
+        self.assertTrue(CI_TRANSITION.should_skip_ci("维护：更新规则 [skip ci]", "push"))
+        self.assertFalse(
+            CI_TRANSITION.should_skip_ci("维护：更新规则 [skip ci]", "workflow_dispatch")
+        )
+        self.assertFalse(
+            CI_TRANSITION.should_skip_ci("Releases: 发布 1.2.58", "workflow_dispatch")
+        )
+
+    def test_github_format_keeps_skip_notice_off_stdout(self) -> None:
+        # stdout 会被重定向进 $GITHUB_OUTPUT，跳过说明必须只出现在 stderr。
+        with mock.patch.object(
+            CI_TRANSITION.resolve_build_version,
+            "run_git",
+            return_value="维护：更新规则 [skip ci]",
+        ):
+            with mock.patch.object(sys, "argv", ["validate_ci_transition.py", "--format", "github"]):
+                with mock.patch.dict(os.environ, {"GITHUB_EVENT_NAME": "push"}):
+                    stdout = io.StringIO()
+                    stderr = io.StringIO()
+                    with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+                        CI_TRANSITION.main()
+        self.assertEqual(stdout.getvalue(), "")
+        self.assertIn("does not trigger CI", stderr.getvalue())
 
     def test_reads_stable_manifest_version(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
