@@ -208,10 +208,17 @@ impl Filesystem for FuseRedirectFs {
         let max_background_enabled = config.set_max_background(32).is_ok();
         let congestion_enabled = config.set_congestion_threshold(24).is_ok();
         let max_write_enabled = config.set_max_write(1024 * 1024).is_ok();
+        // 内核写回缓存：小块写先落内核页缓存、按大块回传，砍掉每请求同步往返。
+        // 真机 2026-10-15：同步往返模式下 4K 写 6.9MB/s（每请求 ~550μs），远低于系统
+        // FUSE 的 353MB/s。注意 writeback_cache 不是 legacy mount data 选项（传了会
+        // EINVAL），只能在 INIT 应答里请求 FUSE_WRITEBACK_CACHE 能力位。
+        let writeback_enabled = config
+            .add_capabilities(InitFlags::FUSE_WRITEBACK_CACHE)
+            .is_ok();
         self.passthrough_enabled
             .store(passthrough_enabled, Ordering::Relaxed);
         log::info!(
-            "fuse init pkg={} kernel_abi={} passthrough_supported={} passthrough_enabled={} probe_state={:?} passthrough_disabled_by_marker={} stack_depth={} max_background={} congestion={} max_write={}",
+            "fuse init pkg={} kernel_abi={} passthrough_supported={} passthrough_enabled={} probe_state={:?} passthrough_disabled_by_marker={} stack_depth={} max_background={} congestion={} max_write={} writeback={}",
             self.policy.session().package_name,
             config.kernel_abi(),
             passthrough_supported,
@@ -221,7 +228,8 @@ impl Filesystem for FuseRedirectFs {
             stack_depth_enabled,
             max_background_enabled,
             congestion_enabled,
-            max_write_enabled
+            max_write_enabled,
+            writeback_enabled
         );
         Ok(())
     }
@@ -727,9 +735,12 @@ impl Filesystem for FuseRedirectFs {
         };
         match file.write_at(data, offset) {
             Ok(n) => {
-                if let Some(backend) = self
-                    .path_for_ino(ino)
-                    .and_then(|rel| policy.backend_for_relative(&rel, OperationKind::Write))
+                // 监视关闭时跳过 ino→路径解析与规则匹配：这是写入热路径上唯一的
+                // 额外查找链，monitor 关闭时 emit_monitor_mutation 必然早退。
+                if policy.is_file_monitor_enabled
+                    && let Some(backend) = self
+                        .path_for_ino(ino)
+                        .and_then(|rel| policy.backend_for_relative(&rel, OperationKind::Write))
                 {
                     policy.emit_monitor_mutation("write", &backend, None);
                 }
