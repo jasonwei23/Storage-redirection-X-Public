@@ -755,6 +755,65 @@ fn fuse_first_capability_available() -> bool {
     true
 }
 
+/// 探测大核 CPU 集合（cpuinfo_max_freq 等于全机最高频率的 CPU）。
+///
+/// MTK/高通大小核架构上，FUSE 事件循环线程被调度到 LITTLE 核时吞吐损失可达
+/// 1.5 倍以上（真机 2026-10-15：fuser-0/3/6 挤在同一个 2.2GHz 小核上）。探测失败
+/// 或单核设备返回 None，调用方保持默认亲和性。
+fn big_core_cpu_mask() -> Option<u64> {
+    let mut max_freq: u64 = 0;
+    let mut freqs: Vec<(u32, u64)> = Vec::new();
+    for cpu in 0..32u32 {
+        let path = format!("/sys/devices/system/cpu/cpu{cpu}/cpufreq/cpuinfo_max_freq");
+        let Ok(text) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+        let Ok(freq) = text.trim().parse::<u64>() else {
+            continue;
+        };
+        max_freq = max_freq.max(freq);
+        freqs.push((cpu, freq));
+    }
+    if freqs.is_empty() || max_freq == 0 {
+        return None;
+    }
+    let mut mask: u64 = 0;
+    for (cpu, freq) in &freqs {
+        if *freq == max_freq {
+            mask |= 1 << cpu;
+        }
+    }
+    (mask != 0).then_some(mask)
+}
+
+/// 把当前线程（及其后续派生的会话线程）绑定到大核。
+///
+/// spawn_mount2 派生的事件循环线程继承调用线程的亲和性掩码，因此在 mount 前设置
+/// 一次即可覆盖全部会话线程。绑定失败（mask 越界、权限）静默跳过。
+fn pin_current_thread_to_big_cores() {
+    let Some(mask) = big_core_cpu_mask() else {
+        log::warn!("fuse session big core detect failed — pin skipped");
+        return;
+    };
+    // SAFETY: cpu_set_t 为纯 POD 位图结构，全零初始化是合法的空 CPU 集合。
+    let mut set: libc::cpu_set_t = unsafe { std::mem::zeroed() };
+    for bit in 0..64u32 {
+        if mask & (1 << bit) != 0 {
+            // SAFETY: bit < 64 < CPU_SETSIZE，set 已零初始化，CPU_SET 写入范围内。
+            unsafe { libc::CPU_SET(bit as usize, &mut set) };
+        }
+    }
+    // SAFETY: set 为完整初始化的 cpu_set_t，size 与类型匹配。
+    let result =
+        unsafe { libc::sched_setaffinity(0, std::mem::size_of::<libc::cpu_set_t>(), &set) };
+    if result != 0 {
+        // 绑定失败只降级为默认调度（部分机型热管控会动态重置核掩码，属正常现象）。
+        log::warn!("fuse session big core pin failed mask={mask:#x}");
+    } else {
+        log::debug!("fuse session big core pin mask={mask:#x}");
+    }
+}
+
 pub fn mount_blocking_with_ready(
     config: FuseRedirectConfig,
     ready_sock: Option<libc::c_int>,
@@ -798,6 +857,8 @@ pub fn mount_blocking_with_ready(
             return false;
         }
     };
+    // 事件循环线程继承调用线程亲和性：先绑大核再挂载，避免 fuser 线程被调度到 LITTLE 核。
+    pin_current_thread_to_big_cores();
     let mut mount_options = fuser::Config::default();
     mount_options.mount_options = vec![
         MountOption::FSName(session_mount_source.clone()),
@@ -968,6 +1029,8 @@ pub fn mount_host_fuse(
     // 交出 `fs` 之前取出按 uid 策略表句柄：宿主会话运行期靠它接收应用策略。
     let policy_table = fs.policy_table();
     crate::fuse_host::host_stage("policy_ok");
+    // 与 scoped 会话同口径：宿主事件循环线程同样继承大核亲和性。
+    pin_current_thread_to_big_cores();
     let mut mount_options = fuser::Config::default();
     mount_options.mount_options = vec![
         MountOption::FSName(session_mount_source.clone()),
