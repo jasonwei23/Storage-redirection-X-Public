@@ -558,6 +558,8 @@ pub(crate) fn try_fast_update_shared_host(request: &MountRequest) -> bool {
             request.storage_backend_mode,
             crate::config::StorageBackendMode::Auto
         )
+        // path_mappings 需要 planner 物化子路径 bind；只更新宿主策略会留下旧根/旧映射层。
+        || !request.path_mappings.is_empty()
     {
         return false;
     }
