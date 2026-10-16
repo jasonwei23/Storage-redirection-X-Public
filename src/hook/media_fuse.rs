@@ -450,6 +450,18 @@ fn is_sqlite_shm_sidecar_path(path: &str) -> bool {
     lower.ends_with(".db-shm") || lower.ends_with(".sqlite-shm") || lower.ends_with(".sqlite3-shm")
 }
 
+/// sqlite `-shm` 边车的尺寸级毒化判定（内容级 salt 校验由
+/// [`sqlite_shm_wal_index_stale`] 负责）。合法尺寸只有 0 与 ≥32KiB 两种：
+/// 0 字节是首个打开者以 O_CREAT 建出的合法初生态，SQLite 会依据同级 `-wal`
+/// 重建 wal-index；非零且不足一个 wal-index 区域（真机实测：3 字节全零）
+/// 才是毒化态。若把 0 字节也判毒化删除，会形成「见 0 删 0 → 后续重定向
+/// open 恒 ENOENT」的死循环，应用侧 SQLITE_CANTOPEN 无法自愈（2026-10-15
+/// XRadiant 真机实测）。判定须与 fuse_redirect 侧
+/// `heal_poisoned_sqlite_shm_backend`（`fuse_redirect/callbacks.rs`）保持一致。
+fn is_poisoned_sqlite_shm_size(size: libc::off_t) -> bool {
+    size > 0 && size < SQLITE_SHM_MIN_SIZE
+}
+
 fn prepare_sqlite_shm_backend(storage_path: &str, backend_path: &str) -> bool {
     let Ok(c_path) = CString::new(backend_path) else {
         return false;
@@ -472,7 +484,11 @@ fn prepare_sqlite_shm_backend(storage_path: &str, backend_path: &str) -> bool {
     unsafe {
         libc::close(fd);
     }
-    if size >= SQLITE_SHM_MIN_SIZE {
+    if !is_poisoned_sqlite_shm_size(size) {
+        if size == 0 {
+            // 合法初生态：放行，SQLite 会按 `-wal` 重建 wal-index。
+            return true;
+        }
         // 满尺寸也可能毒化：wal-index 头 salt 与同级 `-wal` 文件头失配（跨视图
         // inode 分裂、异常会话残留）。SQLite 信任已初始化的 shm 头而不复查 `-wal`
         // 文件，会把未 checkpoint 的 WAL 数据整体判无效并静默回滚到旧检查点
@@ -483,10 +499,10 @@ fn prepare_sqlite_shm_backend(storage_path: &str, backend_path: &str) -> bool {
         }
     }
 
-    // 走到这里的 sidecar 都是毒化态：小于一个完整 wal-index 页框的 inode，或
-    // 满尺寸但 wal-index 与 `-wal` 头 salt 失配。就地扩回尺寸不能恢复 SQLite
-    // 的共享内存头，必须先让 MediaProvider 失效视图节点，再删除真实后端文件，
-    // 下一次 O_CREAT 才会拿到新 inode。
+    // 走到这里的 sidecar 都是毒化态：非零且小于一个完整 wal-index 页框的 inode
+    // （真机实测 3 字节全零），或满尺寸但 wal-index 与 `-wal` 头 salt 失配。就地
+    // 扩回尺寸不能恢复 SQLite 的共享内存头，必须先让 MediaProvider 失效视图节点，
+    // 再删除真实后端文件，下一次 O_CREAT 才会拿到新 inode。
     let removed_storage = unlink_path(storage_path);
     let removed_backend = if std::fs::metadata(backend_path).is_ok() {
         unlink_path(backend_path)
@@ -1072,6 +1088,25 @@ mod tests {
             "com.eg.android.AlipayGphone",
             "com.leo.xposed.xradiant",
         ));
+    }
+
+    #[test]
+    fn zero_size_shm_is_not_poisoned() {
+        // 0 字节是 O_CREAT 初生态，删除会引发「见 0 删 0」死循环。
+        assert!(!is_poisoned_sqlite_shm_size(0));
+    }
+
+    #[test]
+    fn full_size_shm_size_is_not_poisoned() {
+        assert!(!is_poisoned_sqlite_shm_size(32 * 1024));
+        assert!(!is_poisoned_sqlite_shm_size(64 * 1024));
+    }
+
+    #[test]
+    fn partial_shm_size_is_poisoned() {
+        // 真机实测样例：XRadiant 的 XRadiant.db-shm 变成 3 字节全零。
+        assert!(is_poisoned_sqlite_shm_size(3));
+        assert!(is_poisoned_sqlite_shm_size(32 * 1024 - 1));
     }
 
     #[test]
