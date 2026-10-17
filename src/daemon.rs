@@ -400,9 +400,20 @@ fn plan_batch_mode_tag(mode: &ReconcileMode) -> u8 {
 #[derive(Default)]
 struct ReconcileCursor {
     last_attempted: Option<ReconcilePlanIdentity>,
-    /// 本触发周期首个尝试的计划身份：轮转绕回该位置即判定周期已排空，
-    /// 让未完成批次收口，避免永续 ~1Hz 续跑轮询。
+    /// 本触发周期首个尝试的计划身份。
+    ///
+    /// 仅供诊断与旧收口判据兜底保留；真正的收口判定已改由下面的
+    /// `cycle_attempted`（回到已尝试过的计划即排空）承担。
     cycle_head: Option<ReconcilePlanIdentity>,
+    /// 本周期内已被尝试执行的计划身份集合。
+    ///
+    /// 轮转回到已尝试过的计划，说明本轮触发要处理的计划都已尝试过一次，周期应当收口。
+    /// 只比对「周期头位置」的旧判据（`next_index <= head_index`）在周期头不在计划数组
+    /// 末尾时永远不成立：绕回后执行周期头得到 `head+1`，恒大于 `head_index`，周期永不
+    /// 收口，`pending_full_reconcile` 恒为真，主循环退化为 200ms 永续续跑。真机实测
+    /// 表现为全部已挂载应用每 2~3 秒被卸载重建一次（20 秒 64 次重挂、45 分钟零次
+    /// `cycle drained`）。改为「回到已尝试集合即收口」后判定与轮转位置无关。
+    cycle_attempted: HashSet<ReconcilePlanIdentity>,
     /// 本周期内已被监督判定拒绝注入的计划。
     ///
     /// 监督拒绝（skip_superseded / refuse_poisoned 等）是账本状态型结论，
@@ -469,7 +480,20 @@ impl ReconcileCursor {
         if self.cycle_head.is_none() {
             self.cycle_head = Some(identity.clone());
         }
+        self.cycle_attempted.insert(identity.clone());
         self.last_attempted = Some(identity);
+    }
+
+    /// 本周期是否已尝试过该计划。
+    fn attempted_in_cycle(&self, plan: &ReconcilePlan) -> bool {
+        self.cycle_attempted.contains(&plan.identity())
+    }
+
+    /// 结束本周期：清空周期头、已尝试集合与拒绝集合。
+    fn close_cycle(&mut self) {
+        self.cycle_head = None;
+        self.cycle_attempted.clear();
+        self.cycle_refused.clear();
     }
 }
 
@@ -1255,6 +1279,7 @@ fn reconcile_running_apps(
     } else {
         0
     };
+    let mut cycle_wrapped = false;
     for offset in 0..plans.len() {
         let index = (start_index + offset) % plans.len();
         let plan = &plans[index];
@@ -1289,6 +1314,13 @@ fn reconcile_running_apps(
             skipped += 1;
             continue;
         }
+        // 轮转回到本周期已尝试过的计划：本轮触发要处理的计划都已尝试过一次，周期收口。
+        // 该判据与计划数组中的轮转位置无关，替代原先只在周期头位于数组末尾才成立的
+        // `next_index <= head_index`（详见 `cycle_attempted` 字段注释）。
+        if uses_batch_cursor && cursor.attempted_in_cycle(plan) {
+            cycle_wrapped = true;
+            break;
+        }
         if !incremental_change
             && mode != ReconcileMode::Forced
             && batch_requests >= RECONCILE_BATCH_MAX_PLANS
@@ -1321,13 +1353,19 @@ fn reconcile_running_apps(
             skipped += 1;
             continue;
         }
-        match plan.request.operation {
+        let operation = plan.request.operation;
+        let had_mount_state = plan.has_mount_state;
+        match operation {
             MountOperation::Reload => {
                 if execute_mount_request(&plan.request) {
-                    if !plan.has_mount_state && has_mount_state(&plan.request) {
+                    if !had_mount_state && has_mount_state(&plan.request) {
                         crate::runtime_stats::record_runtime_activation();
                     }
                     applied += 1;
+                    // 执行成功即把计划标记为已落地：续跑轮复用同一批计划对象，
+                    // `is_mount_current` 若不更新就会保留枚举时的旧值，让同一计划在
+                    // 本周期内被反复卸载重建（真机实测单 pid 代际每 2~3 秒 +1）。
+                    plans[index].mark_settled(operation);
                 } else if uses_batch_cursor {
                     // 执行失败的计划登记进周期拒绝集合：永久性失败（如 OEM 内核
                     // 拒绝沙盒目录 mkdir，真机实测一台设备 10+ 应用全部失败）若
@@ -1339,9 +1377,11 @@ fn reconcile_running_apps(
                 }
             }
             MountOperation::Disable => {
-                if plan.has_mount_state {
+                if had_mount_state {
                     if execute_mount_request(&plan.request) {
                         disabled += 1;
+                        // 卸载成功后挂载状态已消失，同步清掉，避免续跑轮重复卸载。
+                        plans[index].mark_settled(operation);
                     } else if uses_batch_cursor {
                         cursor.cycle_refused.insert(plan.identity());
                     }
@@ -1355,11 +1395,23 @@ fn reconcile_running_apps(
     // 周期完成判定：批次限流只保证「不阻塞主循环」，不能成为永续轮询的理由。
     // 未配置或被监督拒绝的计划既不 applied 也不 current，deferred 永远不归零——
     // 此前这让 pending 长期为真，主循环以约 1Hz 每轮全量扫 /proc 无限续跑。判据：
-    // 游标轮转已绕回本周期首个尝试计划的位置（或更早），说明本轮触发要处理的
-    // 计划都已被尝试过一次，本周期收口；被拒绝的计划等下一次真实触发（配置、
-    // 宿主、控制事件或 30 秒周期兜底）再进队。执行失败的计划同样登记进拒绝集合，绕回收口后会在新周期里再得到一次尝试。
+    // 本周期内已尝试过的计划被再次命中（轮转绕回），说明本轮触发要处理的计划都已
+    // 被尝试过一次，本周期收口；被拒绝的计划等下一次真实触发（配置、宿主、控制事件
+    // 或 30 秒周期兜底）再进队。执行失败的计划同样登记进拒绝集合，绕回收口后会在
+    // 新周期里再得到一次尝试。
     let plans_len = plans.len();
-    if incomplete_from_batch {
+    if cycle_wrapped {
+        log::info!(
+            "daemon reconcile cycle drained planned={} deferred={} — rest until next event",
+            plans_len,
+            deferred
+        );
+        incomplete_from_batch = false;
+        cursor.close_cycle();
+        // 批次排空即静息：立即把突发期间滞留的分配器空闲页归还内核，
+        // 不等下一个节流窗口。
+        crate::platform::allocator::release_free_pages();
+    } else if incomplete_from_batch {
         if let Some(head) = cursor.cycle_head.clone() {
             let next_index = cursor.next_start_index(&identities);
             let head_index = cursor.position_of(&identities, &head);
@@ -1370,8 +1422,7 @@ fn reconcile_running_apps(
                     deferred
                 );
                 incomplete_from_batch = false;
-                cursor.cycle_head = None;
-                cursor.cycle_refused.clear();
+                cursor.close_cycle();
                 // 批次排空即静息：立即把突发期间滞留的分配器空闲页归还内核，
                 // 不等下一个节流窗口。
                 crate::platform::allocator::release_free_pages();
@@ -1379,8 +1430,7 @@ fn reconcile_running_apps(
         }
     } else {
         // 本轮没有任何批次限流（所有计划都已处理），周期自然结束。
-        cursor.cycle_head = None;
-        cursor.cycle_refused.clear();
+        cursor.close_cycle();
     }
     if incomplete_from_batch {
         // 周期仍在进行：把本轮计划批次放回缓存，续跑轮直接复用，不再重复
@@ -1457,6 +1507,21 @@ impl ReconcilePlan {
 
     fn should_run_in_missing_only(&self) -> bool {
         self.request.operation == MountOperation::Reload && !self.has_mount_state
+    }
+
+    /// 计划已被本轮执行落地：续跑轮复用同一批计划对象，必须就地更新判定字段，
+    /// 否则枚举时的旧值会让同一计划在周期内被反复卸载重建。
+    fn mark_settled(&mut self, operation: MountOperation) {
+        match operation {
+            MountOperation::Reload => {
+                self.is_mount_current = true;
+                self.has_mount_state = true;
+            }
+            MountOperation::Disable => {
+                self.is_mount_current = false;
+                self.has_mount_state = false;
+            }
+        }
     }
 
     /// 幂等跳过：该应用的挂载已按当前配置建立，重挂只会叠加挂载层。
