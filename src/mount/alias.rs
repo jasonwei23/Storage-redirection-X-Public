@@ -47,11 +47,22 @@ impl MountPlanner {
     ) -> bool {
         let mut is_any_mounted = false;
         let alias_targets = self.expand_storage_alias_paths(primary_target);
+        let mut bound_keys: Vec<String> = Vec::new();
 
         for target in alias_targets {
             let is_primary_target = target == primary_target;
             if paths::eq_ignore_case(source, &target) {
                 log::debug!("alias: skip self bind src={} dst={}", source, target);
+                continue;
+            }
+            let bind_key = bind_target_key(&target);
+            if bound_keys.contains(&bind_key) {
+                log::debug!(
+                    "alias: skip duplicate real path bind src={} dst={} real={}",
+                    source,
+                    target,
+                    bind_key
+                );
                 continue;
             }
             if !is_primary_target && !path_exists(&target) {
@@ -121,6 +132,7 @@ impl MountPlanner {
             }
 
             is_any_mounted = true;
+            bound_keys.push(bind_key);
             if !is_primary_target && let Some(log_text) = alias_success_log {
                 let alias_ok_count = ALIAS_SUCCESS_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
                 if should_log_step(alias_ok_count, ALIAS_SUCCESS_LOG_STEP) {
@@ -155,11 +167,22 @@ impl MountPlanner {
     ) -> bool {
         let mut is_any_mounted = false;
         let alias_targets = self.expand_storage_alias_paths(primary_target);
+        let mut bound_keys: Vec<String> = Vec::new();
 
         for target in alias_targets {
             let is_primary_target = target == primary_target;
             if paths::eq_ignore_case(source, &target) {
                 log::debug!("alias: skip self overlay src={} dst={}", source, target);
+                continue;
+            }
+            let bind_key = bind_target_key(&target);
+            if bound_keys.contains(&bind_key) {
+                log::debug!(
+                    "alias: skip duplicate real path overlay src={} dst={} real={}",
+                    source,
+                    target,
+                    bind_key
+                );
                 continue;
             }
             if !is_primary_target && !path_exists(&target) {
@@ -227,6 +250,7 @@ impl MountPlanner {
             }
 
             is_any_mounted = true;
+            bound_keys.push(bind_key);
             if !is_primary_target && let Some(log_text) = alias_success_log {
                 let alias_ok_count = ALIAS_SUCCESS_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
                 if should_log_step(alias_ok_count, ALIAS_SUCCESS_LOG_STEP) {
@@ -261,9 +285,20 @@ impl MountPlanner {
     ) -> bool {
         let mut is_any_mounted = false;
         let alias_targets = self.expand_storage_alias_paths(primary_target);
+        let mut bound_keys: Vec<String> = Vec::new();
 
         for target in alias_targets {
             let is_primary_target = target == primary_target;
+            let bind_key = bind_target_key(&target);
+            if bound_keys.contains(&bind_key) {
+                log::debug!(
+                    "alias: skip duplicate real path readwrite src={} dst={} real={}",
+                    source,
+                    target,
+                    bind_key
+                );
+                continue;
+            }
             if !is_primary_target && !path_exists(&target) {
                 continue;
             }
@@ -306,6 +341,7 @@ impl MountPlanner {
             }
 
             is_any_mounted = true;
+            bound_keys.push(bind_key);
             if !is_primary_target && let Some(log_text) = alias_success_log {
                 let alias_ok_count = ALIAS_SUCCESS_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
                 if should_log_step(alias_ok_count, ALIAS_SUCCESS_LOG_STEP) {
@@ -393,9 +429,20 @@ impl MountPlanner {
     ) -> bool {
         let mut is_any_mounted = false;
         let alias_targets = self.expand_storage_alias_paths(primary_target);
+        let mut bound_keys: Vec<String> = Vec::new();
 
         for target in alias_targets {
             let is_primary_target = target == primary_target;
+            let bind_key = bind_target_key(&target);
+            if bound_keys.contains(&bind_key) {
+                log::debug!(
+                    "alias: skip duplicate real path readonly src={} dst={} real={}",
+                    source,
+                    target,
+                    bind_key
+                );
+                continue;
+            }
             if !is_primary_target && !path_exists(&target) {
                 continue;
             }
@@ -459,6 +506,7 @@ impl MountPlanner {
             }
 
             is_any_mounted = true;
+            bound_keys.push(bind_key);
             if !is_primary_target && let Some(log_text) = alias_success_log {
                 let alias_ok_count = ALIAS_SUCCESS_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
                 if should_log_step(alias_ok_count, ALIAS_SUCCESS_LOG_STEP) {
@@ -501,6 +549,20 @@ fn append_unique(list: &mut Vec<String>, value: String) {
     if !list.iter().any(|item| item == &value) {
         list.push(value);
     }
+}
+
+/// 绑定目标的去重键：解析符号链接后的真实路径。
+///
+/// 别名根里 `/storage/self/primary`（以及 user 0 的 `/storage/emulated/legacy`）是
+/// 指向 `/storage/emulated/0` 的符号链接。`mount(2)` 按解析后的真实路径建立挂载，
+/// 因此对这两个别名绑定会在同一挂载点再叠一层 `source` 与 `root` 都与 primary 完全
+/// 相同的 bind（真机 mountinfo 实测：同一目标出现两条记录，后一条的父挂载就是前一条）。
+/// 内容一致所以不会立刻出错，但白白多占一层，并让「同挂载点取栈顶」的判定出现并列项。
+/// 这里用真实路径去重，保证同一真实目标在一轮别名绑定里只挂一次。
+fn bind_target_key(target: &str) -> String {
+    std::fs::canonicalize(target)
+        .map(|path| path.to_string_lossy().to_string())
+        .unwrap_or_else(|_| target.to_string())
 }
 
 fn should_skip_self_shadowing_alias(source: &str, target: &str) -> bool {
