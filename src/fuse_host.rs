@@ -1534,7 +1534,7 @@ pub fn spawn_fuse_host() -> Option<FuseHost> {
     })
 }
 
-/// 子进程入口：进入私有 namespace、挂直通 FUSE、设 shared，然后常驻。
+/// 子进程入口：进入私有 namespace、收敛为 slave、挂直通 FUSE、设 shared，然后常驻。
 fn fuse_host_child_main(ready_sock: libc::c_int, control_sock: libc::c_int) -> bool {
     // 1. 进入私有 mount namespace；unshare 失败则放弃宿主会话。
     host_stage("before_unshare");
@@ -1546,7 +1546,20 @@ fn fuse_host_child_main(ready_sock: libc::c_int, control_sock: libc::c_int) -> b
         return false;
     }
     host_stage("unshared");
-    // 2. 隔离整棵挂载树，阻断向其它 namespace 传播。
+    // 2. 收敛为 slave：只接收入向挂载事件，不向外传播。
+    //
+    // 这里必须用 `MS_SLAVE` 而不是 `MS_PRIVATE`。`MS_PRIVATE` 会同时切断两个方向，
+    // 于是 init 命名空间在宿主会话建立之后创建的挂载永远进不来。HyperOS 的应用商店
+    // 在每次下载时都会把 `/data/apk-tmp/<pkg>/download` bind 到
+    // `/data/media/0/Android/data/com.xiaomi.market/files/.siexternal`，而宿主后端根
+    // 直连 f2fs（`private_real_root`），一旦错过这个 bind，宿主读到的是 bind 遮蔽
+    // 之前的陈旧目录：真机实测那里残留着若干已卸载应用的下载暂存目录
+    // （`com.kylin.read`、`com.taobao.idlefish` 等），商店校验阶段读不到自己刚下载的
+    // APK，表现为 `failed as error=3` 且不重试。
+    //
+    // 出向隔离不依赖这一步：宿主挂载点在 `mount_host_fuse` 里显式设 shared（只与自身
+    // peer 组互通），应用接入时 `make_mount_private` 又把搬运过去的游离挂载改私有，
+    // 因此宿主与应用的挂载事件不会互相污染。
     let Ok(root) = CString::new("/") else {
         host_stage("root_path_invalid");
         return false;
@@ -1557,16 +1570,16 @@ fn fuse_host_child_main(ready_sock: libc::c_int, control_sock: libc::c_int) -> b
             std::ptr::null(),
             root.as_ptr(),
             std::ptr::null(),
-            (libc::MS_REC | libc::MS_PRIVATE) as libc::c_ulong,
+            (libc::MS_REC | libc::MS_SLAVE) as libc::c_ulong,
             std::ptr::null(),
         )
     } != 0
     {
-        log_errno("fuse host MS_PRIVATE failed");
-        host_stage("private_failed");
+        log_errno("fuse host MS_SLAVE failed");
+        host_stage("slave_failed");
         return false;
     }
-    host_stage("private_ok");
+    host_stage("slave_ok");
 
     // 3. 挂直通宿主 FUSE（mount_host_fuse 内部完成 shared propagation 并常驻）。
     crate::fuse_redirect::config::mount_host_fuse(
