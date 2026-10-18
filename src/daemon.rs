@@ -408,6 +408,8 @@ struct ReconcileCursor {
     /// 本周期内已被尝试执行的计划身份集合。
     ///
     /// 轮转回到已尝试过的计划，说明本轮触发要处理的计划都已尝试过一次，周期应当收口。
+    /// 判定点还要求本轮没有任何计划被批次限流延后（`deferred == 0`）——被延后的计划
+    /// 从未尝试过，绕回命中时它们仍待处理，此时收口等于把工作推给下一个触发周期。
     /// 只比对「周期头位置」的旧判据（`next_index <= head_index`）在周期头不在计划数组
     /// 末尾时永远不成立：绕回后执行周期头得到 `head+1`，恒大于 `head_index`，周期永不
     /// 收口，`pending_full_reconcile` 恒为真，主循环退化为 200ms 永续续跑。真机实测
@@ -1317,7 +1319,14 @@ fn reconcile_running_apps(
         // 轮转回到本周期已尝试过的计划：本轮触发要处理的计划都已尝试过一次，周期收口。
         // 该判据与计划数组中的轮转位置无关，替代原先只在周期头位于数组末尾才成立的
         // `next_index <= head_index`（详见 `cycle_attempted` 字段注释）。
-        if uses_batch_cursor && cursor.attempted_in_cycle(plan) {
+        //
+        // 必须附加「本轮没有任何计划被延后」的前提。批次限流下每轮只放行
+        // RECONCILE_BATCH_MAX_PLANS 个计划，其余全部走 deferred；此时绕回命中的
+        // 已尝试计划是上一轮放行的那一个，中间那一批只是被限流推后、从未尝试过。
+        // 只看命中与否就会在第二次绕回时误判排空，把整批未尝试的计划留到下一个
+        // 触发周期（CI 实测：planned=36 deferred=35 紧接着 cycle drained，挂载被推迟
+        // 到 30 秒兜底才补做）。带延后即说明本轮仍有未处理计划，不收口。
+        if uses_batch_cursor && deferred == 0 && cursor.attempted_in_cycle(plan) {
             cycle_wrapped = true;
             break;
         }
