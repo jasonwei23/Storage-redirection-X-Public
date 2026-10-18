@@ -1017,6 +1017,28 @@ function Test-MediaProviderIsLazy {
     return -not [string]::IsNullOrEmpty($sdk) -and [int]$sdk -ge 37
 }
 
+# MediaProvider 就绪缓存：与 .sh 的 media_provider_ready_cached 对等。全量 URI
+# 探测 ~10s，系统代写监视场景（26/27）每个用例前重复探测成为最大耗时项。按
+# provider 进程 PID 缓存就绪结论，PID 变化自动失效；场景 32/33 的进程内热重载
+# 不换 PID，显式绕过缓存直连探测。
+$script:MediaProviderReadyCachePid = ""
+function Wait-MediaProviderReadyCached {
+    param([string]$Label, [int]$TimeoutSeconds = 120)
+    $scenario = Get-ScenarioFromLabel $Label
+    if ($scenario -in @(32, 33)) {
+        return (Wait-MediaProviderReady -Label $Label -TimeoutSeconds $TimeoutSeconds)
+    }
+    $currentPid = Get-MediaProviderPid
+    if (-not [string]::IsNullOrEmpty($currentPid) -and $currentPid -eq $script:MediaProviderReadyCachePid) {
+        return $true
+    }
+    if (Wait-MediaProviderReady -Label $Label -TimeoutSeconds $TimeoutSeconds) {
+        $script:MediaProviderReadyCachePid = $currentPid
+        return $true
+    }
+    return $false
+}
+
 function Wait-MediaProviderHookReady {
     param(
         [string]$Label,
@@ -2154,7 +2176,7 @@ function Invoke-MediaStoreDownloadCreateCase {
     $lastResult = $null
     for ($attempt = 1; $attempt -le 3; $attempt++) {
         if (-not (Wait-Storage "scenario-$Scenario-$Label-mediastore-storage")) { return $false }
-        if (-not (Wait-MediaProviderReady "scenario-$Scenario-$Label-mediastore-provider")) { return $false }
+        if (-not (Wait-MediaProviderReadyCached "scenario-$Scenario-$Label-mediastore-provider")) { return $false }
         $lastResult = Invoke-ServiceCase "scenario-$Scenario" $Label "mediastore_create_download" $extras "^PASS \[mediastore_create_download\]"
         if ($lastResult.Ok) { return $lastResult }
         if ($attempt -lt 3) {
@@ -2177,7 +2199,7 @@ function Invoke-MediaStoreImageRelativeDataCreateCase {
     $lastResult = $null
     for ($attempt = 1; $attempt -le 3; $attempt++) {
         if (-not (Wait-Storage "scenario-$Scenario-$Label-mediastore-relative-storage")) { return $false }
-        if (-not (Wait-MediaProviderReady "scenario-$Scenario-$Label-mediastore-relative-provider")) { return $false }
+        if (-not (Wait-MediaProviderReadyCached "scenario-$Scenario-$Label-mediastore-relative-provider")) { return $false }
         $lastResult = Invoke-ServiceCase "scenario-$Scenario" $Label "mediastore_create_image_relative_data" @{ file_name = $FileName; relative_path = $RelativeDataDir } "^PASS \[mediastore_create_image_relative_data\]"
         if ($lastResult.Ok) { return $lastResult }
         if ($attempt -lt 3) {
