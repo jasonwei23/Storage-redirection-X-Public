@@ -1290,6 +1290,14 @@ wait_scenario_app_view() {
   local timeout_seconds="${SRT_APP_VIEW_TIMEOUT_SECONDS:-15}"
   local path deadline
 
+  # 探针熔断：首次 15s 超时后写标记文件，同一轮里其余场景直接跳过。
+  # CI 实测 API 34 模拟器上该探针恒不可用（37 场景里 34 次打满超时、场景本体
+  # 照常通过），不熔断时每场景白烧 15s，整条 A14 矩阵多跑约 9.5 分钟。
+  if [ -f "app-view-probe-broken.flag" ]; then
+    # quality-allow(chinese-language): 该行输出的是 CI 日志检索用的英文标记，必须保持英文原样。
+    echo "app_view_probe_skipped label=${label} reason=probe-circuit-broken"
+    return 0
+  fi
   if [ -z "$pid" ]; then
     # quality-allow(chinese-language): 该行输出的是 CI 日志检索用的英文标记，必须保持英文原样。
     echo "app_view_probe_skipped label=${label} reason=no-confirmed-pid"
@@ -1307,7 +1315,7 @@ wait_scenario_app_view() {
   [ -n "$path" ] || return 0
   deadline=$((SECONDS + timeout_seconds))
   while [ "$SECONDS" -lt "$deadline" ]; do
-    if [ -n "$(adb_su "nsenter -t ${pid} -m -- ls -ld '${path}' 2>/dev/null" 2>/dev/null || true)" ]; then
+    if [ -n "$(adb_su "ls -ld '/proc/${pid}/root${path}' 2>/dev/null" 2>/dev/null || true)" ]; then
       return 0
     fi
     sleep 1
@@ -1315,6 +1323,17 @@ wait_scenario_app_view() {
 
   # quality-allow(chinese-language): 该行输出的是 CI 日志检索用的英文标记，必须保持英文原样。
   echo "app_view_not_ready label=${label} path=${path} pid=${pid}"
+  # 首次超时做一次性诊断：目标 pid 有效性、mount namespace 标识、nsenter 与
+  # /proc/<pid>/root 两条探针的实际退出码与错误输出，供根因定位；随后写熔断
+  # 标记，本轮剩余场景不再重试。
+  # 根因（CI run 39123157208 A14 诊断实锤）：API 34 模拟器的 /system/bin/nsenter
+  # 没有正确吃到 -t 参数，报 /proc/0/ns/mnt（target 落到默认 0）——探针失败与应用
+  # 视图无关。改用 /proc/<pid>/root/<path> 直查目标进程根视图，语义等价且无
+  # setns 与参数解析问题。
+  # quality-allow(chinese-language): 输出为日志检索用的 ASCII 标记，中文说明见上一行注释。
+  adb_su "echo app_view_diag_pid=${pid}; echo app_view_diag_ns=\$(readlink /proc/${pid}/ns/mnt 2>&1); echo app_view_diag_nsenter=\$(command -v nsenter 2>&1); nsenter -t ${pid} -m -- ls -ld '${path}' 2>&1; echo app_view_diag_nsenter_rc=\$?; echo app_view_diag_rootprobe=\$(ls -ld '/proc/${pid}/root${path}' 2>&1); echo app_view_diag_rootprobe_rc=\$?" || true
+  : > "app-view-probe-broken.flag"
+  echo "app_view_probe_circuit_broken（本轮剩余场景跳过应用视图探针）"
   print_storage_state "${label}-app-view-timeout"
   return 0
 }
@@ -3755,6 +3774,7 @@ export -f clear_alias_mediastore_fixture remove_mediastore_rows_by_pattern run_q
 export -f run_nested_mapping_chain_scenario
 
 failure_artifacts_captured=0
+rm -f app-view-probe-broken.flag
 for scenario in "${scenarios[@]}"; do
   echo "::group::scenario ${scenario}: $(scenario_title "$scenario")"
   if ! timeout --foreground "${SRT_SCENARIO_TIMEOUT_SECONDS}s" bash -e -o pipefail -c 'run_scenario "$1"' _ "$scenario"; then
