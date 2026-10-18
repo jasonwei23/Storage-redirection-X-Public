@@ -618,9 +618,6 @@ pub fn main_entry() -> i32 {
     }
 
     let mut last_version = 0;
-    let boot_loop_start_ms = crate::platform::paths::monotonic_ms();
-    static BOOT_OWNER_SWEEP_DONE: std::sync::atomic::AtomicBool =
-        std::sync::atomic::AtomicBool::new(false);
     let mut last_fingerprint_check_ms = crate::platform::paths::monotonic_ms();
     let mut last_periodic_reconcile_ms = crate::platform::paths::monotonic_ms();
     let mut round: usize = 0;
@@ -662,15 +659,6 @@ pub fn main_entry() -> i32 {
             for package_name in owner_scan_requests {
                 crate::daemon_monitor::spawn_full_repair_for_package(&package_name);
             }
-        }
-        // 开机一次性全量属主扫描：daemon 启动 3 分钟后触发（等系统与挂载
-        // 稳定），boot_id 去重保证每次开机至多一轮；OwnerScan 覆盖「应用打开
-        // 时」，此处补齐开机后未被打开的应用树的基线。
-        if !BOOT_OWNER_SWEEP_DONE.load(Ordering::Acquire)
-            && crate::platform::paths::monotonic_ms() - boot_loop_start_ms > 180_000
-        {
-            BOOT_OWNER_SWEEP_DONE.store(true, Ordering::Release);
-            crate::metadata_repair::spawn_detached_boot_owner_sweep();
         }
         let before = config.config_version();
         let (did_reload, changed_packages, full_change) =
