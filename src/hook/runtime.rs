@@ -397,15 +397,18 @@ fn fix_system_writer_android_private_owner_inner(path: &str, include_path: bool)
         return;
     }
 
+    // 不再要求 owner 配置了重定向：A17 原生 FUSE 对属主非本应用的
+    // Android/{data,media,obb}/<pkg> 只给 others 位，该语义与是否开启重定向
+    // 无关——未配置应用（真机 2026-10-18 反馈的 Unity 存档）被系统代写污染后
+    // 同样不可读写，而挂载应答期修复只覆盖已配置应用，未配置应用此前仅剩
+    // 30 分钟普查兜底。这里在代写创建的当下把属主即时修回应用 uid，是污染
+    // 源头治理；uid 解析失败与跨 caller 保护仍然生效。
     let allow_cross_caller_sqlite = should_allow_sqlite_private_owner_fix_for_current_caller(
         &storage_path,
         &owner_package,
         owner_uid,
         user_id,
     );
-    if !allow_cross_caller_sqlite && !is_private_owner_fix_enabled(&owner_package, owner_uid) {
-        return;
-    }
     if !allow_cross_caller_sqlite
         && !is_private_owner_fix_allowed_for_current_caller(&owner_package, owner_uid)
     {
@@ -458,10 +461,6 @@ fn android_private_owner_package(normalized_path: &str) -> Option<String> {
 
 fn resolve_private_owner_uid(package_name: &str) -> i32 {
     policy::get_fresh_uid_for_package(package_name)
-}
-
-fn is_private_owner_fix_enabled(owner_package: &str, owner_uid: i32) -> bool {
-    SettingsHub::instance().should_redirect(owner_package, owner_uid)
 }
 
 fn is_private_owner_fix_allowed_for_current_caller(owner_package: &str, owner_uid: i32) -> bool {
