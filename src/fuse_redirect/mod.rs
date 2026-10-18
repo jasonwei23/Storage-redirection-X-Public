@@ -622,9 +622,7 @@ impl FuseRedirectFs {
         // daemon 以自身权限打开 backend，写意图一律升级为 O_RDWR；O_PATH 打开保持
         // 原样（其 fd 不可读写是内核语义，升级反而破坏路径探测）。
         let mut backend_flags = flags | libc::O_CLOEXEC;
-        if backend_flags & libc::O_PATH == 0
-            && backend_flags & libc::O_ACCMODE != libc::O_RDONLY
-        {
+        if backend_flags & libc::O_PATH == 0 && backend_flags & libc::O_ACCMODE != libc::O_RDONLY {
             backend_flags = (backend_flags & !libc::O_ACCMODE) | libc::O_RDWR;
         }
         let c_path = cstring_path(path)?;
