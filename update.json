@@ -14,14 +14,14 @@
   },
   "beta": {
     "version": "1.2.60-ci.46",
-    "tag": "ci-build-39139711421-1",
+    "tag": "ci-build-39140688803-1",
     "title": "CI Build 1.2.60-ci.46",
-    "url": "https://github.com/z1298808165/Storage-redirection-X-Public/releases/tag/ci-build-39139711421-1",
+    "url": "https://github.com/z1298808165/Storage-redirection-X-Public/releases/tag/ci-build-39140688803-1",
     "repository": "z1298808165/Storage-redirection-X-Public",
     "prerelease": true,
-    "downloadUrl": "https://github.com/z1298808165/Storage-redirection-X-Public/releases/download/ci-build-39139711421-1/storage-redirect-x-manager-v1.2.60-ci.46.apk",
-    "moduleUrl": "https://github.com/z1298808165/Storage-redirection-X-Public/releases/download/ci-build-39139711421-1/storage.redirect.x-v1.2.60-ci.46.zip",
-    "releaseNotes": "## CI 构建更新日志\n\n- 当前版本：`1.2.60-ci.46`\n- 对比基准：上一版 CI 或 Release 构建 `ci-build-39135290255-1`\n- 当前提交：`c9e1b2b86ae3`\n\n## 模块更新\n\n### 修复了什么问题\n- 全树属主修复去掉 30 秒启动延迟 用户影响：未开启重定向的应用打开时存量漂移立即修复，首启读档不再等半分钟 范围：detached 全树启动时序 限制：写入竞态防护由 60 秒新鲜跳过独立承担 验证：clippy aarch64-android 与 fmt 全绿；60 秒新鲜跳过已实证防住 CI 场景 34 的 chown 写入竞态，延迟层冗余。\n- 应用启动即请求全树属主修复覆盖未配置应用 用户影响：未开启重定向的应用打开时也自动修复自有目录属主漂移，存档与文件首次使用即可正常读写 范围：OwnerScan 通道与启动扫描请求 限制：每包每小时至多一次全树扫描；存量漂移修复有约 30 秒延迟 验证：clippy aarch64-android 与 fmt 全绿；发送点置于 post 提前返回之前覆盖未配置应用；daemon 侧重新校验包名与 uid。"
+    "downloadUrl": "https://github.com/z1298808165/Storage-redirection-X-Public/releases/download/ci-build-39140688803-1/storage-redirect-x-manager-v1.2.60-ci.46.apk",
+    "moduleUrl": "https://github.com/z1298808165/Storage-redirection-X-Public/releases/download/ci-build-39140688803-1/storage.redirect.x-v1.2.60-ci.46.zip",
+    "releaseNotes": "## CI 构建更新日志\n\n- 当前版本：`1.2.60-ci.46`\n- 对比基准：上一版 CI 或 Release 构建 `ci-build-39139711421-1`\n- 当前提交：`37e0274bf859`\n\n## 模块更新\n\n### 修复了什么问题\n- 新增开机一次性全量属主扫描补齐未打开应用基线 用户影响：开机后即使不打开应用，全系统自有目录属主漂移也会在数分钟内自动修复 范围：daemon 启动触发与全量扫描实现 限制：每开机至多一轮；单包 50 万条目失控预算；正在写入文件延后 验证：clippy aarch64-android 与 fmt 全绿；boot_id 去重与 detached 单进程顺序扫描防 IO 风暴。"
   },
   "releases": []
 }
