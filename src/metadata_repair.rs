@@ -76,9 +76,14 @@ pub(crate) fn repair_media_rw_owner_tree(
     budget: usize,
     visited: &mut usize,
     max_depth: u32,
+    skip_recent_ms: i64,
 ) -> usize {
     let mut repaired = 0usize;
     let mut stack = vec![(root.to_string(), 0u32)];
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_millis() as i64)
+        .unwrap_or(0);
     while let Some((current, depth)) = stack.pop() {
         if *visited >= budget {
             log::debug!(
@@ -100,8 +105,20 @@ pub(crate) fn repair_media_rw_owner_tree(
         // SAFETY: lstat 已成功返回并完整初始化 stat 值。
         let st = unsafe { st.assume_init() };
         if st.st_uid == MEDIA_RW_UID {
+            // 最近修改过的普通文件正在被写入（MP FUSE / passthrough 会话中），
+            // 此时 chown 会触发 attr 失效并打断写入方的 fsync/close（真机 CI
+            // 2026-10-18 场景 34 close EPERM 实证）：跳过这类文件，其余照修。
+            // 墙钟在循环外取一次即可：扫描耗时秒级，远小于 60s 新鲜窗口。
+            let recently_modified = skip_recent_ms > 0
+                && st.st_mode & libc::S_IFMT as libc::mode_t == libc::S_IFREG as libc::mode_t
+                && now_ms - st.st_mtime * 1000 < skip_recent_ms;
             // SAFETY: c_path 在调用期间保持有效；gid 传 u32::MAX（即 -1）保留组不变。
-            let ret = unsafe { libc::lchown(c_path.as_ptr(), owner_uid as u32, u32::MAX) };
+            let ret = if recently_modified {
+                0
+            } else {
+                // SAFETY: c_path 在调用期间保持有效；gid 传 u32::MAX（即 -1）保留组不变。
+                unsafe { libc::lchown(c_path.as_ptr(), owner_uid as u32, u32::MAX) }
+            };
             if ret == 0 {
                 repaired += 1;
             } else {
@@ -192,6 +209,7 @@ pub(crate) fn repair_app_private_owners_on_attach(package_name: &str, user_id: i
             ATTACH_REPAIR_ENTRY_BUDGET,
             &mut kind_visited,
             ATTACH_REPAIR_MAX_DEPTH,
+            0,
         );
         repaired += kind_repaired;
         total_visited += kind_visited;
@@ -294,6 +312,10 @@ pub(crate) fn spawn_detached_full_owner_repair(package_name: &str, user_id: i32)
     }
     // SAFETY: setsid 使孙进程脱离调用方会话；失败不影响后续扫描。
     unsafe { libc::setsid() };
+    // 延迟 30 秒再扫：避开挂载后应用的首波写入窗口（CI 场景 34 的写入与
+    // chown 竞态实证），期间的新漂移由 OwnerFix 代修持续覆盖。
+    // SAFETY: sleep 只传入栈上常量秒数，无指针参数。
+    unsafe { libc::sleep(30) };
     run_full_owner_repair(package_name, user_id, &mark_path);
     unsafe { libc::_exit(0) };
 }
@@ -326,6 +348,7 @@ fn run_full_owner_repair(package_name: &str, user_id: i32, mark_path: &str) {
             usize::MAX,
             &mut visited,
             u32::MAX,
+            60_000,
         );
     }
     log::debug!(

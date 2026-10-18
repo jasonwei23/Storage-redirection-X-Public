@@ -562,6 +562,18 @@ fn chown_android_private_path_if_needed(
         return;
     }
     let st = unsafe { st.assume_init() };
+    // 最近修改过的普通文件正在被写入（MP FUSE / passthrough 会话中），此时
+    // chown 会触发 attr 失效并打断写入方的 fsync/close（真机 CI 2026-10-18
+    // 场景 34 close EPERM 实证）：跳过这类文件；目录无 passthrough 风险照修。
+    if st.st_mode & libc::S_IFMT as mode_t == libc::S_IFREG as mode_t {
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|duration| duration.as_millis() as i64)
+            .unwrap_or(0);
+        if now_ms - st.st_mtime * 1000 < 60_000 {
+            return;
+        }
+    }
     if st.st_uid == owner_uid as u32 && st.st_gid == MEDIA_RW_GID {
         chmod_android_private_path_if_needed(&c_path, path, &st, owner_package, private_root);
         return;
@@ -741,6 +753,7 @@ pub(crate) fn repair_app_private_owners(package_name: &str, user_id: i32) -> usi
             crate::metadata_repair::OWNER_SWEEP_ENTRY_BUDGET,
             &mut kind_visited,
             u32::MAX,
+            0,
         );
     }
     if repaired > 0 {
@@ -806,6 +819,7 @@ fn repair_private_category_owner(backend_path: &str) {
         crate::metadata_repair::OWNER_SWEEP_ENTRY_BUDGET,
         &mut visited,
         u32::MAX,
+        60_000,
     );
 }
 
