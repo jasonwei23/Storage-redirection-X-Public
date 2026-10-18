@@ -38,7 +38,7 @@ use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::FileExt;
 use std::path::Path;
 use std::sync::Arc;
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Instant, SystemTime};
 
 /// sqlite `-shm` 边车的最小合法尺寸（一个 wal-index 区域）。
@@ -189,6 +189,48 @@ fn sqlite_shm_wal_index_stale(real_shm_path: &Path) -> bool {
         return false;
     }
     shm[32..40] != wal[16..24]
+}
+
+/// backend 单次 pwrite 短写后被循环补写观测到的累计次数。
+static SHORT_WRITE_RECOVERED: AtomicU64 = AtomicU64::new(0);
+
+/// 把 `data` 完整写入 backend 的 `offset`，返回写入总长度（恒等于 `data.len()`）。
+///
+/// FUSE WRITE 契约：应答必须恰好等于请求字节数，否则返回错误（fuser 协议解析层
+/// 的注释同样如此声明）。backend 文件的单次 pwrite 在信号中断、或 backend 叠在
+/// 另一层受限文件系统上时可能返回短写——把短写计数原样应答会让内核把短写透传给
+/// 应用且丢失 errno（应用侧表现为诡异短写 + 陈旧 errno，夸克下载引擎视之为致命
+/// 错误进入重建文件死循环），writeback 路径则直接判 IO 失败。因此这里循环补写至
+/// 请求长度；无法推进（Ok(0)）或底层报错时返回真实 errno。
+fn write_full_at(file: &File, mut data: &[u8], mut offset: u64) -> std::io::Result<usize> {
+    let total = data.len();
+    let mut first_write = 0usize;
+    while !data.is_empty() {
+        match file.write_at(data, offset) {
+            Ok(0) => return Err(std::io::Error::from_raw_os_error(libc::ENOSPC)),
+            Ok(n) => {
+                if first_write == 0 {
+                    first_write = n;
+                }
+                data = &data[n..];
+                offset = offset.saturating_add(n as u64);
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(error) => return Err(error),
+        }
+    }
+    if first_write < total {
+        let seen = SHORT_WRITE_RECOVERED.fetch_add(1, Ordering::Relaxed) + 1;
+        if seen <= 32 || seen.is_multiple_of(1024) {
+            log::warn!(
+                "fuse write short recovered count={} want={} first_write={} end_offset={offset}",
+                seen,
+                total,
+                first_write
+            );
+        }
+    }
+    Ok(total)
 }
 
 impl Filesystem for FuseRedirectFs {
@@ -699,7 +741,20 @@ impl Filesystem for FuseRedirectFs {
                     self.perf.record_read_buffer(n, reused);
                     reply.data(&buffer[..n]);
                 }
-                Err(error) => reply.error(errno_from_io(error)),
+                Err(error) => {
+                    // 采样错误探针：writeback 模式下内核 write_begin 的读改写失败
+                    // 会以「应用侧 pwrite 短写」呈现，这里唯一能看到失败根因。
+                    static READ_ERROR_LOGGED: AtomicU64 = AtomicU64::new(0);
+                    let seen = READ_ERROR_LOGGED.fetch_add(1, Ordering::Relaxed) + 1;
+                    if seen <= 32 || seen.is_multiple_of(1024) {
+                        log::warn!(
+                            "fuse read error count={} offset={offset} requested={requested} errno={}",
+                            seen,
+                            error.raw_os_error().unwrap_or(-1)
+                        );
+                    }
+                    reply.error(errno_from_io(error));
+                }
             }
         });
     }
@@ -747,7 +802,7 @@ impl Filesystem for FuseRedirectFs {
             file
         };
         let write_started = std::time::Instant::now();
-        match file.write_at(data, offset) {
+        match write_full_at(&file, data, offset) {
             Ok(n) => {
                 let elapsed = write_started.elapsed();
                 if elapsed.as_millis() >= 2 {
