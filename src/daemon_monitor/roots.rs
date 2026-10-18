@@ -494,30 +494,7 @@ fn strip_path_suffix(path: &str, suffix: &str) -> Option<String> {
 /// （真机实测嵌套 70+ 层直到 ENAMETOOLONG，文件监视线程单核烧满）。这类路径是
 /// 映射伪影而不是用户数据，展开与下载判定都应剪掉。
 pub(super) fn is_self_nested_redirect_path(path: &str) -> bool {
-    const PRIVATE_PREFIX: &str = "Android/data/";
-    const REDIRECT_TAIL: &str = "sdcard/";
-    let mut search_from = 0usize;
-    while let Some(offset) = path[search_from..].find(PRIVATE_PREFIX) {
-        let prefix_start = search_from + offset;
-        let after_prefix = &path[prefix_start + PRIVATE_PREFIX.len()..];
-        // 形态：<pkg>/sdcard/Android/data/...，<pkg> 为单段包名
-        let Some(package_end) = after_prefix.find('/') else {
-            break;
-        };
-        let package = &after_prefix[..package_end];
-        if package.is_empty() {
-            search_from = prefix_start + PRIVATE_PREFIX.len();
-            continue;
-        }
-        let remainder = &after_prefix[package_end + 1..];
-        if let Some(nested) = remainder.strip_prefix(REDIRECT_TAIL)
-            && nested.starts_with(PRIVATE_PREFIX)
-        {
-            return true;
-        }
-        search_from = prefix_start + PRIVATE_PREFIX.len();
-    }
-    false
+    crate::metadata_repair::is_self_nested_redirect_path(path)
 }
 
 pub(super) fn should_descend_into_child(

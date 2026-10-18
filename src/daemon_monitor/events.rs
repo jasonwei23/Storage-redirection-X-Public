@@ -670,7 +670,7 @@ const OWNER_SWEEP_INTERVAL_MS: i64 = 30 * 60 * 1000;
 /// 单轮最多**访问**的条目数（含 lstat）。既封顶修复次数也封顶干净大树的扫描
 /// 成本：预算耗尽立即返回，剩余部分等下一个间隔自动续扫，保证单轮对 daemon
 /// 主循环的阻塞有界。
-const OWNER_SWEEP_ENTRY_BUDGET: usize = 8192;
+const OWNER_SWEEP_ENTRY_BUDGET: usize = crate::metadata_repair::OWNER_SWEEP_ENTRY_BUDGET;
 /// 上次属主清扫的单调时刻；0 表示从未跑过（启动后第一个间隔点即执行）。
 static LAST_OWNER_SWEEP_MS: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
 /// 清扫轮转游标：keys 向量中的下一个起始下标（预算耗尽时停在该包，下一轮续扫）。
@@ -776,12 +776,13 @@ pub(crate) fn maybe_sweep_android_data_owners() {
             stop = index;
             break;
         }
-        repaired += repair_media_rw_owner_tree(
+        repaired += crate::metadata_repair::repair_media_rw_owner_tree(
             package_path,
             owner_uid,
             package_name,
             OWNER_SWEEP_ENTRY_BUDGET,
             &mut visited,
+            u32::MAX,
         );
         stop = (index + 1) % keys.len();
     }
@@ -826,12 +827,13 @@ pub(crate) fn repair_app_private_owners(package_name: &str, user_id: i32) -> usi
         if !std::path::Path::new(&root).is_dir() {
             continue;
         }
-        repaired += repair_media_rw_owner_tree(
+        repaired += crate::metadata_repair::repair_media_rw_owner_tree(
             &root,
             owner_uid,
             package_name,
             OWNER_SWEEP_ENTRY_BUDGET,
             &mut visited,
+            u32::MAX,
         );
     }
     if repaired > 0 {
@@ -890,95 +892,19 @@ fn repair_private_category_owner(backend_path: &str) {
         return;
     }
     let mut visited = 0usize;
-    repair_media_rw_owner_tree(
+    crate::metadata_repair::repair_media_rw_owner_tree(
         backend_path,
         owner_uid,
         package_name,
         OWNER_SWEEP_ENTRY_BUDGET,
         &mut visited,
+        u32::MAX,
     );
 }
 
-/// 把目录树里属主为 media_rw 的条目修回应用 uid，返回实际修正数。
-///
-/// 只在条目属主精确等于 media_rw 时动手（其余属主一律不动），组与模式位保持
-/// 原样（`lchown` 传 -1 保留组）。`budget` 为本轮剩余的**访问条目**预算（含
-/// lstat），既限制修复次数也限制干净大树的扫描成本；超支立即返回，剩余部分
-/// 留给下轮。`visited` 由调用方累计用于跨包预算。
-fn repair_media_rw_owner_tree(
-    root: &str,
-    owner_uid: i32,
-    package_name: &str,
-    budget: usize,
-    visited: &mut usize,
-) -> usize {
-    let mut repaired = 0usize;
-    let mut stack = vec![root.to_string()];
-    while let Some(current) = stack.pop() {
-        if *visited >= budget {
-            log::debug!(
-                "daemon owner repair scan budget exhausted pkg={} path={}",
-                package_name,
-                current
-            );
-            return repaired;
-        }
-        *visited += 1;
-        let Some(c_path) = cstring_path(&current) else {
-            continue;
-        };
-        let mut st = std::mem::MaybeUninit::<libc::stat>::uninit();
-        // SAFETY: c_path 以 NUL 结尾，st 指向可供 lstat 写入的存储空间。
-        if unsafe { libc::lstat(c_path.as_ptr(), st.as_mut_ptr()) } != 0 {
-            continue;
-        }
-        // SAFETY: lstat 已成功返回并完整初始化 stat 值。
-        let st = unsafe { st.assume_init() };
-        if st.st_uid == MEDIA_RW_UID {
-            // SAFETY: c_path 在调用期间保持有效；gid 传 u32::MAX（即 -1）保留组不变。
-            let ret = unsafe { libc::lchown(c_path.as_ptr(), owner_uid as u32, u32::MAX) };
-            if ret == 0 {
-                repaired += 1;
-            } else {
-                log::warn!(
-                    "daemon owner repair failed pkg={} path={} errno={}",
-                    package_name,
-                    current,
-                    last_errno()
-                );
-            }
-        }
-        if st.st_mode & libc::S_IFMT as mode_t == libc::S_IFDIR as mode_t {
-            let Ok(children) = std::fs::read_dir(&current) else {
-                continue;
-            };
-            for child in children.flatten() {
-                let child_path = child.path().display().to_string();
-                // 重定向目标是模块管理的镜像树（`<pkg>/sdcard`，其中还有自嵌套
-                // 复制）：真机实测微信的镜像树足以单独吃满整轮预算，且关闭重定向
-                // 后该子树不再被原生视图访问，属主修复对它没有意义。剪掉。
-                if current == root && child.file_name().to_string_lossy() == "sdcard" {
-                    continue;
-                }
-                if super::roots::is_self_nested_redirect_path(&child_path) {
-                    continue;
-                }
-                stack.push(child_path);
-            }
-        }
-    }
-    if repaired > 0 {
-        log::warn!(
-            "daemon owner repair pkg={} uid={} repaired={} root={}",
-            package_name,
-            owner_uid,
-            repaired,
-            root
-        );
-    }
-    repaired
-}
-
+// 把目录树里属主为 media_rw 的条目修回应用 uid 的实现已下沉到
+// crate::metadata_repair::repair_media_rw_owner_tree（lib/bin 共享，
+// companion mount 路径也需要调用）；本侧调用统一转发。
 fn raw_parent(path: &str) -> String {
     if path.is_empty() || path == "/" {
         return path.to_string();

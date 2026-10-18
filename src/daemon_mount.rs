@@ -1068,6 +1068,19 @@ fn handle_child_process(request: &MountRequest, plan: &MountForkPlan, sock: c_in
             // 否则状态文件会记录已不存在的挂载，后续恢复流程据此误判为“仍在场”。
             mounted_targets = planner.take_mounted_targets();
         }
+        // 新进程首次接入存储视图时的属主交接修复（挂载应答前同步执行）：原生
+        // FUSE（未映射路径、namespace 回退、未挂载窗口）要求应用私有子树属主是
+        // 应用 uid，而 MediaProvider 代写会留下 media_rw 属主条目（真机 2026-10-17
+        // 反馈：A17 上仅映射应用探测自有 Telegram 目录、Unity 游戏读存档全部
+        // EACCES）。只对「无 mount identity 账本」的新 pid 生效，热重载与
+        // reconcile 重挂按账本天然跳过；浅层 + 小预算把冷启动阻塞压在毫秒级，
+        // 深层残留由 30 分钟普查轮转兜底。
+        if mount_identity::load(&request.package_name, request.pid).is_none() {
+            crate::metadata_repair::repair_app_private_owners_on_attach(
+                &request.package_name,
+                crate::platform::user_id_from_uid(request.uid),
+            );
+        }
         if !write_mount_state(request, plan, &mounted_targets, &fuse_children) {
             log::warn!("daemon mount state save failed pid={}", request.pid);
         }

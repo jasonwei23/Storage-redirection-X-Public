@@ -33,8 +33,8 @@
     {
       "id": 6,
       "config_mode": "standard",
-      "bash_title": "仅映射模式，未命中映射路径应保持真实路径写入",
-      "powershell_title": "mapping_mode_only unmatched stays real"
+      "bash_title": "仅映射模式，未命中映射路径保持真实且自有目录属主漂移自动修复",
+      "powershell_title": "mapping_mode_only unmatched stays real and drifted own dir auto-repaired"
     },
     {
       "id": 7,

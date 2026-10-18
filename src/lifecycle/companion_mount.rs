@@ -1199,6 +1199,21 @@ fn handle_child_process(
             );
         }
         let mounted_targets = mount_mgr.take_mounted_targets();
+        // 新进程首次接入存储视图时的属主交接修复（挂载应答前同步执行）：原生
+        // FUSE（未映射路径、namespace 回退、未挂载窗口）要求应用私有子树属主是
+        // 应用 uid，而 MediaProvider 代写会留下 media_rw 属主条目（真机 2026-10-17
+        // 反馈：A17 上仅映射应用探测自有 Telegram 目录、Unity 游戏读存档全部
+        // EACCES）。companion 路径绕过 daemon 子进程，必须与 daemon fork 路径
+        // 一样在应答前修复——真机 2026-10-18 实测 mapping_mode_only 应用的挂载
+        // 普遍走本路径，只挂 daemon fork 会完全漏修。只对「无 mount identity
+        // 账本」的新 pid 生效，热重载与 reconcile 重挂按账本天然跳过；浅层 +
+        // 小预算把冷启动阻塞压在毫秒级，深层残留由 30 分钟普查轮转兜底。
+        if crate::mount_ledger::load(&request.package_name, request.pid).is_none() {
+            crate::metadata_repair::repair_app_private_owners_on_attach(
+                &request.package_name,
+                crate::platform::user_id_from_uid(request.uid),
+            );
+        }
         if !mount_state::write_mount_state(request, plan, &mounted_targets, &fuse_children) {
             log::warn!(
                 "mount state save failed pid={} pkg={}",

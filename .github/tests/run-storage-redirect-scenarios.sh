@@ -506,7 +506,7 @@ scenario_title() {
     3) echo "启用路径映射，验证 SrtProbe 写入真实 Test" ;;
     4) echo "路径映射叠加真实路径放行，验证映射优先级" ;;
     5) echo "放行真实 Download，验证保持原路径写入" ;;
-    6) echo "仅映射模式，未命中映射路径应保持真实路径写入" ;;
+    6) echo "仅映射模式，未命中映射路径保持真实且自有目录属主漂移自动修复" ;;
     7) echo "仅映射模式，命中映射路径应写入映射目标" ;;
     8) echo "FUSE 仅映射模式：命中 sandbox 规则且同级未命中路径保持真实" ;;
     9) echo "read_only_paths 允许读取但拒绝写入、删除、mkdir、rename" ;;
@@ -605,7 +605,7 @@ clean_targets() {
   # 实测 Android 14 完整矩阵两轮稳定复现（41/42ms），而只跑场景 36 时该目录仍存在故通过——
   # 这正是「顺序相关」的来源。补入后与 `SrtMapOnlyMapped` 等同级映射目标保持一致。
   adb_su "mkdir -p '${REAL_ROOT}/Download/SrtProbe' '${REAL_ROOT}/Download/Test' '${REAL_ROOT}/Download/SrtMapOnlyMapped' '${REAL_ROOT}/Download/SrtQqAliasMapped' '${REAL_ROOT}/Download/SrtReadOnly' '${REAL_ROOT}/Download/SrtMapRO' '${REAL_ROOT}/Download/SrtAllow/tmp' '${REAL_ROOT}/Pictures/SrtLocked' '${REAL_ROOT}/Pictures/SrtReadOnlyMedia' '${REAL_ROOT}/.xldownload' '${REAL_ROOT}/.xlDownload' '${BACKEND_PRIVATE_ROOT}/Download/SrtProbe' '${BACKEND_PRIVATE_ROOT}/Download/Test' '${BACKEND_PRIVATE_ROOT}/Download/SrtMapOnlyMapped' '${BACKEND_PRIVATE_ROOT}/Download/SrtReadOnly' '${BACKEND_PRIVATE_ROOT}/Download/SrtMapRO' '${BACKEND_PRIVATE_ROOT}/Download/SrtAllow/tmp' '${BACKEND_PRIVATE_ROOT}/Pictures/SrtLocked' '${BACKEND_PRIVATE_ROOT}/Pictures/SrtReadOnlyMedia' '${BACKEND_PRIVATE_ROOT}/.xldownload' '${BACKEND_PRIVATE_ROOT}/.xlDownload'; chmod -R 777 '${REAL_ROOT}/Download/SrtProbe' '${REAL_ROOT}/Download/Test' '${REAL_ROOT}/Download/SrtMapOnlyMapped' '${REAL_ROOT}/Download/SrtQqAliasMapped' '${REAL_ROOT}/Download/SrtReadOnly' '${REAL_ROOT}/Download/SrtMapRO' '${REAL_ROOT}/Download/SrtAllow' '${REAL_ROOT}/Pictures/SrtLocked' '${REAL_ROOT}/Pictures/SrtReadOnlyMedia' '${BACKEND_PRIVATE_ROOT}/Download/SrtProbe' '${BACKEND_PRIVATE_ROOT}/Download/Test' '${BACKEND_PRIVATE_ROOT}/Download/SrtMapOnlyMapped' '${BACKEND_PRIVATE_ROOT}/Download/SrtReadOnly' '${BACKEND_PRIVATE_ROOT}/Download/SrtMapRO' '${BACKEND_PRIVATE_ROOT}/Download/SrtAllow' '${BACKEND_PRIVATE_ROOT}/Pictures/SrtLocked' '${BACKEND_PRIVATE_ROOT}/Pictures/SrtReadOnlyMedia' 2>/dev/null || true; chmod 777 '${REAL_ROOT}/.xldownload' '${REAL_ROOT}/.xlDownload' '${BACKEND_PRIVATE_ROOT}/.xldownload' '${BACKEND_PRIVATE_ROOT}/.xlDownload' 2>/dev/null || true" >/dev/null
-  adb_su "rm -rf '${REAL_ROOT}/Download/SrtLegacy' '${REAL_ROOT}/Download/SrtQMark' '${REAL_ROOT}/Download/SrtLongest' '${REAL_ROOT}/Download/SrtLongestBase' '${REAL_ROOT}/Download/SrtLongestDeep' '${REAL_ROOT}/Download/SrtPriority' '${REAL_ROOT}/Download/SrtPriorityMapped' '${BACKEND_PRIVATE_ROOT}/Download/SrtLegacy' '${BACKEND_PRIVATE_ROOT}/Download/SrtQMark' '${BACKEND_PRIVATE_ROOT}/Download/SrtLongest' '${BACKEND_PRIVATE_ROOT}/Download/SrtLongestBase' '${BACKEND_PRIVATE_ROOT}/Download/SrtLongestDeep' '${BACKEND_PRIVATE_ROOT}/Download/SrtPriority' '${BACKEND_PRIVATE_ROOT}/Download/SrtPriorityMapped'; mkdir -p '${REAL_ROOT}/Download/SrtLegacy/tmp' '${REAL_ROOT}/Download/SrtQMark/Keep1' '${REAL_ROOT}/Download/SrtQMark/Keep12' '${REAL_ROOT}/Download/SrtLongest/Deep' '${REAL_ROOT}/Download/SrtLongestBase' '${REAL_ROOT}/Download/SrtLongestDeep' '${REAL_ROOT}/Download/SrtPriority' '${REAL_ROOT}/Download/SrtPriorityMapped' '${BACKEND_PRIVATE_ROOT}/Download/SrtLegacy/tmp' '${BACKEND_PRIVATE_ROOT}/Download/SrtQMark/Keep1' '${BACKEND_PRIVATE_ROOT}/Download/SrtQMark/Keep12' '${BACKEND_PRIVATE_ROOT}/Download/SrtLongest/Deep' '${BACKEND_PRIVATE_ROOT}/Download/SrtLongestBase' '${BACKEND_PRIVATE_ROOT}/Download/SrtLongestDeep' '${BACKEND_PRIVATE_ROOT}/Download/SrtPriority' '${BACKEND_PRIVATE_ROOT}/Download/SrtPriorityMapped'; chmod -R 777 '${REAL_ROOT}/Download/SrtLegacy' '${REAL_ROOT}/Download/SrtQMark' '${REAL_ROOT}/Download/SrtLongest' '${REAL_ROOT}/Download/SrtLongestBase' '${REAL_ROOT}/Download/SrtLongestDeep' '${REAL_ROOT}/Download/SrtPriority' '${REAL_ROOT}/Download/SrtPriorityMapped' '${BACKEND_PRIVATE_ROOT}/Download/SrtLegacy' '${BACKEND_PRIVATE_ROOT}/Download/SrtQMark' '${BACKEND_PRIVATE_ROOT}/Download/SrtLongest' '${BACKEND_PRIVATE_ROOT}/Download/SrtLongestBase' '${BACKEND_PRIVATE_ROOT}/Download/SrtLongestDeep' '${BACKEND_PRIVATE_ROOT}/Download/SrtPriority' '${BACKEND_PRIVATE_ROOT}/Download/SrtPriorityMapped' 2>/dev/null || true" >/dev/null
+  adb_su "rm -rf '${REAL_ROOT}/Download/SrtLegacy' '${REAL_ROOT}/Download/SrtQMark' '${REAL_ROOT}/Download/SrtLongest' '${REAL_ROOT}/Download/SrtLongestBase' '${REAL_ROOT}/Download/SrtLongestDeep' '${REAL_ROOT}/Download/SrtPriority' '${REAL_ROOT}/Download/SrtPriorityMapped' '${REAL_ROOT}/Android/data/${APP_ID}/files/SrtDrift' '${BACKEND_PRIVATE_ROOT}/Download/SrtLegacy' '${BACKEND_PRIVATE_ROOT}/Download/SrtQMark' '${BACKEND_PRIVATE_ROOT}/Download/SrtLongest' '${BACKEND_PRIVATE_ROOT}/Download/SrtLongestBase' '${BACKEND_PRIVATE_ROOT}/Download/SrtLongestDeep' '${BACKEND_PRIVATE_ROOT}/Download/SrtPriority' '${BACKEND_PRIVATE_ROOT}/Download/SrtPriorityMapped'; mkdir -p '${REAL_ROOT}/Download/SrtLegacy/tmp' '${REAL_ROOT}/Download/SrtQMark/Keep1' '${REAL_ROOT}/Download/SrtQMark/Keep12' '${REAL_ROOT}/Download/SrtLongest/Deep' '${REAL_ROOT}/Download/SrtLongestBase' '${REAL_ROOT}/Download/SrtLongestDeep' '${REAL_ROOT}/Download/SrtPriority' '${REAL_ROOT}/Download/SrtPriorityMapped' '${BACKEND_PRIVATE_ROOT}/Download/SrtLegacy/tmp' '${BACKEND_PRIVATE_ROOT}/Download/SrtQMark/Keep1' '${BACKEND_PRIVATE_ROOT}/Download/SrtQMark/Keep12' '${BACKEND_PRIVATE_ROOT}/Download/SrtLongest/Deep' '${BACKEND_PRIVATE_ROOT}/Download/SrtLongestBase' '${BACKEND_PRIVATE_ROOT}/Download/SrtLongestDeep' '${BACKEND_PRIVATE_ROOT}/Download/SrtPriority' '${BACKEND_PRIVATE_ROOT}/Download/SrtPriorityMapped'; chmod -R 777 '${REAL_ROOT}/Download/SrtLegacy' '${REAL_ROOT}/Download/SrtQMark' '${REAL_ROOT}/Download/SrtLongest' '${REAL_ROOT}/Download/SrtLongestBase' '${REAL_ROOT}/Download/SrtLongestDeep' '${REAL_ROOT}/Download/SrtPriority' '${REAL_ROOT}/Download/SrtPriorityMapped' '${BACKEND_PRIVATE_ROOT}/Download/SrtLegacy' '${BACKEND_PRIVATE_ROOT}/Download/SrtQMark' '${BACKEND_PRIVATE_ROOT}/Download/SrtLongest' '${BACKEND_PRIVATE_ROOT}/Download/SrtLongestBase' '${BACKEND_PRIVATE_ROOT}/Download/SrtLongestDeep' '${BACKEND_PRIVATE_ROOT}/Download/SrtPriority' '${BACKEND_PRIVATE_ROOT}/Download/SrtPriorityMapped' 2>/dev/null || true" >/dev/null
   adb_su "rm -f '${REAL_ROOT}/Download/$QMARK_FILE_SINGLE_FILE' '${BACKEND_PRIVATE_ROOT}/Download/$QMARK_FILE_SINGLE_FILE'" >/dev/null
   adb_su "rm -rf '${REAL_ROOT}/Download/SrtFusePlain' '${REAL_ROOT}/Download/SrtFuseExclude' '${REAL_ROOT}/Download/SrtFuseMapParent' '${REAL_ROOT}/Download/SrtFuseMapRW' '${REAL_ROOT}/Download/SrtFuseMapRO' '${REAL_ROOT}/Download/SrtFuseMulti' '${REAL_ROOT}/DCIM/SrtFuseQQ' '${BACKEND_PRIVATE_ROOT}/Download/SrtFusePlain' '${BACKEND_PRIVATE_ROOT}/Download/SrtFuseExclude' '${BACKEND_PRIVATE_ROOT}/Download/SrtFuseMapParent' '${BACKEND_PRIVATE_ROOT}/Download/SrtFuseMapRW' '${BACKEND_PRIVATE_ROOT}/Download/SrtFuseMapRO' '${BACKEND_PRIVATE_ROOT}/Download/SrtFuseMulti' '${BACKEND_PRIVATE_ROOT}/DCIM/SrtFuseQQ'; mkdir -p '${REAL_ROOT}/Download/SrtFusePlain' '${REAL_ROOT}/Download/SrtFuseExclude/Locked' '${REAL_ROOT}/Download/SrtFuseExclude/Writable' '${REAL_ROOT}/Download/SrtFuseMapParent/WritableTarget' '${REAL_ROOT}/Download/SrtFuseMapParent/LockedTarget' '${REAL_ROOT}/Download/SrtFuseMapRW' '${REAL_ROOT}/Download/SrtFuseMapRO' '${REAL_ROOT}/Download/SrtFuseMulti/QQ' '${REAL_ROOT}/Download/SrtFuseMulti/WeChat' '${REAL_ROOT}/Download/SrtFuseMulti/Locked' '${REAL_ROOT}/Download/SrtFuseMulti/Other' '${FUSE_DCIM_ALLOWED_ROOT}' '${FUSE_DCIM_OTHER_ROOT}' '${BACKEND_PRIVATE_ROOT}/Download/SrtFusePlain' '${BACKEND_PRIVATE_ROOT}/Download/SrtFuseExclude/Locked' '${BACKEND_PRIVATE_ROOT}/Download/SrtFuseExclude/Writable' '${BACKEND_PRIVATE_ROOT}/Download/SrtFuseMapParent/WritableTarget' '${BACKEND_PRIVATE_ROOT}/Download/SrtFuseMapParent/LockedTarget' '${BACKEND_PRIVATE_ROOT}/Download/SrtFuseMapRW' '${BACKEND_PRIVATE_ROOT}/Download/SrtFuseMapRO' '${BACKEND_PRIVATE_ROOT}/Download/SrtFuseMulti/QQ' '${BACKEND_PRIVATE_ROOT}/Download/SrtFuseMulti/WeChat' '${BACKEND_PRIVATE_ROOT}/Download/SrtFuseMulti/Locked' '${BACKEND_PRIVATE_ROOT}/Download/SrtFuseMulti/Other' '${PRIVATE_FUSE_DCIM_ALLOWED_ROOT}' '${PRIVATE_FUSE_DCIM_OTHER_ROOT}'; chmod -R 777 '${REAL_ROOT}/Download/SrtFusePlain' '${REAL_ROOT}/Download/SrtFuseExclude' '${REAL_ROOT}/Download/SrtFuseMapParent' '${REAL_ROOT}/Download/SrtFuseMapRW' '${REAL_ROOT}/Download/SrtFuseMapRO' '${REAL_ROOT}/Download/SrtFuseMulti' '${REAL_ROOT}/DCIM/SrtFuseQQ' '${BACKEND_PRIVATE_ROOT}/Download/SrtFusePlain' '${BACKEND_PRIVATE_ROOT}/Download/SrtFuseExclude' '${BACKEND_PRIVATE_ROOT}/Download/SrtFuseMapParent' '${BACKEND_PRIVATE_ROOT}/Download/SrtFuseMapRW' '${BACKEND_PRIVATE_ROOT}/Download/SrtFuseMapRO' '${BACKEND_PRIVATE_ROOT}/Download/SrtFuseMulti' '${BACKEND_PRIVATE_ROOT}/DCIM/SrtFuseQQ' 2>/dev/null || true" >/dev/null
   adb_su "rm -rf '${REAL_ROOT}/Download/SrtFuseQa' '${REAL_ROOT}/Download/SrtFuseQab' '${REAL_ROOT}/Download/SrtFuseQb' '${REAL_ROOT}/Download/SrtFuseMediaAlpha' '${BACKEND_PRIVATE_ROOT}/Download/SrtFuseQa' '${BACKEND_PRIVATE_ROOT}/Download/SrtFuseQab' '${BACKEND_PRIVATE_ROOT}/Download/SrtFuseQb' '${BACKEND_PRIVATE_ROOT}/Download/SrtFuseMediaAlpha'; mkdir -p '${REAL_ROOT}/Download/SrtFuseQa/Media' '${REAL_ROOT}/Download/SrtFuseQab/Media' '${REAL_ROOT}/Download/SrtFuseQb/Media' '${REAL_ROOT}/Download/SrtFuseMediaAlpha/Drop' '${REAL_ROOT}/Download/SrtFuseMediaAlpha/Other' '${BACKEND_PRIVATE_ROOT}/Download/SrtFuseQa/Media' '${BACKEND_PRIVATE_ROOT}/Download/SrtFuseQab/Media' '${BACKEND_PRIVATE_ROOT}/Download/SrtFuseQb/Media' '${BACKEND_PRIVATE_ROOT}/Download/SrtFuseMediaAlpha/Drop' '${BACKEND_PRIVATE_ROOT}/Download/SrtFuseMediaAlpha/Other'; chmod -R 777 '${REAL_ROOT}/Download/SrtFuseQa' '${REAL_ROOT}/Download/SrtFuseQab' '${REAL_ROOT}/Download/SrtFuseQb' '${REAL_ROOT}/Download/SrtFuseMediaAlpha' '${BACKEND_PRIVATE_ROOT}/Download/SrtFuseQa' '${BACKEND_PRIVATE_ROOT}/Download/SrtFuseQab' '${BACKEND_PRIVATE_ROOT}/Download/SrtFuseQb' '${BACKEND_PRIVATE_ROOT}/Download/SrtFuseMediaAlpha' 2>/dev/null || true" >/dev/null
@@ -3386,6 +3386,38 @@ run_mediastore_open_typed_collection_scenario() {
   fi
 }
 
+# 仅映射模式自有目录属主漂移回归（真机 2026-10-17 用户反馈，A17/SDK37）：
+# MediaProvider 代写会把应用自有 Android/data/<pkg> 子树属主写成 media_rw，
+# A17 原生 FUSE 对属主非本应用的私有目录只给 others 位——应用首波访问全部
+# EACCES（nagram 目录探针失败致文件/存储统计不可见、Unity 游戏存档回退内部
+# 存储）。修复是新进程挂载应答前的浅层属主修复：本场景在应用启动前注入
+# 1023 属主损伤，启动后应用必须能读写该目录，且后端属主必须已修回应用 uid。
+# A13-16 原生 FUSE 不做 owner==app 强校验，应用读写用例恒过；后端属主断言
+# 保证修复链路在所有 Android 腿都有回归信号。
+prepare_owner_drift_fixture() {
+  local label="$1"
+  local drift_backend="${BACKEND_ROOT}/Android/data/${APP_ID}/files/SrtDrift"
+  if ! adb_su "rm -rf '$drift_backend'; mkdir -p '$drift_backend' && printf 'srt-drift-payload' > '$drift_backend/srt_drift_existing.txt' && chown -R 1023:1023 '$drift_backend' && chmod 2771 '$drift_backend' && chmod 660 '$drift_backend/srt_drift_existing.txt' && [ \"\$(stat -c %u '$drift_backend/srt_drift_existing.txt')\" = '1023' ]"; then
+    echo "owner_drift_fixture_failed label=${label} path=${drift_backend}" >&2
+    return 1
+  fi
+}
+
+run_owner_drift_own_dir_scenario() {
+  local scenario="$1"
+  local drift_visible="/storage/emulated/0/Android/data/${APP_ID}/files/SrtDrift"
+  local drift_backend="${BACKEND_ROOT}/Android/data/${APP_ID}/files/SrtDrift"
+  run_service_case "$scenario" "own-drift-read" "file_read" '^PASS \[file_read\]' --es file_path "$drift_visible/srt_drift_existing.txt" || return 1
+  run_service_case "$scenario" "own-drift-write" "file_write" '^PASS \[file_write\]' --es file_path "$drift_visible/srt_drift_probe.txt" --es payload "$PAYLOAD" --es expected_payload "$PAYLOAD" || return 1
+  # 后端属主必须已从注入的 media_rw 修回应用 uid：以包目录顶层属主为基准比对，
+  # 顶层属主异常时（应为应用 uid）同样判失败。
+  if ! adb_su "top_uid=\$(stat -c %u '${BACKEND_ROOT}/Android/data/${APP_ID}'); file_uid=\$(stat -c %u '$drift_backend/srt_drift_existing.txt'); [ -n \"\$top_uid\" ] && [ \"\$top_uid\" != '1023' ] && [ \"\$top_uid\" = \"\$file_uid\" ]"; then
+    echo "owner_drift_not_repaired scenario=${scenario} backend=${drift_backend}" >&2
+    return 1
+  fi
+  echo "owner_drift_repaired scenario=${scenario}"
+}
+
 run_scenario() {
   local scenario="$1"
   local targets_prepared_before_start=0
@@ -3397,6 +3429,12 @@ run_scenario() {
     apply_config_and_wait "scenario-${scenario}"
   fi
   case "$scenario" in
+    6)
+      echo "step 2/7: 清理并注入自有目录属主漂移夹具"
+      clean_targets
+      prepare_owner_drift_fixture "scenario-${scenario}"
+      targets_prepared_before_start=1
+      ;;
     9)
       echo "step 2/7: 清理并预置只读源文件"
       clean_targets
@@ -3454,6 +3492,13 @@ run_scenario() {
   wait_scenario_app_view "$scenario"
   clean_results
   case "$scenario" in
+    6)
+      echo "step 5/7: 验证未命中映射路径保持真实与自有目录属主漂移修复"
+      if ! run_standard_scenario "$scenario"; then
+        return 1
+      fi
+      run_owner_drift_own_dir_scenario "$scenario"
+      ;;
     8)
       echo "step 5/7: 验证 sandbox 规则命中与同级未命中路径"
       run_rule_sandbox_scenario "$scenario"
@@ -3703,6 +3748,7 @@ export -f media_provider_is_lazy
 export -f fresh_app_enabled_for_label
 export -f app_view_namespace_refresh_allowed
 export -f run_quick_media_provider_restart_recovery_scenario
+export -f prepare_owner_drift_fixture run_owner_drift_own_dir_scenario
 export -f run_own_private_directories_scenario run_own_private_write_case
 export -f run_any_path_mapping_scenario
 export -f clear_alias_mediastore_fixture remove_mediastore_rows_by_pattern run_qq_alias_mapped_existing_file_scenario
