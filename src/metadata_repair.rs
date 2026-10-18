@@ -312,10 +312,9 @@ pub(crate) fn spawn_detached_full_owner_repair(package_name: &str, user_id: i32)
     }
     // SAFETY: setsid 使孙进程脱离调用方会话；失败不影响后续扫描。
     unsafe { libc::setsid() };
-    // 延迟 30 秒再扫：避开挂载后应用的首波写入窗口（CI 场景 34 的写入与
-    // chown 竞态实证），期间的新漂移由 OwnerFix 代修持续覆盖。
-    // SAFETY: sleep 只传入栈上常量秒数，无指针参数。
-    unsafe { libc::sleep(30) };
+    // 不做启动延迟：应用首启即读（游戏存档类）依赖存量漂移尽快修完；写入
+    // 竞态由 skip_recent_ms（60s 内新文件跳过）防护，延迟反而把首启读档
+    // 推迟到约 30 秒后才能受益（CI 场景 34 的 EPERM 由新鲜跳过防住）。
     run_full_owner_repair(package_name, user_id, &mark_path);
     unsafe { libc::_exit(0) };
 }
