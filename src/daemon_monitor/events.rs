@@ -664,138 +664,46 @@ pub(super) fn path_is_same_or_child(path: &str, root: &str) -> bool {
     paths::is_same_or_child(path, root)
 }
 
-/// 属主清扫的最小间隔。属主异常是历史损伤（旧版本在重定向开启期把应用私有子树
-/// chown 成 media_rw，或系统代写留下的陈旧状态），低频修复即可，不值得更高频率。
-const OWNER_SWEEP_INTERVAL_MS: i64 = 30 * 60 * 1000;
-/// 单轮最多**访问**的条目数（含 lstat）。既封顶修复次数也封顶干净大树的扫描
-/// 成本：预算耗尽立即返回，剩余部分等下一个间隔自动续扫，保证单轮对 daemon
-/// 主循环的阻塞有界。
-const OWNER_SWEEP_ENTRY_BUDGET: usize = crate::metadata_repair::OWNER_SWEEP_ENTRY_BUDGET;
-/// 上次属主清扫的单调时刻；0 表示从未跑过（启动后第一个间隔点即执行）。
-static LAST_OWNER_SWEEP_MS: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
-/// 清扫轮转游标：keys 向量中的下一个起始下标（预算耗尽时停在该包，下一轮续扫）。
-static SWEEP_CURSOR: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-
-/// 周期性清扫 `/data/media/*/Android/{data,media,obb}/<pkg>` 的 media_rw 属主异常。
+/// daemon 消费 MP hook 的属主代修请求（OwnerFix 通道）：backend_path 形如
+/// `/data/media/<user>/Android/{data,media,obb}/<pkg>/...`。
 ///
-/// 背景（真机 2026-10-16 实证）：应用私有子树的正确属主是应用 uid——顶层目录组为
-/// ext_data_rw、内容目录组为 media_rw 都属正常形态，唯独**属主**不能是 media_rw：
-/// 原生 FUSE 对属主非本应用的 Android/data/<pkg> 只给 others 位（通常 --x），
-/// 应用读写全部被拒，Unity 类应用表现为存档不可读写并回退内部存储。现有的
-/// [`repair_monitored_backend_owner`] 只覆盖 `should_redirect` 通过的受监视应用
-/// （且依赖 inotify 事件触发），关闭重定向/未配置的应用无人看护、无人修复。
-/// 这里对存储后端做低频全量普查：只把「属主 == media_rw」的异常条目修回应用
-/// uid（`lchown` 仅改属主，组与模式位保持原样）；应用未安装或无法解析 uid 的
-/// 陈旧目录一律不碰。
-pub(crate) fn maybe_sweep_android_data_owners() {
-    if !crate::metadata_repair::enabled() {
+/// MP 等普通 uid 进程无 CAP_CHOWN，进程内 lchown 对非自身属主必然 EPERM
+/// （真机 2026-10-18 实证 media.module 全链 denied）；daemon 以 root 执行，
+/// 在此重新校验路径形态并推导应用 uid——不信任请求方提供的任何 uid 信息，
+/// 伪造请求最多让某应用私有树被修回其应用 uid，与正常修复等价，无提权面。
+/// 修复范围 = 请求路径向上到包根的父链 + 请求路径自身（树内子项不动，避免
+/// 被伪造请求放大扫描量）。
+pub(crate) fn repair_requested_backend_owner(backend_path: &str) {
+    if !crate::metadata_repair::enabled() || backend_path.is_empty() {
         return;
     }
-    let now = crate::platform::paths::monotonic_ms();
-    let last = LAST_OWNER_SWEEP_MS.load(std::sync::atomic::Ordering::Relaxed);
-    // 触发文件用于现场取证：创建即立即执行一次（无论间隔），跑完自动删除。
-    let forced =
-        std::path::Path::new("/data/adb/modules/storage.redirect.x/.owner_sweep_now").exists();
-    if !forced && last != 0 && now - last < OWNER_SWEEP_INTERVAL_MS {
+    let storage_path = paths::data_media_to_storage_path(&paths::normalize(backend_path));
+    let owner_package = paths::extract_android_private_path_owner(&storage_path);
+    if owner_package.is_empty()
+        || policy::is_media_intermediate_package(&owner_package)
+        || policy::is_system_writer_package(&owner_package)
+    {
         return;
     }
-    LAST_OWNER_SWEEP_MS.store(now, std::sync::atomic::Ordering::Relaxed);
-    if forced {
-        let _ = std::fs::remove_file("/data/adb/modules/storage.redirect.x/.owner_sweep_now");
+    let user_id = paths::extract_user_id_from_storage_path(&storage_path);
+    if user_id < 0 {
+        return;
     }
-
-    let mut repaired = 0usize;
-    let mut visited = 0usize;
-    let mut scanned = 0usize;
-    // 先收集再按固定顺序轮转：read_dir 顺序不稳定，且单棵大树可能吃满预算，
-    // 固定从头开始会让排序靠后的包永远轮不到（真机实测微信镜像树现象）。
-    // 游标记录本轮推进到的位置，下一轮从这里继续，保证所有包轮转覆盖。
-    let mut keys: Vec<String> = Vec::new();
-    let Ok(user_entries) = std::fs::read_dir("/data/media") else {
+    let owner_uid = policy::get_fresh_uid_for_package(&owner_package);
+    if owner_uid < ANDROID_APP_UID_START || platform::user_id_from_uid(owner_uid) != user_id {
+        return;
+    }
+    let Some(private_root) =
+        paths::android_private_data_media_root(&storage_path, &owner_package, user_id)
+    else {
         return;
     };
-    let mut user_paths: Vec<String> = user_entries
-        .flatten()
-        .map(|entry| entry.path().display().to_string())
-        .collect();
-    user_paths.sort();
-    for user_path in user_paths {
-        for kind in ["data", "media", "obb"] {
-            let category_dir = format!("{user_path}/Android/{kind}");
-            let Ok(packages) = std::fs::read_dir(&category_dir) else {
-                continue;
-            };
-            let mut package_paths: Vec<String> = packages
-                .flatten()
-                .map(|entry| entry.path().display().to_string())
-                .collect();
-            package_paths.sort();
-            for package_path in package_paths {
-                keys.push(format!("{kind}|{package_path}"));
-            }
-        }
-    }
-    if keys.is_empty() {
-        return;
-    }
-    let start = SWEEP_CURSOR.load(std::sync::atomic::Ordering::Relaxed) % keys.len();
-    let mut stop = start;
-    for offset in 0..keys.len() {
-        let index = (start + offset) % keys.len();
-        let key = &keys[index];
-        let Some((_, package_path)) = key.split_once('|') else {
-            continue;
-        };
-        scanned += 1;
-        let Ok(meta) = std::fs::symlink_metadata(package_path) else {
-            continue;
-        };
-        // 深层损伤（如 files/saves 属主异常而包目录顶层正常）是实测的主要
-        // 形态，顶层属主正常不代表子树干净——每个包目录都下钻扫描，由
-        // repair_media_rw_owner_tree 内部只修属主精确等于 media_rw 的条目。
-        if !meta.is_dir() {
-            continue;
-        }
-        let package_name = package_path.rsplit('/').next().unwrap_or_default();
-        if policy::is_media_intermediate_package(package_name)
-            || policy::is_system_writer_package(package_name)
-        {
-            continue;
-        }
-        let owner_uid = policy::get_fresh_uid_for_package(package_name);
-        if owner_uid < ANDROID_APP_UID_START {
-            continue;
-        }
-        if visited >= OWNER_SWEEP_ENTRY_BUDGET {
-            log::warn!(
-                "daemon owner sweep budget exhausted visited={} repaired={} scanned={}",
-                visited,
-                repaired,
-                scanned
-            );
-            stop = index;
-            break;
-        }
-        repaired += crate::metadata_repair::repair_media_rw_owner_tree(
-            package_path,
-            owner_uid,
-            package_name,
-            OWNER_SWEEP_ENTRY_BUDGET,
-            &mut visited,
-            u32::MAX,
-        );
-        stop = (index + 1) % keys.len();
-    }
-    SWEEP_CURSOR.store(stop, std::sync::atomic::Ordering::Relaxed);
-    // 无条件记录汇总：这是低频操作（30 分钟一次或触发文件），留一条执行证据
-    // 便于现场判断普查是否真的跑过、扫到了哪里。
-    log::warn!(
-        "daemon owner sweep done visited={} repaired={} scanned={} cursor={}",
-        visited,
-        repaired,
-        scanned,
-        stop
-    );
+    let scope = AndroidPrivateOwnerRepairScope {
+        backend_root: private_root,
+        owner_uid,
+        owner_package,
+    };
+    repair_backend_owner_in_scope(&scope, backend_path);
 }
 
 /// 应用退出重定向（Disable）时的属主交接修复。
@@ -803,7 +711,7 @@ pub(crate) fn maybe_sweep_android_data_owners() {
 /// 关闭重定向意味着模块要把存储视图交还原生 FUSE：原生模型要求应用私有子树
 /// 属主是应用 uid，而重定向开启期可能留下属主为 media_rw 的条目（系统代写、
 /// 旧版本损伤）。交还前就地修干净，应用关掉重定向的瞬间即可正常读写存档，
-/// 不必等类别 watch 事件或低频普查。预算与普查共用，超支部分由后续机制兜底。
+/// 不必等类别 watch 事件。预算按树独立，超支部分由 daemon 代修兜底。
 pub(crate) fn repair_app_private_owners(package_name: &str, user_id: i32) -> usize {
     if !crate::metadata_repair::enabled() || package_name.is_empty() || user_id < 0 {
         return 0;
@@ -818,11 +726,10 @@ pub(crate) fn repair_app_private_owners(package_name: &str, user_id: i32) -> usi
         return 0;
     }
     let mut repaired = 0usize;
-    let mut visited = 0usize;
     for kind in ["data", "media", "obb"] {
-        if visited >= OWNER_SWEEP_ENTRY_BUDGET {
-            break;
-        }
+        // 预算按 kind 独立（与 attach 修复同因）：共享预算会让 data 树的
+        // cache 积累吃光额度，media/obb 树在入口即被跳过。
+        let mut kind_visited = 0usize;
         let root = format!("/data/media/{user_id}/Android/{kind}/{package_name}");
         if !std::path::Path::new(&root).is_dir() {
             continue;
@@ -831,8 +738,8 @@ pub(crate) fn repair_app_private_owners(package_name: &str, user_id: i32) -> usi
             &root,
             owner_uid,
             package_name,
-            OWNER_SWEEP_ENTRY_BUDGET,
-            &mut visited,
+            crate::metadata_repair::OWNER_SWEEP_ENTRY_BUDGET,
+            &mut kind_visited,
             u32::MAX,
         );
     }
@@ -896,7 +803,7 @@ fn repair_private_category_owner(backend_path: &str) {
         backend_path,
         owner_uid,
         package_name,
-        OWNER_SWEEP_ENTRY_BUDGET,
+        crate::metadata_repair::OWNER_SWEEP_ENTRY_BUDGET,
         &mut visited,
         u32::MAX,
     );

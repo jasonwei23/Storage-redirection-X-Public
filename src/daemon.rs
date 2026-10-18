@@ -643,13 +643,15 @@ pub fn main_entry() -> i32 {
             log::warn!("boot pre-register resumed: media CE key ready");
             pre_register_all_configured_apps(config, config.config_version());
         }
-        // 私有目录属主普查（内部自带 30 分钟间隔门控与条目预算，绝大多数轮次
-        // 是一次单调时钟比较的廉价跳过）：修复关闭重定向/未配置应用无人看护的
-        // media_rw 属主损伤——事件驱动的修复链路覆盖不到它们（无 inotify 监视、
-        // 修复 scope 也要求 should_redirect）。触发文件 .owner_sweep_now 可在
-        // 现场取证时立即执行一轮。放在 should_reconcile 之外，避免被 reconcile
-        // 触发条件卡住导致触发文件不生效。
-        crate::daemon_monitor::maybe_sweep_android_data_owners();
+        // 消费 MP hook 的属主代修请求（OwnerFix 通道）：MP 等普通 uid 进程
+        // 进程内 lchown 必然 EPERM，由 daemon 以 root 代修。事件驱动、无轮询，
+        // 队列空时本调用是锁一次空 Vec 的廉价跳过。
+        let owner_fix_requests = crate::log_daemon::take_owner_fix_requests();
+        if !owner_fix_requests.is_empty() {
+            for backend_path in owner_fix_requests {
+                crate::daemon_monitor::repair_requested_backend_owner(&backend_path);
+            }
+        }
         let before = config.config_version();
         let (did_reload, changed_packages, full_change) =
             reload_config_for_daemon(config, &mut last_fingerprint_check_ms);

@@ -586,6 +586,9 @@ fn chown_private_path_if_needed(
     let error_no = current_errno();
     if error_no == libc::EPERM || error_no == libc::EACCES {
         chmod_private_node_if_needed(&c_path, path, &st, owner_package, private_root);
+        // 进程内 lchown 被 EPERM 拒绝（MP 等普通 uid 无 CAP_CHOWN，真机 2026-10-18
+        // 实证 media.module 全链 denied）：转请求 daemon（root）代修。
+        crate::logging::send_owner_fix_request(path);
     }
     if error_no != libc::ENOENT && error_no != libc::EPERM && error_no != libc::EACCES {
         log::warn!(

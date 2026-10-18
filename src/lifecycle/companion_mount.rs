@@ -1767,6 +1767,14 @@ fn run_mount_in_forked_child(request: &CompanionMountRequest) -> bool {
     unsafe { close(sockets[0]) };
     let sock = sockets[1];
     let is_success = handle_child_process(request, &plan, sock);
+    if is_success {
+        // 应答已在 handle_child_process 内发出：detached 全树属主修复兜住浅层
+        // 预算覆盖不到的大树深层，double-fork 不阻塞 companion 父进程收尾。
+        crate::metadata_repair::spawn_detached_full_owner_repair(
+            &request.package_name,
+            crate::platform::user_id_from_uid(request.uid),
+        );
+    }
     unsafe { libc::_exit(if is_success { 0 } else { 1 }) };
 }
 

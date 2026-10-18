@@ -1087,6 +1087,12 @@ fn handle_child_process(request: &MountRequest, plan: &MountForkPlan, sock: c_in
         record_mount_identity(request, &mounted_targets, &fuse_children);
         let _ = send_mount_result(sock, 0);
         unsafe { close(sock) };
+        // 应答已发出：detached 全树属主修复兜住浅层预算覆盖不到的大树深层
+        // （QQ files/Tencent/MobileQQ 类），double-fork 不占用任何挂载链路。
+        crate::metadata_repair::spawn_detached_full_owner_repair(
+            &request.package_name,
+            crate::platform::user_id_from_uid(request.uid),
+        );
         return true;
     }
 

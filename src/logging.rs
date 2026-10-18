@@ -18,6 +18,9 @@ const CURRENT_LOG_LEVEL: i32 = LOG_LEVEL_DEBUG;
 const DEFAULT_LOG_TAG: &str = "StorageRedirect";
 const FILE_MONITOR_LOG_TAG: &str = "FileMonitorOp";
 const STATS_LOG_TAG: &str = "Stats";
+/// MP hook 请求 daemon（root）代修属主的通道标签；与 src/log_daemon.rs 的
+/// TAG_OWNER_FIX 保持字面一致。
+const OWNER_FIX_LOG_TAG: &str = "OwnerFix";
 const PRIVATE_LOG_SOCKET_NAME: &[u8] = b"storage.redirect.x.logd";
 
 const ANDROID_LOG_VERBOSE: i32 = 2;
@@ -177,6 +180,20 @@ pub fn write_log(level: Level, tag: &str, message: &str) {
     if is_critical || (!private_sent && matches!(tag, FILE_MONITOR_LOG_TAG | STATS_LOG_TAG)) {
         android_log(level_to_priority(level), tag, message);
     }
+}
+
+/// 请求 daemon（root）代修一个应用私有树路径的 media_rw 属主。
+///
+/// 发送方是 MP hook 进程：普通 uid 无 CAP_CHOWN，进程内 lchown 对非自身属主
+/// 必然 EPERM（真机 2026-10-18 实证 media.module 全链 denied）。daemon 收到后
+/// 重新校验路径形态并推导应用 uid，只信任自己的校验结果。
+pub fn send_owner_fix_request(backend_path: &str) -> bool {
+    if backend_path.is_empty() || !backend_path.starts_with("/data/media/") {
+        return false;
+    }
+    private_log_socket()
+        .map(|socket| socket.send(Level::Info, OWNER_FIX_LOG_TAG, backend_path))
+        .unwrap_or(false)
 }
 
 /// 向 daemon 私有日志通道发送一条 Control 命令。
