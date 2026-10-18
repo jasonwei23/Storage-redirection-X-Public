@@ -56,6 +56,9 @@ const TAG_CONTROL: &str = "Control";
 /// MP hook 进程请求 daemon（root）代修属主的通道标签；与 src/logging.rs 的
 /// OWNER_FIX_LOG_TAG 保持字面一致。
 const TAG_OWNER_FIX: &str = "OwnerFix";
+/// 应用进程启动时请求 daemon 做全树属主修复的通道标签；与 src/logging.rs 的
+/// OWNER_SCAN_LOG_TAG 保持字面一致。
+const TAG_OWNER_SCAN: &str = "OwnerScan";
 /// 待代修路径队列上限：恶意/异常发送方在 per-uid 限流之外再受总量约束。
 const OWNER_FIX_REQUEST_LIMIT: usize = 256;
 const CONTROL_CLEAR_MONITOR: &str = "clear-monitor";
@@ -69,6 +72,7 @@ const STATS_SCHEMA: &str = "2";
 static RECONCILE_REQUEST: OnceLock<Mutex<Option<String>>> = OnceLock::new();
 static POLICY_REGISTER_REQUEST: OnceLock<Mutex<Option<String>>> = OnceLock::new();
 static OWNER_FIX_REQUESTS: OnceLock<Mutex<Vec<String>>> = OnceLock::new();
+static OWNER_SCAN_REQUESTS: OnceLock<Mutex<Vec<String>>> = OnceLock::new();
 static DAEMON_WAKE_EVENTFD: AtomicI32 = AtomicI32::new(-1);
 
 pub fn set_daemon_wake_eventfd(fd: i32) {
@@ -123,6 +127,32 @@ pub fn take_owner_fix_requests() -> Vec<String> {
         .lock()
         .map(|mut queue| std::mem::take(&mut *queue))
         .unwrap_or_default()
+}
+
+fn owner_scan_requests_slot() -> &'static Mutex<Vec<String>> {
+    OWNER_SCAN_REQUESTS.get_or_init(|| Mutex::new(Vec::new()))
+}
+
+/// 取出待全树修复的应用包名。重复请求由 daemon 侧 detached 修复的每小时
+/// 去重标记兜底，队列内只做去重防放大。
+pub fn take_owner_scan_requests() -> Vec<String> {
+    owner_scan_requests_slot()
+        .lock()
+        .map(|mut queue| std::mem::take(&mut *queue))
+        .unwrap_or_default()
+}
+
+fn queue_owner_scan_request(package_name: String) {
+    let mut queue = match owner_scan_requests_slot().lock() {
+        Ok(queue) => queue,
+        Err(_) => return,
+    };
+    if queue.len() >= OWNER_FIX_REQUEST_LIMIT || queue.contains(&package_name) {
+        return;
+    }
+    queue.push(package_name);
+    drop(queue);
+    wake_daemon();
 }
 
 fn queue_owner_fix_request(backend_path: String) {
@@ -461,6 +491,17 @@ impl LogState {
             TAG_STATS => {
                 if self.allow_from_sender(sender_uid) {
                     self.add_stats(message);
+                }
+            }
+            TAG_OWNER_SCAN => {
+                // 消息体是包名；daemon 消费时重新校验合法性与 uid。
+                if self.allow_from_sender(sender_uid)
+                    && !message.is_empty()
+                    && !message.contains('/')
+                    && !message.contains('\n')
+                    && message.len() <= 128
+                {
+                    queue_owner_scan_request(message.to_string());
                 }
             }
             TAG_OWNER_FIX => {

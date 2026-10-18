@@ -652,6 +652,14 @@ pub fn main_entry() -> i32 {
                 crate::daemon_monitor::repair_requested_backend_owner(&backend_path);
             }
         }
+        // 消费应用启动扫描请求（OwnerScan 通道）：未开启重定向的应用打开时
+        // 也获得一次 detached 全树属主修复。
+        let owner_scan_requests = crate::log_daemon::take_owner_scan_requests();
+        if !owner_scan_requests.is_empty() {
+            for package_name in owner_scan_requests {
+                crate::daemon_monitor::spawn_full_repair_for_package(&package_name);
+            }
+        }
         let before = config.config_version();
         let (did_reload, changed_packages, full_change) =
             reload_config_for_daemon(config, &mut last_fingerprint_check_ms);

@@ -718,6 +718,33 @@ pub(crate) fn repair_requested_backend_owner(backend_path: &str) {
     repair_backend_owner_in_scope(&scope, backend_path);
 }
 
+/// daemon 消费应用启动扫描请求（OwnerScan 通道）：对刚启动的包做 detached
+/// 全树属主修复。
+///
+/// 未开启重定向的应用没有挂载应答流程，attach/全树修复都不会被触发（真机
+/// 2026-10-18 反馈：开机后未打开的应用属主保持 1023）；post_app_specialize
+/// 对每个被注入的进程补发本请求，daemon 在此重新校验包名与 uid 后复用
+/// detached 全树修复（内含每小时去重标记，重复请求廉价）。
+pub(crate) fn spawn_full_repair_for_package(package_name: &str) {
+    if !crate::metadata_repair::enabled()
+        || package_name.is_empty()
+        || package_name.contains('/')
+        || policy::is_media_intermediate_package(package_name)
+        || policy::is_system_writer_package(package_name)
+    {
+        return;
+    }
+    let owner_uid = policy::get_fresh_uid_for_package(package_name);
+    if owner_uid < ANDROID_APP_UID_START {
+        return;
+    }
+    let user_id = platform::user_id_from_uid(owner_uid);
+    if user_id < 0 {
+        return;
+    }
+    crate::metadata_repair::spawn_detached_full_owner_repair(package_name, user_id);
+}
+
 /// 应用退出重定向（Disable）时的属主交接修复。
 ///
 /// 关闭重定向意味着模块要把存储视图交还原生 FUSE：原生模型要求应用私有子树
