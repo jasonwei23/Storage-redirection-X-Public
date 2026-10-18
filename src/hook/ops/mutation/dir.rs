@@ -324,7 +324,7 @@ where
         } else {
             path_for_decision.as_ref()
         };
-        runtime::fix_system_writer_android_private_owner(owner_path, true);
+        runtime::fix_system_writer_android_private_owner(owner_path, true, -1);
     }
     if redirect_result.is_redirect() {
         if result == 0 || error_no == libc::EEXIST {

@@ -221,7 +221,7 @@ where
         flags,
     );
     if should_fix_system_writer_private_owner(hub, flags) {
-        runtime::fix_system_writer_android_private_owner(final_path.as_ref(), false);
+        runtime::fix_system_writer_android_private_owner(final_path.as_ref(), false, -1);
     }
     if is_system_writer && is_sqlite_shm_sidecar_path(path_for_decision.as_ref()) {
         crate::hook::media_fuse::prepare_private_owner_sqlite_sidecar(path_for_decision.as_ref());
@@ -251,7 +251,7 @@ where
     }
 
     if result >= 0 && is_system_writer {
-        runtime::fix_system_writer_android_private_owner(final_path.as_ref(), true);
+        runtime::fix_system_writer_android_private_owner(final_path.as_ref(), true, result);
     }
 
     finalize_open_result(
@@ -351,7 +351,7 @@ where
         flags,
     );
     if should_fix_system_writer_private_owner(hub, flags) {
-        runtime::fix_system_writer_android_private_owner(final_path.as_ref(), false);
+        runtime::fix_system_writer_android_private_owner(final_path.as_ref(), false, -1);
     }
     if is_system_writer && is_sqlite_shm_sidecar_path(path_for_decision.as_ref()) {
         crate::hook::media_fuse::prepare_private_owner_sqlite_sidecar(path_for_decision.as_ref());
@@ -390,7 +390,7 @@ where
     );
 
     if result >= 0 && is_system_writer {
-        runtime::fix_system_writer_android_private_owner(final_path.as_ref(), true);
+        runtime::fix_system_writer_android_private_owner(final_path.as_ref(), true, result);
     }
 
     result
@@ -512,6 +512,7 @@ where
         runtime::fix_system_writer_android_private_owner(
             final_path,
             has_create_intent_flags_for_owner_fix(flags),
+            result,
         );
     }
     monitor::record_open_result(

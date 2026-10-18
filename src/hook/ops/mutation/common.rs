@@ -245,7 +245,7 @@ pub(super) fn fix_system_writer_private_owner_for_mutation(hub: &InterceptHub, p
     if !hub.with_package_name(should_fix_system_writer_private_owner_for_package) {
         return;
     }
-    runtime::fix_system_writer_android_private_owner(path, true);
+    runtime::fix_system_writer_android_private_owner(path, true, -1);
 }
 
 pub(super) fn handle_fd_path_audit<F>(

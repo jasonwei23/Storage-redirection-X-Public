@@ -199,7 +199,7 @@ unsafe fn fix_system_writer_private_owner_for_query(dirfd: c_int, pathname: *con
     let Some(path_text) = resolve_system_writer_query_path(dirfd, pathname) else {
         return;
     };
-    runtime::fix_system_writer_android_private_owner(&path_text, false);
+    runtime::fix_system_writer_android_private_owner(&path_text, false, -1);
 }
 
 // 用原始系统调用判断目录是否真实存在。这里不能走 libc 包装，否则会再次进入本模块的

@@ -1,4 +1,5 @@
 mod caller;
+pub mod companion_api;
 mod context;
 mod diagnostic;
 mod entries;

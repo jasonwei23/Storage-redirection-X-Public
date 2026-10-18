@@ -214,7 +214,7 @@ pub fn normalize_redirect_directory(path: &str) {
     normalize_redirect_dir_metadata(path, STORAGE_DIR_MODE, owner.as_ref());
 }
 
-pub fn fix_system_writer_android_private_owner(path: &str, include_path: bool) {
+pub fn fix_system_writer_android_private_owner(path: &str, include_path: bool, fd: i32) {
     if !crate::metadata_repair::enabled() || path.is_empty() {
         return;
     }
@@ -225,7 +225,7 @@ pub fn fix_system_writer_android_private_owner(path: &str, include_path: bool) {
     }
 
     let saved_errno = current_errno();
-    fix_system_writer_android_private_owner_inner(path, include_path);
+    fix_system_writer_android_private_owner_inner(path, include_path, fd);
     fix_system_writer_mapping_target_access(path);
     set_errno(saved_errno);
 }
@@ -376,7 +376,7 @@ fn data_media_user_dir(path: &str) -> String {
     paths::data_media_user_root(path).unwrap_or_default()
 }
 
-fn fix_system_writer_android_private_owner_inner(path: &str, include_path: bool) {
+fn fix_system_writer_android_private_owner_inner(path: &str, include_path: bool, fd: i32) {
     let normalized = paths::normalize(path);
     let storage_path = if normalized.starts_with("/data/media/") {
         paths::data_media_to_storage_path(&normalized)
@@ -428,11 +428,11 @@ fn fix_system_writer_android_private_owner_inner(path: &str, include_path: bool)
     };
     let parent = paths::parent(&backend_path);
     if path_is_same_or_child(&parent, &private_root) {
-        chown_private_path_if_needed(&parent, owner_uid, &owner_package, &private_root);
+        chown_private_path_if_needed(&parent, owner_uid, &owner_package, &private_root, -1);
     }
 
     if should_fix_private_path_node(&backend_path, &private_root, include_path) {
-        chown_private_path_if_needed(&backend_path, owner_uid, &owner_package, &private_root);
+        chown_private_path_if_needed(&backend_path, owner_uid, &owner_package, &private_root, fd);
     }
 }
 
@@ -555,6 +555,7 @@ fn chown_private_path_if_needed(
     owner_uid: i32,
     owner_package: &str,
     private_root: &str,
+    fd: i32,
 ) {
     let Ok(c_path) = CString::new(path) else {
         return;
@@ -587,7 +588,12 @@ fn chown_private_path_if_needed(
     if error_no == libc::EPERM || error_no == libc::EACCES {
         chmod_private_node_if_needed(&c_path, path, &st, owner_package, private_root);
         // 进程内 lchown 被 EPERM 拒绝（MP 等普通 uid 无 CAP_CHOWN，真机 2026-10-18
-        // 实证 media.module 全链 denied）：转请求 daemon（root）代修。
+        // 实证 media.module 全链 denied）：优先经 companion（root）对 open fd
+        // 即时 fchown——fd 在应用拿到之前已是正确属主，零竞态零扫描；companion
+        // 不可用时回退 daemon 代修请求（异步，主循环 ≤1s 消费）。
+        if fd >= 0 && crate::hook::companion_api::companion_fchown(fd, owner_uid) {
+            return;
+        }
         crate::logging::send_owner_fix_request(path);
     }
     if error_no != libc::ENOENT && error_no != libc::EPERM && error_no != libc::EACCES {
