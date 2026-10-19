@@ -40,15 +40,6 @@ impl RuntimeFlow {
         if policy::is_media_provider_package(&self.package_name) {
             java_hook::start_hot_reload_after_specialize();
         }
-        // 未开启重定向的应用没有挂载应答流程，attach/全树修复都不会触发；
-        // 在任何 post 提前返回之前补发启动扫描请求，让存量 media_rw 漂移在
-        // 应用首次使用前由 daemon（root）修掉。系统代写进程与隔离 uid 不发。
-        if self.app_uid >= 10000
-            && !platform::is_isolated_uid(self.app_uid)
-            && !policy::is_system_writer_package(&self.package_name)
-        {
-            crate::logging::send_owner_scan_request(&self.package_name);
-        }
         if self.should_skip_post_work {
             log_post_perf(self, "skip", 0, 0, 0, perf_started_ms);
             return;

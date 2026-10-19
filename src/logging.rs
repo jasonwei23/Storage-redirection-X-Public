@@ -21,9 +21,6 @@ const STATS_LOG_TAG: &str = "Stats";
 /// MP hook 请求 daemon（root）代修属主的通道标签；与 src/log_daemon.rs 的
 /// TAG_OWNER_FIX 保持字面一致。
 const OWNER_FIX_LOG_TAG: &str = "OwnerFix";
-/// 应用进程启动时请求 daemon 对该包做 detached 全树属主修复；与
-/// src/log_daemon.rs 的 TAG_OWNER_SCAN 保持字面一致。
-const OWNER_SCAN_LOG_TAG: &str = "OwnerScan";
 const PRIVATE_LOG_SOCKET_NAME: &[u8] = b"storage.redirect.x.logd";
 
 const ANDROID_LOG_VERBOSE: i32 = 2;
@@ -196,21 +193,6 @@ pub fn send_owner_fix_request(backend_path: &str) -> bool {
     }
     private_log_socket()
         .map(|socket| socket.send(Level::Info, OWNER_FIX_LOG_TAG, backend_path))
-        .unwrap_or(false)
-}
-
-/// 请求 daemon 对刚启动的应用包做一次 detached 全树属主修复。
-///
-/// 未开启重定向的应用没有挂载应答流程，attach/全树修复都不会被触发；在
-/// post_app_specialize（hook 安装后、应用代码运行前）补发本请求，让存量
-/// media_rw 漂移在应用首次使用前被修掉。daemon 侧有包名/uid 校验与每小时
-/// 去重标记，重复请求廉价。
-pub fn send_owner_scan_request(package_name: &str) -> bool {
-    if package_name.is_empty() || package_name.contains('\n') {
-        return false;
-    }
-    private_log_socket()
-        .map(|socket| socket.send(Level::Info, OWNER_SCAN_LOG_TAG, package_name))
         .unwrap_or(false)
 }
 
