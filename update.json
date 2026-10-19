@@ -14,14 +14,14 @@
   },
   "beta": {
     "version": "1.2.60-ci.48",
-    "tag": "ci-build-39183638874-1",
+    "tag": "ci-build-39183742004-1",
     "title": "CI Build 1.2.60-ci.48",
-    "url": "https://github.com/z1298808165/Storage-redirection-X-Public/releases/tag/ci-build-39183638874-1",
+    "url": "https://github.com/z1298808165/Storage-redirection-X-Public/releases/tag/ci-build-39183742004-1",
     "repository": "z1298808165/Storage-redirection-X-Public",
     "prerelease": true,
-    "downloadUrl": "https://github.com/z1298808165/Storage-redirection-X-Public/releases/download/ci-build-39183638874-1/storage-redirect-x-manager-v1.2.60-ci.48.apk",
-    "moduleUrl": "https://github.com/z1298808165/Storage-redirection-X-Public/releases/download/ci-build-39183638874-1/storage.redirect.x-v1.2.60-ci.48.zip",
-    "releaseNotes": "## CI 构建更新日志\n\n- 当前版本：`1.2.60-ci.48`\n- 对比基准：上一版 CI 或 Release 构建 `ci-build-39178246411-1`\n- 当前提交：`a798d92cc937`\n\n## 模块更新\n\n### 增加了什么功能\n- 私有树查询做视图层属主伪装 用户影响：历史存量 media_rw 文件零修复直接可读写，应用冷启动无任何额外开销 范围：MP stat 类 hook 的视图层伪装 限制：实验分支，仅覆盖 FUSE 视图 验证：clippy aarch64-android 与 fmt 全绿；伪装仅当 caller 即归属包应用时生效，无跨应用越权面；其它视图由 companion fchown 源头治理。"
+    "downloadUrl": "https://github.com/z1298808165/Storage-redirection-X-Public/releases/download/ci-build-39183742004-1/storage-redirect-x-manager-v1.2.60-ci.48.apk",
+    "moduleUrl": "https://github.com/z1298808165/Storage-redirection-X-Public/releases/download/ci-build-39183742004-1/storage.redirect.x-v1.2.60-ci.48.zip",
+    "releaseNotes": "## CI 构建更新日志\n\n- 当前版本：`1.2.60-ci.48`\n- 对比基准：上一版 CI 或 Release 构建 `ci-build-39183638874-1`\n- 当前提交：`58351cc6ff48`\n\n## 模块更新\n\n### 功能变化\n- 移除应用启动全树扫描改由视图伪装覆盖 用户影响：应用冷启动完全无额外开销，历史存量文件由视图层伪装直接放行读写 范围：OwnerScan 通道整体移除 限制：存量写意图仍由 companion fchown 治理 验证：clippy aarch64-android 与 fmt 全绿；视图伪装实验 CI 全 Android 腿全绿证实存量读取已覆盖。"
   },
   "releases": []
 }
