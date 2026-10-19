@@ -14,11 +14,14 @@ use events::{
     should_skip_ambiguous_allowed_real_path_event, should_skip_ambiguous_read_only_path_event,
     should_skip_public_root_event_identity,
 };
+pub(crate) use events::{
+    repair_app_private_owners, repair_requested_backend_owner, spawn_full_repair_for_package,
+};
 use roots::{
-    build_private_owner_repair_roots, build_public_owner_repair_root, build_watch_roots,
-    dedup_roots, is_self_nested_redirect_path, is_under_any_root, map_record_from_path,
-    select_watch_start, should_descend_into_child, should_record_display_path,
-    sort_roots_by_monitor_priority,
+    build_private_category_owner_roots, build_private_owner_repair_roots,
+    build_public_owner_repair_root, build_watch_roots, dedup_roots, is_self_nested_redirect_path,
+    is_under_any_root, map_record_from_path, select_watch_start, should_descend_into_child,
+    should_record_display_path, sort_roots_by_monitor_priority,
 };
 use std::collections::{HashMap, HashSet, VecDeque};
 
@@ -63,6 +66,12 @@ const PUBLIC_OWNER_REPAIR_INTERVAL_MS: i64 = 1000;
 const PRUNE_DEAD_WATCHES_INTERVAL_MS: i64 = 60_000;
 /// 公共 owner 修复扫描在目录数没有变化时的记录间隔（扫描每 1 秒一轮，约 5 分钟）。
 const PUBLIC_OWNER_REPAIR_LOG_HEARTBEAT: u64 = 300;
+/// 创建/写入观察事件的延迟裁决窗口：请求行（hook→socket→日志线程登记 hint）
+/// 晚于 inotify 事件到达是固有顺序，窗口内等 hint 落位后再裁决是否抑制。
+/// 只影响台账时序（至多数百毫秒），不影响文件系统路径。
+const OBSERVATION_PARK_WINDOW_MS: i64 = 250;
+/// 待裁决观察事件队列上限；风暴期超过上限时放弃延迟，按原行为立即发射。
+const MAX_PENDING_OBSERVATIONS: usize = 4096;
 /// 递归展开监视树时最多访问的目录数，与 [`MAX_PUBLIC_OWNER_REPAIR_DIRS`] 对齐。
 const MAX_EXISTING_TREE_REPAIR_DIRS: usize = 32768;
 const PUBLIC_OWNER_EXISTING_WATCH_DEPTH: usize = 2;
@@ -249,6 +258,17 @@ pub struct RegularAppMonitor {
     public_owner_repair_log_dirs: HashMap<String, usize>,
     /// 公共 owner 修复扫描的记录次数，用于按心跳间隔补充摘要。
     public_owner_repair_log_count: u64,
+    /// 延迟裁决中的创建/写入观察事件：等待请求 hint 落位后再决定是否抑制。
+    pending_observations: Vec<ParkedObservation>,
+}
+
+/// 延迟裁决中的观察事件快照。
+struct ParkedObservation {
+    wd: i32,
+    display_path: String,
+    backend_path: String,
+    mask: u32,
+    parked_at_ms: i64,
 }
 
 impl RegularAppMonitor {
@@ -275,6 +295,7 @@ impl RegularAppMonitor {
             last_prune_dead_ms: 0,
             public_owner_repair_log_dirs: HashMap::new(),
             public_owner_repair_log_count: 0,
+            pending_observations: Vec::new(),
         }
     }
 
@@ -365,6 +386,9 @@ impl RegularAppMonitor {
                 roots.extend(build_watch_roots(spec));
             }
         }
+        // 类别级私有属主 watch 与应用配置无关：只要存储用户目录存在就登记，
+        // 覆盖未开启重定向/未配置应用的属主异常发现。
+        roots.extend(build_private_category_owner_roots());
         dedup_roots(&mut roots);
         sort_roots_by_monitor_priority(&mut roots);
         self.public_owner_roots = roots
@@ -407,10 +431,9 @@ impl RegularAppMonitor {
                             .iter()
                             .any(|watcher| watcher.source == "private_owner"));
                 let recurse_existing_tree = overflow_resync
-                    || node
-                        .watchers
-                        .iter()
-                        .any(|watcher| watcher.source != "public_owner");
+                    || node.watchers.iter().any(|watcher| {
+                        !matches!(watcher.source, "public_owner" | "private_category_owner")
+                    });
                 self.expand_watch_tree_from(node, repair_existing_files, recurse_existing_tree);
                 if self.capacity_limited {
                     break;
@@ -491,10 +514,9 @@ impl RegularAppMonitor {
                         .watchers
                         .iter()
                         .any(|watcher| watcher.source == "private_owner");
-                let recurse_existing_tree = node
-                    .watchers
-                    .iter()
-                    .any(|watcher| watcher.source != "public_owner");
+                let recurse_existing_tree = node.watchers.iter().any(|watcher| {
+                    !matches!(watcher.source, "public_owner" | "private_category_owner")
+                });
                 self.expand_watch_tree_from(node, repair_existing_files, recurse_existing_tree);
                 if self.capacity_limited {
                     break;
@@ -528,6 +550,9 @@ impl RegularAppMonitor {
             return false;
         }
 
+        // 上一轮停顿期间到期的延迟裁决事件先发射，再读新事件。
+        self.flush_pending_observations();
+
         // inotify_event 需要 4 字节对齐；内核保证每个事件总长度是 sizeof(int) 的倍数，
         // 因此缓冲区起始 4 字节对齐后，后续每个事件也满足对齐要求。
         let mut buffer = inotify::InotifyBuf::<{ 16 * 1024 }>::new();
@@ -539,6 +564,7 @@ impl RegularAppMonitor {
                     "daemon monitor drain budget reached n={}, resume next round",
                     handled
                 );
+                self.flush_pending_observations();
                 return true;
             }
             let n = inotify::read_into(self.fd, &mut buffer.0);
@@ -563,6 +589,7 @@ impl RegularAppMonitor {
                 handled = handled.saturating_add(1);
             });
         }
+        self.flush_pending_observations();
         false
     }
 
@@ -638,6 +665,9 @@ impl RegularAppMonitor {
                 roots.extend(build_watch_roots(spec));
             }
         }
+        // 与全量 reconfigure 相同：类别级属主 watch 独立于应用配置，增量重建也要补上
+        //（inotify_add_watch 幂等复用已有 wd，重复登记零成本）。
+        roots.extend(build_private_category_owner_roots());
         dedup_roots(&mut roots);
         sort_roots_by_monitor_priority(&mut roots);
 
@@ -664,10 +694,9 @@ impl RegularAppMonitor {
                         .watchers
                         .iter()
                         .any(|watcher| watcher.source == "private_owner");
-                let recurse_existing_tree = node
-                    .watchers
-                    .iter()
-                    .any(|watcher| watcher.source != "public_owner");
+                let recurse_existing_tree = node.watchers.iter().any(|watcher| {
+                    !matches!(watcher.source, "public_owner" | "private_category_owner")
+                });
                 self.expand_watch_tree_from(node, repair_existing_files, recurse_existing_tree);
                 if self.capacity_limited {
                     break;
@@ -885,6 +914,20 @@ impl RegularAppMonitor {
                     )
                 }) || is_self_nested_redirect_path(&child_backend_dir)
                 {
+                    // 类别级属主 watch 不下钻，但登记/重建时的存量包目录仍要做
+                    // 属主异常检查——这是它「登记即普查」语义的一半（另一半是
+                    // 运行期 IN_ATTRIB/CREATE 事件）。
+                    if node
+                        .watchers
+                        .iter()
+                        .any(|watcher| watcher.source == "private_category_owner")
+                    {
+                        repair_monitored_backend_owner_for_watchers_dir(
+                            &node.watchers,
+                            &child_display_dir,
+                            &child_backend_dir,
+                        );
+                    }
                     continue;
                 }
                 if self.watch_nodes.len() >= self.max_watches {
@@ -1211,80 +1254,170 @@ impl RegularAppMonitor {
             // （event_role=request）与 daemon inotify 观察侧（event_role=observation）
             // 会对同一次创建/写入各写一条记录，管理器监视列表里同一文件因此出现
             // 两条未合并的条目。命中近期请求记录的创建与写入观察事件直接跳过；
-            // 重命名/删除/属性事件不涉及该重复形态，保持原行为。查询按节点做一次，
-            // 不随 watcher 数量放大。
-            let request_record_recent = {
+            // 重命名/删除/属性事件不涉及该重复形态，保持原行为。
+            //
+            // 未命中的创建/写入事件不立即发射：请求行经 hook→socket→日志线程
+            // 登记 hint，而 inotify 事件在 open 过程中就已入队，事件先于 hint 是
+            // 固有顺序（真机实测首批 CREATE 必漏）。延迟 PARK_WINDOW 再裁决，
+            // hint 落位后即被抑制；窗口只影响台账时序，不影响文件系统路径。
+            let is_create_or_modify =
+                inotify::is_created_or_moved_to(mask) || inotify::is_modify(mask);
+            let request_record_recent = is_create_or_modify && {
                 let user_id = paths::extract_user_id_from_storage_path(&display_path);
                 user_id >= 0
-                    && (inotify::is_created_or_moved_to(mask) || inotify::is_modify(mask))
                     && crate::monitor::has_recent_public_path_request(&display_path, user_id)
             };
             let operation_name = monitor_operation_from_mask(mask);
-            for watcher in node.watchers.iter() {
-                if watcher.source == "public_owner" || watcher.source == "private_owner" {
-                    continue;
-                }
-
+            if is_create_or_modify {
                 if request_record_recent {
                     continue;
                 }
-                if !should_record_display_path(&display_path, &watcher.record_display_root)
-                    || should_filter_display_path(&display_path, operation_name)
-                    || is_under_any_root(&display_path, &watcher.excluded_roots)
-                {
+                if self.pending_observations.len() < MAX_PENDING_OBSERVATIONS {
+                    self.pending_observations.push(ParkedObservation {
+                        wd: event.wd,
+                        display_path: display_path.clone(),
+                        backend_path: backend_path.clone(),
+                        mask,
+                        parked_at_ms: paths::monotonic_ms(),
+                    });
                     continue;
                 }
-                let identity = resolve_monitor_identity(
-                    &watcher.package_name,
-                    &display_path,
-                    &backend_path,
-                    watcher.source,
-                );
-                if should_skip_ambiguous_allowed_real_path_event(
-                    &identity,
-                    watcher.source,
-                    &display_path,
-                    &watcher.package_name,
-                ) || should_skip_ambiguous_read_only_path_event(
-                    &identity,
-                    watcher.source,
-                    &watcher.package_name,
-                ) || should_skip_public_root_event_identity(
-                    &identity,
-                    watcher.source,
-                    &watcher.package_name,
-                ) {
-                    continue;
-                }
-                let from_path = map_record_from_path(
-                    &display_path,
-                    &watcher.record_display_root,
-                    &watcher.record_from_root,
-                );
-                if self.should_skip_duplicate(
-                    &identity.package_name,
-                    &display_path,
-                    &from_path,
-                    operation_name,
-                    mask,
-                ) {
-                    continue;
-                }
-                let event_paths = MonitorEventPaths {
-                    backend_path: backend_path.clone(),
-                    display_path: display_path.clone(),
-                    from_path,
-                };
-                emit_monitor_event(
-                    &identity,
-                    &event_paths,
-                    &watcher.package_name,
-                    watcher.source,
-                    mask,
-                    operation_name,
-                );
+                // 队列满：放弃延迟，按原行为立即发射。
             }
+            self.emit_observation_event(
+                &node.watchers,
+                &display_path,
+                &backend_path,
+                mask,
+                operation_name,
+            );
         }
+    }
+
+    /// 对一组 watcher 发射一条观察记录（含逐 watcher 过滤与去重）。
+    fn emit_observation_event(
+        &mut self,
+        watchers: &std::sync::Arc<Vec<WatchWatcher>>,
+        display_path: &str,
+        backend_path: &str,
+        mask: u32,
+        operation_name: &str,
+    ) {
+        for watcher in watchers.iter() {
+            if watcher.source == "public_owner" || watcher.source == "private_owner" {
+                continue;
+            }
+            if !should_record_display_path(display_path, &watcher.record_display_root)
+                || should_filter_display_path(display_path, operation_name)
+                || is_under_any_root(display_path, &watcher.excluded_roots)
+            {
+                continue;
+            }
+            let identity = resolve_monitor_identity(
+                &watcher.package_name,
+                display_path,
+                backend_path,
+                watcher.source,
+            );
+            if should_skip_ambiguous_allowed_real_path_event(
+                &identity,
+                watcher.source,
+                display_path,
+                &watcher.package_name,
+            ) || should_skip_ambiguous_read_only_path_event(
+                &identity,
+                watcher.source,
+                &watcher.package_name,
+            ) || should_skip_public_root_event_identity(
+                &identity,
+                watcher.source,
+                &watcher.package_name,
+            ) {
+                continue;
+            }
+            let from_path = map_record_from_path(
+                display_path,
+                &watcher.record_display_root,
+                &watcher.record_from_root,
+            );
+            if self.should_skip_duplicate(
+                &identity.package_name,
+                display_path,
+                &from_path,
+                operation_name,
+                mask,
+            ) {
+                continue;
+            }
+            let event_paths = MonitorEventPaths {
+                backend_path: backend_path.to_string(),
+                display_path: display_path.to_string(),
+                from_path,
+            };
+            emit_monitor_event(
+                &identity,
+                &event_paths,
+                &watcher.package_name,
+                watcher.source,
+                mask,
+                operation_name,
+            );
+        }
+    }
+
+    /// 发射已到延迟裁决期的观察事件：重新查询请求 hint（此时大概率已落位），
+    /// 仍未命中才真正发射。watcher 集合按 wd 现取，节点在窗口内被重建/剪除
+    /// 时事件直接丢弃（重建自带的补偿扫描会兜住归属，不值得为瞬时事件保留
+    /// 陈旧 watcher）。
+    fn flush_pending_observations(&mut self) {
+        if self.pending_observations.is_empty() {
+            return;
+        }
+        let now_ms = paths::monotonic_ms();
+        let pending = std::mem::take(&mut self.pending_observations);
+        for item in pending {
+            if now_ms.saturating_sub(item.parked_at_ms) < OBSERVATION_PARK_WINDOW_MS {
+                self.pending_observations.push(item);
+                continue;
+            }
+            let user_id = paths::extract_user_id_from_storage_path(&item.display_path);
+            if user_id >= 0
+                && crate::monitor::has_recent_public_path_request(&item.display_path, user_id)
+            {
+                continue;
+            }
+            let watchers = self.watch_nodes.get(&item.wd).and_then(|nodes| {
+                nodes
+                    .iter()
+                    .find(|node| node.backend_dir == item.backend_path)
+                    .map(|node| std::sync::Arc::clone(&node.watchers))
+            });
+            let Some(watchers) = watchers else {
+                continue;
+            };
+            let operation_name = monitor_operation_from_mask(item.mask);
+            self.emit_observation_event(
+                &watchers,
+                &item.display_path,
+                &item.backend_path,
+                item.mask,
+                operation_name,
+            );
+        }
+    }
+
+    /// 距离最近一条待裁决观察事件到期还剩多少毫秒；无待裁决事件时返回 None。
+    /// 供监视线程把 poll 超时压到到期点，避免延迟裁决被 30 秒轮询拖长。
+    pub fn pending_flush_delay_ms(&self) -> Option<u64> {
+        let now_ms = paths::monotonic_ms();
+        self.pending_observations
+            .iter()
+            .map(|item| {
+                OBSERVATION_PARK_WINDOW_MS.saturating_sub(now_ms.saturating_sub(item.parked_at_ms))
+            })
+            .filter(|remaining| *remaining > 0)
+            .min()
+            .map(|remaining| remaining as u64)
     }
 
     fn should_skip_duplicate(
@@ -1309,15 +1442,25 @@ impl RegularAppMonitor {
 
         let event_key = format!("{}|{}|{}|{}", package_name, operation_name, path, from_path);
         if inotify::is_modify(mask) {
-            if self
-                .recent_event_ms
-                .insert(event_key.clone(), now_ms)
-                .is_none()
-            {
-                self.recent_event_order.push_back(event_key);
+            // IN_MODIFY 随每个写入块逐次触发，持续下载会在同一文件上产生大量
+            // 事件；按 (包名, 操作, 路径) 节流：窗口内跳过，窗口过期后重记一条，
+            // 长下载仍保留活动痕迹且不刷屏。窗口从上次「记账」时刻起算而非上次
+            // 事件时刻，避免连续写入把窗口无限顺延、整段写入只留首条记录。
+            match self.recent_event_ms.get_mut(&event_key) {
+                Some(last_ms) => {
+                    if now_ms.saturating_sub(*last_ms) < DUPLICATE_EVENT_WINDOW_MS {
+                        return true;
+                    }
+                    *last_ms = now_ms;
+                    return false;
+                }
+                None => {
+                    self.recent_event_ms.insert(event_key.clone(), now_ms);
+                    self.recent_event_order.push_back(event_key);
+                    self.trim_recent_events();
+                    return false;
+                }
             }
-            self.trim_recent_events();
-            return false;
         }
         if let Some(last_ms) = self.recent_event_ms.get_mut(&event_key) {
             if now_ms.saturating_sub(*last_ms) < DUPLICATE_EVENT_WINDOW_MS {

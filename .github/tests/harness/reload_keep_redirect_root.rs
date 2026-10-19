@@ -69,6 +69,7 @@ pub struct MountRequest {
     pub operation: MountOperation,
     pub package_name: String,
     pub redirect_target: String,
+    pub path_mappings: Vec<String>,
     pub is_mapping_mode_only: bool,
 }
 
@@ -82,10 +83,24 @@ pub struct MountRequest {
 const SANDBOX_TARGET: &str = "/storage/emulated/0/Android/data/com.demo/sdcard";
 
 fn request(operation: MountOperation, redirect_target: &str, is_mapping_mode_only: bool) -> MountRequest {
+    request_with_mappings(operation, redirect_target, is_mapping_mode_only, false)
+}
+
+fn request_with_mappings(
+    operation: MountOperation,
+    redirect_target: &str,
+    is_mapping_mode_only: bool,
+    has_path_mappings: bool,
+) -> MountRequest {
     MountRequest {
         operation,
         package_name: "com.demo".to_string(),
         redirect_target: redirect_target.to_string(),
+        path_mappings: if has_path_mappings {
+            vec!["Download/SrtProbe -> Download/Test".to_string()]
+        } else {
+            Vec::new()
+        },
         is_mapping_mode_only,
     }
 }
@@ -276,6 +291,20 @@ fn main() {
         should_keep_reload_redirect_root(
             "/storage/emulated/0",
             &request(MountOperation::Reload, SANDBOX_TARGET, true),
+            &no_scoped_roots,
+            Some(("/dev/block/dm-60", "/media/0/Android/data/com.demo/sdcard")),
+        ),
+        false,
+    );
+
+    // 默认重定向切换到 path_mappings：即使旧沙箱根与 redirect_target 一致，也必须摘除
+    // 重建；新映射子树需要在新根上物化，不能与旧根层叠放。
+    check(
+        &mut failures,
+        "reload_path_mapping_not_kept",
+        should_keep_reload_redirect_root(
+            "/storage/emulated/0",
+            &request_with_mappings(MountOperation::Reload, SANDBOX_TARGET, false, true),
             &no_scoped_roots,
             Some(("/dev/block/dm-60", "/media/0/Android/data/com.demo/sdcard")),
         ),

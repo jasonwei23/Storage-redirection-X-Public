@@ -357,6 +357,10 @@ pub(super) fn repair_monitored_backend_owner(
     if !crate::metadata_repair::enabled() {
         return;
     }
+    if source == "private_category_owner" {
+        repair_private_category_owner(backend_path);
+        return;
+    }
     if source == "public_owner" {
         repair_public_directory_owner(display_path, backend_path);
         return;
@@ -558,6 +562,18 @@ fn chown_android_private_path_if_needed(
         return;
     }
     let st = unsafe { st.assume_init() };
+    // 最近修改过的普通文件正在被写入（MP FUSE / passthrough 会话中），此时
+    // chown 会触发 attr 失效并打断写入方的 fsync/close（真机 CI 2026-10-18
+    // 场景 34 close EPERM 实证）：跳过这类文件；目录无 passthrough 风险照修。
+    if st.st_mode & libc::S_IFMT as mode_t == libc::S_IFREG as mode_t {
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|duration| duration.as_millis() as i64)
+            .unwrap_or(0);
+        if now_ms - st.st_mtime * 1000 < 60_000 {
+            return;
+        }
+    }
     if st.st_uid == owner_uid as u32 && st.st_gid == MEDIA_RW_GID {
         chmod_android_private_path_if_needed(&c_path, path, &st, owner_package, private_root);
         return;
@@ -660,6 +676,183 @@ pub(super) fn path_is_same_or_child(path: &str, root: &str) -> bool {
     paths::is_same_or_child(path, root)
 }
 
+/// daemon 消费 MP hook 的属主代修请求（OwnerFix 通道）：backend_path 形如
+/// `/data/media/<user>/Android/{data,media,obb}/<pkg>/...`。
+///
+/// MP 等普通 uid 进程无 CAP_CHOWN，进程内 lchown 对非自身属主必然 EPERM
+/// （真机 2026-10-18 实证 media.module 全链 denied）；daemon 以 root 执行，
+/// 在此重新校验路径形态并推导应用 uid——不信任请求方提供的任何 uid 信息，
+/// 伪造请求最多让某应用私有树被修回其应用 uid，与正常修复等价，无提权面。
+/// 修复范围 = 请求路径向上到包根的父链 + 请求路径自身（树内子项不动，避免
+/// 被伪造请求放大扫描量）。
+pub(crate) fn repair_requested_backend_owner(backend_path: &str) {
+    if !crate::metadata_repair::enabled() || backend_path.is_empty() {
+        return;
+    }
+    let storage_path = paths::data_media_to_storage_path(&paths::normalize(backend_path));
+    let owner_package = paths::extract_android_private_path_owner(&storage_path);
+    if owner_package.is_empty()
+        || policy::is_media_intermediate_package(&owner_package)
+        || policy::is_system_writer_package(&owner_package)
+    {
+        return;
+    }
+    let user_id = paths::extract_user_id_from_storage_path(&storage_path);
+    if user_id < 0 {
+        return;
+    }
+    let owner_uid = policy::get_fresh_uid_for_package(&owner_package);
+    if owner_uid < ANDROID_APP_UID_START || platform::user_id_from_uid(owner_uid) != user_id {
+        return;
+    }
+    let Some(private_root) =
+        paths::android_private_data_media_root(&storage_path, &owner_package, user_id)
+    else {
+        return;
+    };
+    let scope = AndroidPrivateOwnerRepairScope {
+        backend_root: private_root,
+        owner_uid,
+        owner_package,
+    };
+    repair_backend_owner_in_scope(&scope, backend_path);
+}
+
+/// daemon 消费应用启动扫描请求（OwnerScan 通道）：对刚启动的包做 detached
+/// 全树属主修复。
+///
+/// 未开启重定向的应用没有挂载应答流程，attach/全树修复都不会被触发（真机
+/// 2026-10-18 反馈：开机后未打开的应用属主保持 1023）；post_app_specialize
+/// 对每个被注入的进程补发本请求，daemon 在此重新校验包名与 uid 后复用
+/// detached 全树修复（内含每小时去重标记，重复请求廉价）。
+pub(crate) fn spawn_full_repair_for_package(package_name: &str) {
+    if !crate::metadata_repair::enabled()
+        || package_name.is_empty()
+        || package_name.contains('/')
+        || policy::is_media_intermediate_package(package_name)
+        || policy::is_system_writer_package(package_name)
+    {
+        return;
+    }
+    let owner_uid = policy::get_fresh_uid_for_package(package_name);
+    if owner_uid < ANDROID_APP_UID_START {
+        return;
+    }
+    let user_id = platform::user_id_from_uid(owner_uid);
+    if user_id < 0 {
+        return;
+    }
+    crate::metadata_repair::spawn_detached_full_owner_repair(package_name, user_id);
+}
+
+/// 应用退出重定向（Disable）时的属主交接修复。
+///
+/// 关闭重定向意味着模块要把存储视图交还原生 FUSE：原生模型要求应用私有子树
+/// 属主是应用 uid，而重定向开启期可能留下属主为 media_rw 的条目（系统代写、
+/// 旧版本损伤）。交还前就地修干净，应用关掉重定向的瞬间即可正常读写存档，
+/// 不必等类别 watch 事件。预算按树独立，超支部分由 daemon 代修兜底。
+pub(crate) fn repair_app_private_owners(package_name: &str, user_id: i32) -> usize {
+    if !crate::metadata_repair::enabled() || package_name.is_empty() || user_id < 0 {
+        return 0;
+    }
+    if policy::is_media_intermediate_package(package_name)
+        || policy::is_system_writer_package(package_name)
+    {
+        return 0;
+    }
+    let owner_uid = policy::get_fresh_uid_for_package(package_name);
+    if owner_uid < ANDROID_APP_UID_START {
+        return 0;
+    }
+    let mut repaired = 0usize;
+    for kind in ["data", "media", "obb"] {
+        // 预算按 kind 独立（与 attach 修复同因）：共享预算会让 data 树的
+        // cache 积累吃光额度，media/obb 树在入口即被跳过。
+        let mut kind_visited = 0usize;
+        let root = format!("/data/media/{user_id}/Android/{kind}/{package_name}");
+        if !std::path::Path::new(&root).is_dir() {
+            continue;
+        }
+        repaired += crate::metadata_repair::repair_media_rw_owner_tree(
+            &root,
+            owner_uid,
+            package_name,
+            crate::metadata_repair::OWNER_SWEEP_ENTRY_BUDGET,
+            &mut kind_visited,
+            u32::MAX,
+            0,
+        );
+    }
+    if repaired > 0 {
+        log::warn!(
+            "daemon disable owner repair pkg={} uid={} entries={}",
+            package_name,
+            owner_uid,
+            repaired
+        );
+    }
+    repaired
+}
+
+/// 类别级私有属主事件的修复入口：backend_path 形如
+/// `/data/media/<user>/Android/<data|media|obb>/<pkg>`。
+///
+/// 只在包目录存在、是目录且属主精确等于 media_rw 时修复（这正是损坏形态：
+/// 正常状态下包目录属主是应用 uid，组才是 media_rw/ext_data_rw）。应用未安装
+/// 或 uid 无法解析的陈旧目录不动。watch 登记时的存量检查与运行期 IN_ATTRIB /
+/// IN_CREATE / IN_MOVED_TO 事件都走这里。
+fn repair_private_category_owner(backend_path: &str) {
+    let mut parts = backend_path.split('/').filter(|part| !part.is_empty());
+    // 形状校验：…/Android/<kind>/<pkg>，防止其它来源的事件误入。
+    let Some(package_name) = parts.next_back() else {
+        return;
+    };
+    let Some(kind) = parts.next_back() else {
+        return;
+    };
+    if !matches!(kind, "data" | "media" | "obb") || parts.next_back() != Some("Android") {
+        return;
+    }
+    // 倒数第四段必须是用户号（纯数字）：把类别目录自身（…/Android/<kind>）挡在外面。
+    let Some(user_segment) = parts.next_back() else {
+        return;
+    };
+    if user_segment.is_empty() || !user_segment.bytes().all(|byte| byte.is_ascii_digit()) {
+        return;
+    }
+    if package_name.is_empty() || package_name.contains('/') {
+        return;
+    }
+    let Ok(meta) = std::fs::symlink_metadata(backend_path) else {
+        return;
+    };
+    if !meta.is_dir() || meta.uid() != MEDIA_RW_UID {
+        return;
+    }
+    if policy::is_media_intermediate_package(package_name)
+        || policy::is_system_writer_package(package_name)
+    {
+        return;
+    }
+    let owner_uid = policy::get_fresh_uid_for_package(package_name);
+    if owner_uid < ANDROID_APP_UID_START {
+        return;
+    }
+    let mut visited = 0usize;
+    crate::metadata_repair::repair_media_rw_owner_tree(
+        backend_path,
+        owner_uid,
+        package_name,
+        crate::metadata_repair::OWNER_SWEEP_ENTRY_BUDGET,
+        &mut visited,
+        u32::MAX,
+        60_000,
+    );
+}
+
+// 把目录树里属主为 media_rw 的条目修回应用 uid 的实现已下沉到
+// crate::metadata_repair::repair_media_rw_owner_tree（lib/bin 共享，
+// companion mount 路径也需要调用）；本侧调用统一转发。
 fn raw_parent(path: &str) -> String {
     if path.is_empty() || path == "/" {
         return path.to_string();

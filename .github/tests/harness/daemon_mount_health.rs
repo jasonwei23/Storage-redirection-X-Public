@@ -27,6 +27,7 @@ mod platform {
         // 数据类型的副本（非匹配实现）：字段与 src/platform/mountinfo.rs 一致。
         pub struct MountInfoEntry<'a> {
             pub mount_id: u64,
+            pub parent_mount_id: u64,
             pub root: &'a str,
             pub target: &'a str,
             pub fs_type: &'a str,

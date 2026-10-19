@@ -400,9 +400,22 @@ fn plan_batch_mode_tag(mode: &ReconcileMode) -> u8 {
 #[derive(Default)]
 struct ReconcileCursor {
     last_attempted: Option<ReconcilePlanIdentity>,
-    /// 本触发周期首个尝试的计划身份：轮转绕回该位置即判定周期已排空，
-    /// 让未完成批次收口，避免永续 ~1Hz 续跑轮询。
+    /// 本触发周期首个尝试的计划身份。
+    ///
+    /// 仅供诊断与旧收口判据兜底保留；真正的收口判定已改由下面的
+    /// `cycle_attempted`（回到已尝试过的计划即排空）承担。
     cycle_head: Option<ReconcilePlanIdentity>,
+    /// 本周期内已被尝试执行的计划身份集合。
+    ///
+    /// 轮转回到已尝试过的计划，说明本轮触发要处理的计划都已尝试过一次，周期应当收口。
+    /// 判定点还要求本轮没有任何计划被批次限流延后（`deferred == 0`）——被延后的计划
+    /// 从未尝试过，绕回命中时它们仍待处理，此时收口等于把工作推给下一个触发周期。
+    /// 只比对「周期头位置」的旧判据（`next_index <= head_index`）在周期头不在计划数组
+    /// 末尾时永远不成立：绕回后执行周期头得到 `head+1`，恒大于 `head_index`，周期永不
+    /// 收口，`pending_full_reconcile` 恒为真，主循环退化为 200ms 永续续跑。真机实测
+    /// 表现为全部已挂载应用每 2~3 秒被卸载重建一次（20 秒 64 次重挂、45 分钟零次
+    /// `cycle drained`）。改为「回到已尝试集合即收口」后判定与轮转位置无关。
+    cycle_attempted: HashSet<ReconcilePlanIdentity>,
     /// 本周期内已被监督判定拒绝注入的计划。
     ///
     /// 监督拒绝（skip_superseded / refuse_poisoned 等）是账本状态型结论，
@@ -469,7 +482,20 @@ impl ReconcileCursor {
         if self.cycle_head.is_none() {
             self.cycle_head = Some(identity.clone());
         }
+        self.cycle_attempted.insert(identity.clone());
         self.last_attempted = Some(identity);
+    }
+
+    /// 本周期是否已尝试过该计划。
+    fn attempted_in_cycle(&self, plan: &ReconcilePlan) -> bool {
+        self.cycle_attempted.contains(&plan.identity())
+    }
+
+    /// 结束本周期：清空周期头、已尝试集合与拒绝集合。
+    fn close_cycle(&mut self) {
+        self.cycle_head = None;
+        self.cycle_attempted.clear();
+        self.cycle_refused.clear();
     }
 }
 
@@ -616,6 +642,23 @@ pub fn main_entry() -> i32 {
             BOOT_PRE_REGISTER_PENDING.store(false, Ordering::Release);
             log::warn!("boot pre-register resumed: media CE key ready");
             pre_register_all_configured_apps(config, config.config_version());
+        }
+        // 消费 MP hook 的属主代修请求（OwnerFix 通道）：MP 等普通 uid 进程
+        // 进程内 lchown 必然 EPERM，由 daemon 以 root 代修。事件驱动、无轮询，
+        // 队列空时本调用是锁一次空 Vec 的廉价跳过。
+        let owner_fix_requests = crate::log_daemon::take_owner_fix_requests();
+        if !owner_fix_requests.is_empty() {
+            for backend_path in owner_fix_requests {
+                crate::daemon_monitor::repair_requested_backend_owner(&backend_path);
+            }
+        }
+        // 消费应用启动扫描请求（OwnerScan 通道）：未开启重定向的应用打开时
+        // 也获得一次 detached 全树属主修复。
+        let owner_scan_requests = crate::log_daemon::take_owner_scan_requests();
+        if !owner_scan_requests.is_empty() {
+            for package_name in owner_scan_requests {
+                crate::daemon_monitor::spawn_full_repair_for_package(&package_name);
+            }
         }
         let before = config.config_version();
         let (did_reload, changed_packages, full_change) =
@@ -906,6 +949,11 @@ fn wait_for_file_monitor_events(sync: &FileMonitorSync, monitor: &RegularAppMoni
         std::thread::sleep(Duration::from_secs(30));
         return;
     }
+    // 待裁决观察事件的到期点优先：延迟裁决最长数百毫秒，不能等 30 秒轮询。
+    let poll_timeout_ms = monitor
+        .pending_flush_delay_ms()
+        .map(|delay| delay.clamp(20, 30_000))
+        .unwrap_or(30_000);
     let mut fds = [
         libc::pollfd {
             fd: monitor.event_fd(),
@@ -918,10 +966,16 @@ fn wait_for_file_monitor_events(sync: &FileMonitorSync, monitor: &RegularAppMoni
             revents: 0,
         },
     ];
-    // inotify 是主事件源，eventfd 唤醒配置重建；30 秒超时只作为 runtime disable 的兜底。
-    // SAFETY: fds 是本栈帧上的合法 pollfd 数组，poll 只在其中写入 revents；
-    // nfds_t 转换不会截断（数组长度恒为 2）。
-    let result = unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as libc::nfds_t, 30_000) };
+    // inotify 是主事件源，eventfd 唤醒配置重建；超时兜底 runtime disable 与
+    // 延迟裁决到期（有待裁决事件时压到到期点）。
+    // SAFETY: fds 是本栈帧上的合法 pollfd 数组，poll 只在其中写入 revents；nfds_t 转换由调用方保证不截断。
+    let result = unsafe {
+        libc::poll(
+            fds.as_mut_ptr(),
+            fds.len() as libc::nfds_t,
+            poll_timeout_ms as libc::c_int,
+        )
+    };
     if result < 0 && std::io::Error::last_os_error().raw_os_error() == Some(libc::EINTR) {
         return;
     }
@@ -1237,6 +1291,7 @@ fn reconcile_running_apps(
     } else {
         0
     };
+    let mut cycle_wrapped = false;
     for offset in 0..plans.len() {
         let index = (start_index + offset) % plans.len();
         let plan = &plans[index];
@@ -1271,6 +1326,20 @@ fn reconcile_running_apps(
             skipped += 1;
             continue;
         }
+        // 轮转回到本周期已尝试过的计划：本轮触发要处理的计划都已尝试过一次，周期收口。
+        // 该判据与计划数组中的轮转位置无关，替代原先只在周期头位于数组末尾才成立的
+        // `next_index <= head_index`（详见 `cycle_attempted` 字段注释）。
+        //
+        // 必须附加「本轮没有任何计划被延后」的前提。批次限流下每轮只放行
+        // RECONCILE_BATCH_MAX_PLANS 个计划，其余全部走 deferred；此时绕回命中的
+        // 已尝试计划是上一轮放行的那一个，中间那一批只是被限流推后、从未尝试过。
+        // 只看命中与否就会在第二次绕回时误判排空，把整批未尝试的计划留到下一个
+        // 触发周期（CI 实测：planned=36 deferred=35 紧接着 cycle drained，挂载被推迟
+        // 到 30 秒兜底才补做）。带延后即说明本轮仍有未处理计划，不收口。
+        if uses_batch_cursor && deferred == 0 && cursor.attempted_in_cycle(plan) {
+            cycle_wrapped = true;
+            break;
+        }
         if !incremental_change
             && mode != ReconcileMode::Forced
             && batch_requests >= RECONCILE_BATCH_MAX_PLANS
@@ -1303,13 +1372,19 @@ fn reconcile_running_apps(
             skipped += 1;
             continue;
         }
-        match plan.request.operation {
+        let operation = plan.request.operation;
+        let had_mount_state = plan.has_mount_state;
+        match operation {
             MountOperation::Reload => {
                 if execute_mount_request(&plan.request) {
-                    if !plan.has_mount_state && has_mount_state(&plan.request) {
+                    if !had_mount_state && has_mount_state(&plan.request) {
                         crate::runtime_stats::record_runtime_activation();
                     }
                     applied += 1;
+                    // 执行成功即把计划标记为已落地：续跑轮复用同一批计划对象，
+                    // `is_mount_current` 若不更新就会保留枚举时的旧值，让同一计划在
+                    // 本周期内被反复卸载重建（真机实测单 pid 代际每 2~3 秒 +1）。
+                    plans[index].mark_settled(operation);
                 } else if uses_batch_cursor {
                     // 执行失败的计划登记进周期拒绝集合：永久性失败（如 OEM 内核
                     // 拒绝沙盒目录 mkdir，真机实测一台设备 10+ 应用全部失败）若
@@ -1321,9 +1396,11 @@ fn reconcile_running_apps(
                 }
             }
             MountOperation::Disable => {
-                if plan.has_mount_state {
+                if had_mount_state {
                     if execute_mount_request(&plan.request) {
                         disabled += 1;
+                        // 卸载成功后挂载状态已消失，同步清掉，避免续跑轮重复卸载。
+                        plans[index].mark_settled(operation);
                     } else if uses_batch_cursor {
                         cursor.cycle_refused.insert(plan.identity());
                     }
@@ -1337,11 +1414,23 @@ fn reconcile_running_apps(
     // 周期完成判定：批次限流只保证「不阻塞主循环」，不能成为永续轮询的理由。
     // 未配置或被监督拒绝的计划既不 applied 也不 current，deferred 永远不归零——
     // 此前这让 pending 长期为真，主循环以约 1Hz 每轮全量扫 /proc 无限续跑。判据：
-    // 游标轮转已绕回本周期首个尝试计划的位置（或更早），说明本轮触发要处理的
-    // 计划都已被尝试过一次，本周期收口；被拒绝的计划等下一次真实触发（配置、
-    // 宿主、控制事件或 30 秒周期兜底）再进队。执行失败的计划同样登记进拒绝集合，绕回收口后会在新周期里再得到一次尝试。
+    // 本周期内已尝试过的计划被再次命中（轮转绕回），说明本轮触发要处理的计划都已
+    // 被尝试过一次，本周期收口；被拒绝的计划等下一次真实触发（配置、宿主、控制事件
+    // 或 30 秒周期兜底）再进队。执行失败的计划同样登记进拒绝集合，绕回收口后会在
+    // 新周期里再得到一次尝试。
     let plans_len = plans.len();
-    if incomplete_from_batch {
+    if cycle_wrapped {
+        log::info!(
+            "daemon reconcile cycle drained planned={} deferred={} — rest until next event",
+            plans_len,
+            deferred
+        );
+        incomplete_from_batch = false;
+        cursor.close_cycle();
+        // 批次排空即静息：立即把突发期间滞留的分配器空闲页归还内核，
+        // 不等下一个节流窗口。
+        crate::platform::allocator::release_free_pages();
+    } else if incomplete_from_batch {
         if let Some(head) = cursor.cycle_head.clone() {
             let next_index = cursor.next_start_index(&identities);
             let head_index = cursor.position_of(&identities, &head);
@@ -1352,8 +1441,7 @@ fn reconcile_running_apps(
                     deferred
                 );
                 incomplete_from_batch = false;
-                cursor.cycle_head = None;
-                cursor.cycle_refused.clear();
+                cursor.close_cycle();
                 // 批次排空即静息：立即把突发期间滞留的分配器空闲页归还内核，
                 // 不等下一个节流窗口。
                 crate::platform::allocator::release_free_pages();
@@ -1361,8 +1449,7 @@ fn reconcile_running_apps(
         }
     } else {
         // 本轮没有任何批次限流（所有计划都已处理），周期自然结束。
-        cursor.cycle_head = None;
-        cursor.cycle_refused.clear();
+        cursor.close_cycle();
     }
     if incomplete_from_batch {
         // 周期仍在进行：把本轮计划批次放回缓存，续跑轮直接复用，不再重复
@@ -1439,6 +1526,21 @@ impl ReconcilePlan {
 
     fn should_run_in_missing_only(&self) -> bool {
         self.request.operation == MountOperation::Reload && !self.has_mount_state
+    }
+
+    /// 计划已被本轮执行落地：续跑轮复用同一批计划对象，必须就地更新判定字段，
+    /// 否则枚举时的旧值会让同一计划在周期内被反复卸载重建。
+    fn mark_settled(&mut self, operation: MountOperation) {
+        match operation {
+            MountOperation::Reload => {
+                self.is_mount_current = true;
+                self.has_mount_state = true;
+            }
+            MountOperation::Disable => {
+                self.is_mount_current = false;
+                self.has_mount_state = false;
+            }
+        }
     }
 
     /// 幂等跳过：该应用的挂载已按当前配置建立，重挂只会叠加挂载层。
@@ -1613,16 +1715,33 @@ fn register_policy_for_pid_token(token: &str, config_version: u64) {
         log::warn!("register-policy token invalid token={}", token);
         return;
     };
-    let Some(proc) = list_app_processes()
+    let proc = match list_app_processes()
         .into_iter()
         .find(|proc| proc.pid == pid && proc.package_name == package_name)
-    else {
-        log::debug!(
-            "register-policy process gone pkg={} pid={}",
-            package_name,
-            pid
-        );
-        return;
+    {
+        Some(proc) => proc,
+        None => {
+            // companion 在 specialize 早期就发 token，此时进程尚未 setArgV0，
+            // /proc/<pid>/cmdline 还是 zygote——按 cmdline 匹配必然 miss（真机实测：
+            // token 秒达时 100% 命中这条路径）。token 本身来自模块注入的可信通道，
+            // 包名与 pid 语义以 token 为准，这里只从 status 复核 uid 归属即可。
+            match read_process_status(pid) {
+                Some((uid, _)) if uid >= ANDROID_APP_UID_START => AppProcess {
+                    pid,
+                    uid,
+                    package_name: package_name.to_string(),
+                    is_uninterruptible: false,
+                },
+                _ => {
+                    log::debug!(
+                        "register-policy process gone pkg={} pid={}",
+                        package_name,
+                        pid
+                    );
+                    return;
+                }
+            }
+        }
     };
     if should_skip_process(&proc) {
         return;

@@ -20,6 +20,25 @@ static NAMESPACE_POLICY_MISSES: AtomicU64 = AtomicU64::new(0);
 static RECENT_MONITOR_CREATES: Lazy<Mutex<HashMap<String, i64>>> =
     Lazy::new(|| Mutex::new(HashMap::new()));
 
+/// 跨应用只读别名兜底的会话表句柄：共享宿主进程内所有已登记应用的策略。
+///
+/// 由 [`SharedPolicyTable::register`] 首次按 uid 登记时挂入，始终指向同一份活表，
+/// 应用策略的新增与覆盖对兜底解析即时可见。scoped 独立会话进程不经过按 uid 登记，
+/// 表中「其它应用」集合为空，跨应用兜底自然不生效，行为与改动前一致。
+static CROSS_SESSION_POLICY_TABLE: Lazy<Mutex<Option<SharedPolicyTable>>> =
+    Lazy::new(|| Mutex::new(None));
+
+/// 跨应用只读别名兜底的交接信号窗口与容量。
+///
+/// 应用 A 通过 FileProvider 等机制把 fd 交给应用 B 之前，必须先在自己的 FUSE 会话里
+/// 以映射视图路径打开同一个文件；这条访问记录就是「B 正被 A 调用」的唯一可观测等价
+/// 信号（FUSE 层看不到 intent/binder 调用链）。窗口取 60 秒：交接在毫秒级完成，
+/// 窗口只用于吸收 B 侧多轮探测与重试的间隔；容量上限防止长会话进程内无界增长。
+const CROSS_APP_HANDOFF_TTL_MS: i64 = 60_000;
+const CROSS_APP_HANDOFF_CAPACITY: usize = 256;
+static RECENT_CROSS_APP_HANDOFFS: Lazy<Mutex<HashMap<String, i64>>> =
+    Lazy::new(|| Mutex::new(HashMap::new()));
+
 pub(super) struct BackendPath {
     pub(super) rel: String,
     pub(super) path: PathBuf,
@@ -211,6 +230,11 @@ impl SharedPolicyTable {
         let mut table = self.by_uid.write().ok()?;
         table.insert(uid, Arc::clone(&policy));
         drop(table);
+        // 首次按 uid 登记时把活表句柄挂入进程级静态：跨应用只读别名兜底从这份表
+        // 派生「其它应用的映射规则」。重复赋值无副作用，句柄内的 Arc 指向同一份表。
+        if let Ok(mut handle) = CROSS_SESSION_POLICY_TABLE.lock() {
+            *handle = Some(self.clone());
+        }
         if let Some(namespace) = namespace {
             let mut namespaces = self.by_namespace.0.write().ok()?;
             namespaces.insert(namespace, Arc::clone(&policy));
@@ -552,16 +576,52 @@ impl RedirectPolicy {
         let storage_path = self.storage_path_for_rel(&rel);
         let resolved_storage_path = paths::normalize(&storage_path);
         let decision = self.backend_decision(&resolved_storage_path, operation);
+        let own_mapping_target = self.resolve_mapping(&resolved_storage_path);
+        if own_mapping_target.is_some() {
+            // 本应用经自身映射访问了该视图路径：登记交接信号。应用随后通过
+            // FileProvider 等机制把该路径交给其它应用时，对方会话可以据此在
+            // 窗口内完成跨应用只读解析（见下方跨应用别名兜底）。
+            record_own_mapped_handoff(&resolved_storage_path);
+        }
         let mut backend = match decision.kind {
-            BackendKind::Real => {
-                if let Some(mapped_target) = self.resolve_mapping(&resolved_storage_path) {
-                    self.backend_path_for_storage(&mapped_target, BackendKind::Real)?
-                } else {
-                    self.real_backend_for_rel(&rel)
+            BackendKind::Real => match &own_mapping_target {
+                Some(mapped_target) => {
+                    self.backend_path_for_storage(mapped_target, BackendKind::Real)?
                 }
-            }
+                None => self.real_backend_for_rel(&rel),
+            },
             BackendKind::Redirect => self.redirect_backend_for_rel(&rel),
         };
+
+        // 跨应用只读别名兜底：应用 A 把自身映射视图形态的文件路径交给应用 B 时
+        // （fd 的 d_path 保留 A 会话里的视图名），B 的会话没有 A 的映射规则，按该
+        // 路径的 stat/open 全部落 ENOENT（真机：夸克把 QuarkDownloads 下的 APK 交给
+        // R-安装，安装器读不到元数据，安装面板信息空白但安装本身走 fd 流不受影响）。
+        // 这里在 B 的 Read 未命中真实后端时，以「A 最近经自身映射访问过同一路径或
+        // 其祖先」为门控信号，按 A 的映射规则换算出真实后端路径完成只读解析：
+        // - 写操作、目录列举候选集、自身映射命中与真实存在的路径都不受影响；
+        // - 门控不命中时本分支零动作，无关应用拼出的视图路径依旧 ENOENT，与改动
+        //   前完全一致；即便信号在窗口内，能读到的也只是真实后端上本就可见的内容。
+        if matches!(operation, OperationKind::Read)
+            && decision.kind == BackendKind::Real
+            && own_mapping_target.is_none()
+            && has_recent_cross_app_handoff(&resolved_storage_path)
+            && !backend.exists()
+            && let Some(alias_target) = self.resolve_cross_app_read_alias(&resolved_storage_path)
+            && let Some(alias_backend) =
+                self.backend_path_for_storage(&alias_target, BackendKind::Real)
+            && alias_backend.exists()
+        {
+            log::debug!(
+                "fuse cross-app alias read pkg={} uid={} path={} alias={} fp={:016x}",
+                self.package_name,
+                self.uid,
+                resolved_storage_path,
+                alias_backend.display(),
+                self.fingerprint
+            );
+            backend = alias_backend;
+        }
 
         // 分享应用传递的文件路径时，目标应用的 scoped FUSE 仍会套用自身的
         // sandboxed_paths。若发送方文件尚未在目标应用沙箱中建立同名副本，目标
@@ -609,6 +669,45 @@ impl RedirectPolicy {
             }
         }
         None
+    }
+
+    /// 在其它已登记应用策略的映射里解析跨应用只读别名目标。
+    ///
+    /// 遍历宿主进程按 uid 策略表中**其它应用**的 `path_mappings`，取请求侧命中的
+    /// 最长规则换算目标路径；无匹配返回 `None`。调用方必须已确认 Read 兜底前提
+    /// （自身映射未命中、真实后端不存在、交接信号在窗口内）。
+    fn resolve_cross_app_read_alias(&self, storage_path: &str) -> Option<String> {
+        let guard = CROSS_SESSION_POLICY_TABLE.lock().ok()?;
+        let table = guard.as_ref()?;
+        let by_uid = table.by_uid.read().ok()?;
+        let mut matched: Option<(&PathMapping, usize)> = None;
+        for (uid, policy) in by_uid.iter() {
+            if *uid == self.uid as u32 {
+                continue;
+            }
+            for mapping in &policy.path_mappings {
+                if !paths::matches(&mapping.request_path, storage_path, true) {
+                    continue;
+                }
+                let request_len = mapping.request_path.len();
+                let is_longer = match &matched {
+                    Some((_, best_len)) => request_len > *best_len,
+                    None => true,
+                };
+                if is_longer {
+                    matched = Some((mapping, request_len));
+                }
+            }
+        }
+        let (mapping, _) = matched?;
+        let Some(suffix) = paths::child_suffix(storage_path, &mapping.request_path) else {
+            return Some(mapping.final_path.clone());
+        };
+        Some(format!(
+            "{}{}",
+            mapping.final_path.trim_end_matches('/'),
+            suffix
+        ))
     }
 
     fn is_read_only(&self, storage_path: &str) -> bool {
@@ -1129,6 +1228,67 @@ impl RedirectPolicy {
             return false;
         };
         !is_android_app_private_relative_path(relative)
+    }
+}
+
+/// 登记本应用经自身映射访问过的视图路径，供跨应用只读别名兜底做交接门控。
+///
+/// 应用 A 通过 FileProvider 把 fd 交给应用 B 之前，必须先在自己的 FUSE 会话里以
+/// 映射视图路径打开同一个文件；这条访问记录就是「B 正被 A 调用」的唯一可观测
+/// 等价信号（FUSE 层看不到 intent/binder 调用链）。记录按精确路径写入，A 侧的
+/// 组件级解析会自然把祖先目录一并登记；消费侧（[`has_recent_cross_app_handoff`]）
+/// 再沿祖先链回溯匹配。
+fn record_own_mapped_handoff(storage_path: &str) {
+    let key = paths::match_key(storage_path);
+    let Ok(mut handoffs) = RECENT_CROSS_APP_HANDOFFS.lock() else {
+        return;
+    };
+    let now = paths::monotonic_ms();
+    handoffs.insert(key, now);
+    if handoffs.len() <= CROSS_APP_HANDOFF_CAPACITY {
+        return;
+    }
+    handoffs.retain(|_, at| now - *at < CROSS_APP_HANDOFF_TTL_MS);
+    if handoffs.len() <= CROSS_APP_HANDOFF_CAPACITY {
+        return;
+    }
+    // 容量兜底：全部未过期时驱逐最旧一条，避免长会话进程内无界增长。
+    if let Some(oldest) = handoffs
+        .iter()
+        .min_by_key(|(_, at)| **at)
+        .map(|(key, _)| key.clone())
+    {
+        handoffs.remove(&oldest);
+    }
+}
+
+/// 是否存在近窗口内其它应用经自身映射访问过该路径或其祖先的交接信号。
+///
+/// 沿祖先链回溯是必须的：FUSE LOOKUP 按组件逐级解析，A 交给 B 的是完整文件路径，
+/// 但 B 的会话要先解析 `QuarkDownloads`、`CloudDrive` 等中间目录才能走到文件。
+fn has_recent_cross_app_handoff(storage_path: &str) -> bool {
+    let Ok(handoffs) = RECENT_CROSS_APP_HANDOFFS.lock() else {
+        return false;
+    };
+    // 空表快速路径：设备上没有任何应用经自身映射产生交接记录时，热路径上
+    // 不为每次 Read 请求构造 match_key（含一次分配）。
+    if handoffs.is_empty() {
+        return false;
+    }
+    let now = paths::monotonic_ms();
+    let mut current = storage_path.trim_end_matches('/');
+    loop {
+        if handoffs
+            .get(&paths::match_key(current))
+            .is_some_and(|at| now - *at < CROSS_APP_HANDOFF_TTL_MS)
+        {
+            return true;
+        }
+        match current.rfind('/') {
+            // 只在还有父目录时继续回溯；根路径（rfind == 0）与无分隔符路径终止。
+            Some(pos) if pos > 0 => current = &current[..pos],
+            _ => return false,
+        }
     }
 }
 

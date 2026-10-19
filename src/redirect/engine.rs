@@ -652,6 +652,15 @@ fn resolve_anonymous_owner_hints(
     }
 }
 
+/// 查询路径落在某应用映射请求侧（或其映射目标）时返回该应用包名。
+///
+/// 供查询回退在没有「同线程近期写过」信号时按路径直接确定归属：MediaProvider 的
+/// FuseDaemon 在冷 LOOKUP/stat 请求侧子树时不会先发生写操作，只有路径本身能证明
+/// 该路径属于哪个应用的映射视图。
+pub fn resolve_mapping_request_owner_for_path(user_id: i32, normalized_path: &str) -> String {
+    caller::resolve_mapping_request_owner_package_by_path(user_id, normalized_path)
+}
+
 pub fn record_redirect_hit(hub: &InterceptHub, op_name: &str, from_path: &str, to_path: &str) {
     log::trace!("{}: {} -> {}", op_name, from_path, to_path);
     hub.increment_total_redirected();

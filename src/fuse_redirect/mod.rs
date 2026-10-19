@@ -615,11 +615,24 @@ impl FuseRedirectFs {
     }
 
     fn open_backend_file(path: &Path, flags: i32, mode: u32) -> Result<File, Errno> {
+        // FUSE writeback 回写模式下的部分页写，内核要先读原页（read-modify-write），
+        // 该读仍由本 daemon 应答。backend 若照搬应用的 O_WRONLY 打开，pread 会返回
+        // EBADF，内核 write_begin 失败后在应用侧呈现为诡异的 pwrite 短写（夸克下载
+        // 引擎的 TNet 日志与下载目标都是 O_WRONLY，短写让其进入重建文件死循环）。
+        // daemon 以自身权限打开 backend，写意图一律升级为 O_RDWR；O_PATH 打开保持
+        // 原样（其 fd 不可读写是内核语义，升级反而破坏路径探测）。
+        let mut backend_flags = flags | libc::O_CLOEXEC;
+        if backend_flags & libc::O_PATH == 0 && backend_flags & libc::O_ACCMODE != libc::O_RDONLY {
+            backend_flags = (backend_flags & !libc::O_ACCMODE) | libc::O_RDWR;
+        }
         let c_path = cstring_path(path)?;
-        let fd = unsafe { libc::open(c_path.as_ptr(), flags | libc::O_CLOEXEC, mode) };
+        // SAFETY: c_path 是合法的 NUL 结尾字符串，backend_flags/mode 为整数参数，
+        // open 只在失败时返回 -1，成功返回的 fd 由 File 接管所有权。
+        let fd = unsafe { libc::open(c_path.as_ptr(), backend_flags, mode) };
         if fd < 0 {
             Err(errno_from_code(last_errno()))
         } else {
+            // SAFETY: fd 刚由 open 成功返回且未被其它对象接管，转移给 File 独占管理。
             Ok(unsafe { File::from_raw_fd(fd) })
         }
     }

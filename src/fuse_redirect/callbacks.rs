@@ -38,7 +38,7 @@ use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::FileExt;
 use std::path::Path;
 use std::sync::Arc;
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Instant, SystemTime};
 
 /// sqlite `-shm` 边车的最小合法尺寸（一个 wal-index 区域）。
@@ -62,6 +62,12 @@ const SQLITE_SHM_MIN_SIZE_BYTES: u64 = 32 * 1024;
 /// 失效该名称，供管理器等经 MP FUSE 的读取方保持一致），再删 f2fs 真实文件兜底
 /// （保证毒化数据消失）——与人工删除 shm 的治愈路径一致。对任何消费方都无损：
 /// 文件内容本就是无效垃圾，SQLite 下次打开会从 `-wal` 重建 wal-index。
+///
+/// 满尺寸（≥32KiB）的 `-shm` 也可能毒化：wal-index 头 salt 与同级 `-wal` 文件头
+/// 失配（跨 FUSE 视图 inode 分裂、异常会话残留）。SQLite 信任已初始化的 shm 头
+/// 而不复查 `-wal` 文件，会把未 checkpoint 的 WAL 数据整体判无效，应用静默回滚到
+/// 旧检查点（跨应用共享库掉登录），随后的写入覆写 WAL 造成不可逆数据丢失。此类
+/// 毒化按 [`sqlite_shm_wal_index_stale`] 内容级判定，删除同样无损。
 fn heal_poisoned_sqlite_shm_backend(
     user_id: i32,
     view_root: Option<&Path>,
@@ -77,7 +83,12 @@ fn heal_poisoned_sqlite_shm_backend(
         return false;
     }
     let size = metadata.len();
-    if size == 0 || size >= SQLITE_SHM_MIN_SIZE_BYTES {
+    if size == 0 {
+        return false;
+    }
+    let stale_wal_index =
+        size >= SQLITE_SHM_MIN_SIZE_BYTES && sqlite_shm_wal_index_stale(&real_path);
+    if size >= SQLITE_SHM_MIN_SIZE_BYTES && !stale_wal_index {
         return false;
     }
 
@@ -104,10 +115,11 @@ fn heal_poisoned_sqlite_shm_backend(
 
     if removed_real || removed_view {
         log::info!(
-            "fuse sqlite shm poisoned backend removed real={} view={} size={} pkg={} rel={}",
+            "fuse sqlite shm poisoned backend removed real={} view={} size={} stale_wal_index={} pkg={} rel={}",
             removed_real,
             removed_view,
             size,
+            stale_wal_index,
             package_name,
             rel
         );
@@ -115,14 +127,110 @@ fn heal_poisoned_sqlite_shm_backend(
     }
     let errno = last_errno();
     log::warn!(
-        "fuse sqlite shm poisoned backend unlink failed errno={} {} size={} pkg={} rel={}",
+        "fuse sqlite shm poisoned backend unlink failed errno={} {} size={} stale_wal_index={} pkg={} rel={}",
         errno,
         crate::platform::errno::text(errno),
         size,
+        stale_wal_index,
         package_name,
         rel
     );
     false
+}
+
+/// 由 `-shm` 边车路径推出同级 `-wal` 路径：后缀按小写不敏感识别，替换为小写
+/// `-wal`，库名主干保持原样。
+fn sqlite_sidecar_wal_path(shm_path: &Path) -> Option<std::path::PathBuf> {
+    let file_name = shm_path.file_name()?.to_str()?;
+    let lower = file_name.to_ascii_lowercase();
+    let stem_len = lower.len().checked_sub("-shm".len())?;
+    if stem_len == 0 || !lower.ends_with("-shm") {
+        return None;
+    }
+    let mut wal_path = shm_path.to_path_buf();
+    wal_path.set_file_name(std::ffi::OsString::from(format!(
+        "{}-wal",
+        &file_name[..stem_len]
+    )));
+    Some(wal_path)
+}
+
+/// 读取文件前 `len` 字节；文件不足 `len` 字节或不可读时返回 `None`。
+fn read_file_prefix(path: &Path, len: usize) -> Option<Vec<u8>> {
+    use std::io::Read;
+    let mut file = File::open(path).ok()?;
+    let mut buf = vec![0u8; len];
+    file.read_exact(&mut buf).ok()?;
+    Some(buf)
+}
+
+/// 满尺寸 `-shm` 的内容级毒化判定：wal-index 头与同级 `-wal` 文件头 salt 失配。
+///
+/// SQLite 恢复 wal-index 时按 `memcpy` 原样拷贝 `-wal` 文件头（大端字节模式）的
+/// 8 字节 salt 到 wal-index 头偏移 32..40，不做字节序转换，因此毒化判定用原始
+/// 字节比对即可。两者失配说明 wal-index 停留在旧一代 WAL 或来自分裂视图。
+/// `-shm` 头未初始化（isInit≠1）或 `-wal` 头缺失/魔数非法时 SQLite 自己会重建，
+/// 一律不判定为毒化，保持保守。
+fn sqlite_shm_wal_index_stale(real_shm_path: &Path) -> bool {
+    let Some(wal_path) = sqlite_sidecar_wal_path(real_shm_path) else {
+        return false;
+    };
+    let Some(shm) = read_file_prefix(real_shm_path, 48) else {
+        return false;
+    };
+    if shm[12] != 1 {
+        return false;
+    }
+    let Some(wal) = read_file_prefix(&wal_path, 32) else {
+        return false;
+    };
+    let wal_magic = u32::from_be_bytes([wal[0], wal[1], wal[2], wal[3]]);
+    if wal_magic != 0x377f_0682 && wal_magic != 0x377f_0683 {
+        return false;
+    }
+    shm[32..40] != wal[16..24]
+}
+
+/// backend 单次 pwrite 短写后被循环补写观测到的累计次数。
+static SHORT_WRITE_RECOVERED: AtomicU64 = AtomicU64::new(0);
+
+/// 把 `data` 完整写入 backend 的 `offset`，返回写入总长度（恒等于 `data.len()`）。
+///
+/// FUSE WRITE 契约：应答必须恰好等于请求字节数，否则返回错误（fuser 协议解析层
+/// 的注释同样如此声明）。backend 文件的单次 pwrite 在信号中断、或 backend 叠在
+/// 另一层受限文件系统上时可能返回短写——把短写计数原样应答会让内核把短写透传给
+/// 应用且丢失 errno（应用侧表现为诡异短写 + 陈旧 errno，夸克下载引擎视之为致命
+/// 错误进入重建文件死循环），writeback 路径则直接判 IO 失败。因此这里循环补写至
+/// 请求长度；无法推进（Ok(0)）或底层报错时返回真实 errno。
+fn write_full_at(file: &File, mut data: &[u8], mut offset: u64) -> std::io::Result<usize> {
+    let total = data.len();
+    let mut first_write = 0usize;
+    while !data.is_empty() {
+        match file.write_at(data, offset) {
+            Ok(0) => return Err(std::io::Error::from_raw_os_error(libc::ENOSPC)),
+            Ok(n) => {
+                if first_write == 0 {
+                    first_write = n;
+                }
+                data = &data[n..];
+                offset = offset.saturating_add(n as u64);
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(error) => return Err(error),
+        }
+    }
+    if first_write < total {
+        let seen = SHORT_WRITE_RECOVERED.fetch_add(1, Ordering::Relaxed) + 1;
+        if seen <= 32 || seen.is_multiple_of(1024) {
+            log::warn!(
+                "fuse write short recovered count={} want={} first_write={} end_offset={offset}",
+                seen,
+                total,
+                first_write
+            );
+        }
+    }
+    Ok(total)
 }
 
 impl Filesystem for FuseRedirectFs {
@@ -139,23 +247,44 @@ impl Filesystem for FuseRedirectFs {
             && passthrough_supported
             && !crate::config::is_fuse_passthrough_disabled();
         let stack_depth_enabled = config.set_max_stack_depth(2).is_ok();
-        let max_background_enabled = config.set_max_background(32).is_ok();
-        let congestion_enabled = config.set_congestion_threshold(24).is_ok();
-        let max_write_enabled = config.set_max_write(1024 * 1024).is_ok();
+        // 并发额度是**连接级**的，而共享宿主会话只有一条连接。曾据此推测开机风暴时额度
+        // 打满导致 fuse_get_req 排队，实测把额度提到 512/384 后该类卡死并未消失
+        // （真机 2026-10-16 三轮开机采样均仍有），说明不是队列拥塞，而是挂载子进程解析到
+        // 了连接已中止的死 FUSE 层（fc->blocked 常驻，只有 SIGKILL 能打断）。因此额度维持
+        // 原值，根因另案处理：子进程不应在 FUSE 路径上做元数据操作。
+        let max_background_enabled = config.set_max_background(128).is_ok();
+        let congestion_enabled = config.set_congestion_threshold(96).is_ok();
+        let max_write_enabled = config.set_max_write(4 * 1024 * 1024).is_ok();
+        // 内核写回缓存：小块写先落内核页缓存、按大块回传，砍掉每请求同步往返。
+        // 真机 2026-10-15：同步往返模式下 4K 写 6.9MB/s（每请求 ~550μs），远低于系统
+        // FUSE 的 353MB/s。注意 writeback_cache 不是 legacy mount data 选项（传了会
+        // EINVAL），只能在 INIT 应答里请求 FUSE_WRITEBACK_CACHE 能力位。
+        let writeback_enabled = config
+            .add_capabilities(InitFlags::FUSE_WRITEBACK_CACHE)
+            .is_ok();
+        // passthrough 必须在 INIT 应答里申请能力位，否则内核拒绝所有 backing 注册，
+        // open_backing 首败即触发会话级关闭，数据面永远走 daemon 往返（真机 2026-10-15：
+        // 大文件 1.9GB 写期间宿主会话 daemon CPU 124%，487MB/s 封顶；内核直通后大 IO
+        // 绕过 daemon，接近原生吞吐）。probe_state ok 只代表内核数据面可用，不代表
+        // 本会话协商过能力位。
+        let passthrough_negotiated =
+            passthrough_enabled && config.add_capabilities(InitFlags::FUSE_PASSTHROUGH).is_ok();
         self.passthrough_enabled
-            .store(passthrough_enabled, Ordering::Relaxed);
+            .store(passthrough_negotiated, Ordering::Relaxed);
         log::info!(
-            "fuse init pkg={} kernel_abi={} passthrough_supported={} passthrough_enabled={} probe_state={:?} passthrough_disabled_by_marker={} stack_depth={} max_background={} congestion={} max_write={}",
+            "fuse init pkg={} kernel_abi={} passthrough_supported={} passthrough_enabled={} passthrough_negotiated={} probe_state={:?} passthrough_disabled_by_marker={} stack_depth={} max_background={} congestion={} max_write={} writeback={}",
             self.policy.session().package_name,
             config.kernel_abi(),
             passthrough_supported,
             passthrough_enabled,
+            passthrough_negotiated,
             probe_state,
             crate::config::is_fuse_passthrough_disabled(),
             stack_depth_enabled,
             max_background_enabled,
             congestion_enabled,
-            max_write_enabled
+            max_write_enabled,
+            writeback_enabled
         );
         Ok(())
     }
@@ -612,7 +741,20 @@ impl Filesystem for FuseRedirectFs {
                     self.perf.record_read_buffer(n, reused);
                     reply.data(&buffer[..n]);
                 }
-                Err(error) => reply.error(errno_from_io(error)),
+                Err(error) => {
+                    // 采样错误探针：writeback 模式下内核 write_begin 的读改写失败
+                    // 会以「应用侧 pwrite 短写」呈现，这里唯一能看到失败根因。
+                    static READ_ERROR_LOGGED: AtomicU64 = AtomicU64::new(0);
+                    let seen = READ_ERROR_LOGGED.fetch_add(1, Ordering::Relaxed) + 1;
+                    if seen <= 32 || seen.is_multiple_of(1024) {
+                        log::warn!(
+                            "fuse read error count={} offset={offset} requested={requested} errno={}",
+                            seen,
+                            error.raw_os_error().unwrap_or(-1)
+                        );
+                    }
+                    reply.error(errno_from_io(error));
+                }
             }
         });
     }
@@ -659,11 +801,24 @@ impl Filesystem for FuseRedirectFs {
             };
             file
         };
-        match file.write_at(data, offset) {
+        let write_started = std::time::Instant::now();
+        match write_full_at(&file, data, offset) {
             Ok(n) => {
-                if let Some(backend) = self
-                    .path_for_ino(ino)
-                    .and_then(|rel| policy.backend_for_relative(&rel, OperationKind::Write))
+                let elapsed = write_started.elapsed();
+                if elapsed.as_millis() >= 2 {
+                    // 慢写探针：定位大块回写在 handler 侧的真实耗时（debug 级）。
+                    log::debug!(
+                        "fuse write slow us={} bytes={offset}+{}",
+                        elapsed.as_micros(),
+                        data.len()
+                    );
+                }
+                // 监视关闭时跳过 ino→路径解析与规则匹配：这是写入热路径上唯一的
+                // 额外查找链，monitor 关闭时 emit_monitor_mutation 必然早退。
+                if policy.is_file_monitor_enabled
+                    && let Some(backend) = self
+                        .path_for_ino(ino)
+                        .and_then(|rel| policy.backend_for_relative(&rel, OperationKind::Write))
                 {
                     policy.emit_monitor_mutation("write", &backend, None);
                 }

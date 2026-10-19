@@ -9,6 +9,10 @@ thread_local! {
     static CALLER_UID: Cell<i32> = const { Cell::new(-1) };
     static CALLER_TS_MS: Cell<i64> = const { Cell::new(-1) };
     static CALLER_FROM_EXTERNAL_SIGNAL: Cell<bool> = const { Cell::new(false) };
+    // 归属来自「映射请求侧路径」推断（而非外部调用方信号）。MediaProvider 的
+    // FuseDaemon 在 create/mkdir 之后用原始路径回查 attr 时没有外部调用方信号，
+    // 只有这条归属可用；查询回退必须接受它，否则映射重定向后的应答会 ENOENT。
+    static CALLER_FROM_MAPPING_REQUEST_OWNER: Cell<bool> = const { Cell::new(false) };
     static CALLER_SCOPE_STACK: RefCell<Vec<(String, i32)>> = const { RefCell::new(Vec::new()) };
     static FUSE_CALLER_UID: Cell<i32> = const { Cell::new(-1) };
     static FUSE_CALLER_UID_TS_MS: Cell<i64> = const { Cell::new(-1) };
@@ -99,6 +103,7 @@ pub fn set_current_caller_package(name: &str) {
     CALLER_PACKAGE.with(|pkg| *pkg.borrow_mut() = name.to_string());
     CALLER_TS_MS.with(|cell| cell.set(monotonic_ms()));
     CALLER_FROM_EXTERNAL_SIGNAL.with(|cell| cell.set(false));
+    CALLER_FROM_MAPPING_REQUEST_OWNER.with(|cell| cell.set(false));
 }
 
 pub fn get_current_caller_package() -> String {
@@ -109,6 +114,7 @@ pub fn set_current_caller_uid(uid: i32) {
     CALLER_UID.with(|cell| cell.set(uid));
     CALLER_TS_MS.with(|cell| cell.set(monotonic_ms()));
     CALLER_FROM_EXTERNAL_SIGNAL.with(|cell| cell.set(false));
+    CALLER_FROM_MAPPING_REQUEST_OWNER.with(|cell| cell.set(false));
 }
 
 pub fn get_current_caller_uid() -> i32 {
@@ -131,6 +137,7 @@ pub fn clear_current_caller() {
     CALLER_UID.with(|cell| cell.set(-1));
     CALLER_TS_MS.with(|cell| cell.set(-1));
     CALLER_FROM_EXTERNAL_SIGNAL.with(|cell| cell.set(false));
+    CALLER_FROM_MAPPING_REQUEST_OWNER.with(|cell| cell.set(false));
 }
 
 pub fn set_current_caller_from_external_signal(package_name: &str, uid: i32) {
@@ -144,6 +151,23 @@ pub fn is_current_caller_from_external_signal() -> bool {
     CALLER_FROM_EXTERNAL_SIGNAL.with(|cell| cell.get())
 }
 
+/// 归属来自映射请求侧路径推断时，登记调用方并标记来源。
+///
+/// 与外部调用方信号互斥：外部信号代表「确有应用在发起本次调用」，本信号代表
+/// 「本次调用的路径属于某应用的映射请求侧」。查询回退两条都接受，写路径决策
+/// 仍按原有 external 语义区分。
+pub fn set_current_caller_from_mapping_request_owner(package_name: &str, uid: i32) {
+    CALLER_PACKAGE.with(|pkg| *pkg.borrow_mut() = package_name.to_string());
+    CALLER_UID.with(|cell| cell.set(uid));
+    CALLER_TS_MS.with(|cell| cell.set(monotonic_ms()));
+    CALLER_FROM_EXTERNAL_SIGNAL.with(|cell| cell.set(false));
+    CALLER_FROM_MAPPING_REQUEST_OWNER.with(|cell| cell.set(true));
+}
+
+pub fn is_current_caller_from_mapping_request_owner() -> bool {
+    CALLER_FROM_MAPPING_REQUEST_OWNER.with(|cell| cell.get())
+}
+
 pub fn push_current_caller_scope(package_name: &str, uid: i32) {
     let previous_package = get_current_caller_package();
     let previous_uid = get_current_caller_uid();
@@ -154,6 +178,7 @@ pub fn push_current_caller_scope(package_name: &str, uid: i32) {
     CALLER_UID.with(|cell| cell.set(uid));
     CALLER_TS_MS.with(|cell| cell.set(monotonic_ms()));
     CALLER_FROM_EXTERNAL_SIGNAL.with(|cell| cell.set(false));
+    CALLER_FROM_MAPPING_REQUEST_OWNER.with(|cell| cell.set(false));
 }
 
 pub fn pop_current_caller_scope() {
@@ -167,6 +192,7 @@ pub fn pop_current_caller_scope() {
             CALLER_TS_MS.with(|cell| cell.set(-1));
         }
         CALLER_FROM_EXTERNAL_SIGNAL.with(|cell| cell.set(false));
+        CALLER_FROM_MAPPING_REQUEST_OWNER.with(|cell| cell.set(false));
     } else {
         clear_current_caller();
     }

@@ -558,6 +558,8 @@ pub(crate) fn try_fast_update_shared_host(request: &MountRequest) -> bool {
             request.storage_backend_mode,
             crate::config::StorageBackendMode::Auto
         )
+        // path_mappings 需要 planner 物化子路径 bind；只更新宿主策略会留下旧根/旧映射层。
+        || !request.path_mappings.is_empty()
     {
         return false;
     }
@@ -575,7 +577,11 @@ pub(crate) fn try_fast_update_shared_host(request: &MountRequest) -> bool {
         return false;
     }
     let config = fuse_config_from_request(request, None, None);
-    if !crate::fuse_host::register_app_policy(&config, request.policy_fingerprint) {
+    if !crate::fuse_host::register_app_policy(
+        &config,
+        request.policy_fingerprint,
+        crate::fuse_host_control::HOST_POLICY_ACK_BUDGET_MAX_MS,
+    ) {
         return false;
     }
     if !refresh_mount_state_fingerprint(request) {
@@ -796,10 +802,12 @@ struct MountForkPlan {
     overlay_targets: Vec<String>,
     /// 目标进程的 mount namespace 路径，已提前转换为 C 字符串。
     mount_namespace_path: Option<CString>,
+    /// 父进程等待本次挂载结果的预算（秒），子进程据此给宿主策略登记的应答等待设上限。
+    parent_timeout_sec: i64,
 }
 
 impl MountForkPlan {
-    fn build(request: &MountRequest) -> Self {
+    fn build(request: &MountRequest, parent_timeout_sec: i64) -> Self {
         let state_path = state_file_path(request);
         let temp_state_path = format!("{}.tmp", state_path);
         Self {
@@ -808,17 +816,26 @@ impl MountForkPlan {
             temp_state_path,
             overlay_targets: request_overlay_targets(request),
             mount_namespace_path: CString::new(format!("/proc/{}/ns/mnt", request.pid)).ok(),
+            parent_timeout_sec,
         }
     }
+}
+
+/// 预接入共享宿主所需的最小剩余时间（毫秒）；不足则跳过预接入走 scoped。
+const PREATTACH_MIN_REMAINING_MS: i64 = 1_500;
+
+/// 父进程等待本次挂载结果的预算（秒）。
+fn parent_recv_timeout_sec(scoped_fuse_roots: &[String]) -> i64 {
+    PARENT_RECV_TIMEOUT_SEC
+        .saturating_add(FUSE_READY_TIMEOUT_SEC.saturating_mul(scoped_fuse_roots.len() as i64))
 }
 
 fn run_mount_in_forked_child(request: &MountRequest) -> bool {
     // fork 之后的子进程只保留调用线程。此时若再做堆分配、首次初始化或获取全局锁，
     // 可能因为其它父线程在 fork 瞬间持有 malloc arena 或全局锁而永久阻塞。
     // 因此把可以提前算出的字符串与路径列表全部在父进程算好，子进程只做 setns/mount/write。
-    let plan = MountForkPlan::build(request);
-    let parent_timeout_sec = PARENT_RECV_TIMEOUT_SEC
-        .saturating_add(FUSE_READY_TIMEOUT_SEC.saturating_mul(plan.scoped_fuse_roots.len() as i64));
+    let parent_timeout_sec = parent_recv_timeout_sec(&scoped_fuse_mount_roots(request));
+    let plan = MountForkPlan::build(request, parent_timeout_sec);
     let mut sockets = [0; 2];
     if unsafe { socketpair(AF_UNIX, SOCK_DGRAM, 0, sockets.as_mut_ptr()) } != 0 {
         log_errno("daemon socketpair failed");
@@ -848,6 +865,10 @@ fn run_mount_in_forked_child(request: &MountRequest) -> bool {
 }
 
 fn handle_child_process(request: &MountRequest, plan: &MountForkPlan, sock: c_int) -> bool {
+    // 父进程只等 parent_timeout_sec：子进程必须在这之前回包，否则会被判卡死并 SIGKILL，
+    // 这一轮挂载作废且可能留下死层。这里记下截止时间，后面所有可阻塞步骤都按剩余量收敛。
+    let deadline_ms = crate::platform::paths::monotonic_ms()
+        .saturating_add(plan.parent_timeout_sec.saturating_mul(1000));
     if !set_mount_namespace(plan.mount_namespace_path.as_deref()) {
         let _ = send_mount_result(sock, -1);
         unsafe { close(sock) };
@@ -897,6 +918,15 @@ fn handle_child_process(request: &MountRequest, plan: &MountForkPlan, sock: c_in
     clear_previous_allowed_real_backend_mounts(request);
 
     if request.operation == MountOperation::Disable {
+        // 开关切换时刻的属主交接修复：关闭重定向意味着存储视图交还原生 FUSE，
+        // 原生模型要求应用私有子树属主是应用 uid。重定向开启期可能留下属主为
+        // media_rw 的条目（真机实证：这种状态下原生 FUSE 对应用只给 others 位，
+        // Unity 类应用存档不可读写），交还前就地修干净。内部自带预算与「只在
+        // 属主精确等于 media_rw 时动手」的守卫，干净子树是纯 lstat 扫描。
+        crate::daemon_monitor::repair_app_private_owners(
+            &request.package_name,
+            crate::platform::user_id_from_uid(request.uid),
+        );
         // 已确认清除时才丢弃账本：挂载明细已随卸载消失，保留它只会让后续监督把
         // "目标上没有本模块挂载"误判成需要重新注入的 Detached 状态。
         if cleanup.is_cleared() {
@@ -937,7 +967,12 @@ fn handle_child_process(request: &MountRequest, plan: &MountForkPlan, sock: c_in
     // 共享宿主必须先于 namespace 重定向接管存储根。否则应用在宿主挂载完成前会
     // 短暂看到 `/data/media/<user>/Android/data/<pkg>/sdcard`，SQLite 可能先打开
     // 其中的旧副本；之后宿主再覆盖同一挂载点，已打开的 inode 不会自动切换。
-    let preattached_host = preattach_shared_host(request, scoped_fuse_roots);
+    //
+    // 预登记要等宿主的应答，而控制通道是 daemon 与所有挂载 worker 共用的同一条 socket：
+    // 并发登记时应答可能被别的 worker 取走，本方只能继续等，最坏会阻塞到预算耗尽。因此
+    // 给它一个「剩余时间减去 scoped 回退所需」的上限，宁可提前放弃走 scoped，也不要挂在
+    // 等应答上被父进程 SIGKILL。
+    let preattached_host = preattach_shared_host(request, scoped_fuse_roots, deadline_ms);
     let ok = if preattached_host.is_some() {
         true
     } else if request.is_monitor_only {
@@ -975,7 +1010,12 @@ fn handle_child_process(request: &MountRequest, plan: &MountForkPlan, sock: c_in
         let (fuse_children, attempt) = if let Some(state) = preattached_host {
             (vec![state], ScopedMountAttempt::Ready)
         } else if !fuse_roots.is_empty() {
-            match start_scoped_fuse_services(request, fuse_roots, planner.real_storage_anchor()) {
+            match start_scoped_fuse_services(
+                request,
+                fuse_roots,
+                planner.real_storage_anchor(),
+                deadline_ms,
+            ) {
                 Some(children) => (children, ScopedMountAttempt::Ready),
                 None => (Vec::new(), ScopedMountAttempt::Failed),
             }
@@ -1028,12 +1068,31 @@ fn handle_child_process(request: &MountRequest, plan: &MountForkPlan, sock: c_in
             // 否则状态文件会记录已不存在的挂载，后续恢复流程据此误判为“仍在场”。
             mounted_targets = planner.take_mounted_targets();
         }
+        // 新进程首次接入存储视图时的属主交接修复（挂载应答前同步执行）：原生
+        // FUSE（未映射路径、namespace 回退、未挂载窗口）要求应用私有子树属主是
+        // 应用 uid，而 MediaProvider 代写会留下 media_rw 属主条目（真机 2026-10-17
+        // 反馈：A17 上仅映射应用探测自有 Telegram 目录、Unity 游戏读存档全部
+        // EACCES）。只对「无 mount identity 账本」的新 pid 生效，热重载与
+        // reconcile 重挂按账本天然跳过；浅层 + 小预算把冷启动阻塞压在毫秒级，
+        // 深层残留由 30 分钟普查轮转兜底。
+        if mount_identity::load(&request.package_name, request.pid).is_none() {
+            crate::metadata_repair::repair_app_private_owners_on_attach(
+                &request.package_name,
+                crate::platform::user_id_from_uid(request.uid),
+            );
+        }
         if !write_mount_state(request, plan, &mounted_targets, &fuse_children) {
             log::warn!("daemon mount state save failed pid={}", request.pid);
         }
         record_mount_identity(request, &mounted_targets, &fuse_children);
         let _ = send_mount_result(sock, 0);
         unsafe { close(sock) };
+        // 应答已发出：detached 全树属主修复兜住浅层预算覆盖不到的大树深层
+        // （QQ files/Tencent/MobileQQ 类），double-fork 不占用任何挂载链路。
+        crate::metadata_repair::spawn_detached_full_owner_repair(
+            &request.package_name,
+            crate::platform::user_id_from_uid(request.uid),
+        );
         return true;
     }
 
@@ -1047,11 +1106,30 @@ fn handle_child_process(request: &MountRequest, plan: &MountForkPlan, sock: c_in
 /// 只有 Auto 模式且规划根已经收敛为整棵用户存储视图时才允许提前接管；其它模式
 /// 继续走原有 scoped/namespace 挂载流程。预接管只尝试共享宿主，失败后由后续挂载
 /// 流程启动 scoped 会话，避免先启动再回滚一份多余的 FUSE 服务。
+/// 预接入共享宿主。整段必须在 `deadline_ms`（父进程等待本轮挂载的截止时刻）之前完成。
+///
+/// 这里有两处会阻塞：策略登记要等宿主应答（共用控制通道，应答可能被别的 worker 取走），
+/// 接入要对 `/storage/emulated/<user>` 做 `open_tree` + `move_mount`（遍历应用命名空间里的
+/// FUSE 挂载，共享会话只有一条连接，开机风暴时 `fuse_get_req` 会把进程卡在 D 态，只有
+/// SIGKILL 能打断）。两者都不能用固定超时：固定值比父进程预算长时，子进程必然先被判卡死
+/// 杀掉，这一轮挂载作废且可能留下死层。预算不够就整段跳过，走始终可用的 scoped 路径。
 fn preattach_shared_host(
     request: &MountRequest,
     scoped_fuse_roots: &[String],
+    deadline_ms: i64,
 ) -> Option<FuseMountState> {
     if !shared_host_preattach_candidate(request, scoped_fuse_roots) {
+        return None;
+    }
+    // 剩下的时间连"回一个失败结果"都不够时，直接放弃预接入。
+    let remaining_ms = deadline_ms.saturating_sub(crate::platform::paths::monotonic_ms());
+    if remaining_ms < PREATTACH_MIN_REMAINING_MS {
+        log::warn!(
+            "daemon shared host preattach skipped reason=budget pid={} pkg={} remaining_ms={}",
+            request.pid,
+            request.package_name,
+            remaining_ms
+        );
         return None;
     }
     let user_id = crate::platform::user_id_from_uid(request.uid);
@@ -1059,12 +1137,32 @@ fn preattach_shared_host(
 
     let host = crate::fuse_host::get_fuse_host()?;
     let policy_config = fuse_config_from_request(request, None, None);
-    if !crate::fuse_host::register_app_policy(&policy_config, request.policy_fingerprint)
-        || !crate::fuse_host::can_attach_app(request.uid, &storage_root)
+    // 登记应答预算：给 scoped 回退留出一个 FUSE_READY 周期。
+    let ack_budget_ms = deadline_ms
+        .saturating_sub(crate::platform::paths::monotonic_ms())
+        .saturating_sub(FUSE_READY_TIMEOUT_SEC.saturating_mul(1000))
+        .clamp(0, crate::fuse_host_control::HOST_POLICY_ACK_BUDGET_MAX_MS);
+    if !crate::fuse_host::register_app_policy(
+        &policy_config,
+        request.policy_fingerprint,
+        ack_budget_ms,
+    ) || !crate::fuse_host::can_attach_app(request.uid, &storage_root)
     {
         return None;
     }
-    let state = try_bind_to_fuse_host(&host, request, &storage_root)?;
+    // 接入预算：登记之后再按剩余时间收敛。接入失败还要回退 scoped，而 scoped 自己要等
+    // 一个 FUSE_READY 周期，再加结果回包与状态落盘，因此两部分都要从剩余时间里扣掉；
+    // 否则接入把时间耗光，回退也没机会完成，子进程照样会撞上父进程的超时判定。
+    let attach_timeout_sec = deadline_ms
+        .saturating_sub(crate::platform::paths::monotonic_ms())
+        .saturating_sub(
+            FUSE_READY_TIMEOUT_SEC
+                .saturating_add(1)
+                .saturating_mul(1000),
+        )
+        .saturating_div(1000)
+        .clamp(1, crate::fuse_host::HOST_ATTACH_TIMEOUT_SEC);
+    let state = try_bind_to_fuse_host(&host, request, &storage_root, attach_timeout_sec)?;
     log::info!(
         "daemon shared host preattached pid={} pkg={} target={}",
         request.pid,
@@ -1081,6 +1179,14 @@ fn shared_host_preattach_candidate(request: &MountRequest, scoped_fuse_roots: &[
     );
     let is_monitor_only = request.is_monitor_only && request.is_file_monitor_enabled;
     if !is_auto && !is_monitor_only {
+        return false;
+    }
+    if crate::domain::mappings_need_namespace_mount(
+        request.uid,
+        &request.app_data_dir,
+        &request.redirect_target,
+        &request.path_mappings,
+    ) {
         return false;
     }
     let user_id = crate::platform::user_id_from_uid(request.uid);
@@ -1104,12 +1210,15 @@ fn start_scoped_fuse_services(
     request: &MountRequest,
     roots: &[String],
     real_root_override: Option<String>,
+    deadline_ms: i64,
 ) -> Option<Vec<FuseMountState>> {
     crate::fuse_session::start_scoped_fuse_services(
         request,
         roots,
         real_root_override,
-        |root, real_root_override| start_fuse_service_for_root(request, root, real_root_override),
+        |root, real_root_override| {
+            start_fuse_service_for_root(request, root, real_root_override, deadline_ms)
+        },
     )
 }
 
@@ -1124,6 +1233,19 @@ fn scoped_fuse_mount_roots(request: &MountRequest) -> Vec<String> {
     // 先卸旧 scoped 层、再挂新层，中间应用对该路径的访问会穿透到真实存储（fail-open
     // 窗口）；等待发生在挂载应答返回之前，应用进程尚未恢复运行，一次挂载到位。
     // 接入被显式关闭、等待超时或处于失败冷却期时保持原规划——旧数据面照常服务。
+    //
+    // 存在私有 fs 侧映射时保持按目录规划：宿主策略层只覆盖存储视图，target 在视图外
+    // 的映射会被宿主忽略，写入穿透到默认重定向根（真机实证：scenario 35 的
+    // Download/X → /data/user/0/<pkg>/no_backup 在收敛路径下落到 sdcard 沙盒）。
+    // 按目录 scoped 会话与命名空间 bind 才能完整表达这类映射。
+    if crate::domain::mappings_need_namespace_mount(
+        request.uid,
+        &request.app_data_dir,
+        &request.redirect_target,
+        &request.path_mappings,
+    ) {
+        return roots;
+    }
     if roots.is_empty()
         || !matches!(
             request.storage_backend_mode,
@@ -1163,6 +1285,7 @@ fn start_fuse_service_for_root(
     request: &MountRequest,
     mount_root: &str,
     real_root_override: Option<String>,
+    deadline_ms: i64,
 ) -> Option<FuseMountState> {
     // B2-b：优先尝试共享宿主会话接入。
     if let Some(host) = crate::fuse_host::get_fuse_host() {
@@ -1176,8 +1299,19 @@ fn start_fuse_service_for_root(
         // 读成空——真机实测表现为仅映射模式的应用整个公共存储视图消失，只剩被沙盒化的那几条
         // 路径。宿主命名空间里 `/data/media/<user>` 就是未经覆盖的真实存储，本就无需别名。
         let policy_config = fuse_config_from_request(request, None, None);
-        let registered =
-            crate::fuse_host::register_app_policy(&policy_config, request.policy_fingerprint);
+        // 登记与接入共享父进程预算（与 preattach_shared_host 同一套公式）：给 scoped
+        // 回退留出一个 FUSE_READY 周期，登记内部再在登记与 media 视图绑定间分摊。
+        // 固定超时（旧实现 MAX 16s + 接入 10s）在开机风暴期会远超父进程预算，
+        // 子进程被守卫 SIGKILL，本轮挂载作废。
+        let ack_budget_ms = deadline_ms
+            .saturating_sub(crate::platform::paths::monotonic_ms())
+            .saturating_sub(FUSE_READY_TIMEOUT_SEC.saturating_mul(1000))
+            .clamp(0, crate::fuse_host_control::HOST_POLICY_ACK_BUDGET_MAX_MS);
+        let registered = crate::fuse_host::register_app_policy(
+            &policy_config,
+            request.policy_fingerprint,
+            ack_budget_ms,
+        );
         if !crate::fuse_host::can_attach_app(request.uid, mount_root) {
             // 宿主会话的虚拟根只能是整个存储视图根，且默认不接管应用挂载；两种情况都保持
             // 既有 scoped 路径，不能因为"宿主会话可用"就顺手接上。
@@ -1197,9 +1331,21 @@ fn start_fuse_service_for_root(
                 mount_root,
                 request.policy_fingerprint
             );
-        } else if let Some(state) = try_bind_to_fuse_host(&host, request, mount_root) {
-            return Some(state);
         } else {
+            let attach_timeout_sec = deadline_ms
+                .saturating_sub(crate::platform::paths::monotonic_ms())
+                .saturating_sub(
+                    FUSE_READY_TIMEOUT_SEC
+                        .saturating_add(1)
+                        .saturating_mul(1000),
+                )
+                .saturating_div(1000)
+                .clamp(1, crate::fuse_host::HOST_ATTACH_TIMEOUT_SEC);
+            if let Some(state) =
+                try_bind_to_fuse_host(&host, request, mount_root, attach_timeout_sec)
+            {
+                return Some(state);
+            }
             log::warn!(
                 "daemon bind to fuse host failed, falling back to scoped fork pid={} pkg={}",
                 request.pid,
@@ -1263,6 +1409,9 @@ fn start_fuse_service_for_root(
             request.package_name
         );
         crate::fuse_terminate::terminate_fuse_process(service_child, None);
+        // 子进程可能在 mount(2) 已完成后才被判失败：终止后若目标顶层残留本模块 scoped
+        // 死层，就地摘除，避免常驻应用的命名空间留下无人清理的 ENOTCONN 死挂载。
+        crate::fuse_session::detach_dead_scoped_layer_after_terminate(mount_root);
         return None;
     }
 
@@ -1297,10 +1446,12 @@ fn try_bind_to_fuse_host(
     host: &crate::fuse_host::FuseHost,
     request: &MountRequest,
     mount_root: &str,
+    attach_timeout_sec: i64,
 ) -> Option<FuseMountState> {
     let attached = crate::fuse_host::attach_app_to_host(
         &crate::fuse_host::HostSessionView::from(host),
         mount_root,
+        attach_timeout_sec,
     )?;
     log::info!(
         "daemon fuse host attach ok pid={} pkg={} target={} host={}",
@@ -1535,6 +1686,18 @@ fn clear_previous_mounts(request: &MountRequest, plan: &MountForkPlan) -> ClearO
     let fuse_children = read_fuse_children(state_path);
     let mut targets = read_mount_targets(state_path);
     targets.extend(plan.overlay_targets.iter().cloned());
+    // path_mappings 热重载必须显式覆盖全部存储别名根：旧状态文件可能来自 companion
+    // 或上一轮部分失败，只记录了子映射目标；若漏掉视图根，旧沙箱层会继续压在新映射层上。
+    // 仅在挂载形态发生变化时扩大清理集合，普通 reload 仍按状态文件精确清理。
+    if request.operation == MountOperation::Reload
+        && !request.path_mappings.is_empty()
+        && request.uid >= 0
+    {
+        let user_id = crate::platform::user_id_from_uid(request.uid);
+        targets.extend(crate::platform::paths::storage_alias_roots_for_user(
+            user_id,
+        ));
+    }
     let targets = module_paths::normalize_mount_targets(&targets);
     if targets.is_empty() && fuse_children.is_empty() {
         return if std::fs::remove_file(state_path).is_ok() || std::fs::metadata(state_path).is_err()
@@ -1562,7 +1725,16 @@ fn clear_previous_mounts(request: &MountRequest, plan: &MountForkPlan) -> ClearO
             );
             continue;
         }
-        if !clear_mount_target_stack_verified(target, ledger.as_ref()) {
+        // path_mappings 形态切换时旧 ledger 可能只登记上一层 mount_id；若继续用
+        // superseded 保护，会把新层误判为“更新的其它会话”而拒绝摘除，旧根与新映射
+        // 叠加后应用同时命中请求路径和目标。此时按当前挂载形态重新判定归属，清理
+        // 所有模块层；系统自有 app-private FUSE 层仍由形态判定保留。
+        let cleanup_ledger = request
+            .path_mappings
+            .is_empty()
+            .then_some(ledger.as_ref())
+            .flatten();
+        if !clear_mount_target_stack_verified(target, cleanup_ledger) {
             outcome = ClearOutcome::Unverified;
         }
     }
@@ -1602,9 +1774,13 @@ fn should_keep_reload_redirect_root(
     scoped_fuse_roots: &[String],
     live_layer: Option<(&str, &str)>,
 ) -> bool {
-    // 仅映射模式不走重定向根保留：从默认重定向切到仅映射模式时，旧沙箱根绑定必须按原逻辑
-    // 摘除重建，否则改了挂载方式却仍保留旧重定向根，应用读到的是上一轮重定向留下的错误视图。
+    // 挂载形态发生变化时不保留旧重定向根：从默认重定向切到仅映射模式，或新增
+    // path_mappings 时，旧沙箱根与新映射层不能叠放。必须完整摘除并重建，否则旧根
+    // 会继续遮蔽/污染新映射层，应用可能同时看到请求路径与映射目标的残留。
     if request.is_mapping_mode_only {
+        return false;
+    }
+    if !request.path_mappings.is_empty() {
         return false;
     }
     if request.operation != MountOperation::Reload || request.redirect_target.is_empty() {
@@ -2138,7 +2314,11 @@ pub(crate) fn pre_register_host_policy(request: &MountRequest) -> PreRegisterOut
                 .unwrap_or(0)
         );
         let config = fuse_config_from_request(request, None, None);
-        if crate::fuse_host::register_app_policy(&config, request.policy_fingerprint) {
+        if crate::fuse_host::register_app_policy(
+            &config,
+            request.policy_fingerprint,
+            crate::fuse_host_control::HOST_POLICY_ACK_BUDGET_MAX_MS,
+        ) {
             if let Ok(mut registered) = PRE_REGISTERED_HOST_POLICIES.lock() {
                 registered.insert(request.uid as u32, fingerprint);
             }
@@ -2147,7 +2327,11 @@ pub(crate) fn pre_register_host_policy(request: &MountRequest) -> PreRegisterOut
         return PreRegisterOutcome::NotApplicable;
     }
     let config = fuse_config_from_request(request, None, None);
-    if crate::fuse_host::register_app_policy(&config, request.policy_fingerprint) {
+    if crate::fuse_host::register_app_policy(
+        &config,
+        request.policy_fingerprint,
+        crate::fuse_host_control::HOST_POLICY_ACK_BUDGET_MAX_MS,
+    ) {
         PreRegisterOutcome::Registered
     } else {
         PreRegisterOutcome::NotApplicable

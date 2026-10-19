@@ -214,7 +214,7 @@ pub fn normalize_redirect_directory(path: &str) {
     normalize_redirect_dir_metadata(path, STORAGE_DIR_MODE, owner.as_ref());
 }
 
-pub fn fix_system_writer_android_private_owner(path: &str, include_path: bool) {
+pub fn fix_system_writer_android_private_owner(path: &str, include_path: bool, fd: i32) {
     if !crate::metadata_repair::enabled() || path.is_empty() {
         return;
     }
@@ -225,7 +225,7 @@ pub fn fix_system_writer_android_private_owner(path: &str, include_path: bool) {
     }
 
     let saved_errno = current_errno();
-    fix_system_writer_android_private_owner_inner(path, include_path);
+    fix_system_writer_android_private_owner_inner(path, include_path, fd);
     fix_system_writer_mapping_target_access(path);
     set_errno(saved_errno);
 }
@@ -376,7 +376,7 @@ fn data_media_user_dir(path: &str) -> String {
     paths::data_media_user_root(path).unwrap_or_default()
 }
 
-fn fix_system_writer_android_private_owner_inner(path: &str, include_path: bool) {
+fn fix_system_writer_android_private_owner_inner(path: &str, include_path: bool, fd: i32) {
     let normalized = paths::normalize(path);
     let storage_path = if normalized.starts_with("/data/media/") {
         paths::data_media_to_storage_path(&normalized)
@@ -397,15 +397,18 @@ fn fix_system_writer_android_private_owner_inner(path: &str, include_path: bool)
         return;
     }
 
+    // 不再要求 owner 配置了重定向：A17 原生 FUSE 对属主非本应用的
+    // Android/{data,media,obb}/<pkg> 只给 others 位，该语义与是否开启重定向
+    // 无关——未配置应用（真机 2026-10-18 反馈的 Unity 存档）被系统代写污染后
+    // 同样不可读写，而挂载应答期修复只覆盖已配置应用，未配置应用此前仅剩
+    // 30 分钟普查兜底。这里在代写创建的当下把属主即时修回应用 uid，是污染
+    // 源头治理；uid 解析失败与跨 caller 保护仍然生效。
     let allow_cross_caller_sqlite = should_allow_sqlite_private_owner_fix_for_current_caller(
         &storage_path,
         &owner_package,
         owner_uid,
         user_id,
     );
-    if !allow_cross_caller_sqlite && !is_private_owner_fix_enabled(&owner_package, owner_uid) {
-        return;
-    }
     if !allow_cross_caller_sqlite
         && !is_private_owner_fix_allowed_for_current_caller(&owner_package, owner_uid)
     {
@@ -425,11 +428,11 @@ fn fix_system_writer_android_private_owner_inner(path: &str, include_path: bool)
     };
     let parent = paths::parent(&backend_path);
     if path_is_same_or_child(&parent, &private_root) {
-        chown_private_path_if_needed(&parent, owner_uid, &owner_package, &private_root);
+        chown_private_path_if_needed(&parent, owner_uid, &owner_package, &private_root, -1);
     }
 
     if should_fix_private_path_node(&backend_path, &private_root, include_path) {
-        chown_private_path_if_needed(&backend_path, owner_uid, &owner_package, &private_root);
+        chown_private_path_if_needed(&backend_path, owner_uid, &owner_package, &private_root, fd);
     }
 }
 
@@ -458,10 +461,6 @@ fn android_private_owner_package(normalized_path: &str) -> Option<String> {
 
 fn resolve_private_owner_uid(package_name: &str) -> i32 {
     policy::get_fresh_uid_for_package(package_name)
-}
-
-fn is_private_owner_fix_enabled(owner_package: &str, owner_uid: i32) -> bool {
-    SettingsHub::instance().should_redirect(owner_package, owner_uid)
 }
 
 fn is_private_owner_fix_allowed_for_current_caller(owner_package: &str, owner_uid: i32) -> bool {
@@ -556,6 +555,7 @@ fn chown_private_path_if_needed(
     owner_uid: i32,
     owner_package: &str,
     private_root: &str,
+    fd: i32,
 ) {
     let Ok(c_path) = CString::new(path) else {
         return;
@@ -587,6 +587,14 @@ fn chown_private_path_if_needed(
     let error_no = current_errno();
     if error_no == libc::EPERM || error_no == libc::EACCES {
         chmod_private_node_if_needed(&c_path, path, &st, owner_package, private_root);
+        // 进程内 lchown 被 EPERM 拒绝（MP 等普通 uid 无 CAP_CHOWN，真机 2026-10-18
+        // 实证 media.module 全链 denied）：优先经 companion（root）对 open fd
+        // 即时 fchown——fd 在应用拿到之前已是正确属主，零竞态零扫描；companion
+        // 不可用时回退 daemon 代修请求（异步，主循环 ≤1s 消费）。
+        if fd >= 0 && crate::hook::companion_api::companion_fchown(fd, owner_uid) {
+            return;
+        }
+        crate::logging::send_owner_fix_request(path);
     }
     if error_no != libc::ENOENT && error_no != libc::EPERM && error_no != libc::EACCES {
         log::warn!(

@@ -64,6 +64,59 @@ pub(crate) fn rollback_scoped_fuse_services(states: &[FuseMountState]) {
     }
 }
 
+/// scoped 服务被判定未就绪而终止后，就地摘除可能残留的会话死层。
+///
+/// 子进程在 `mount(2)` 已完成、会话收尾尚未跑完时被父进程终止（握手失败、就绪超时），
+/// 会在应用命名空间留下一条连接已断的 scoped 死挂载。应用若是常驻进程（如承载下载
+/// 管理器的 `android.process.media`），这层死挂载没有任何台账记录、无人清理，应用对
+/// 整个存储根的访问从此一直 ENOTCONN（真机 2026-10-15：应用商店更新下载全部 492）。
+/// 终止后目标顶层若仍是本模块 scoped 层且访问已断连，就地 `MNT_DETACH` 摘除。
+pub(crate) fn detach_dead_scoped_layer_after_terminate(mount_root: &str) {
+    let Some(live) = crate::mount_ledger::topmost_live_mount(0, mount_root) else {
+        return;
+    };
+    // 只认 scoped 会话源前缀：宿主会话跨应用共享，绝不在此路径上摘除。
+    if !live.source.starts_with("srx_fuse_redirect") {
+        return;
+    }
+    if !scoped_endpoint_is_dead(mount_root) {
+        return;
+    }
+    let Ok(c_target) = CString::new(mount_root) else {
+        return;
+    };
+    // SAFETY: c_target 是以 NUL 结尾的合法路径；MNT_DETACH 只摘除已确认归属且断连的层。
+    if unsafe { libc::umount2(c_target.as_ptr(), libc::MNT_DETACH) } == 0 {
+        log::warn!(
+            "fuse scoped dead layer detached after terminate target={} source={}",
+            mount_root,
+            live.source
+        );
+    }
+}
+
+/// 探测目标路径是否已断连（挂载记录在但 FUSE 服务已消失）。
+///
+/// 与 bin 侧 `fuse_supervisor::probe_endpoint` 的断连判定同口径；本模块在 lib 侧
+/// 编译，不能引用仅在 bin 声明的 `fuse_supervisor`，故在此保留最小实现。
+fn scoped_endpoint_is_dead(target: &str) -> bool {
+    let probe_path = format!("/proc/self/root{target}");
+    let Ok(c_path) = CString::new(probe_path) else {
+        return false;
+    };
+    // SAFETY: c_path 由当前作用域持有，指针在 open 调用期间有效；只读打开目录探测。
+    let fd = unsafe { libc::open(c_path.as_ptr(), libc::O_RDONLY | libc::O_DIRECTORY) };
+    if fd >= 0 {
+        // SAFETY: fd 来自上面的成功 open，此处是唯一关闭路径。
+        unsafe { libc::close(fd) };
+        return false;
+    }
+    matches!(
+        last_errno(),
+        libc::ENOTCONN | libc::EIO | libc::ENODEV | libc::ESTALE
+    )
+}
+
 /// 把本次挂载写入状态文件（原子写：临时文件 + fsync + rename）。
 ///
 /// 状态行契约：`version=` 与 `fingerprint=`（指纹跨进程可比、version 计数器两侧不同域）、

@@ -613,28 +613,66 @@ impl<FS: Filesystem> SessionEventLoop<FS> {
         // it is reused immediately after dispatching to conserve memory and allocations.
         let mut buf = FuseReadBuf::new();
         let buf = buf.as_mut();
+        // 每请求延迟分解（诊断用）：接收（内核→用户）与分发（handler+应答）分开累计，
+        // debug 级按 128 请求窗口输出平均与峰值，仅当日志启用时才计时。
+        let timed = log::log_enabled!(log::Level::Debug);
+        let mut recv_ns: u128 = 0;
+        let mut disp_ns: u128 = 0;
+        let mut recv_max_ns: u128 = 0;
+        let mut disp_max_ns: u128 = 0;
+        let mut count: u64 = 0;
         loop {
             // Read the next request from the given channel to kernel driver
             // The kernel driver makes sure that we get exactly one request per read
+            let t0 = if timed { Some(std::time::Instant::now()) } else { None };
             match self.ch.receive_retrying(buf) {
-                Ok(size) => match RequestWithSender::new(self.ch.sender(), &buf[..size]) {
-                    // Dispatch request
-                    Some(req) => {
-                        if let Ok(Operation::Destroy(_)) = req.request.operation() {
-                            req.reply::<ReplyEmpty>().ok();
-                            return Ok(());
-                        } else {
-                            req.dispatch(self)
+                Ok(size) => {
+                    if let Some(t0) = t0 {
+                        let r = t0.elapsed().as_nanos();
+                        recv_ns += r;
+                        recv_max_ns = recv_max_ns.max(r);
+                    }
+                    let t1 = if timed { Some(std::time::Instant::now()) } else { None };
+                    let result = match RequestWithSender::new(self.ch.sender(), &buf[..size]) {
+                        // Dispatch request
+                        Some(req) => {
+                            if let Ok(Operation::Destroy(_)) = req.request.operation() {
+                                req.reply::<ReplyEmpty>().ok();
+                                return Ok(());
+                            } else {
+                                req.dispatch(self)
+                            }
+                        }
+                        // Quit loop on illegal request
+                        None => {
+                            return Err(io::Error::new(
+                                io::ErrorKind::InvalidData,
+                                "Invalid request",
+                            ));
+                        }
+                    };
+                    if let Some(t1) = t1 {
+                        let d = t1.elapsed().as_nanos();
+                        disp_ns += d;
+                        disp_max_ns = disp_max_ns.max(d);
+                        count += 1;
+                        if count % 128 == 0 {
+                            let n = count.max(1) as u128;
+                            log::debug!(
+                                "fuse loop stats count={count} recv_avg_us={} recv_max_us={} disp_avg_us={} disp_max_us={}",
+                                recv_ns / n / 1000,
+                                recv_max_ns / 1000,
+                                disp_ns / n / 1000,
+                                disp_max_ns / 1000
+                            );
+                            recv_ns = 0;
+                            disp_ns = 0;
+                            recv_max_ns = 0;
+                            disp_max_ns = 0;
                         }
                     }
-                    // Quit loop on illegal request
-                    None => {
-                        return Err(io::Error::new(
-                            io::ErrorKind::InvalidData,
-                            "Invalid request",
-                        ));
-                    }
-                },
+                    result
+                }
                 Err(nix::errno::Errno::ENODEV) => return Ok(()),
                 Err(err) => return Err(err.into()),
             }

@@ -4,8 +4,8 @@ use super::lsplant;
 use crate::hook::{
     resolve_download_media_placeholder_path_for_caller, resolve_open_storage_path_for_caller,
     rewrite_cursor_storage_path_for_caller, rewrite_media_store_bucket_id_for_caller,
-    rewrite_media_store_storage_path_for_caller, should_allow_public_mapping_target_access,
-    should_hide_cursor_storage_path_for_caller,
+    rewrite_media_store_storage_path_for_caller, should_allow_own_android_private_path_access,
+    should_allow_public_mapping_target_access, should_hide_cursor_storage_path_for_caller,
 };
 use crate::zygisk::jni::{
     call_object_method_a, call_static_object_method_a, delete_local_ref, get_method_id,
@@ -65,6 +65,8 @@ const RECORD_READ_ONLY_FUSE_OPERATION_SIG: &[u8] =
     b"(ILjava/lang/String;Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;II)Z\0";
 const ALLOW_PUBLIC_MAPPING_TARGET_NAME: &[u8] = b"allowsPublicMappingTarget\0";
 const ALLOW_PUBLIC_MAPPING_TARGET_SIG: &[u8] = b"(Ljava/lang/String;I)Z\0";
+const ALLOW_OWN_ANDROID_PRIVATE_PATH_NAME: &[u8] = b"allowsOwnAndroidPrivatePath\0";
+const ALLOW_OWN_ANDROID_PRIVATE_PATH_SIG: &[u8] = b"(Ljava/lang/String;I)Z\0";
 const CAPTURE_BINDER_CALLER_NAME: &[u8] = b"captureBinderCaller\0";
 const CAPTURE_BINDER_CALLER_SIG: &[u8] = b"(II)V\0";
 const ENTER_CALLER_SCOPE_NAME: &[u8] = b"enterCallerScope\0";
@@ -191,6 +193,11 @@ pub fn init(env: *mut JNIEnv, hooker_class: jclass) -> bool {
             name: ALLOW_PUBLIC_MAPPING_TARGET_NAME.as_ptr() as *mut _,
             signature: ALLOW_PUBLIC_MAPPING_TARGET_SIG.as_ptr() as *mut _,
             fnPtr: allows_public_mapping_target as *mut _,
+        },
+        JNINativeMethod {
+            name: ALLOW_OWN_ANDROID_PRIVATE_PATH_NAME.as_ptr() as *mut _,
+            signature: ALLOW_OWN_ANDROID_PRIVATE_PATH_SIG.as_ptr() as *mut _,
+            fnPtr: allows_own_android_private_path as *mut _,
         },
         JNINativeMethod {
             name: CAPTURE_BINDER_CALLER_NAME.as_ptr() as *mut _,
@@ -785,6 +792,23 @@ unsafe extern "C" fn allows_public_mapping_target(
     }
     let path_text = crate::zygisk::jni::get_jstring_utf8(env, path);
     if should_allow_public_mapping_target_access(&path_text, caller_uid) {
+        jni_sys::JNI_TRUE
+    } else {
+        jni_sys::JNI_FALSE
+    }
+}
+
+unsafe extern "C" fn allows_own_android_private_path(
+    env: *mut JNIEnv,
+    _class: jclass,
+    path: jstring,
+    caller_uid: jni_sys::jint,
+) -> jni_sys::jboolean {
+    if env.is_null() || path.is_null() {
+        return jni_sys::JNI_FALSE;
+    }
+    let path_text = crate::zygisk::jni::get_jstring_utf8(env, path);
+    if should_allow_own_android_private_path_access(&path_text, caller_uid) {
         jni_sys::JNI_TRUE
     } else {
         jni_sys::JNI_FALSE

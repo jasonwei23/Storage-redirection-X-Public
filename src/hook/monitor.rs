@@ -132,6 +132,11 @@ fn record_open_result_with_extra(
         record.is_mapping,
         record_existed_before,
     );
+    // 请求行补 caller_uid：daemon 日志线程据此为写入类 open 登记 path hint，
+    // 让纯映射路径的 request/观察记录也能走 10 秒窗口去重。uid 取不到（-1）
+    // 时照常输出，由登记侧校验拒绝。
+    let caller_uid = hub.get_current_caller_uid();
+    extra.push_str(&format!("|caller_uid={caller_uid}"));
     append_extra_tail(&mut extra, extra_tail);
     let caller_package = hub.get_current_caller_package();
     AuditTrail::instance().record_operation_result(
