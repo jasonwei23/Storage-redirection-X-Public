@@ -14,9 +14,7 @@ use events::{
     should_skip_ambiguous_allowed_real_path_event, should_skip_ambiguous_read_only_path_event,
     should_skip_public_root_event_identity,
 };
-pub(crate) use events::{
-    repair_app_private_owners, repair_requested_backend_owner, spawn_full_repair_for_package,
-};
+pub(crate) use events::{repair_app_private_owners, repair_requested_backend_owner};
 use roots::{
     build_private_category_owner_roots, build_private_owner_repair_roots,
     build_public_owner_repair_root, build_watch_roots, dedup_roots, is_self_nested_redirect_path,
