@@ -5945,10 +5945,13 @@
       viewer.innerHTML =
         '<div class="loading-state"><div class="spinner"></div><span>加载日志...</span></div>';
     try {
-      await Api.ensureLogCollectors?.();
+      // 采集器自愈独立于快照读取，维护命令变慢时仍可查看已有日志。
+      Api.ensureLogCollectors?.().catch(() => {});
       const [content, filters] = await Promise.all([
         Api.readFileWithBackups(FILE_MONITOR_LOG),
-        Api.readMonitorFilters({ force: true }).catch(() => State.monitorFilters || null),
+        Api.readMonitorFilters({ force: true, timeoutMs: 5000 }).catch(
+          () => State.monitorFilters || null,
+        ),
       ]);
       if (loadGeneration !== State.logLoadGeneration) return;
       if (filters) State.monitorFilters = filters;
@@ -5959,7 +5962,7 @@
         Theme.showToast("刷新文件监视失败", "error");
         throw new Error("refresh failed");
       } else {
-        viewer.innerHTML = '<div class="log-empty">暂无日志或无法读取</div>';
+        viewer.innerHTML = '<div class="log-empty">日志读取失败，请下拉重试</div>';
       }
     }
   }
@@ -6039,8 +6042,8 @@
     } else {
       infoEl.textContent =
         renderedCount < filteredCount
-          ? "显示 " + renderedCount + " / 共 " + totalCount + " 条"
-          : "共 " + totalCount + " 条";
+          ? "最近记录：显示 " + renderedCount + " / 共 " + totalCount + " 条（最多读取1000行）"
+          : "最近记录：共 " + totalCount + " 条（最多读取1000行）";
     }
   }
 

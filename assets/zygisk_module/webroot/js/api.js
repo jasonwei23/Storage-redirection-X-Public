@@ -229,7 +229,7 @@ const NativeBridge = {
             finish(0, result, "");
           }
         } catch (e) {
-          cleanup();
+          // 兼容调用同样受原超时保护；这里只切换签名，不能提前清除计时器。
           try {
             const result = ksu.exec(cmd, finish);
             if (result && typeof result.then === "function") {
@@ -917,9 +917,9 @@ const Api = {
   },
 
   /** 以字符串形式读取文件内容 */
-  async readFile(path) {
+  async readFile(path, options) {
     try {
-      return await this.exec(shellCommand("cat", path) + " 2>/dev/null");
+      return await this.exec(shellCommand("cat", path) + " 2>/dev/null", options);
     } catch {
       return "";
     }
@@ -935,19 +935,21 @@ const Api = {
     }
   },
 
-  /** 读取当前日志及全部轮转备份，按时间顺序合并。 */
+  /** 从当前日志与轮转备份读取最近记录，避免把全部历史传入 WebView。 */
   async readFileWithBackups(path) {
+    const lines = 1000;
     const command =
       "base=" +
       shellQuote(path) +
       '; { for f in "$base".*; do [ -f "$f" ] || continue; suffix="${f##*.}"; case "$suffix" in ' +
       "''|*[!0-9]*) continue;; esac; printf '%s\\t%s\\n' \"$suffix\" \"$f\"; done | " +
-      'sort -rn | while IFS="$(printf \'\\t\')" read -r _ f; do cat "$f"; done; cat "$base" 2>/dev/null; }';
-    try {
-      return await this.exec(command);
-    } catch {
-      return "";
-    }
+      'sort -rn | while IFS="$(printf \'\\t\')" read -r _ f; do tail -n ' +
+      lines +
+      ' "$f" 2>/dev/null; done; tail -n ' +
+      lines +
+      ' "$base" 2>/dev/null; } | tail -n ' +
+      lines;
+    return await this.exec(command, { timeoutMs: 10000 });
   },
 
   /** 将内容写入文件 */
@@ -1590,7 +1592,9 @@ const Api = {
   async readMonitorFilters(options) {
     if (options?.force) this.invalidateMonitorFiltersCache();
     if (this._monitorFiltersCache) return JSON.parse(JSON.stringify(this._monitorFiltersCache));
-    const content = await this.readFile(FILE_MONITOR_FILTERS_CONFIG);
+    const content = await this.readFile(FILE_MONITOR_FILTERS_CONFIG, {
+      timeoutMs: options?.timeoutMs,
+    });
     if (!content) {
       this._monitorFiltersCache = JSON.parse(JSON.stringify(DEFAULT_FILE_MONITOR_FILTERS));
       return JSON.parse(JSON.stringify(this._monitorFiltersCache));
@@ -2072,9 +2076,10 @@ const Api = {
 
   async ensureLogCollectors() {
     try {
-      if (await this.fileExists(SRXCTL)) {
-        await this.exec(srxCtlCommand("ensure-collectors"));
-      }
+      await this.exec(
+        "if [ -r " + shellQuote(SRXCTL) + " ]; then " + srxCtlCommand("ensure-collectors") + "; fi",
+        { timeoutMs: 5000 },
+      );
     } catch {}
   },
 
