@@ -27,8 +27,8 @@ use crate::platform::paths;
 use fuser::{
     AccessFlags, CopyFileRangeFlags, Errno, FileHandle, FileType, Filesystem, FopenFlags,
     Generation, INodeNo, InitFlags, KernelConfig, LockOwner, OpenFlags, RenameFlags, ReplyAttr,
-    ReplyCreate, ReplyData, ReplyDirectory, ReplyDirectoryPlus, ReplyEmpty, ReplyEntry, ReplyOpen,
-    ReplyStatfs, ReplyWrite, Request, TimeOrNow, WriteFlags,
+    ReplyCreate, ReplyData, ReplyDirectory, ReplyDirectoryPlus, ReplyEmpty, ReplyEntry, ReplyLseek,
+    ReplyOpen, ReplyStatfs, ReplyWrite, ReplyXattr, Request, TimeOrNow, WriteFlags,
 };
 use std::collections::HashMap;
 use std::ffi::OsStr;
@@ -233,6 +233,12 @@ fn write_full_at(file: &File, mut data: &[u8], mut offset: u64) -> std::io::Resu
     Ok(total)
 }
 
+/// xattr 首查/取值两段式应答的中间产物：`size==0` 的探测请求回长度，其余回数据。
+pub(super) enum XattrOutcome {
+    Size(u32),
+    Data(Vec<u8>),
+}
+
 impl Filesystem for FuseRedirectFs {
     fn init(&mut self, _req: &Request, config: &mut KernelConfig) -> std::io::Result<()> {
         // 三层判定（自动开启，兼容性由端到端探针保障）：
@@ -294,6 +300,7 @@ impl Filesystem for FuseRedirectFs {
     fn lookup(&self, req: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEntry) {
         let _perf = self.perf.observe(&self.perf.lookup_calls);
         let Some(parent_rel) = self.path_for_ino(parent) else {
+            self.log_reply_error("lookup", req.uid(), None, Errno::ENOENT);
             reply.error(Errno::ENOENT);
             return;
         };
@@ -346,7 +353,11 @@ impl Filesystem for FuseRedirectFs {
             .and_then(|backend| self.visible_attr_for_backend(&policy, ino, &backend))
         {
             Ok(attr) => reply.attr(&ATTR_TTL, &attr),
-            Err(errno) => reply.error(errno),
+            Err(errno) => {
+                let rel = self.path_for_ino(ino);
+                self.log_reply_error("getattr", req.uid(), rel.as_deref(), errno);
+                reply.error(errno)
+            }
         }
     }
 
@@ -1024,6 +1035,264 @@ impl Filesystem for FuseRedirectFs {
         }
     }
 
+    fn symlink(
+        &self,
+        req: &Request,
+        parent: INodeNo,
+        link_name: &OsStr,
+        target: &Path,
+        reply: ReplyEntry,
+    ) {
+        let _perf = self.perf.observe(&self.perf.mutation_calls);
+        let NewEntryRoute {
+            policy,
+            rel,
+            backend,
+        } = match self.route_new_entry(req, parent, link_name, "symlink") {
+            Ok(route) => route,
+            Err(errno) => {
+                Self::log_new_entry_errno(&self.policy_for_request(req), link_name, errno);
+                reply.error(errno);
+                return;
+            }
+        };
+        let target_bytes = target.as_os_str().as_bytes();
+        let c_target = match std::ffi::CString::new(target_bytes) {
+            Ok(value) => value,
+            Err(_) => {
+                reply.error(Errno::EINVAL);
+                return;
+            }
+        };
+        let c_path = match cstring_path(&backend.path) {
+            Ok(path) => path,
+            Err(errno) => {
+                reply.error(errno);
+                return;
+            }
+        };
+        // SAFETY: 两个 CString 在调用期间存活且以 NUL 结尾，symlink 只读取不写入。
+        let ret = unsafe { libc::symlink(c_target.as_ptr(), c_path.as_ptr()) };
+        if ret != 0 {
+            reply.error(errno_from_code(last_errno()));
+            return;
+        }
+        fix_path_metadata(
+            &backend.path,
+            policy.uid,
+            0o777,
+            backend.is_shared_public_backend,
+            false,
+        );
+        self.invalidate_dir_candidate_cache();
+        let ino = {
+            let mut state = self.state.write().unwrap_or_else(|err| err.into_inner());
+            let ino = Self::ino_for_path_locked(&mut state, &rel);
+            // 同 create：登记属主供跨进程 fstat 回退。
+            Self::remember_policy_for_inode_locked(&mut state, ino, &rel, &policy);
+            Self::add_lookup_locked(&mut state, ino);
+            ino
+        };
+        match self.visible_attr_for_backend(&policy, ino, &backend) {
+            Ok(attr) => reply.entry(&ENTRY_TTL, &attr, Generation(0)),
+            Err(errno) => {
+                let mut state = self.state.write().unwrap_or_else(|err| err.into_inner());
+                Self::remove_lookup_locked(&mut state, ino, 1);
+                reply.error(errno);
+            }
+        }
+    }
+
+    fn getxattr(&self, req: &Request, ino: INodeNo, name: &OsStr, size: u32, reply: ReplyXattr) {
+        let policy = self.policy_for_fd_stat_or_request(req, ino);
+        let outcome = self.with_backend_for_xattr(&policy, ino, "getxattr", |c_path| {
+            let c_name = match std::ffi::CString::new(name.as_bytes()) {
+                Ok(value) => value,
+                Err(_) => return Err(Errno::EINVAL),
+            };
+            // SAFETY: c_path/c_name 在调用期间存活且以 NUL 结尾；首查长度，空缓冲合法。
+            let needed = unsafe {
+                libc::lgetxattr(c_path.as_ptr(), c_name.as_ptr(), std::ptr::null_mut(), 0)
+            };
+            if needed < 0 {
+                return Err(errno_from_code(last_errno()));
+            }
+            if size == 0 {
+                return Ok(XattrOutcome::Size(needed as u32));
+            }
+            if (needed as u64) > size as u64 {
+                return Err(Errno::ERANGE);
+            }
+            let mut buffer = vec![0u8; needed as usize];
+            // SAFETY: buffer 长度即上面查得的 needed，lgetxattr 只写入 buffer 范围内。
+            let written = unsafe {
+                libc::lgetxattr(
+                    c_path.as_ptr(),
+                    c_name.as_ptr(),
+                    buffer.as_mut_ptr() as *mut libc::c_void,
+                    buffer.len(),
+                )
+            };
+            if written < 0 {
+                return Err(errno_from_code(last_errno()));
+            }
+            buffer.truncate(written as usize);
+            Ok(XattrOutcome::Data(buffer))
+        });
+        match outcome {
+            Ok(XattrOutcome::Size(value)) => reply.size(value),
+            Ok(XattrOutcome::Data(bytes)) => reply.data(&bytes),
+            Err(errno) => reply.error(errno),
+        }
+    }
+
+    fn setxattr(
+        &self,
+        req: &Request,
+        ino: INodeNo,
+        name: &OsStr,
+        value: &[u8],
+        flags: i32,
+        position: u32,
+        reply: ReplyEmpty,
+    ) {
+        if position != 0 {
+            // position 仅 pwritev 风格的 resource fork 语义使用，Linux 上恒为 0。
+            reply.error(Errno::EINVAL);
+            return;
+        }
+        let policy = self.policy_for_fd_stat_or_request(req, ino);
+        let outcome = self.with_backend_for_xattr(&policy, ino, "setxattr", |c_path| {
+            let c_name = match std::ffi::CString::new(name.as_bytes()) {
+                Ok(value) => value,
+                Err(_) => return Err(Errno::EINVAL),
+            };
+            // SAFETY: c_path/c_name 存活且以 NUL 结尾；value 为调用方传入的只读缓冲。
+            let ret = unsafe {
+                libc::lsetxattr(
+                    c_path.as_ptr(),
+                    c_name.as_ptr(),
+                    value.as_ptr() as *const libc::c_void,
+                    value.len(),
+                    flags,
+                )
+            };
+            if ret == 0 {
+                Ok(XattrOutcome::Data(Vec::new()))
+            } else {
+                Err(errno_from_code(last_errno()))
+            }
+        });
+        match outcome {
+            Ok(_) => reply.ok(),
+            Err(errno) => reply.error(errno),
+        }
+    }
+
+    fn listxattr(&self, req: &Request, ino: INodeNo, size: u32, reply: ReplyXattr) {
+        let policy = self.policy_for_fd_stat_or_request(req, ino);
+        let outcome = self.with_backend_for_xattr(&policy, ino, "listxattr", |c_path| {
+            // SAFETY: c_path 存活且以 NUL 结尾；首查长度，空缓冲合法。
+            let needed = unsafe { libc::llistxattr(c_path.as_ptr(), std::ptr::null_mut(), 0) };
+            if needed < 0 {
+                return Err(errno_from_code(last_errno()));
+            }
+            if size == 0 {
+                return Ok(XattrOutcome::Size(needed as u32));
+            }
+            if (needed as u64) > size as u64 {
+                return Err(Errno::ERANGE);
+            }
+            let mut buffer = vec![0u8; needed as usize];
+            // SAFETY: buffer 长度即上面查得的 needed，llistxattr 只写入 buffer 范围内。
+            let written = unsafe {
+                libc::llistxattr(
+                    c_path.as_ptr(),
+                    buffer.as_mut_ptr() as *mut libc::c_char,
+                    buffer.len(),
+                )
+            };
+            if written < 0 {
+                return Err(errno_from_code(last_errno()));
+            }
+            buffer.truncate(written as usize);
+            Ok(XattrOutcome::Data(buffer))
+        });
+        match outcome {
+            Ok(XattrOutcome::Size(value)) => reply.size(value),
+            Ok(XattrOutcome::Data(bytes)) => reply.data(&bytes),
+            Err(errno) => reply.error(errno),
+        }
+    }
+
+    fn removexattr(&self, req: &Request, ino: INodeNo, name: &OsStr, reply: ReplyEmpty) {
+        let policy = self.policy_for_fd_stat_or_request(req, ino);
+        let outcome = self.with_backend_for_xattr(&policy, ino, "removexattr", |c_path| {
+            let c_name = match std::ffi::CString::new(name.as_bytes()) {
+                Ok(value) => value,
+                Err(_) => return Err(Errno::EINVAL),
+            };
+            // SAFETY: c_path/c_name 存活且以 NUL 结尾，lremovexattr 只读取。
+            let ret = unsafe { libc::lremovexattr(c_path.as_ptr(), c_name.as_ptr()) };
+            if ret == 0 {
+                Ok(XattrOutcome::Data(Vec::new()))
+            } else {
+                Err(errno_from_code(last_errno()))
+            }
+        });
+        match outcome {
+            Ok(_) => reply.ok(),
+            Err(errno) => reply.error(errno),
+        }
+    }
+
+    fn lseek(
+        &self,
+        _req: &Request,
+        _ino: INodeNo,
+        fh: FileHandle,
+        offset: i64,
+        whence: i32,
+        reply: ReplyLseek,
+    ) {
+        let file = {
+            let state = self.state.read().unwrap_or_else(|err| err.into_inner());
+            match state.files.get(&fh.into()).and_then(|f| f.file.clone()) {
+                Some(file) => file,
+                None => {
+                    reply.error(Errno::EBADF);
+                    return;
+                }
+            }
+        };
+        // 内核仅对 SEEK_HOLE/SEEK_DATA 下发 FUSE lseek（普通定位在页缓存层完成）。
+        // 后端文件非稀疏语义：DATA 返回起始偏移，HOLE 返回文件尾（EOF 处的洞）。
+        let size = match file.metadata() {
+            Ok(metadata) => metadata.len() as i64,
+            Err(error) => {
+                reply.error(errno_from_io(error));
+                return;
+            }
+        };
+        match whence {
+            libc::SEEK_DATA => {
+                if offset >= size {
+                    reply.error(Errno::ENXIO);
+                } else {
+                    reply.offset(offset.max(0));
+                }
+            }
+            libc::SEEK_HOLE => {
+                if offset >= size {
+                    reply.error(Errno::ENXIO);
+                } else {
+                    reply.offset(size);
+                }
+            }
+            _ => reply.error(Errno::EINVAL),
+        }
+    }
+
     fn create(
         &self,
         req: &Request,
@@ -1417,6 +1686,8 @@ impl Filesystem for FuseRedirectFs {
         let backend = match self.backend_for_ino(&policy, ino) {
             Ok(backend) => backend,
             Err(errno) => {
+                let rel = self.path_for_ino(ino);
+                self.log_reply_error("setattr", req.uid(), rel.as_deref(), errno);
                 reply.error(errno);
                 return;
             }
@@ -1510,6 +1781,8 @@ impl Filesystem for FuseRedirectFs {
         let backend = match self.backend_for_ino(&policy, ino) {
             Ok(backend) => backend,
             Err(errno) => {
+                let rel = self.path_for_ino(ino);
+                self.log_reply_error("access", req.uid(), rel.as_deref(), errno);
                 reply.error(errno);
                 return;
             }

@@ -462,6 +462,23 @@ impl FuseRedirectFs {
             .ok_or(Errno::ENOENT)
     }
 
+    /// xattr 系 op 的公共后端路由：错误统一走应答错误观测，成功后以
+    /// backend 的 NUL 结尾路径执行动作。
+    fn with_backend_for_xattr(
+        &self,
+        policy: &RedirectPolicy,
+        ino: INodeNo,
+        op: &'static str,
+        action: impl FnOnce(&std::ffi::CString) -> Result<callbacks::XattrOutcome, Errno>,
+    ) -> Result<callbacks::XattrOutcome, Errno> {
+        let backend = self.backend_for_ino(policy, ino).inspect_err(|&errno| {
+            let rel = self.path_for_ino(ino);
+            self.log_reply_error(op, policy.uid as u32, rel.as_deref(), errno);
+        })?;
+        let c_path = metadata::cstring_path(&backend.path)?;
+        action(&c_path)
+    }
+
     fn child_rel(parent_rel: &str, name: &OsStr) -> Result<String, Errno> {
         let name_bytes = name.as_bytes();
         if name_bytes.is_empty()
@@ -550,6 +567,7 @@ impl FuseRedirectFs {
     fn reply_entry_for_rel(&self, policy: &RedirectPolicy, rel: &str, reply: ReplyEntry) {
         let Some(backend) = policy.backend_for_relative(rel, OperationKind::Read) else {
             Self::log_new_entry_errno(policy, OsStr::new(rel), Errno::ENOENT);
+            self.log_reply_error("lookup", policy.uid as u32, Some(rel), Errno::ENOENT);
             reply.error(Errno::ENOENT);
             return;
         };
@@ -563,6 +581,7 @@ impl FuseRedirectFs {
         match self.visible_attr_for_backend(policy, ino, &backend) {
             Ok(attr) => reply.entry(&ENTRY_TTL, &attr, Generation(0)),
             Err(errno) => {
+                self.log_reply_error("lookup", policy.uid as u32, Some(rel), errno);
                 let mut state = self.state.write().unwrap_or_else(|err| err.into_inner());
                 Self::remove_lookup_locked(&mut state, ino, 1);
                 reply.error(errno);
@@ -621,6 +640,36 @@ impl FuseRedirectFs {
     /// W 级日志不受 verbose 门禁，宿主进程必然落入 running.log。
     /// create/mkdir 等新建入口的异常 errno 诊断：写路径 O_CREAT 走 create 回调而非 open，
     /// 不补这个点则「未登记 uid / 旧映射残留」的 ENOENT 与旧只读策略的 EROFS 全部无痕。
+    /// xattr 系 op 的策略解析：与 getattr 一致的属主回退——跨进程 fd 的
+    /// getxattr/setxattr 同样不能按请求者 uid 重路由 rel 路径。
+    fn policy_for_fd_stat_or_request(&self, req: &Request, ino: INodeNo) -> Arc<RedirectPolicy> {
+        let policy = self.policy_for_read_request(req, Some(ino), None);
+        if let Some(owner_policy) = self.inode_owner_policy_for_fd_stat(ino, req.uid()) {
+            return owner_policy;
+        }
+        policy
+    }
+
+    /// 统一应答错误观测。ENOENT/EACCES 是热路径正常语义，仅 debug 日志开启时
+    /// 记录——此前 QQ 相机失败链中 MP 侧 getattr ENOENT 因宿主应答完全无观测
+    /// 成为盲区，这次补上。其余错误罕见且排查价值高，warn 级采样（前 16 次全
+    /// 记，之后每 256 次记一次）兼顾证据留存与模块日志 20s 轮转的限流约束。
+    fn log_reply_error(&self, op: &'static str, uid: u32, rel: Option<&str>, errno: Errno) {
+        let errno_value = i32::from(errno);
+        if matches!(errno_value, libc::ENOENT | libc::EACCES) {
+            if crate::logging::is_debug_logging_enabled() {
+                log::debug!("fuse {op} error uid={uid} rel={rel:?} errno={errno_value}");
+            }
+            return;
+        }
+        static UNEXPECTED_COUNT: AtomicU64 = AtomicU64::new(0);
+        let seen = UNEXPECTED_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
+        if seen > 16 && !seen.is_multiple_of(256) {
+            return;
+        }
+        log::warn!("fuse {op} error uid={uid} rel={rel:?} errno={errno_value} seen={seen}");
+    }
+
     fn log_new_entry_errno(policy: &RedirectPolicy, name: &OsStr, errno: Errno) {
         let errno_value = i32::from(errno);
         if !matches!(errno_value, libc::ENOENT | libc::EACCES | libc::EROFS) {
