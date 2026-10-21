@@ -593,6 +593,23 @@ fn chown_private_path_if_needed(
         if fd >= 0 && crate::hook::companion_api::companion_fchown(fd, owner_uid) {
             return;
         }
+        // 目录（mkdir/mkdirat 钩子不持有 fd）此前在此处静默失败：无 CAP_CHOWN
+        // 的代写进程对私有树目录的属主修复全部落空，累积成 uid=1023/2773 的
+        // 漂移目录（2026-10-21 用户反馈）。就地打开一个只读 fd 交给 companion
+        // fchown，补上「目录无 fd 通道」的结构性缺口；文件路径 O_DIRECTORY
+        // 打开会 ENOTDIR，回退普通只读打开再试一次。
+        if fd < 0
+            && open_fd_for_owner_fix(path, true)
+                .or_else(|| open_fd_for_owner_fix(path, false))
+                .is_some_and(|opened| {
+                    let fixed = crate::hook::companion_api::companion_fchown(opened, owner_uid);
+                    // SAFETY: opened 是刚打开的合法 fd，close 不借用其它数据。
+                    unsafe { libc::close(opened) };
+                    fixed
+                })
+        {
+            return;
+        }
     }
     if error_no != libc::ENOENT && error_no != libc::EPERM && error_no != libc::EACCES {
         log::warn!(
@@ -603,6 +620,18 @@ fn chown_private_path_if_needed(
             error_no
         );
     }
+}
+
+/// 为无 fd 的属主修复目标打开一个只读 fd（目录用 O_DIRECTORY，文件回退普通打开）。
+fn open_fd_for_owner_fix(path: &str, directory: bool) -> Option<libc::c_int> {
+    let mut flags = libc::O_RDONLY | libc::O_CLOEXEC;
+    if directory {
+        flags |= libc::O_DIRECTORY;
+    }
+    let c_path = CString::new(path).ok()?;
+    // SAFETY: c_path 以 NUL 结尾且在调用期间保持有效，open 只返回新 fd。
+    let opened = unsafe { libc::open(c_path.as_ptr(), flags) };
+    (opened >= 0).then_some(opened)
 }
 
 fn chmod_private_node_if_needed(
@@ -921,6 +950,10 @@ fn create_parent_dirs_recursive(path: &str, mode: mode_t, owner: Option<&Redirec
     let ret = unsafe { libc::mkdirat(AT_FDCWD, c_parent.as_ptr(), mode) };
     if ret == 0 {
         normalize_redirect_dir_metadata(&parent, mode, owner);
+        // 自动补建的父目录逐级交由系统代写属主治理：链中间层不经过 open/mkdir
+        // 钩子触发面，漏掉就会残留 media_rw 属主（uid=1023/2773 签名，2026-10-21
+        // 用户反馈）。治理入口自带系统代写进程门控与 errno 保存，应用进程内零开销。
+        fix_system_writer_android_private_owner(&parent, true, -1);
         log::debug!("auto mkdir parent {}", parent);
         return;
     }
@@ -959,6 +992,8 @@ fn create_parent_dirs_recursive_until(
     let ret = unsafe { libc::mkdirat(AT_FDCWD, c_parent.as_ptr(), mode) };
     if ret == 0 {
         normalize_redirect_dir_metadata(&parent, mode, owner);
+        // 同 create_parent_dirs_recursive：存储父链每一级都要过属主治理。
+        fix_system_writer_android_private_owner(&parent, true, -1);
         log::debug!("auto mkdir storage parent {}", parent);
         return;
     }
