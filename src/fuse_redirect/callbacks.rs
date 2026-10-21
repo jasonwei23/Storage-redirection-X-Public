@@ -317,7 +317,7 @@ impl Filesystem for FuseRedirectFs {
                         &policy.package_name,
                     );
                 }
-                self.reply_entry_for_rel(&policy, &rel, reply)
+                self.reply_entry_for_rel(req.uid(), &policy, &rel, reply)
             }
             Err(errno) => {
                 Self::log_new_entry_errno(
@@ -348,6 +348,12 @@ impl Filesystem for FuseRedirectFs {
         if let Some(owner_policy) = self.inode_owner_policy_for_fd_stat(ino, req.uid()) {
             policy = owner_policy;
         }
+        // 宿主共享会话的系统读取者路径反解：MP 扫描/元数据协商对重定向树的
+        if let Some(rel) = self.path_for_ino(ino)
+            && let Some(owner_policy) = self.system_reader_policy_on_miss(req.uid(), &policy, &rel)
+        {
+            policy = owner_policy;
+        }
         match self
             .backend_for_ino(&policy, ino)
             .and_then(|backend| self.visible_attr_for_backend(&policy, ino, &backend))
@@ -376,7 +382,7 @@ impl Filesystem for FuseRedirectFs {
 
     fn opendir(&self, req: &Request, ino: INodeNo, _flags: OpenFlags, reply: ReplyOpen) {
         let _perf = self.perf.observe(&self.perf.open_calls);
-        let policy = self.policy_for_read_request(req, Some(ino), None);
+        let mut policy = self.policy_for_read_request(req, Some(ino), None);
         let track_dir_perf = crate::logging::is_debug_logging_enabled();
         let first_lock_started = track_dir_perf.then(std::time::Instant::now);
         let (mut rel, mut path_version) = {
@@ -385,8 +391,15 @@ impl Filesystem for FuseRedirectFs {
                 reply.error(Errno::ENOENT);
                 return;
             };
-            let version = state.inode_path_versions.get(&ino.0).copied().unwrap_or(0);
-            (rel, version)
+            // MP 扫描重定向树目录靠系统读取者重试才能看到条目；rel 在锁内一并取出。
+            if let Some(owner_policy) = self.system_reader_policy_on_miss(req.uid(), &policy, &rel)
+            {
+                policy = owner_policy;
+            }
+            (
+                rel,
+                state.inode_path_versions.get(&ino.0).copied().unwrap_or(0),
+            )
         };
         let mut lock_wait_ns = elapsed_ns(first_lock_started);
         let mut scan_ns = 0u64;
@@ -626,11 +639,18 @@ impl Filesystem for FuseRedirectFs {
         let _perf = self.perf.observe(&self.perf.open_calls);
         let is_create = open_flags_create(flags.0);
         let is_mutation = open_flags_write(flags.0) || is_create;
-        let policy = if is_mutation {
+        let mut policy = if is_mutation {
             self.policy_for_request(req)
         } else {
             self.policy_for_read_request(req, Some(ino), None)
         };
+        // 读取类 open 走系统读取者 miss 重试；写入类保持宿主拒绝语义。
+        if !is_mutation
+            && let Some(rel) = self.path_for_ino(ino)
+            && let Some(owner_policy) = self.system_reader_policy_on_miss(req.uid(), &policy, &rel)
+        {
+            policy = owner_policy;
+        }
         let backend = match self.backend_for_ino(&policy, ino) {
             Ok(backend) => backend,
             Err(errno) => {
@@ -1535,7 +1555,7 @@ impl Filesystem for FuseRedirectFs {
         }
         self.invalidate_dir_candidate_cache();
         policy.emit_monitor_create(&backend);
-        self.reply_entry_for_rel(&policy, &rel, reply);
+        self.reply_entry_for_rel(req.uid(), &policy, &rel, reply);
     }
 
     fn unlink(&self, req: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEmpty) {
@@ -1773,11 +1793,16 @@ impl Filesystem for FuseRedirectFs {
     }
 
     fn access(&self, req: &Request, ino: INodeNo, mask: AccessFlags, reply: ReplyEmpty) {
-        let policy = if mask.contains(AccessFlags::W_OK) {
+        let mut policy = if mask.contains(AccessFlags::W_OK) {
             self.policy_for_request(req)
         } else {
             self.policy_for_read_request(req, Some(ino), None)
         };
+        if let Some(rel) = self.path_for_ino(ino)
+            && let Some(owner_policy) = self.system_reader_policy_on_miss(req.uid(), &policy, &rel)
+        {
+            policy = owner_policy;
+        }
         let backend = match self.backend_for_ino(&policy, ino) {
             Ok(backend) => backend,
             Err(errno) => {

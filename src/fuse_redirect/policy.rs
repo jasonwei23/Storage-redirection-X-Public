@@ -365,6 +365,21 @@ impl PolicyRegistry {
             .and_then(|table| table.get(&uid).cloned())
     }
 
+    /// 按包名反查已登记的属主策略，供宿主共享会话的「系统读取者」路径反解使用：
+    /// MediaProvider 等系统读取者按路径访问 `Android/data/<pkg>/**` 时，需要用
+    /// 目标应用的属主策略解析后端落点，否则 deny_all 回退必然 ENOENT。
+    /// 表规模为已登记应用数（几十级），线性查找代价可忽略。
+    pub(super) fn find_owner_policy_by_package(
+        &self,
+        package_name: &str,
+    ) -> Option<Arc<RedirectPolicy>> {
+        let table = self.by_uid.by_uid.read().ok()?;
+        table
+            .values()
+            .find(|policy| policy.package_name == package_name)
+            .cloned()
+    }
+
     /// 取出可写表句柄，交给宿主会话的控制通道在运行期登记应用策略。
     pub(super) fn shared_table(&self) -> SharedPolicyTable {
         self.by_uid.clone()

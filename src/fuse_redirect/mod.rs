@@ -253,6 +253,89 @@ struct NewEntryRoute {
     backend: BackendPath,
 }
 
+/// MediaProvider 应用 uid：宿主 daemon 以 root 运行，直接解析 packages.list
+/// （系统维护的权威映射；不同设备/用户 profile 的分配值不构成契约），
+/// 解析失败回退 A16/A17 观测值。
+fn media_provider_uid() -> u32 {
+    static MEDIA_PROVIDER_UID: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    *MEDIA_PROVIDER_UID.get_or_init(|| {
+        let parsed = std::fs::read_to_string("/data/system/packages.list")
+            .ok()
+            .and_then(|content| {
+                content.lines().find_map(|line| {
+                    let mut fields = line.split_whitespace();
+                    if fields.next() == Some("com.android.providers.media.module") {
+                        fields.next().and_then(|value| value.parse::<i32>().ok())
+                    } else {
+                        None
+                    }
+                })
+            })
+            .filter(|uid| *uid >= 10000);
+        parsed.map(|uid| uid as u32).unwrap_or(10217)
+    })
+}
+
+/// 宿主共享会话的「系统读取者」白名单：MediaProvider 应用 uid 与 media/media_rw
+/// 系统身份。这些调用方按路径访问应用重定向树是系统扫描/元数据协商的正常路径，
+/// 不属于 scoped storage 越权；其余应用 uid 一律维持 deny_all。
+fn is_system_reader_uid(uid: u32) -> bool {
+    uid == media_provider_uid() || uid == 1013 || uid == 1023
+}
+
+impl FuseRedirectFs {
+    /// 系统读取者的路径解析（miss 重试语义）：先用请求者自身策略解析——MP 在宿主
+    /// 共享会话有已登记策略（公共视图），命中即维持原语义；解析失败且请求者为
+    /// 白名单 uid（MP/媒体身份）时，改用目标应用的属主策略重试——文件在被重定向
+    /// 的后端落点而公共视图不存在，正是本轮 QQ 相机 fd 协商 ENOENT 的路径侧同源
+    /// 场景。仅 Read 类，仅 `Android/data/<pkg>/` 前缀且该应用已登记；写路径与
+    /// 其它应用 uid 一律维持原解析结果（宿主拒绝未登记调用方写入的沙盒设计）。
+    fn backend_for_relative_with_system_reader(
+        &self,
+        uid: u32,
+        policy: &Arc<RedirectPolicy>,
+        rel: &str,
+    ) -> Option<(Arc<RedirectPolicy>, BackendPath)> {
+        if let Some(backend) = policy.backend_for_relative(rel, OperationKind::Read) {
+            return Some((Arc::clone(policy), backend));
+        }
+        let owner_policy = self.system_reader_policy_on_miss(uid, policy, rel)?;
+        let backend = owner_policy.backend_for_relative(rel, OperationKind::Read)?;
+        Some((owner_policy, backend))
+    }
+
+    /// 请求者策略解析 miss 时的系统读取者重试：命中则返回属主策略，调用方以它
+    /// 重新执行原解析并沿同一视角完成 attr 塑形与应答；未命中返回 None 维持原结果。
+    fn system_reader_policy_on_miss(
+        &self,
+        uid: u32,
+        _policy: &Arc<RedirectPolicy>,
+        rel: &str,
+    ) -> Option<Arc<RedirectPolicy>> {
+        if !is_system_reader_uid(uid) {
+            return None;
+        }
+        let package_name = rel
+            .strip_prefix("Android/data/")
+            .and_then(|rest| rest.split('/').next())
+            .filter(|name| !name.is_empty())?;
+        let owner_policy = self.policy.find_owner_policy_by_package(package_name)?;
+        owner_policy.backend_for_relative(rel, OperationKind::Read)?;
+        static SYSTEM_READER_COUNT: AtomicU64 = AtomicU64::new(0);
+        let seen = SYSTEM_READER_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
+        if seen == 1 || seen.is_multiple_of(256) {
+            log::debug!(
+                "fuse system-reader resolve uid={} pkg={} rel={} count={}",
+                uid,
+                package_name,
+                rel,
+                seen
+            );
+        }
+        Some(owner_policy)
+    }
+}
+
 impl FuseRedirectFs {
     /// 取出按 uid 策略表句柄。
     ///
@@ -564,13 +647,24 @@ impl FuseRedirectFs {
         }
     }
 
-    fn reply_entry_for_rel(&self, policy: &RedirectPolicy, rel: &str, reply: ReplyEntry) {
-        let Some(backend) = policy.backend_for_relative(rel, OperationKind::Read) else {
-            Self::log_new_entry_errno(policy, OsStr::new(rel), Errno::ENOENT);
-            self.log_reply_error("lookup", policy.uid as u32, Some(rel), Errno::ENOENT);
+    fn reply_entry_for_rel(
+        &self,
+        uid: u32,
+        policy: &Arc<RedirectPolicy>,
+        rel: &str,
+        reply: ReplyEntry,
+    ) {
+        // lookup 是系统读取者路径反解的主入口：MP 对重定向树的路径访问先经此建立 dentry。
+        let Some((policy, backend)) =
+            self.backend_for_relative_with_system_reader(uid, policy, rel)
+        else {
+            // 双重 miss（请求者视图 + 系统读取者重试）：ENOENT 归因由
+            // log_reply_error 承担，log_new_entry_errno 的 create 诊断不适用。
+            self.log_reply_error("lookup", uid, Some(rel), Errno::ENOENT);
             reply.error(Errno::ENOENT);
             return;
         };
+        let policy = &policy;
         let ino = {
             let mut state = self.state.write().unwrap_or_else(|err| err.into_inner());
             let ino = Self::ino_for_path_locked(&mut state, rel);
