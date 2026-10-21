@@ -19,6 +19,13 @@ log_ctl() {
   log -p i -t SRXCTL "$*" 2>/dev/null
 }
 
+# 重挂/热重载失败原因的机器可读输出：stdout 供管理器 APP 解析，
+# stderr 供 WebUI exec 在非零退出码的拒绝错误信息里携带同一令牌。
+remount_fail_reason() {
+  printf 'remount_reason=%s\n' "$1"
+  printf 'remount_reason=%s\n' "$1" >&2
+}
+
 stop_pid_file() {
   pid_file="$1"
   [ -f "$pid_file" ] || return 0
@@ -184,6 +191,7 @@ request_running_app_remount() {
   required="${1:-1}"
   if ! is_daemon_alive; then
     log_ctl "running app remount skipped: daemon not running"
+    remount_fail_reason daemon-not-running
     [ "$required" = "1" ] && return 1
     return 0
   fi
@@ -193,6 +201,7 @@ request_running_app_remount() {
   daemon_bin="$MODDIR/bin/srx_daemon"
   if [ ! -x "$daemon_bin" ] || ! "$daemon_bin" control "reconcile-running:$request_id" >/dev/null 2>&1; then
     log_ctl "running app remount request failed"
+    remount_fail_reason daemon-control-failed
     return 1
   fi
   attempts=100
@@ -207,6 +216,7 @@ request_running_app_remount() {
     i=$((i + 1))
   done
   log_ctl "running app remount timed out request=$request_id"
+  remount_fail_reason remount-timeout
   return 1
 }
 
@@ -248,15 +258,18 @@ restart_media_provider() {
   done
   if [ -z "$provider_pid" ]; then
     log_ctl "media provider hot reload skipped: provider not running"
+    remount_fail_reason provider-not-running
     return 1
   fi
   request_id=$(write_media_provider_hot_reload_request "$provider_pid") || {
     log_ctl "media provider hot reload request write failed"
+    remount_fail_reason hot-reload-request-failed
     return 1
   }
   before_count=$(hot_reload_completed_count "$provider_pid")
   if ! signal_media_provider_hot_reload "$provider_pid"; then
     log_ctl "media provider hot reload signal failed pid=$provider_pid"
+    remount_fail_reason hot-reload-signal-failed
     return 1
   fi
   if wait_for_media_provider_hot_reload "$request_id" "$provider_pid" "$before_count" 100 100000; then
@@ -264,6 +277,7 @@ restart_media_provider() {
     ready=0
   else
     log_ctl "media provider hot reload timed out pid=$provider_pid"
+    remount_fail_reason hot-reload-timeout
     ready=1
   fi
   if [ "$ready" -eq 0 ]; then

@@ -351,6 +351,15 @@ function srxCtlCommand(action) {
   return "/system/bin/sh " + shellQuote(SRXCTL) + " " + action;
 }
 
+/**
+ * 从 exec 失败信息中提取 srxctl 输出的重挂失败原因令牌（remount_reason=<key>）。
+ * exec 在非零退出码时只把 stderr 作为 Error message 抛出，因此令牌必须从 stderr 文本里解析。
+ */
+function extractRemountReason(text) {
+  const match = /remount_reason=([a-z0-9-]+)/.exec(String(text || ""));
+  return match ? match[1] : "";
+}
+
 function withSrxCtlFallback(action, fallback) {
   return (
     "if [ -r " +
@@ -2344,8 +2353,8 @@ const Api = {
         timeoutMs: 30_000,
       });
       return { ok: true };
-    } catch {
-      return { ok: false };
+    } catch (error) {
+      return { ok: false, failureReason: extractRemountReason(error?.message) };
     } finally {
       try {
         await this.ensureLogCollectors();

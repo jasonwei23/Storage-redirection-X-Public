@@ -139,6 +139,27 @@ class RootModuleControllerTest {
   }
 
   @Test
+  fun restartMediaProviderParsesFailureReason() = runBlocking {
+    val cases =
+        mapOf(
+            "remount_reason=provider-not-running\n" to "provider-not-running",
+            "remount_reason=daemon-not-running\n" to "daemon-not-running",
+            "remount_reason=remount-timeout\n" to "remount-timeout",
+            "" to null,
+        )
+
+    cases.forEach { (stdout, expected) ->
+      val shell = CapturingShell(ShellResult(1, stdout, ""))
+      val controller = RootModuleController(shell)
+
+      val restart = controller.restartMediaProvider()
+
+      assertTrue(!restart.success)
+      assertEquals(expected, restart.failureReason)
+    }
+  }
+
+  @Test
   fun ensureLogCollectorsUsesSrxctlWithLegacyFallback() = runBlocking {
     val shell = CapturingShell(ShellResult(0, "", ""))
     val controller = RootModuleController(shell)

@@ -200,9 +200,9 @@ internal fun ModuleToggleConfirmDialog(
 ) {
   val message =
       if (enable) {
-        "启动模块会恢复运行时并重启 MediaProvider，普通应用进程保持运行。媒体访问可能短暂不可用，是否继续？"
+        "启动模块会恢复运行时并请求 MediaProvider 在原进程内热重载，普通应用进程保持运行。媒体访问可能短暂抖动，是否继续？"
       } else {
-        "停止模块会停止运行时并重启 MediaProvider，普通应用进程保持运行。媒体访问可能短暂不可用，是否继续？"
+        "停止模块会停止运行时并请求 MediaProvider 在原进程内热重载，普通应用进程保持运行。媒体访问可能短暂抖动，是否继续？"
       }
   CenteredDialog(
       show = show,

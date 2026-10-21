@@ -8,6 +8,8 @@ private const val VersionSectionMarker = "__SRX_VERSION__"
 
 data class MediaProviderRestartResult(
     val success: Boolean,
+    /** srxctl 在失败时输出的 remount_reason 令牌；成功或无法解析时为 null。 */
+    val failureReason: String? = null,
 )
 
 class RootModuleController(
@@ -22,8 +24,15 @@ class RootModuleController(
 
   suspend fun restartMediaProvider(): MediaProviderRestartResult {
     val result = shell.exec(buildRestartMediaProviderCommand())
-    return MediaProviderRestartResult(result.isSuccess)
+    if (result.isSuccess) return MediaProviderRestartResult(success = true)
+    return MediaProviderRestartResult(
+        success = false,
+        failureReason = parseRemountFailReason(result.stdout),
+    )
   }
+
+  private fun parseRemountFailReason(stdout: String): String? =
+      Regex("remount_reason=([a-z0-9-]+)").find(stdout)?.groupValues?.get(1)
 
   suspend fun ensureLogCollectors(): Boolean =
       shell.exec(buildEnsureLogCollectorsCommand()).isSuccess

@@ -728,7 +728,7 @@ class SrxViewModel(
     viewModelScope.launch {
       updateBusy(
           BusyStateChange.Started(
-              if (enabled) "正在启动模块并重启 MediaProvider" else "正在停止模块并重启 MediaProvider"
+              if (enabled) "正在启动模块并请求 MediaProvider 热重载" else "正在停止模块并请求 MediaProvider 热重载"
           )
       )
       val ok = repository.setModuleEnabled(enabled)
@@ -751,7 +751,7 @@ class SrxViewModel(
                     if (result.success) {
                       "运行中应用已重新挂载，MediaProvider 已同步热重载"
                     } else {
-                      "运行中应用重新挂载超时"
+                      remountFailureMessage(result.failureReason)
                     },
                 )
               }
@@ -762,6 +762,23 @@ class SrxViewModel(
       }
     }
   }
+
+  /**
+   * 把 srxctl 的 remount_reason 令牌翻译成用户可读的失败提示。
+   *
+   * srxctl 在 daemon 未运行、MediaProvider 未运行、热重载超时等场景各有独立日志， 此前 UI 一律报「超时」，用户无法区分是环境没就绪还是真的超时。
+   */
+  private fun remountFailureMessage(reason: String?): String =
+      when (reason) {
+        "provider-not-running" -> "MediaProvider 未在运行，无法同步热重载"
+        "daemon-not-running" -> "模块 daemon 未运行，无法重新挂载运行中应用"
+        "hot-reload-timeout" -> "MediaProvider 热重载超时"
+        "remount-timeout" -> "运行中应用重新挂载超时"
+        "daemon-control-failed",
+        "hot-reload-request-failed",
+        "hot-reload-signal-failed" -> "热重载或重挂请求发送失败"
+        else -> "重新挂载运行中应用失败"
+      }
 
   fun refreshLogs() {
     viewModelScope.launch {

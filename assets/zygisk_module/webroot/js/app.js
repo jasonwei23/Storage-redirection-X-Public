@@ -4188,7 +4188,7 @@
           "Fuse Fixer",
           "fuseFix",
           State.globalConfig.fuse_fix_enabled !== false,
-          "SRX 内置 Fuse Fixer 兼容保护，处理特殊 Unicode 字符",
+          "SRX 内置 Fuse Fixer 兼容保护，修正 MediaProvider 的 FUSE 可访问性判定与 passthrough 行为",
         ) +
         switchRow(
           "详细日志",
@@ -5925,13 +5925,36 @@
     const loading = Theme.showLoadingDialog("正在重新挂载运行中应用...");
     try {
       const result = await Api.restartMediaProvider();
-      if (!result?.ok) throw new Error("MediaProvider hot reload timeout");
+      if (!result?.ok) {
+        Theme.showToast(remountFailureMessage(result?.failureReason), "error");
+        return;
+      }
       Api.showManagerToast("运行中应用已重新挂载，MediaProvider 已同步热重载");
     } catch (error) {
       Theme.showToast("重新挂载运行中应用失败", "error");
     } finally {
       loading.close();
       State.mediaProviderReloadRunning = false;
+    }
+  }
+
+  /** 把 srxctl 的 remount_reason 令牌翻译成用户可读的失败提示。 */
+  function remountFailureMessage(reason) {
+    switch (reason) {
+      case "provider-not-running":
+        return "MediaProvider 未在运行，无法同步热重载";
+      case "daemon-not-running":
+        return "模块 daemon 未运行，无法重新挂载运行中应用";
+      case "hot-reload-timeout":
+        return "MediaProvider 热重载超时";
+      case "remount-timeout":
+        return "运行中应用重新挂载超时";
+      case "daemon-control-failed":
+      case "hot-reload-request-failed":
+      case "hot-reload-signal-failed":
+        return "热重载或重挂请求发送失败";
+      default:
+        return "重新挂载运行中应用失败";
     }
   }
 
