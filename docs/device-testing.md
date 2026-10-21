@@ -192,8 +192,8 @@ CI/Release 以 Android 版本为矩阵维度运行测试流：Android 13/14/15/1
 Android 17（API 37.0）已并入上面的矩阵（不再是独立 job），与主矩阵一同被 `Test-flow required gate` 校验并执行同一套 scenario 1-37。它与其他版本有三处执行环境差异：
 
 - **设备侧图形读回保护**：Android 17 系统镜像的 `mapper.ranchu` gralloc 未实现 DMA 颜色缓冲读回，而 emulator 的 gfxstream 后端仍会广播 `ReadColorBufferDMA` 特性。SystemUI 的 `RegionSampling` 与 system_server 的 `TaskSnapshotPersister` 触发读回后会命中 `Assertion failed: !rcEnc->featureInfo()->hasReadColorBufferDma`，并连带重启 framework。测试脚本在设备 SDK 版本为 37 时先执行 `service call window 137 i32 0` 关闭 task snapshot，再 `pm disable-user com.android.systemui` 关闭 SystemUI，并在模块安装重启 framework 后重新应用，直到确认 task snapshot 已关闭且 SystemUI 处于 disabled 状态才继续。该缺陷与 GPU 模式无关，保护逻辑仅在检测到 `ro.build.version.sdk = 37` 时生效。保护过程写入设备侧 `test-flow-graphics-state.txt`（该文件目前不在任何 job 的 artifact 上传清单内，排障需结合 job 日志中的 `android17:` 行）。
-- **注入与启动参数**：Android 17 矩阵条目显式使用 `Magisk v31.0` 完成 rootAVD 注入（其余版本不设置 `MAGISK_URL`，沿用安装脚本内置默认版本），模拟器启动超时放宽到 1800 秒并保留系统动画（其余版本为 1500 秒、关闭动画）。
-- **用例粒度**：Android 17 矩阵条目覆盖 `SRT_FRESH_APP_PER_CASE=1`（每个服务用例前冷启动应用）；其余版本显式设为 0。
+- **注入方案与启动参数**：Android 17 矩阵条目使用 KernelSU 方案（`root_method: ksu`，AVD 镜像打 KernelSU 补丁，ksud 负责安装模块与 Zygisk Next），root shell 走 `su 0 sh -c`（`ADB_ROOT_MODE=su0`）；其余版本仍由安装脚本按 Magisk 探测完成注入。模拟器启动超时放宽到 1800 秒并保留系统动画（其余版本为 1500 秒、关闭动画），GPU 模式固定 `swiftshader_indirect`。
+- **用例粒度**：Android 17 矩阵条目覆盖 `SRT_FRESH_APP_PER_CASE=1`（每个服务用例前冷启动应用），并经 `SRT_FRESH_APP_SCENARIOS` 收窄到配置切换与生命周期场景（1,2,29,32,33）；其余版本显式设为 0。
 
 完整脚本覆盖以下场景：
 

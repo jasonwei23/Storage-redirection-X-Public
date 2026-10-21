@@ -377,5 +377,5 @@ CI 测试流为共享宿主增加**轻量时间点快照**：每个 Android job 
 - **普通应用不安装 native/inline/PLT hook**：本改造全部走 companion mount / mount
   namespace / FUSE 路径，未新增任何进程内 hook；
 - **测试流同时识别两类 FUSE 挂载**：`srx_fuse_redirect` 表示 scoped 回退会话，`srx_fuse_host` 表示共享宿主会话；场景断言不能只匹配其中一种。
-- **能力熔断快照语义不变**：`fuse_capability` 的 `state`/`reason`/`fail_count` 未改动。
+- **能力熔断快照**：共享宿主改造本身未改快照语义；后续 `schema=3` 已引入按应用分桶（设备级 `unavailable` 需 ≥2 个不同应用失败）与 `retry_at_ms` 退避自愈，当前语义见 [存储后端架构](storage-backend.md)。
 - **后端选择仍由 `auto` 统一控制**：文档、测试和诊断不应把 FUSE 或 namespace 单独描述成所有设备的固定后端。
