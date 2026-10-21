@@ -24,8 +24,10 @@ use std::thread;
 use std::time::Duration;
 
 /// 完成标记。位于模块目录 tmp/ 下，随 /data 持久化；文件存在即视为迁移已完成。
+// v2：v1 迁移跑完后的设备又经「目录无 fd 通道」缺口累积了新漂移
+// （2026-10-21 用户反馈 uid=1023/2773 目录），源头修复落地后重跑一轮。
 const MIGRATION_MARKER: &str =
-    "/data/adb/modules/storage.redirect.x/tmp/owner-migration-1023-v1.done";
+    "/data/adb/modules/storage.redirect.x/tmp/owner-migration-1023-v2.done";
 
 /// 漂移签名：私有树内 owner 恰好是 media_rw 的条目才修复。
 const MEDIA_RW_UID: u32 = 1023;
@@ -90,7 +92,7 @@ fn run() {
         );
         return;
     }
-    match std::fs::write(MIGRATION_MARKER, "v1\n") {
+    match std::fs::write(MIGRATION_MARKER, "v2\n") {
         Ok(()) => log::info!(
             "owner migration done scanned={} repaired={} packages={} unknown_uid_packages={}",
             stats.scanned,
