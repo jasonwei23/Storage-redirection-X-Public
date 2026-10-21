@@ -918,15 +918,6 @@ fn handle_child_process(request: &MountRequest, plan: &MountForkPlan, sock: c_in
     clear_previous_allowed_real_backend_mounts(request);
 
     if request.operation == MountOperation::Disable {
-        // 开关切换时刻的属主交接修复：关闭重定向意味着存储视图交还原生 FUSE，
-        // 原生模型要求应用私有子树属主是应用 uid。重定向开启期可能留下属主为
-        // media_rw 的条目（真机实证：这种状态下原生 FUSE 对应用只给 others 位，
-        // Unity 类应用存档不可读写），交还前就地修干净。内部自带预算与「只在
-        // 属主精确等于 media_rw 时动手」的守卫，干净子树是纯 lstat 扫描。
-        crate::daemon_monitor::repair_app_private_owners(
-            &request.package_name,
-            crate::platform::user_id_from_uid(request.uid),
-        );
         // 已确认清除时才丢弃账本：挂载明细已随卸载消失，保留它只会让后续监督把
         // "目标上没有本模块挂载"误判成需要重新注入的 Detached 状态。
         if cleanup.is_cleared() {
@@ -1068,31 +1059,12 @@ fn handle_child_process(request: &MountRequest, plan: &MountForkPlan, sock: c_in
             // 否则状态文件会记录已不存在的挂载，后续恢复流程据此误判为“仍在场”。
             mounted_targets = planner.take_mounted_targets();
         }
-        // 新进程首次接入存储视图时的属主交接修复（挂载应答前同步执行）：原生
-        // FUSE（未映射路径、namespace 回退、未挂载窗口）要求应用私有子树属主是
-        // 应用 uid，而 MediaProvider 代写会留下 media_rw 属主条目（真机 2026-10-17
-        // 反馈：A17 上仅映射应用探测自有 Telegram 目录、Unity 游戏读存档全部
-        // EACCES）。只对「无 mount identity 账本」的新 pid 生效，热重载与
-        // reconcile 重挂按账本天然跳过；浅层 + 小预算把冷启动阻塞压在毫秒级，
-        // 深层残留由 30 分钟普查轮转兜底。
-        if mount_identity::load(&request.package_name, request.pid).is_none() {
-            crate::metadata_repair::repair_app_private_owners_on_attach(
-                &request.package_name,
-                crate::platform::user_id_from_uid(request.uid),
-            );
-        }
         if !write_mount_state(request, plan, &mounted_targets, &fuse_children) {
             log::warn!("daemon mount state save failed pid={}", request.pid);
         }
         record_mount_identity(request, &mounted_targets, &fuse_children);
         let _ = send_mount_result(sock, 0);
         unsafe { close(sock) };
-        // 应答已发出：detached 全树属主修复兜住浅层预算覆盖不到的大树深层
-        // （QQ files/Tencent/MobileQQ 类），double-fork 不占用任何挂载链路。
-        crate::metadata_repair::spawn_detached_full_owner_repair(
-            &request.package_name,
-            crate::platform::user_id_from_uid(request.uid),
-        );
         return true;
     }
 

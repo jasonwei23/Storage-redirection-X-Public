@@ -14,7 +14,6 @@ use events::{
     should_skip_ambiguous_allowed_real_path_event, should_skip_ambiguous_read_only_path_event,
     should_skip_public_root_event_identity,
 };
-pub(crate) use events::{repair_app_private_owners, repair_requested_backend_owner};
 use roots::{
     build_private_category_owner_roots, build_private_owner_repair_roots,
     build_public_owner_repair_root, build_watch_roots, dedup_roots, is_self_nested_redirect_path,
@@ -957,6 +956,14 @@ impl RegularAppMonitor {
     }
 
     fn repair_existing_public_tree(&mut self, root: &WatchNode) {
+        // CE 未解锁窗口内 /data/media 已挂载但目录名是 fscrypt 密文，无法从名字
+        // 识别 Android/{data,media,obb} 私有树——此时执行公共归一会把解锁后属于
+        // 应用私有树的全部目录 chown 成 media_rw（2026-10-19 用户 A17 设备 5857
+        // 条乱码路径 fix 实证，重启后私有目录属主变 1023 的根因）。密钥就绪前
+        // 直接跳过本轮，解锁后下一轮（1s 周期）自动恢复。
+        if !crate::daemon::media_ce_storage_ready() {
+            return;
+        }
         let mut stack = vec![root.clone()];
         let mut repaired = 0usize;
         let mut scanned_entries = 0usize;

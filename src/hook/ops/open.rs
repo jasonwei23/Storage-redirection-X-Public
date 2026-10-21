@@ -220,9 +220,6 @@ where
         final_path.as_ref(),
         flags,
     );
-    if should_fix_system_writer_private_owner(hub, flags) {
-        runtime::fix_system_writer_android_private_owner(final_path.as_ref(), false, -1);
-    }
     if is_system_writer && is_sqlite_shm_sidecar_path(path_for_decision.as_ref()) {
         crate::hook::media_fuse::prepare_private_owner_sqlite_sidecar(path_for_decision.as_ref());
     }
@@ -350,9 +347,6 @@ where
         final_path.as_ref(),
         flags,
     );
-    if should_fix_system_writer_private_owner(hub, flags) {
-        runtime::fix_system_writer_android_private_owner(final_path.as_ref(), false, -1);
-    }
     if is_system_writer && is_sqlite_shm_sidecar_path(path_for_decision.as_ref()) {
         crate::hook::media_fuse::prepare_private_owner_sqlite_sidecar(path_for_decision.as_ref());
     }
@@ -508,13 +502,6 @@ where
         log_redirected_open_fd(op_name, from_path, final_path, flags, &fd_diag);
     }
 
-    if result >= 0 && should_fix_system_writer_private_owner(hub, flags) {
-        runtime::fix_system_writer_android_private_owner(
-            final_path,
-            has_create_intent_flags_for_owner_fix(flags),
-            result,
-        );
-    }
     monitor::record_open_result(
         hub,
         monitor::OpenResultRecord {
@@ -992,17 +979,4 @@ pub unsafe extern "C" fn hooked_creat(pathname: *const c_char, mode: mode_t) -> 
             })
         },
     )
-}
-
-fn should_fix_system_writer_private_owner(hub: &InterceptHub, flags: c_int) -> bool {
-    !hub.is_monitor_only()
-        && hub.with_package_name(policy::is_system_writer_package)
-        && monitor::has_write_intent_flags(flags)
-}
-
-fn has_create_intent_flags_for_owner_fix(flags: c_int) -> bool {
-    if flags < 0 || (flags & libc::O_PATH) != 0 {
-        return false;
-    }
-    (flags & libc::O_CREAT) != 0 || (flags & libc::O_TMPFILE) == libc::O_TMPFILE
 }

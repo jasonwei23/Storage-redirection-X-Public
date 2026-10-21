@@ -32,7 +32,6 @@ pub(super) fn fix_path_metadata(
         owner_uid as u32
     };
     if let Ok(c_path) = cstring_path(path) {
-        // SAFETY: c_path 以 NUL 结尾，并在 chown 调用期间保持有效。
         let _ = unsafe { libc::chown(c_path.as_ptr(), effective_uid, MEDIA_RW_GID) };
     }
     let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode));

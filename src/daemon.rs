@@ -80,7 +80,7 @@ static BOOT_PRE_REGISTER_PENDING: AtomicBool = AtomicBool::new(false);
 /// available），整批预登记必然失败——真机实测是每次开机的确定性竞态。用一次 mkdir
 /// 探测代替几十次注定失败的登记：路径可达（返回成功或 EEXIST）即就绪，其余错误
 /// （ENOKEY/ENOENT 等）一律视为未就绪，交由挂起补跑与 media_ready 触发兜住。
-fn media_ce_storage_ready() -> bool {
+pub(crate) fn media_ce_storage_ready() -> bool {
     const PROBE_DIR: &std::ffi::CStr = c"/data/media/0/Android/data";
     // SAFETY: libc::mkdir/rmdir 只接收 NUL 结尾的合法路径常量，不借用调用方数据。
     let rc = unsafe { libc::mkdir(PROBE_DIR.as_ptr(), 0o770) };
@@ -642,15 +642,6 @@ pub fn main_entry() -> i32 {
             BOOT_PRE_REGISTER_PENDING.store(false, Ordering::Release);
             log::warn!("boot pre-register resumed: media CE key ready");
             pre_register_all_configured_apps(config, config.config_version());
-        }
-        // 消费 MP hook 的属主代修请求（OwnerFix 通道）：MP 等普通 uid 进程
-        // 进程内 lchown 必然 EPERM，由 daemon 以 root 代修。事件驱动、无轮询，
-        // 队列空时本调用是锁一次空 Vec 的廉价跳过。
-        let owner_fix_requests = crate::log_daemon::take_owner_fix_requests();
-        if !owner_fix_requests.is_empty() {
-            for backend_path in owner_fix_requests {
-                crate::daemon_monitor::repair_requested_backend_owner(&backend_path);
-            }
         }
         let before = config.config_version();
         let (did_reload, changed_packages, full_change) =

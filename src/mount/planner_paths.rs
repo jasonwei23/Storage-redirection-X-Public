@@ -109,7 +109,6 @@ pub(super) fn fix_real_public_directory_metadata(path: &str) {
     let st = unsafe { st.assume_init() };
 
     if st.st_uid != MEDIA_RW_UID || st.st_gid != MEDIA_RW_GID {
-        // SAFETY: c_path 指向本作用域内以 NUL 结尾的合法路径，只改属主不改内容。
         let ret = unsafe { chown(c_path.as_ptr(), MEDIA_RW_UID, MEDIA_RW_GID) };
         if ret != 0 {
             log_metadata_fix_failure("real public chown", path);
@@ -134,7 +133,6 @@ pub(super) fn fix_allowed_real_directory_metadata(path: &str) {
         return;
     };
 
-    // SAFETY: c_path 在调用期间是有效且以 NUL 结尾的 CString。
     let ret = unsafe { chown(c_path.as_ptr(), MEDIA_RW_UID, MEDIA_RW_GID) };
     if ret != 0 {
         log_metadata_fix_failure("allowed real chown", path);
