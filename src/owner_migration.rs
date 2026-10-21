@@ -55,6 +55,7 @@ struct MigrationStats {
     packages: usize,
     unknown_uid_packages: usize,
     failures: usize,
+    mode_fixed: usize,
     budget_exhausted: bool,
 }
 
@@ -94,9 +95,10 @@ fn run() {
     }
     match std::fs::write(MIGRATION_MARKER, "v2\n") {
         Ok(()) => log::info!(
-            "owner migration done scanned={} repaired={} packages={} unknown_uid_packages={}",
+            "owner migration done scanned={} repaired={} mode_fixed={} packages={} unknown_uid_packages={}",
             stats.scanned,
             stats.repaired,
+            stats.mode_fixed,
             stats.packages,
             stats.unknown_uid_packages
         ),
@@ -235,10 +237,36 @@ fn visit_entry(path: &str, target_uid: u32, stats: &mut MigrationStats) -> bool 
     let Ok(metadata) = std::fs::symlink_metadata(path) else {
         return false;
     };
+    // 泄漏签名收敛：auto-mkdir 曾给私有树目录打 0o2773（others 可写可穿越），
+    // 与原生 02770 相悖；属主已正确（应用 uid）的这类目录同样归一。
+    if metadata.is_dir() && (metadata.mode() & 0o7777) == 0o2773 {
+        normalize_leaked_dir_mode(path, stats);
+    }
     if metadata.uid() != MEDIA_RW_UID {
         return false;
     }
     repair_owner(path, target_uid, metadata.gid(), stats)
+}
+
+/// 把私有树泄漏的 0o2773 目录收敛为原生 02770。
+fn normalize_leaked_dir_mode(path: &str, stats: &mut MigrationStats) {
+    let Ok(c_path) = CString::new(path) else {
+        return;
+    };
+    // SAFETY: c_path 在调用期间保持有效并以 NUL 结尾。
+    let ret = unsafe { libc::chmod(c_path.as_ptr(), 0o2770) };
+    if ret == 0 {
+        stats.mode_fixed = stats.mode_fixed.saturating_add(1);
+        return;
+    }
+    if stats.failures < MAX_FAILURE_LOGS {
+        log::warn!(
+            "owner migration chmod failed path={} errno={}",
+            path,
+            crate::platform::errno::last()
+        );
+    }
+    stats.failures = stats.failures.saturating_add(1);
 }
 
 /// lchown 只改 owner，gid 保留原值；符号链接不跟随。

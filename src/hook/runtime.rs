@@ -12,6 +12,27 @@ static FORK_CHILD_HOOK_BYPASS: AtomicU64 = AtomicU64::new(0);
 const ANDROID_APP_UID_START: i32 = 10000;
 const MEDIA_RW_GID: u32 = 1023;
 const STORAGE_DIR_MODE: mode_t = 0o2773;
+/// 私有树目录的原生 MediaProvider 语义（owner→group 镜像、others 清零）。
+/// auto-mkdir 曾对私有树沿用公共目标的 0o2773（others 可写可穿越），与原生
+/// 02770 相悖且弱化隔离——用户 2026-10-21 反馈的微信私有目录 2773 即此来源。
+const PRIVATE_TREE_DIR_MODE: mode_t = 0o2770;
+
+/// 按路径形态派生 auto-mkdir 的目录 mode：私有树（Android/{data,media,obb}）
+/// 对齐原生 02770，其余（公共重定向目标等）维持 0o2773。
+fn redirect_mkdir_mode_for(path: &str, base: mode_t) -> mode_t {
+    let normalized = crate::platform::paths::normalize(path);
+    if let Some(rest) = normalized.strip_prefix("/data/media/") {
+        let mut parts = rest.split('/');
+        if let Some(user) = parts.next()
+            && user.chars().all(|ch| ch.is_ascii_digit())
+            && parts.next() == Some("Android")
+            && matches!(parts.next(), Some("data" | "media" | "obb"))
+        {
+            return PRIVATE_TREE_DIR_MODE;
+        }
+    }
+    base
+}
 const PRIVATE_CHILD_DIR_REQUIRED_MODE: mode_t = 0o2751;
 const PRIVATE_CHILD_FILE_REQUIRED_MODE: mode_t = 0o664;
 
@@ -781,6 +802,7 @@ fn normalize_redirect_dir_metadata(path: &str, mode: mode_t, owner: Option<&Redi
         return;
     };
 
+    let mode = redirect_mkdir_mode_for(path, mode);
     let ret = unsafe { libc::chmod(c_path.as_ptr(), mode) };
     if ret != 0 {
         let error_no = current_errno();
@@ -947,7 +969,14 @@ fn create_parent_dirs_recursive(path: &str, mode: mode_t, owner: Option<&Redirec
 
     create_parent_dirs_recursive(&parent, mode, owner);
 
-    let ret = unsafe { libc::mkdirat(AT_FDCWD, c_parent.as_ptr(), mode) };
+    // SAFETY: c_parent 以 NUL 结尾并在调用期间保持有效；mode 由路径形态派生。
+    let ret = unsafe {
+        libc::mkdirat(
+            AT_FDCWD,
+            c_parent.as_ptr(),
+            redirect_mkdir_mode_for(&parent, mode),
+        )
+    };
     if ret == 0 {
         normalize_redirect_dir_metadata(&parent, mode, owner);
         // 自动补建的父目录逐级交由系统代写属主治理：链中间层不经过 open/mkdir
@@ -989,7 +1018,14 @@ fn create_parent_dirs_recursive_until(
 
     create_parent_dirs_recursive_until(&parent, stop_dir, mode, owner);
 
-    let ret = unsafe { libc::mkdirat(AT_FDCWD, c_parent.as_ptr(), mode) };
+    // SAFETY: c_parent 以 NUL 结尾并在调用期间保持有效；mode 由路径形态派生。
+    let ret = unsafe {
+        libc::mkdirat(
+            AT_FDCWD,
+            c_parent.as_ptr(),
+            redirect_mkdir_mode_for(&parent, mode),
+        )
+    };
     if ret == 0 {
         normalize_redirect_dir_metadata(&parent, mode, owner);
         // 同 create_parent_dirs_recursive：存储父链每一级都要过属主治理。

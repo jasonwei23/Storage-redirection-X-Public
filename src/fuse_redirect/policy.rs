@@ -446,6 +446,7 @@ impl RedirectPolicy {
             } else {
                 -1
             };
+            let existed_redirect_root = fs::is_directory(&redirect_root_string);
             if !fs::create_directory(&redirect_root_string, redirect_root_uid)
                 && !fs::is_directory(&redirect_root_string)
             {
@@ -472,6 +473,21 @@ impl RedirectPolicy {
                 return None;
             }
             fix_mapped_dir_metadata(&redirect_root_string, config.uid);
+            // 本次初始化新建的私有树重定向根按原生语义补 chmod：create_directory
+            // 的 mkdir(0755) 受 daemon umask 与 setgid 继承影响，会落下 2750 这类
+            // 非原生形态（2026-10-21 duchamp 实测）；既有目录仍交 fix_mapped 的
+            // keep-existing 守卫保留。
+            if !existed_redirect_root
+                && let Some(user_id) =
+                    paths::extract_user_id_from_data_media_path(&redirect_root_string)
+                && is_android_private_backend_path(&redirect_root_string, user_id)
+            {
+                let c_root = CString::new(redirect_root_string.as_str()).ok();
+                if let Some(c_root) = c_root {
+                    // SAFETY: c_root 在调用期间保持有效并以 NUL 结尾。
+                    let _ = unsafe { libc::chmod(c_root.as_ptr(), 0o2770) };
+                }
+            }
             redirect_root_string
         };
 
@@ -1663,9 +1679,20 @@ pub(super) fn fix_mapped_dir_metadata(path: &str, owner_uid: i32) {
             log::debug!("fuse keep existing Android private metadata path={}", path);
             return;
         }
+        // 私有树（含包根）对齐原生 02770；此前包根会被打成 MAPPED_DIR_MODE
+        // 0o2773（others 可写可穿越），与 MediaProvider 原生语义相悖——
+        // 2026-10-21 用户反馈「微信私有目录 2773」即此来源。
+        let mode = if let Some(user_id) = paths::extract_user_id_from_data_media_path(path)
+            && is_android_private_backend_path(path, user_id)
+        {
+            0o2770
+        } else {
+            super::MAPPED_DIR_MODE
+        };
         // SAFETY: c_path 以 NUL 结尾，并在 chown/chmod 调用期间保持有效。
         let _ = unsafe { libc::chown(c_path.as_ptr(), owner_uid as u32, super::MEDIA_RW_GID) };
-        let _ = unsafe { libc::chmod(c_path.as_ptr(), super::MAPPED_DIR_MODE) };
+        // SAFETY: c_path 以 NUL 结尾，并在 chmod 调用期间保持有效。
+        let _ = unsafe { libc::chmod(c_path.as_ptr(), mode) };
     }
 }
 
