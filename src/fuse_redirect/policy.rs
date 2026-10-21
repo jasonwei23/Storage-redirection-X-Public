@@ -800,17 +800,21 @@ impl RedirectPolicy {
 
     fn backend_decision(&self, storage_path: &str, operation: OperationKind) -> BackendDecision {
         let is_read_only = self.is_read_only(storage_path);
+        let mapping_hit = self.resolve_mapping(storage_path).is_some();
         // sandboxed_paths 优先于监视/直通会话短路：系统代写组件（共享 media uid
         // 等监视会话）对配置沙盒路径的访问也必须重定向进私有沙盒，否则 native
         // 层创建会绕过沙盒直落真实路径。命中与排除的判定口径与下方
-        // mapping_mode_only 分支保持一致。
+        // mapping_mode_only 分支保持一致。映射优先于沙盒（场景 15 契约）：命中
+        // 映射规则的路径由 Real 分支按映射目标解析，沙盒只接管未命中映射的路径
+        // ——此前沙盒判定整体前置曾把「映射+沙盒双命中」劫进私有沙盒根。
         let is_sandbox = self.is_mapping_mode_only
+            && !mapping_hit
             && self.matches_any(&self.sandboxed_index, storage_path)
             && !self.matches_any(&self.sandboxed_excluded_index, storage_path);
         let kind = if is_sandbox {
             BackendKind::Redirect
         } else if self.is_monitor_only
-            || self.resolve_mapping(storage_path).is_some()
+            || mapping_hit
             || self.is_own_private_storage_path(storage_path)
         {
             BackendKind::Real
