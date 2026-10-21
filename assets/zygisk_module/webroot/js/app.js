@@ -99,6 +99,12 @@
       url: "https://github.com/MaterialCleaner/Media-Provider-FuseFixer",
     },
     {
+      group: "模块核心",
+      name: "Fuse-Proxy",
+      license: "GPL-3.0",
+      url: "https://github.com/huniangitb/Fuse-Proxy",
+    },
+    {
       group: "Root / WebUI",
       name: "KernelSU",
       license: "GPL 3.0 / GPL 2.0",
