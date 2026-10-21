@@ -109,8 +109,8 @@ foreach ($rawLine in ($message -split "`r?`n")) {
 if ([string]::IsNullOrWhiteSpace($title)) {
     throw "Commit 标题不能为空。"
 }
-if ($title.Length -gt 72) {
-    throw "Commit 标题不得超过 72 个字符；当前为 $($title.Length) 个字符。"
+if ($title.Length -gt 50) {
+    throw "Commit 标题不得超过 50 个字符；当前为 $($title.Length) 个字符。"
 }
 
 $releasePattern = '^Releases: \u53d1\u5e03 \d+\.\d+\.\d+(?:[-+][0-9A-Za-z.-]+)?$'
