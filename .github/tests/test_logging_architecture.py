@@ -590,14 +590,15 @@ class LoggingArchitectureTest(unittest.TestCase):
 
         self.assertIn('if root.source == "public_owner"', reconfigure)
         self.assertIn("self.repair_public_owner_root(root)", reconfigure)
-        self.assertIn("self.repair_public_owner_roots_if_due()", reconfigure)
         self.assertIn("public_owner_roots", reconfigure)
-        self.assertIn("fn repair_public_owner_roots_if_due", monitor)
-        self.assertIn("PUBLIC_OWNER_REPAIR_INTERVAL_MS", monitor)
         self.assertIn("MAX_PUBLIC_OWNER_REPAIR_DIRS: usize = 32768", monitor)
+        # 1 秒周期扫描已移除（2026-10-21 用户拍板）：周期入口与节流常量不得回潮，
+        # 建树一次性扫描 + inotify 事件驱动修复 + missing 重试是仅存通道。
+        self.assertNotIn("repair_public_owner_roots_if_due", monitor)
+        self.assertNotIn("PUBLIC_OWNER_REPAIR_INTERVAL_MS", monitor)
+        self.assertNotIn("last_public_owner_repair_ms", monitor)
         reset = monitor[monitor.index("fn reset") : monitor.index("fn repair_public_owner_root")]
         self.assertIn("self.public_owner_roots.clear()", reset)
-        self.assertIn("self.last_public_owner_repair_ms = 0", reset)
         self.assertIn('if root.source == "public_owner"', retry)
         self.assertIn("self.repair_public_owner_root(&root)", retry)
         self.assertIn("self.repair_existing_public_tree(&node)", repair)

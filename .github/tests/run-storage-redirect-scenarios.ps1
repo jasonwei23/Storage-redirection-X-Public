@@ -2016,7 +2016,7 @@ function Get-ScenarioTitle {
         3 { "path mapping to Download/Test" }
         4 { "mapping priority over allow Download" }
         5 { "allow Download keeps real path" }
-        6 { "mapping_mode_only unmatched stays real and drifted own dir auto-repaired" }
+        6 { "mapping_mode_only unmatched stays real and drifted own dir stays inert" }
         7 { "mapping_mode_only mapped path maps" }
         8 { "FUSE mapping_mode_only sandbox hit with unmatched sibling kept real" }
         9 { "read_only_paths deny writes" }
@@ -2322,14 +2322,17 @@ function Invoke-StandardScenario {
     $ok
 }
 
-# 仅映射模式自有目录属主漂移回归（真机 2026-10-17 用户反馈，A17/SDK37）：
-# MediaProvider 代写会把应用自有 Android/data/<pkg> 子树属主写成 media_rw，
-# A17 原生 FUSE 对属主非本应用的私有目录只给 others 位——应用首波访问全部
-# EACCES（nagram 目录探针失败致文件/存储统计不可见、Unity 游戏存档回退内部
-# 存储）。修复是新进程挂载应答前的浅层属主修复：本场景在应用启动前注入
-# 1023 属主损伤，启动后应用必须能读写该目录，且后端属主必须已修回应用 uid。
-# A13-16 原生 FUSE 不做 owner==app 强校验，应用读写用例恒过；后端属主断言
-# 保证修复链路在所有 Android 腿都有回归信号。
+# 仅映射模式自有目录属主漂移契约（2026-10-21 起契约反转）：
+# 历史背景是真机 2026-10-17 用户反馈——MediaProvider 代写把应用自有
+# Android/data/<pkg> 子树属主写成 media_rw，原生 FUSE 对属主非本应用的私有
+# 目录只给 others 位，应用访问全部 EACCES。当时的守卫是「浅层属主修复链」，
+# 该链已随 2026-10-20「属主修复体系全面拆除」决定移除；存量漂移改由一次性
+# 迁移（owner-migration-1023）在模块升级重启时修复，运行期不再改写属主。
+# 本场景在应用启动前注入
+# 1023 属主损伤，断言 2026-10-21 起的新契约：旧「浅层属主修复链」已随拆除决定
+# 移除，存量漂移由一次性迁移（owner-migration-1023）在模块升级重启时修复，运行
+# 期守护与应用都不改写私有树属主——应用对漂移目录的读写被原生 DAC 拒绝（各
+# Android 腿一致），后端属主保持 1023；修复链一旦回潮场景当场报错。
 function Set-OwnerDriftFixture {
     param([string]$Label)
     $driftBackend = "$BackendRoot/Android/data/$AppId/files/SrtDrift"
@@ -2343,17 +2346,18 @@ function Invoke-OwnerDriftOwnDirScenario {
     $driftVisible = "$RealRoot/Android/data/$AppId/files/SrtDrift"
     $driftBackend = "$BackendRoot/Android/data/$AppId/files/SrtDrift"
     $ok = $true
-    $ok = (Invoke-ServiceCase "scenario-$Scenario" "own-drift-read" "file_read" @{ file_path = "$driftVisible/srt_drift_existing.txt" } "^PASS \[file_read\]").Ok -and $ok
-    $ok = (Invoke-ServiceCase "scenario-$Scenario" "own-drift-write" "file_write" @{ file_path = "$driftVisible/srt_drift_probe.txt"; payload = $Payload; expected_payload = $Payload } "^PASS \[file_write\]").Ok -and $ok
-    # 后端属主必须已从注入的 media_rw 修回应用 uid：以包目录顶层属主为基准比对，
-    # 顶层属主异常时（应为应用 uid）同样判失败。
-    $ownerRepaired = Test-Su "top_uid=`$(stat -c %u '$BackendRoot/Android/data/$AppId'); file_uid=`$(stat -c %u '$driftBackend/srt_drift_existing.txt'); [ -n `"`$top_uid`" ] && [ `"`$top_uid`" != 1023 ] && [ `"`$top_uid`" = `"`$file_uid`" ]"
-    if (-not $ownerRepaired) {
-        $script:Failures.Add("scenario-$Scenario/owner-drift-not-repaired") | Out-Null
-        Write-Host "  - scenario-$Scenario/owner-drift-not-repaired backend=$driftBackend"
+    # 漂移目录的读与新建写入都必须被原生 DAC 拒绝：任何 PASS 都说明有链路在
+    # 改写属主或绕过 DAC 放行。
+    $ok = (Invoke-ServiceCase "scenario-$Scenario" "own-drift-read-denied" "file_read" @{ file_path = "$driftVisible/srt_drift_existing.txt" } "^FAIL \[file_read\]").Ok -and $ok
+    $ok = (Invoke-ServiceCase "scenario-$Scenario" "own-drift-write-denied" "file_write" @{ file_path = "$driftVisible/srt_drift_probe.txt"; payload = $Payload; expected_payload = $Payload } "^FAIL \[file_write\]").Ok -and $ok
+    # 后端属主必须保持注入的 1023：守护与应用都不得改写私有树属主（拆除契约）。
+    $ownerIntact = Test-Su "[ \$(stat -c %u '$driftBackend/srt_drift_existing.txt') -eq 1023 ]"
+    if (-not $ownerIntact) {
+        $script:Failures.Add("scenario-$Scenario/owner-drift-repaired-unexpectedly") | Out-Null
+        Write-Host "  - scenario-$Scenario/owner-drift-repaired-unexpectedly backend=$driftBackend"
         return $false
     }
-    Write-Host "  - scenario-$Scenario/owner-drift-repaired"
+    Write-Host "  - scenario-$Scenario/owner-drift-inert"
     $ok
 }
 
