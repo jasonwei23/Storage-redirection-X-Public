@@ -18,6 +18,8 @@
 
 ## 版本与发布要求
 
+- 版本号采用语义化版本 `主版本.次版本.修订号`（MAJOR.MINOR.PATCH）：缺陷修复递增修订号，新增功能或较大优化递增次版本，不兼容变更或核心架构重写递增主版本；纯文档、CI 与测试流变更不递增版本号。次版本或修订号达到 99 时必须进位到更高一位。
+- 本项目自 `v2.0.0` 起使用独立版本线，与上游项目的版本号相互独立。
 - Release workflow 只由指向 `SRX-R` 分支可达提交的 `v*` tag 推送触发，普通 `SRX-R` 分支 push 不会发布正式版本。
 - 发布版本 `X.Y.Z` 时，`Cargo.toml` 中 `[package].version` 必须为 `X.Y.Z`，发布 tag 必须是 `vX.Y.Z`。
 - 发布 tag 必须指向一个不包含 `[skip ci]`、`[ci skip]`、`[no ci]` 的提交。
@@ -62,8 +64,8 @@
 2. 合并 PR 到 main
 3. 在 `SRX-R` 分支可达提交上打 tag：
    ```bash
-   git tag v1.2.40
-   git push origin v1.2.40
+   git tag v2.0.0
+   git push SRX-R v2.0.0
    ```
 4. Release 工作流自动触发：
    - 构建模块
