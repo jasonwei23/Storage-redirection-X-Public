@@ -9,6 +9,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 
 use super::FuseRedirectConfig;
+use super::backend_overlay;
 
 const FILE_MONITOR_LOG_TAG: &str = "FileMonitorOp";
 const READ_ONLY_DENY_EXTRA: &str = "deny_reason=read_only_rule";
@@ -856,9 +857,15 @@ impl RedirectPolicy {
 
     pub(super) fn real_backend_for_storage_rel(&self, rel: &str) -> PathBuf {
         if rel.is_empty() {
-            return self.real_root.clone();
+            return backend_overlay::overlay_backend_path(&self.real_root)
+                .unwrap_or_else(|| self.real_root.clone());
         }
-        self.real_backend_root_for_storage_rel(rel).join(rel)
+        let joined = self.real_backend_root_for_storage_rel(rel).join(rel);
+        // 覆盖挂载感知：HyperOS 等系统会在 init 命名空间把下载暂存目录 bind 到
+        // `/data/media/...` 子树（如应用商店 `.siexternal`），应用命名空间里的
+        // scoped 会话按普通路径解析会落到被遮蔽的真实目录，与宿主/MP 读侧分裂。
+        // 命中覆盖挂载时改写到物理源路径，未命中保持原路径（CI 断言不受影响）。
+        backend_overlay::overlay_backend_path(&joined).unwrap_or(joined)
     }
 
     // 按相对路径选择真实后端根：应用自有私有目录走 private_real_root 直连 f2fs，
@@ -971,10 +978,13 @@ impl RedirectPolicy {
 
     pub(super) fn redirect_backend_for_storage_rel(&self, rel: &str) -> PathBuf {
         if rel.is_empty() {
-            self.redirect_root.clone()
-        } else {
-            self.redirect_root.join(rel)
+            return backend_overlay::overlay_backend_path(&self.redirect_root)
+                .unwrap_or_else(|| self.redirect_root.clone());
         }
+        let joined = self.redirect_root.join(rel);
+        // 与 real 后端同口径：重定向根同样落在 `/data/media/...` 物理树上，
+        // 需要经过同一套覆盖挂载感知解析（见 real_backend_for_storage_rel 注释）。
+        backend_overlay::overlay_backend_path(&joined).unwrap_or(joined)
     }
 
     /// 折叠视图对重定向根自身的再进入：`<redirect_view_rel>/<rest>` → `<rest>`。

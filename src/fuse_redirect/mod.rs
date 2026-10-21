@@ -1,4 +1,5 @@
 mod attrs;
+mod backend_overlay;
 mod callbacks;
 pub(crate) mod config;
 mod helpers;
@@ -427,7 +428,13 @@ impl FuseRedirectFs {
         };
         let rel = Self::child_rel(&parent_rel, name)?;
         let policy = self.policy_for_request(req);
-        let backend = self.backend_for_relative(&policy, &rel, OperationKind::Write)?;
+        let mut backend = self.backend_for_relative(&policy, &rel, OperationKind::Write)?;
+        // HyperOS 下载 bind 在任务入队瞬间创建，快照 TTL 可能刚好错过；新建入口
+        // 强制重读 init mountinfo，避免首次 CREATE 与 bind 创建竞态时落到被遮蔽的
+        // 真实目录（真机 2026-10-19：商店增量下载校验 error=3 的直接成因）。
+        if let Some(resolved) = backend_overlay::overlay_backend_path_fresh(&backend.path) {
+            backend.path = resolved;
+        }
         if backend.is_read_only {
             policy.emit_monitor_read_only_deny(operation_name, &backend);
             return Err(Errno::EROFS);
@@ -515,14 +522,21 @@ impl FuseRedirectFs {
         } else {
             policy.uid
         };
-        if fs::is_directory(&parent) || fs::create_directory(&parent, owner_uid) {
-            fix_path_metadata(
-                Path::new(parent.as_ref()),
-                policy.uid,
-                MAPPED_DIR_MODE,
-                backend.is_shared_public_backend,
-                true,
-            );
+        let parent_path = Path::new(parent.as_ref());
+        let parent_overlaid = backend_overlay::overlay_backend_path(parent_path).is_some();
+        let existed = fs::is_directory(&parent);
+        if existed || fs::create_directory(&parent, owner_uid) {
+            // 覆盖挂载目标（如 HyperOS apk-tmp 下载目录）由系统按下载方身份自管
+            // 属主与权限，既有层级不得改写；仅本会话新建的层级按调用方身份修复。
+            if !existed || !parent_overlaid {
+                fix_path_metadata(
+                    parent_path,
+                    policy.uid,
+                    MAPPED_DIR_MODE,
+                    backend.is_shared_public_backend,
+                    true,
+                );
+            }
             Ok(())
         } else {
             Err(Errno::EIO)
