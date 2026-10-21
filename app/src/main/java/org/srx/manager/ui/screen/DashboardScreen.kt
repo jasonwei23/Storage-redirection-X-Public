@@ -64,6 +64,7 @@ internal fun DashboardScreen(
           enabledApps = state.dashboard.enabledApps,
           runtimeActivations =
               formatCompactRuntimeActivationCount(state.dashboard.runtimeActivations),
+          storageBackend = state.dashboard.storageBackend,
           onToggleModule = { pendingModuleToggle = it },
           onRuntimeActivationClick = { showRuntimeActivationDetails = true },
           onRuntimeActivationLongClick = { pendingRuntimeStatsReset = true },

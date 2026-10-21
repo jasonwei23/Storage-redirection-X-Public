@@ -106,6 +106,26 @@ class RootModuleController(
   private fun buildRestartMediaProviderCommand(): String =
       withSrxCtlFallback("remount-running", "exit 1")
 
+  private fun buildStorageBackendStatusCommand(): String =
+      withSrxCtlFallback("host-status", "echo unknown")
+
+  /** 读取共享宿主会话状态指示；输出无法识别时返回 null，由调用方按未知处理。 */
+  suspend fun storageBackendStatus(): StorageBackendStatus? =
+      parseStorageBackendStatus(shell.exec(buildStorageBackendStatusCommand()).stdout.trim())
+
+  private fun parseStorageBackendStatus(text: String): StorageBackendStatus? =
+      when {
+        text == "inactive" -> StorageBackendStatus(active = false)
+        else -> {
+          val match = Regex("^active pid=(\\d+) policies=(\\d+)$").find(text) ?: return null
+          StorageBackendStatus(
+              active = true,
+              pid = match.groupValues[1].toIntOrNull(),
+              policyCount = match.groupValues[2].toIntOrNull(),
+          )
+        }
+      }
+
   private fun buildEnsureLogCollectorsCommand(): String =
       withSrxCtlFallback(
           "ensure-collectors",
@@ -123,3 +143,10 @@ class RootModuleController(
   ): String =
       "if [ -r ${shellQuote(SrxCtlPath)} ]; then /system/bin/sh ${shellQuote(SrxCtlPath)} $action; else $fallback; fi"
 }
+
+/** 共享宿主会话状态指示；[pid]/[policyCount] 仅在会话活跃时有值。 */
+data class StorageBackendStatus(
+    val active: Boolean,
+    val pid: Int? = null,
+    val policyCount: Int? = null,
+)

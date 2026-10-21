@@ -43,6 +43,7 @@ import org.srx.manager.GlassTextButton
 import org.srx.manager.R
 import org.srx.manager.data.GlobalConfig
 import org.srx.manager.data.ModuleStatus
+import org.srx.manager.data.StorageBackendStatus
 import org.srx.manager.glassPanel
 import org.srx.manager.glassSurfaceColor
 import org.srx.manager.isSrxBackdropEffectEnabled
@@ -71,6 +72,14 @@ internal fun moduleStatusUi(status: ModuleStatus): StatusUi =
       ModuleStatus.Unknown -> StatusUi("状态未知", srxWarningColor())
     }
 
+/** 共享宿主状态指示的展示文本；读取失败时按未知展示为 --。 */
+internal fun storageBackendStatusText(storageBackend: StorageBackendStatus?): String =
+    when {
+      storageBackend == null -> "--"
+      storageBackend.active -> "运行中"
+      else -> "未运行"
+    }
+
 @Composable
 @OptIn(ExperimentalLayoutApi::class)
 internal fun ModuleStatusCard(
@@ -78,6 +87,7 @@ internal fun ModuleStatusCard(
     globalConfig: GlobalConfig,
     enabledApps: Int,
     runtimeActivations: String,
+    storageBackend: StorageBackendStatus?,
     onToggleModule: (Boolean) -> Unit,
     onRuntimeActivationClick: () -> Unit,
     onRuntimeActivationLongClick: () -> Unit,
@@ -158,6 +168,12 @@ internal fun ModuleStatusCard(
                     onClick = onRuntimeActivationClick,
                 ),
         )
+        Box(
+            Modifier.width(1.dp)
+                .height(52.dp)
+                .background(colors.onSurface.copy(alpha = if (isSrxDarkTheme()) 0.045f else 0.06f)),
+        )
+        MetricBox("共享宿主", storageBackendStatusText(storageBackend), Modifier.weight(1f))
       }
     }
   }

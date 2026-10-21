@@ -869,13 +869,15 @@
     if (showInitialLoading) {
       setDashboardCountLoading("statAppCount", true);
       setDashboardCountLoading("statEnabledAppCount", true);
+      setDashboardCountLoading("statHostStatus", true);
     }
     const run = async () => {
       State.dashboardCountsSchedule = null;
       try {
-        const [configuredConfigs, runtimeActivations] = await Promise.all([
+        const [configuredConfigs, runtimeActivations, storageBackend] = await Promise.all([
           Api.readConfiguredAppConfigs(),
           Api.readStatsCount(),
+          Api.readStorageBackendStatus(),
         ]);
         if (
           State.currentPage !== requestPage ||
@@ -892,8 +894,10 @@
           Api.formatCompactRuntimeActivationCount(runtimeActivations),
           runtimeActivations,
         );
+        renderHostStatusMetric(storageBackend);
         setDashboardCountLoading("statAppCount", false);
         setDashboardCountLoading("statEnabledAppCount", false);
+        setDashboardCountLoading("statHostStatus", false);
       } catch {
         if (
           State.currentPage === requestPage &&
@@ -903,9 +907,11 @@
           if (!State.dashboardCountsLoaded) {
             setDashboardCountValue("statAppCount", "--");
             setDashboardCountValue("statEnabledAppCount", "--");
+            setDashboardCountValue("statHostStatus", "--");
           }
           setDashboardCountLoading("statAppCount", false);
           setDashboardCountLoading("statEnabledAppCount", false);
+          setDashboardCountLoading("statHostStatus", false);
         }
       } finally {
         if (State.dashboardCountsInFlight === requestGeneration) {
@@ -957,6 +963,21 @@
     el.textContent = text;
     if (exactValue != null && String(exactValue) !== text) el.title = String(exactValue);
     else el.removeAttribute("title");
+  }
+
+  /** 渲染概览页的共享宿主状态指示；读取失败时保持 --。 */
+  function renderHostStatusMetric(storageBackend) {
+    const state = storageBackend?.state || "unknown";
+    const display = state === "active" ? "运行中" : state === "inactive" ? "未运行" : "--";
+    const exact =
+      state === "active" && storageBackend?.pid != null
+        ? "pid=" +
+          storageBackend.pid +
+          (storageBackend?.policies != null
+            ? "，已登记策略 " + storageBackend.policies + " 个"
+            : "")
+        : null;
+    setDashboardCountValue("statHostStatus", display, exact);
   }
 
   function showRuntimeActivationDetails() {

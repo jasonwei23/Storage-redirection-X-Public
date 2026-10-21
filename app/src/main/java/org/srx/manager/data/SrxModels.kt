@@ -164,6 +164,7 @@ data class DashboardState(
     val globalConfig: GlobalConfig = GlobalConfig(),
     val enabledApps: Int = 0,
     val runtimeActivations: String = "0",
+    val storageBackend: StorageBackendStatus? = null,
 )
 
 @Serializable

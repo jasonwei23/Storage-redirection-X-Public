@@ -219,6 +219,7 @@ class SrxViewModel(
                                 runtimeActivations = runtimeActivations,
                             ),
                     )
+                refreshStorageBackendStatus()
               }
               .onFailure {
                 // 计数刷新失败时数字会停留在旧值，与「确实没有已启用应用」无法区分，
@@ -227,6 +228,23 @@ class SrxViewModel(
                 showMessage("加载概览计数失败：${it.message ?: "未知错误"}")
               }
         }
+  }
+
+  /**
+   * 单独刷新概览页的共享宿主状态指示。
+   *
+   * 失败时保持旧值不清空：宿主状态读取走的是一次额外 root 调用， 偶发失败不应该把上一次的有效状态抹成未知。
+   */
+  private fun refreshStorageBackendStatus() {
+    viewModelScope.launch {
+      runCatching { repository.readStorageBackendStatus() }
+          .onSuccess { status ->
+            _state.value =
+                _state.value.copy(
+                    dashboard = _state.value.dashboard.copy(storageBackend = status),
+                )
+          }
+    }
   }
 
   fun refreshUsers() {
@@ -875,6 +893,7 @@ class SrxViewModel(
                               runtimeActivations = runtimeActivations,
                           ),
                   )
+              refreshStorageBackendStatus()
             }
         showMessage("生效次数已清零")
       } else {

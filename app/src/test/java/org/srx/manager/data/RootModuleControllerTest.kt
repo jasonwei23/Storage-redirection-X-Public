@@ -160,6 +160,33 @@ class RootModuleControllerTest {
   }
 
   @Test
+  fun storageBackendStatusParsesHostStatusOutput() = runBlocking {
+    val shell = CapturingShell(ShellResult(0, "active pid=1234 policies=2\n", ""))
+    val controller = RootModuleController(shell)
+
+    assertEquals(
+        StorageBackendStatus(active = true, pid = 1234, policyCount = 2),
+        controller.storageBackendStatus(),
+    )
+    assertEquals(
+        "if [ -r ${shellQuote(SrxCtlPath)} ]; then /system/bin/sh ${shellQuote(SrxCtlPath)} host-status; else echo unknown; fi",
+        shell.invocations.single().command,
+    )
+  }
+
+  @Test
+  fun storageBackendStatusHandlesInactiveAndUnknown() = runBlocking {
+    val inactiveShell = CapturingShell(ShellResult(0, "inactive\n", ""))
+    assertEquals(
+        StorageBackendStatus(active = false),
+        RootModuleController(inactiveShell).storageBackendStatus(),
+    )
+
+    val unknownShell = CapturingShell(ShellResult(0, "unknown\n", ""))
+    assertEquals(null, RootModuleController(unknownShell).storageBackendStatus())
+  }
+
+  @Test
   fun ensureLogCollectorsUsesSrxctlWithLegacyFallback() = runBlocking {
     val shell = CapturingShell(ShellResult(0, "", ""))
     val controller = RootModuleController(shell)

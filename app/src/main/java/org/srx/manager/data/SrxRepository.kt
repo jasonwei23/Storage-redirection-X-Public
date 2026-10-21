@@ -74,6 +74,7 @@ class SrxRepository(
     val statusAndVersion = async { moduleController.statusAndVersion() }
     val configs = async { readConfiguredAppConfigs(force = true) }
     val runtimeActivations = async { readRuntimeActivations() }
+    val storageBackend = async { readStorageBackendStatus() }
     val loadedConfigs = configs.await()
     val (status, version) = statusAndVersion.await()
     DashboardState(
@@ -82,6 +83,7 @@ class SrxRepository(
         globalConfig = global.await(),
         enabledApps = countEnabledAppConfigs(loadedConfigs),
         runtimeActivations = runtimeActivations.await(),
+        storageBackend = storageBackend.await(),
     )
   }
 
@@ -107,6 +109,10 @@ class SrxRepository(
     val enabledApps = countEnabledAppConfigs(configs.await())
     enabledApps to runtimeActivations.await()
   }
+
+  /** 读取共享宿主会话状态指示；失败或输出不可识别时返回 null，界面按未知展示。 */
+  suspend fun readStorageBackendStatus(): StorageBackendStatus? =
+      moduleController.storageBackendStatus()
 
   suspend fun readGlobalConfig(): GlobalConfig {
     return when (
