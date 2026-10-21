@@ -587,6 +587,7 @@ su -c 'touch /data/adb/modules/storage.redirect.x/disable && reboot'
 - [Zygisk](https://github.com/topjohnwu/Magisk) 与 [Zygisk Next](https://github.com/Dr-TSNG/ZygiskNext)：Zygisk 注入环境
 - [LSPlant](https://github.com/LSPosed/LSPlant)：Java 层 hook 框架
 - [libfuse](https://github.com/libfuse/libfuse)：scoped FUSE 会话实现的基础
+- [Fuse-Proxy](https://github.com/huniangitb/Fuse-Proxy)：共享宿主 FUSE 会话设计的参考实现
 
 ## 📄 开源协议
 
