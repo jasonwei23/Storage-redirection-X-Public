@@ -910,13 +910,18 @@ class ScenarioConsistencyTest(unittest.TestCase):
         # 都不得再直读会话绑定策略的字段，一律经注册表取值。
         source = read("src/fuse_redirect/mod.rs")
         # `shared_table()` 与 `for_uid_exact()` 都是注册表出口：前者交给宿主登记，后者用于
-        # root 子进程跨 namespace 接续已由 inode/path 记住的应用策略；除它们之外的 `self.policy.`
-        # 仍然只能走 `for_request` / `session`。
+        # root 子进程跨 namespace 接续已由 inode/path 记住的应用策略（含 2026-10-21 fd 属主
+        # 回退按 inode 属主 uid 解析）；除它们之外的 `self.policy.` 仍然只能走 `for_request` /
+        # `session`。
+        # `find_owner_policy_by_package()` 是系统读取者路径反解出口（2026-10-21）：跨进程
+        # fd 的文件身份在 open 时刻固定，fstat/getxattr 不能按请求者 uid 重路由，只能按
+        # inode 属主包经注册表解析；仅限 Read 且由 is_system_reader_uid 门控。
         allowed = (
             "self.policy.for_request(req.uid(), req.pid())",
             "self.policy.session()",
             "self.policy.shared_table()",
-            "self.policy.for_uid_exact(cached_uid)",
+            "self.policy.for_uid_exact(",
+            "self.policy.find_owner_policy_by_package(",
         )
         for number, line in enumerate(source.splitlines(), 1):
             if "self.policy." not in line:

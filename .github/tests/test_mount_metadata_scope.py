@@ -183,10 +183,13 @@ class MountMetadataScopeTest(unittest.TestCase):
         policy = read("src/fuse_redirect/policy.rs")
         self.assertIn("is_android_private_backend_path", policy)
         self.assertIn("keep existing Android private metadata", policy)
+        # 私有树事后属主修复链已于 2026-10-20 随属主翻转案定案整体拆除：守护侧不再
+        # 对 Android/{data,media,obb} 做 chown/chmod 修复，元数据保持由 MediaProvider
+        # 所有权管理与上方 mount/policy 的 keep-existing 守卫共同保证。断言修复链与
+        # 类别级私有修复入口没有回潮。
         monitor = read("src/daemon_monitor/events.rs")
-        repair_body = function_body(monitor, "fn chown_android_private_path_if_needed(")
-        self.assertIn("private_root", repair_body)
-        self.assertIn("eq_ignore_case(path, private_root)", repair_body)
+        self.assertNotIn("chown_android_private_path_if_needed", monitor)
+        self.assertNotIn("repair_private_category_owner", monitor)
 
     def test_storage_alias_binding_skips_source_self_bind(self) -> None:
         # 私有目录恢复会同时遍历 /storage、/mnt 和 /data/media 别名；源路径对应的
