@@ -47,6 +47,8 @@ mod mount_identity;
 mod mount_intent;
 #[path = "../mount_ledger.rs"]
 mod mount_ledger;
+#[path = "../owner_migration.rs"]
+mod owner_migration;
 #[path = "../platform.rs"]
 mod platform;
 #[path = "../redirect/policy.rs"]

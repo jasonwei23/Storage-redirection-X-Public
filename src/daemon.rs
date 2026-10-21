@@ -596,6 +596,9 @@ pub fn main_entry() -> i32 {
     }
     crate::fuse_redirect::config::refresh_fuse_capability_snapshot("daemon_start");
     policy::refresh_shared_uid_cache();
+    // 一次性存量属主迁移（ci.49 前版本误 chown 的私有树残留）：线程内自行等待
+    // CE 就绪并受完成标记门控，已迁移设备仅多一条 skip 日志。
+    crate::owner_migration::spawn_once();
     let config_watch_fd = watcher::init(crate::platform::module_paths::CONFIG_DIR);
     if config_watch_fd < 0 {
         log::warn!("daemon config watcher unavailable, using fingerprint polling");
