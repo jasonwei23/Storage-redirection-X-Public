@@ -77,9 +77,22 @@ impl RuntimeFlow {
         }
 
         let hook_started_ms = monotonic_ms();
+        let mp_hooks_disabled = super::specialize_pre::mp_hooks_disabled()
+            && policy::is_media_provider_package(&self.package_name);
+        let plt_disabled = super::specialize_pre::plt_hook_disabled()
+            && policy::is_media_provider_package(&self.package_name);
+        let fuse_fix_disabled = super::specialize_pre::fuse_fix_disabled()
+            && policy::is_media_provider_package(&self.package_name);
         let is_redirect_via_hook = self.should_redirect
             && (self.is_system_writer_hook_redirect || self.should_install_app_redirect_hook);
-        let is_plt_hook_active = if self.should_install_fuse_fix && !is_redirect_via_hook {
+        let is_plt_hook_active = if mp_hooks_disabled || plt_disabled {
+            log::info!(
+                "plt hook skip: disabled by diagnostic marker mp={} plt={}",
+                mp_hooks_disabled,
+                plt_disabled
+            );
+            false
+        } else if self.should_install_fuse_fix && !is_redirect_via_hook {
             install_media_runtime_hook(&self.package_name, self.should_monitor)
         } else if should_install_process_plt_hook(self, is_redirect_via_hook) {
             install_plt_hook(
@@ -99,7 +112,7 @@ impl RuntimeFlow {
             );
             false
         };
-        if self.should_install_fuse_fix {
+        if self.should_install_fuse_fix && !mp_hooks_disabled && !fuse_fix_disabled {
             install_fuse_fix_if_enabled(&self.package_name);
         }
         crate::hook::refresh_runtime_config_from_settings();

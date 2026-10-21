@@ -18,9 +18,9 @@ use super::metadata::{
 use super::perf::DirectoryCacheMissReason;
 use super::policy::OperationKind;
 use super::{
-    CachedDirCandidates, DIR_CANDIDATE_CACHE_TTL, DirEntry, DirEntryCandidate,
-    DirectorySourceSignature, DirectorySourceState, FUSE_READ_BUFFER, FuseRedirectFs, FuseState,
-    MAX_READ_SIZE, MEDIA_RW_GID, MEDIA_RW_UID, NewEntryRoute, OpenFile, ROOT_INO, TTL,
+    ATTR_TTL, CachedDirCandidates, DIR_CANDIDATE_CACHE_TTL, DirEntry, DirEntryCandidate,
+    DirectorySourceSignature, DirectorySourceState, ENTRY_TTL, FUSE_READ_BUFFER, FuseRedirectFs,
+    FuseState, MAX_READ_SIZE, MEDIA_RW_GID, MEDIA_RW_UID, NewEntryRoute, OpenFile, ROOT_INO,
     estimate_cached_dir_candidates_bytes,
 };
 use crate::platform::paths;
@@ -271,6 +271,8 @@ impl Filesystem for FuseRedirectFs {
             passthrough_enabled && config.add_capabilities(InitFlags::FUSE_PASSTHROUGH).is_ok();
         self.passthrough_enabled
             .store(passthrough_negotiated, Ordering::Relaxed);
+        self.writeback_enabled
+            .store(writeback_enabled, Ordering::Relaxed);
         log::info!(
             "fuse init pkg={} kernel_abi={} passthrough_supported={} passthrough_enabled={} passthrough_negotiated={} probe_state={:?} passthrough_disabled_by_marker={} stack_depth={} max_background={} congestion={} max_write={} writeback={}",
             self.policy.session().package_name,
@@ -331,12 +333,19 @@ impl Filesystem for FuseRedirectFs {
 
     fn getattr(&self, req: &Request, ino: INodeNo, _fh: Option<FileHandle>, reply: ReplyAttr) {
         let _perf = self.perf.observe(&self.perf.metadata_calls);
-        let policy = self.policy_for_read_request(req, Some(ino), None);
+        let mut policy = self.policy_for_read_request(req, Some(ino), None);
+        // fstat on open fd：fd 可能已跨进程（binder dup），按请求者 uid 重新路由
+        // 会把合法 fstat 打成 ENOENT，回退到 inode 属主策略（文件身份已固定）。
+        // 不以 fh 是否存在为门控：内核对 fstat 未必置 FUSE_GETATTR_FH，而非属主
+        // 经路径 lookup 根本拿不到属主私有 inode，能引用该 ino 即 fd 途径。
+        if let Some(owner_policy) = self.inode_owner_policy_for_fd_stat(ino, req.uid()) {
+            policy = owner_policy;
+        }
         match self
             .backend_for_ino(&policy, ino)
             .and_then(|backend| self.visible_attr_for_backend(&policy, ino, &backend))
         {
-            Ok(attr) => reply.attr(&TTL, &attr),
+            Ok(attr) => reply.attr(&ATTR_TTL, &attr),
             Err(errno) => reply.error(errno),
         }
     }
@@ -577,7 +586,7 @@ impl Filesystem for FuseRedirectFs {
                 entry.ino,
                 (index + 1) as u64,
                 &entry.name,
-                &TTL,
+                &ENTRY_TTL,
                 &attr,
                 Generation(0),
             ) {
@@ -699,11 +708,11 @@ impl Filesystem for FuseRedirectFs {
                         backend.rel,
                         error
                     );
-                    reply.opened(FileHandle(fh), FopenFlags::empty());
+                    reply.opened(FileHandle(fh), self.file_open_flags());
                 }
             }
         } else {
-            reply.opened(FileHandle(fh), FopenFlags::empty());
+            reply.opened(FileHandle(fh), self.file_open_flags());
         }
     }
 
@@ -969,6 +978,52 @@ impl Filesystem for FuseRedirectFs {
         }
     }
 
+    fn fallocate(
+        &self,
+        _req: &Request,
+        _ino: INodeNo,
+        fh: FileHandle,
+        offset: u64,
+        length: u64,
+        mode: i32,
+        reply: ReplyEmpty,
+    ) {
+        let _perf = self.perf.observe(&self.perf.mutation_calls);
+        // 原生 MP FUSE 支持 fallocate（MPEG4Writer 录制预分配依赖它，真机 2026-10-20
+        // 实证：缺失时返回 EOPNOTSUPP，写入方降级为无预分配路径）。这里透传到后端
+        // fd，与原生语义对齐。
+        let Some(file) = ({
+            let state = self.state.read().unwrap_or_else(|err| err.into_inner());
+            let Some(open_file) = state.files.get(&fh.into()) else {
+                reply.error(Errno::EBADF);
+                return;
+            };
+            if open_file.is_read_only {
+                reply.error(Errno::EBADF);
+                return;
+            }
+            open_file.file.clone()
+        }) else {
+            reply.error(Errno::ENOSYS);
+            return;
+        };
+        let Some(offset) = libc::off_t::try_from(offset).ok() else {
+            reply.error(Errno::EINVAL);
+            return;
+        };
+        let Some(length) = libc::off_t::try_from(length).ok() else {
+            reply.error(Errno::EINVAL);
+            return;
+        };
+        // SAFETY: file 的 RawFd 在调用期间有效；fallocate 仅按 (offset, length) 操作空间分配。
+        let ret = unsafe { libc::fallocate(file.as_raw_fd(), mode, offset, length) };
+        if ret == 0 {
+            reply.ok();
+        } else {
+            reply.error(errno_from_code(last_errno()));
+        }
+    }
+
     fn create(
         &self,
         req: &Request,
@@ -1021,6 +1076,9 @@ impl Filesystem for FuseRedirectFs {
         let ino = {
             let mut state = self.state.write().unwrap_or_else(|err| err.into_inner());
             let ino = Self::ino_for_path_locked(&mut state, &rel);
+            // 登记属主：该文件 fd 经 binder 跨进程后，fstat（GETATTR 带 fh）
+            // 需要回退到创建者策略而不是按请求者 uid 重路由。
+            Self::remember_policy_for_inode_locked(&mut state, ino, &rel, &policy);
             Self::add_lookup_locked(&mut state, ino);
             ino
         };
@@ -1065,11 +1123,11 @@ impl Filesystem for FuseRedirectFs {
                         }
                     }
                     reply.created_passthrough(
-                        &TTL,
+                        &ATTR_TTL,
                         &attr,
                         Generation(0),
                         FileHandle(fh),
-                        FopenFlags::empty(),
+                        self.file_open_flags(),
                         &backing,
                     );
                 }
@@ -1082,21 +1140,21 @@ impl Filesystem for FuseRedirectFs {
                         error
                     );
                     reply.created(
-                        &TTL,
+                        &ATTR_TTL,
                         &attr,
                         Generation(0),
                         FileHandle(fh),
-                        FopenFlags::empty(),
+                        self.file_open_flags(),
                     );
                 }
             }
         } else {
             reply.created(
-                &TTL,
+                &ATTR_TTL,
                 &attr,
                 Generation(0),
                 FileHandle(fh),
-                FopenFlags::empty(),
+                self.file_open_flags(),
             );
         }
     }
@@ -1153,13 +1211,15 @@ impl Filesystem for FuseRedirectFs {
         let ino = {
             let mut state = self.state.write().unwrap_or_else(|err| err.into_inner());
             let ino = Self::ino_for_path_locked(&mut state, &rel);
+            // 同 create：登记属主供跨进程 fstat 回退。
+            Self::remember_policy_for_inode_locked(&mut state, ino, &rel, &policy);
             Self::add_lookup_locked(&mut state, ino);
             ino
         };
         match self.attr_for_backend(&policy, ino, &backend) {
             Ok(attr) => {
                 policy.emit_monitor_create(&backend);
-                reply.entry(&TTL, &attr, Generation(0));
+                reply.entry(&ENTRY_TTL, &attr, Generation(0));
             }
             Err(errno) => {
                 let mut state = self.state.write().unwrap_or_else(|err| err.into_inner());
@@ -1348,7 +1408,12 @@ impl Filesystem for FuseRedirectFs {
         reply: ReplyAttr,
     ) {
         let _perf = self.perf.observe(&self.perf.mutation_calls);
-        let policy = self.policy_for_request(req);
+        let mut policy = self.policy_for_request(req);
+        // ftruncate/fchmod 等经跨进程 fd 到达时同样不能按请求者 uid 重路由
+        // （fstat 同理，见 getattr 的属主回退注释）。
+        if let Some(owner_policy) = self.inode_owner_policy_for_fd_stat(ino, req.uid()) {
+            policy = owner_policy;
+        }
         let backend = match self.backend_for_ino(&policy, ino) {
             Ok(backend) => backend,
             Err(errno) => {
@@ -1431,7 +1496,7 @@ impl Filesystem for FuseRedirectFs {
         }
 
         match self.attr_for_backend(&policy, ino, &backend) {
-            Ok(attr) => reply.attr(&TTL, &attr),
+            Ok(attr) => reply.attr(&ATTR_TTL, &attr),
             Err(errno) => reply.error(errno),
         }
     }

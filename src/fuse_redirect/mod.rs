@@ -24,7 +24,9 @@ pub use scoped_mount::{
 
 use crate::platform::{fs, paths};
 use attrs::{file_attr_from_metadata, synthetic_dir_attr};
-use fuser::{Errno, FileAttr, FileType, Generation, INodeNo, ReplyEmpty, ReplyEntry, Request};
+use fuser::{
+    Errno, FileAttr, FileType, FopenFlags, Generation, INodeNo, ReplyEmpty, ReplyEntry, Request,
+};
 use inode::{remove_inode_path, remove_unreferenced_inode};
 use metadata::{cstring_path, errno_from_code, errno_from_io, fix_path_metadata, last_errno};
 use perf::FusePerfStats;
@@ -40,7 +42,13 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant, SystemTime};
 
-const TTL: Duration = Duration::from_millis(250);
+/// attr 有效期：与原生 MP FuseDaemon 对齐（10s）。writeback 回写模式下内核在
+/// 本地维护 inode 的 i_size，应用轮询 stat 命中未过期的内核缓存时拿到的是
+/// 真实尺寸；TTL 过短（旧值 250ms）会让每次轮询穿透到后端 lstat，读到回刷
+/// 滞后的旧尺寸——QQ 相机录制即因此读到 size=0/截断值而判「录制异常」。
+const ATTR_TTL: Duration = Duration::from_secs(10);
+/// entry 有效期：与原生一致取 0（不缓存查找结果，负查询亦不缓存）。
+const ENTRY_TTL: Duration = Duration::ZERO;
 const ROOT_INO: u64 = 1;
 const MAX_READ_SIZE: usize = 256 * 1024;
 const DIR_CANDIDATE_CACHE_TTL: Duration = Duration::from_millis(250);
@@ -79,6 +87,11 @@ struct FuseRedirectFs {
     state: RwLock<FuseState>,
     perf: FusePerfStats,
     passthrough_enabled: AtomicBool,
+    /// 会话是否协商了 FUSE_WRITEBACK_CACHE：写进内核页缓存、延迟回刷后端。
+    /// 决定文件 open/create 应答是否必须携带 FOPEN_KEEP_CACHE——缺失时内核在
+    /// 每次 open 都失效该 inode 页缓存，第二个 fd 读正在写的文件会经 GETATTR
+    /// 取到回刷滞后的后端 size（截断视图），读方（如录制 I 帧提取）据此判坏。
+    writeback_enabled: AtomicBool,
 }
 
 struct FuseState {
@@ -271,6 +284,7 @@ impl FuseRedirectFs {
             policy,
             perf,
             passthrough_enabled: AtomicBool::new(false),
+            writeback_enabled: AtomicBool::new(false),
             state: RwLock::new(FuseState {
                 next_ino: ROOT_INO + 1,
                 next_fh: 1,
@@ -290,6 +304,19 @@ impl FuseRedirectFs {
                 dir_candidate_cache_max_capacity: dir_cache_max_capacity,
             }),
         })
+    }
+
+    /// 文件 open/create 应答的 FOPEN 标志：writeback 回写模式下必须携带
+    /// FOPEN_KEEP_CACHE。缺失时内核每次 open 都失效该 inode 的页缓存，第二个
+    /// fd 读「正在写的文件」会经 GETATTR 取到回刷滞后的后端 size（截断视图），
+    /// 例如录制中 I 帧提取管线打开 growing mp4 直接判坏。与 passthrough open
+    /// 应答（恒带 KEEP_CACHE）保持一致。
+    pub(super) fn file_open_flags(&self) -> FopenFlags {
+        if self.writeback_enabled.load(Ordering::Relaxed) {
+            FopenFlags::FOPEN_KEEP_CACHE
+        } else {
+            FopenFlags::empty()
+        }
     }
 
     fn policy_for_request(&self, req: &Request) -> Arc<RedirectPolicy> {
@@ -331,16 +358,56 @@ impl FuseRedirectFs {
         policy
     }
 
+    /// fstat 已打开 fd（GETATTR 带 fh）的属主策略回退：fd 可经 binder 跨进程复制
+    /// （如 QQ 录制结束后把视频 fd 交给 MediaProvider 做原始格式协商，MP 进程对
+    /// 该 fd fstat 时 FUSE GETATTR 以 MP 的 uid 到达 daemon）。fd 的文件身份在
+    /// open 时刻已固定，不能按请求者 uid 重新路由 rel 路径——非属主解析必然
+    /// ENOENT。属主与请求者一致或属主策略已注销时返回 None，沿用调用方策略。
+    fn inode_owner_policy_for_fd_stat(
+        &self,
+        ino: INodeNo,
+        requester_uid: u32,
+    ) -> Option<Arc<RedirectPolicy>> {
+        let owner_uid = {
+            let state = self.state.read().unwrap_or_else(|err| err.into_inner());
+            state.inode_policy_uids.get(&ino.0).copied()?
+        };
+        let owner_policy = self.policy.for_uid_exact(owner_uid)?;
+        if owner_policy.uid as u32 == requester_uid {
+            return None;
+        }
+        log::debug!(
+            "fuse getattr fd-owner fallback ino={:x} requester_uid={} owner_uid={}",
+            ino.0,
+            requester_uid,
+            owner_uid
+        );
+        Some(owner_policy)
+    }
+
     fn remember_policy_for_inode_locked(
         state: &mut FuseState,
         ino: INodeNo,
         rel: &str,
         policy: &RedirectPolicy,
     ) {
-        state
-            .path_policy_uids
-            .insert(rel.to_string(), policy.uid as u32);
-        state.inode_policy_uids.insert(ino.0, policy.uid as u32);
+        // 跨进程 fstat 回退以「应用属主」为唯一可信登记：系统身份（MP/media/root）
+        // 的解析晚到、失败（attr ENOENT 时 remember 已先行执行）或视图不同，都不得
+        // 覆盖已登记的应用属主；应用属主之间先到者保留。
+        let uid = policy.uid as u32;
+        let is_app_uid = uid >= 10000;
+        if let Some(&existing) = state.inode_policy_uids.get(&ino.0)
+            && (!is_app_uid || (existing >= 10000 && existing != uid))
+        {
+            return;
+        }
+        if let Some(&existing) = state.path_policy_uids.get(rel)
+            && (!is_app_uid || (existing >= 10000 && existing != uid))
+        {
+            return;
+        }
+        state.path_policy_uids.insert(rel.to_string(), uid);
+        state.inode_policy_uids.insert(ino.0, uid);
     }
 
     fn ino_for_path_locked(state: &mut FuseState, rel: &str) -> INodeNo {
@@ -494,7 +561,7 @@ impl FuseRedirectFs {
             ino
         };
         match self.visible_attr_for_backend(policy, ino, &backend) {
-            Ok(attr) => reply.entry(&TTL, &attr, Generation(0)),
+            Ok(attr) => reply.entry(&ENTRY_TTL, &attr, Generation(0)),
             Err(errno) => {
                 let mut state = self.state.write().unwrap_or_else(|err| err.into_inner());
                 Self::remove_lookup_locked(&mut state, ino, 1);
