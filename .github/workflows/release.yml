@@ -19,7 +19,7 @@ env:
 jobs:
   quality:
     if: github.repository == 'z1298808165/Storage-redirection-X-Public' && startsWith(github.ref, 'refs/tags/v')
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     timeout-minutes: 15
     steps:
       - name: Checkout repository
@@ -63,7 +63,7 @@ jobs:
 
   prepare:
     if: github.repository == 'z1298808165/Storage-redirection-X-Public' && startsWith(github.ref, 'refs/tags/v')
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     timeout-minutes: 15
     outputs:
       version: ${{ steps.version.outputs.version }}
@@ -102,7 +102,7 @@ jobs:
       - quality
       - prepare
     if: startsWith(github.ref, 'refs/tags/v')
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     timeout-minutes: 10
     env:
       VERSION: ${{ needs.prepare.outputs.version }}
@@ -124,7 +124,7 @@ jobs:
       - quality
       - prepare
       - init-release
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     timeout-minutes: 30
     env:
       VERSION: ${{ needs.prepare.outputs.version }}
@@ -278,7 +278,7 @@ jobs:
       - quality
       - prepare
       - init-release
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     timeout-minutes: 30
     env:
       VERSION: ${{ needs.prepare.outputs.version }}
@@ -368,7 +368,7 @@ jobs:
     needs:
       - quality
       - prepare
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     timeout-minutes: 30
     env:
       VERSION: ${{ needs.prepare.outputs.version }}
@@ -489,7 +489,7 @@ jobs:
       - quality
       - prepare
       - test-flow-build
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     timeout-minutes: ${{ matrix.android.timeout_minutes }}
     env:
       VERSION: ${{ needs.prepare.outputs.version }}
@@ -682,7 +682,7 @@ jobs:
       - prepare
       - test-flow
     if: always() && needs.prepare.result != 'skipped'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     timeout-minutes: 10
     steps:
       - name: Require all test-flow matrix jobs to pass
@@ -704,7 +704,7 @@ jobs:
       - module
       - app
       - test-flow-required
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     timeout-minutes: 20
     env:
       VERSION: ${{ needs.prepare.outputs.version }}
@@ -809,7 +809,7 @@ jobs:
       - test-flow-required
       - publish-release
     if: always() && needs.prepare.result == 'success'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     timeout-minutes: 10
     permissions:
       actions: write
