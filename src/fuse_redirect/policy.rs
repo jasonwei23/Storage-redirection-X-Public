@@ -62,6 +62,10 @@ pub(super) enum OperationKind {
 struct BackendDecision {
     kind: BackendKind,
     is_read_only: bool,
+    /// 命中 sandboxed_paths 的重定向：监视/直通会话的重定向根是存储根本身，
+    /// 此时 backend 必须落到该应用私有 sdcard 沙盒根，否则 native 层创建会
+    /// 绕过沙盒直落真实路径（2026-10-21 用户反馈的 .xlDownload 侧漏）。
+    is_sandbox: bool,
 }
 
 #[derive(Clone, Default)]
@@ -168,6 +172,8 @@ pub(super) struct RedirectPolicy {
     pub(super) path_mappings: Vec<PathMapping>,
     pub(super) is_mapping_mode_only: bool,
     pub(super) is_monitor_only: bool,
+    /// 监视/直通会话的沙盒 backend 根（该应用私有 sdcard 根）；普通重定向会话为 None。
+    pub(super) sandbox_backend_root: Option<PathBuf>,
     pub(super) is_file_monitor_enabled: bool,
     /// 一律拒绝：路径决策全部失败，调用方据此返回 `ENOENT`。
     ///
@@ -498,6 +504,19 @@ impl RedirectPolicy {
             .unwrap_or_default()
             .trim_matches('/')
             .to_string();
+        // 监视/直通会话的重定向根是存储根，sandboxed_paths 命中时宿主面需要把
+        // backend 换到该应用私有 sdcard 沙盒根（否则 native 层创建绕过沙盒直落
+        // 真实路径——2026-10-21 用户反馈的 .xlDownload 侧漏）。普通重定向会话的
+        // 重定向根本身就是沙盒根，走既有 redirect_backend_for_rel 即可。
+        let sandbox_backend_root = if config.is_mapping_mode_only && redirect_view_rel.is_empty() {
+            Some(PathBuf::from(format!(
+                "{}/Android/data/{}/sdcard",
+                paths::data_media_user_root_for_user(user_id),
+                config.package_name
+            )))
+        } else {
+            None
+        };
 
         let mut path_mappings = resolve_path_mappings(
             &config.path_mappings,
@@ -549,6 +568,7 @@ impl RedirectPolicy {
             media_sqlite_real_root: media_sqlite_view_root_for_user(user_id),
             redirect_root: PathBuf::from(redirect_root_string),
             redirect_view_rel,
+            sandbox_backend_root,
             rule_prefixes,
             allowed_real_paths,
             excluded_real_paths,
@@ -622,7 +642,15 @@ impl RedirectPolicy {
                 }
                 None => self.real_backend_for_rel(&rel),
             },
-            BackendKind::Redirect => self.redirect_backend_for_rel(&rel),
+            BackendKind::Redirect => {
+                if decision.is_sandbox
+                    && let Some(sandbox_root) = &self.sandbox_backend_root
+                {
+                    sandbox_root.join(&rel)
+                } else {
+                    self.redirect_backend_for_rel(&rel)
+                }
+            }
         };
 
         // 跨应用只读别名兜底：应用 A 把自身映射视图形态的文件路径交给应用 B 时
@@ -772,16 +800,22 @@ impl RedirectPolicy {
 
     fn backend_decision(&self, storage_path: &str, operation: OperationKind) -> BackendDecision {
         let is_read_only = self.is_read_only(storage_path);
-        let kind = if self.is_monitor_only
+        // sandboxed_paths 优先于监视/直通会话短路：系统代写组件（共享 media uid
+        // 等监视会话）对配置沙盒路径的访问也必须重定向进私有沙盒，否则 native
+        // 层创建会绕过沙盒直落真实路径。命中与排除的判定口径与下方
+        // mapping_mode_only 分支保持一致。
+        let is_sandbox = self.is_mapping_mode_only
+            && self.matches_any(&self.sandboxed_index, storage_path)
+            && !self.matches_any(&self.sandboxed_excluded_index, storage_path);
+        let kind = if is_sandbox {
+            BackendKind::Redirect
+        } else if self.is_monitor_only
             || self.resolve_mapping(storage_path).is_some()
             || self.is_own_private_storage_path(storage_path)
         {
             BackendKind::Real
         } else if self.is_mapping_mode_only {
-            if self.is_foreign_private_storage_path(storage_path)
-                || (self.matches_any(&self.sandboxed_index, storage_path)
-                    && !self.matches_any(&self.sandboxed_excluded_index, storage_path))
-            {
+            if self.is_foreign_private_storage_path(storage_path) {
                 BackendKind::Redirect
             } else {
                 BackendKind::Real
@@ -797,7 +831,11 @@ impl RedirectPolicy {
         } else {
             BackendKind::Redirect
         };
-        BackendDecision { kind, is_read_only }
+        BackendDecision {
+            kind,
+            is_read_only,
+            is_sandbox,
+        }
     }
 
     fn matches_any(&self, index: &RuleIndex, storage_path: &str) -> bool {

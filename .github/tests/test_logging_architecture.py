@@ -91,7 +91,17 @@ class LoggingArchitectureTest(unittest.TestCase):
         self.assertIn('get("monitor_only")', request)
         policy = read("src/fuse_redirect/policy.rs")
         backend = policy[policy.index("fn backend_decision") : policy.index("fn matches_any")]
-        self.assertLess(backend.index("if self.is_monitor_only"), backend.index("BackendKind::Redirect"))
+        # 2026-10-21 起沙盒命中（仅限配置了 sandboxed_paths 的应用）优先于监视
+        # 直通短路：未配置应用的沙盒索引为空，is_sandbox 恒 false，监视直通
+        # 语义不变；监视分支仍须先于其余映射类 Redirect 分支。
+        self.assertLess(
+            backend.index("let is_sandbox = self.is_mapping_mode_only"),
+            backend.index("if self.is_monitor_only"),
+        )
+        self.assertLess(
+            backend.index("if self.is_monitor_only"),
+            backend.rindex("BackendKind::Redirect"),
+        )
         self.assertIn('"fuse_monitor_only"', policy)
         constructor_start = policy.index("impl RedirectPolicy")
         constructor = policy[constructor_start : policy.index("        let mut path_mappings", constructor_start)]
