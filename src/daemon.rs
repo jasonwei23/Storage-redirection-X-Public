@@ -70,6 +70,129 @@ static LAST_MEDIA_PROVIDER_PIDS: Mutex<Vec<i32>> = Mutex::new(Vec::new());
 /// MediaProvider 进程出现后补登记一次（幂等，已成功者跳过），覆盖首次失败的应用。
 static PRE_REGISTER_ALL_AFTER_MEDIA_READY: AtomicBool = AtomicBool::new(false);
 
+/// 开机全量预登记因 CE 密钥未就绪而挂起，待就绪后补跑。
+static BOOT_PRE_REGISTER_PENDING: AtomicBool = AtomicBool::new(false);
+
+/// 探测 /data/media 的用户 CE 密钥是否已就绪。
+///
+/// 开机全量预登记发生在 daemon 启动（post-fs-data/service 阶段），此时 /data/media
+/// 的用户 CE 密钥尚未安装，任何 mkdir/lookup 都返回 errno=126（Required key not
+/// available），整批预登记必然失败——真机实测是每次开机的确定性竞态。用一次 mkdir
+/// 探测代替几十次注定失败的登记：路径可达（返回成功或 EEXIST）即就绪，其余错误
+/// （ENOKEY/ENOENT 等）一律视为未就绪，交由挂起补跑与 media_ready 触发兜住。
+pub(crate) fn media_ce_storage_ready() -> bool {
+    const PROBE_DIR: &std::ffi::CStr = c"/data/media/0/Android/data";
+    // SAFETY: libc::mkdir/rmdir 只接收 NUL 结尾的合法路径常量，不借用调用方数据。
+    let rc = unsafe { libc::mkdir(PROBE_DIR.as_ptr(), 0o770) };
+    if rc == 0 {
+        // 目录本不该缺失：清掉探针，仍视为就绪（密钥已可用才会创建成功）。
+        // SAFETY: 仅传入 NUL 结尾的常量路径指针，不借用调用方数据。
+        unsafe { libc::rmdir(PROBE_DIR.as_ptr()) };
+        return true;
+    }
+    crate::platform::errno::last() == libc::EEXIST
+}
+
+/// 预登记失败重试条目。
+struct PendingPolicyRetry {
+    package_name: String,
+    uid: i32,
+    attempts: u32,
+}
+
+/// 预登记失败重试队列。
+///
+/// 开机全量预登记可能在 FBE 密钥未就绪的竞态窗口整批失败：沙箱目录 mkdir 返回
+/// errno=126（Required key not available），宿主整批拒绝策略（fuse host policy
+/// rejected + ack rejected），且此后没有任何重试——所有应用落入宿主 fail-closed
+/// deny_all，用户可见症状是所有应用视角 /storage/emulated/0 为空（真机 2026-10-13
+/// 事故）。media_ready 补登记只有一次机会，若那一刻密钥仍未就绪同样失效。失败
+/// 条目进入本队列，由周期 reconcile 逐轮限量重试；上限内成功或超限后移除。
+static PENDING_POLICY_RETRIES: Mutex<Vec<PendingPolicyRetry>> = Mutex::new(Vec::new());
+
+/// 单个应用的最大重试次数。30 秒周期下约覆盖 15 分钟的开机恢复窗口。
+const POLICY_RETRY_MAX_ATTEMPTS: u32 = 30;
+/// 每个 reconcile 周期最多重试的条目数：登记要 fork 子进程探测 media 视图并等待
+/// 宿主 ack（最坏秒级），限量保证重试不挤占同一循环内挂载计划的关键窗口（计划
+/// 本身单轮也只执行 1 个）。
+const POLICY_RETRY_PER_CYCLE: usize = 2;
+
+/// 把预登记失败的应用加入重试队列（按 uid 去重）。
+fn enqueue_policy_retry(package_name: &str, uid: i32) {
+    if uid < ANDROID_APP_UID_START {
+        return;
+    }
+    let mut queue = PENDING_POLICY_RETRIES
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if queue.iter().any(|entry| entry.uid == uid) {
+        return;
+    }
+    queue.push(PendingPolicyRetry {
+        package_name: package_name.to_string(),
+        uid,
+        attempts: 0,
+    });
+}
+
+/// 在 reconcile 周期内限量重试预登记失败的应用。
+///
+/// 复用与开机全量预登记完全相同的 build_request + pre_register_host_policy 路径；
+/// 幂等由指纹表保证，成功（含已登记）即出队，持续失败计满上限后放弃并告警。
+fn drain_pending_policy_retries(config_version: u64) {
+    let snapshot = SettingsHub::instance().get_daemon_reconcile_config_snapshot();
+    let mut retried = 0usize;
+    let mut queue = PENDING_POLICY_RETRIES
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let mut index = 0usize;
+    while index < queue.len() && retried < POLICY_RETRY_PER_CYCLE {
+        let (package_name, uid, attempts) = {
+            let entry = &mut queue[index];
+            entry.attempts += 1;
+            (entry.package_name.clone(), entry.uid, entry.attempts)
+        };
+        let proc = AppProcess {
+            pid: 0,
+            uid,
+            package_name,
+            is_uninterruptible: false,
+        };
+        let request = build_request(&proc, config_version, &snapshot);
+        if request.operation != MountOperation::Reload {
+            // 配置已不再产生 Reload 请求（应用被移除或关闭重定向）：无需重试，出队。
+            queue.remove(index);
+            continue;
+        }
+        retried += 1;
+        match crate::daemon_mount::pre_register_host_policy(&request) {
+            crate::daemon_mount::PreRegisterOutcome::Registered
+            | crate::daemon_mount::PreRegisterOutcome::AlreadyRegistered => {
+                log::info!(
+                    "policy retry registered uid={} pkg={} attempts={}",
+                    uid,
+                    request.package_name,
+                    attempts
+                );
+                queue.remove(index);
+            }
+            crate::daemon_mount::PreRegisterOutcome::NotApplicable => {
+                if attempts >= POLICY_RETRY_MAX_ATTEMPTS {
+                    log::warn!(
+                        "policy retry exhausted uid={} pkg={} attempts={}",
+                        uid,
+                        request.package_name,
+                        attempts
+                    );
+                    queue.remove(index);
+                } else {
+                    index += 1;
+                }
+            }
+        }
+    }
+}
+
 /// 周期 reconcile 摘要的记录状态。
 ///
 /// 每轮都按 info 记录摘要会让调试日志以秒级速度增长，把真正需要排查的挂载事件
@@ -277,9 +400,22 @@ fn plan_batch_mode_tag(mode: &ReconcileMode) -> u8 {
 #[derive(Default)]
 struct ReconcileCursor {
     last_attempted: Option<ReconcilePlanIdentity>,
-    /// 本触发周期首个尝试的计划身份：轮转绕回该位置即判定周期已排空，
-    /// 让未完成批次收口，避免永续 ~1Hz 续跑轮询。
+    /// 本触发周期首个尝试的计划身份。
+    ///
+    /// 仅供诊断与旧收口判据兜底保留；真正的收口判定已改由下面的
+    /// `cycle_attempted`（回到已尝试过的计划即排空）承担。
     cycle_head: Option<ReconcilePlanIdentity>,
+    /// 本周期内已被尝试执行的计划身份集合。
+    ///
+    /// 轮转回到已尝试过的计划，说明本轮触发要处理的计划都已尝试过一次，周期应当收口。
+    /// 判定点还要求本轮没有任何计划被批次限流延后（`deferred == 0`）——被延后的计划
+    /// 从未尝试过，绕回命中时它们仍待处理，此时收口等于把工作推给下一个触发周期。
+    /// 只比对「周期头位置」的旧判据（`next_index <= head_index`）在周期头不在计划数组
+    /// 末尾时永远不成立：绕回后执行周期头得到 `head+1`，恒大于 `head_index`，周期永不
+    /// 收口，`pending_full_reconcile` 恒为真，主循环退化为 200ms 永续续跑。真机实测
+    /// 表现为全部已挂载应用每 2~3 秒被卸载重建一次（20 秒 64 次重挂、45 分钟零次
+    /// `cycle drained`）。改为「回到已尝试集合即收口」后判定与轮转位置无关。
+    cycle_attempted: HashSet<ReconcilePlanIdentity>,
     /// 本周期内已被监督判定拒绝注入的计划。
     ///
     /// 监督拒绝（skip_superseded / refuse_poisoned 等）是账本状态型结论，
@@ -346,7 +482,20 @@ impl ReconcileCursor {
         if self.cycle_head.is_none() {
             self.cycle_head = Some(identity.clone());
         }
+        self.cycle_attempted.insert(identity.clone());
         self.last_attempted = Some(identity);
+    }
+
+    /// 本周期是否已尝试过该计划。
+    fn attempted_in_cycle(&self, plan: &ReconcilePlan) -> bool {
+        self.cycle_attempted.contains(&plan.identity())
+    }
+
+    /// 结束本周期：清空周期头、已尝试集合与拒绝集合。
+    fn close_cycle(&mut self) {
+        self.cycle_head = None;
+        self.cycle_attempted.clear();
+        self.cycle_refused.clear();
     }
 }
 
@@ -447,6 +596,9 @@ pub fn main_entry() -> i32 {
     }
     crate::fuse_redirect::config::refresh_fuse_capability_snapshot("daemon_start");
     policy::refresh_shared_uid_cache();
+    // 一次性存量属主迁移（ci.49 前版本误 chown 的私有树残留）：线程内自行等待
+    // CE 就绪并受完成标记门控，已迁移设备仅多一条 skip 日志。
+    crate::owner_migration::spawn_once();
     let config_watch_fd = watcher::init(crate::platform::module_paths::CONFIG_DIR);
     if config_watch_fd < 0 {
         log::warn!("daemon config watcher unavailable, using fingerprint polling");
@@ -456,11 +608,16 @@ pub fn main_entry() -> i32 {
     // 后续 reconcile 会在宿主子进程死亡后按需恢复，而不是继续使用失效句柄。
     if !crate::fuse_host::ensure_global() {
         log::warn!("fuse host session unavailable, scoped path remains active");
-    } else {
+    } else if media_ce_storage_ready() {
         // 宿主就绪后立即全量预登记所有已配置应用：让应用冷启动时无需等待 reconcile
         // 轮询到该进程，就能从宿主快照确认 uid 并接入共享会话，避免 scoped 竞态与
         // 启动窗口。宿主未就绪时跳过（此时预登记必然失败，逐个触发等待反而拖慢启动）。
         pre_register_all_configured_apps(config, config.config_version());
+    } else {
+        // CE 密钥未就绪的竞态窗口：整批登记必然失败（errno=126），跳过本次全量并
+        // 挂起，待密钥就绪后由 reconcile 补跑，避免几十次注定失败的 fork 与拒绝日志。
+        BOOT_PRE_REGISTER_PENDING.store(true, Ordering::Release);
+        log::warn!("boot pre-register deferred: media CE key not ready");
     }
 
     let mut last_version = 0;
@@ -480,6 +637,14 @@ pub fn main_entry() -> i32 {
             cleanup_all_mount_states();
             log::info!("daemon stop reason=runtime_disabled");
             return 0;
+        }
+        // 挂起的开机全量预登记：CE 密钥就绪后立即补跑。放在 should_reconcile 判定
+        // 之外，配合挂起态下 1 秒的 poll 上限，密钥就绪后 ~1 秒内完成补登记；
+        // 幂等由指纹表保证，未挂起时本块零开销。
+        if BOOT_PRE_REGISTER_PENDING.load(Ordering::Acquire) && media_ce_storage_ready() {
+            BOOT_PRE_REGISTER_PENDING.store(false, Ordering::Release);
+            log::warn!("boot pre-register resumed: media CE key ready");
+            pre_register_all_configured_apps(config, config.config_version());
         }
         let before = config.config_version();
         let (did_reload, changed_packages, full_change) =
@@ -632,6 +797,10 @@ fn wait_for_daemon_events(
 ) -> bool {
     let timeout_ms: libc::c_int = if reconcile_pending {
         RECONCILE_CONTINUE_WAIT_MS
+    } else if BOOT_PRE_REGISTER_PENDING.load(Ordering::Acquire) {
+        // 挂起的开机预登记等待 CE 密钥就绪：1 秒粒度轮询，密钥就绪后 ~1 秒内补跑，
+        // 避免 30 秒周期兜底带来的启动登记延迟。挂起态只存在于开机后一两分钟。
+        1_000
     } else {
         30_000
     };
@@ -766,6 +935,11 @@ fn wait_for_file_monitor_events(sync: &FileMonitorSync, monitor: &RegularAppMoni
         std::thread::sleep(Duration::from_secs(30));
         return;
     }
+    // 待裁决观察事件的到期点优先：延迟裁决最长数百毫秒，不能等 30 秒轮询。
+    let poll_timeout_ms = monitor
+        .pending_flush_delay_ms()
+        .map(|delay| delay.clamp(20, 30_000))
+        .unwrap_or(30_000);
     let mut fds = [
         libc::pollfd {
             fd: monitor.event_fd(),
@@ -778,10 +952,16 @@ fn wait_for_file_monitor_events(sync: &FileMonitorSync, monitor: &RegularAppMoni
             revents: 0,
         },
     ];
-    // inotify 是主事件源，eventfd 唤醒配置重建；30 秒超时只作为 runtime disable 的兜底。
-    // SAFETY: fds 是本栈帧上的合法 pollfd 数组，poll 只在其中写入 revents；
-    // nfds_t 转换不会截断（数组长度恒为 2）。
-    let result = unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as libc::nfds_t, 30_000) };
+    // inotify 是主事件源，eventfd 唤醒配置重建；超时兜底 runtime disable 与
+    // 延迟裁决到期（有待裁决事件时压到到期点）。
+    // SAFETY: fds 是本栈帧上的合法 pollfd 数组，poll 只在其中写入 revents；nfds_t 转换由调用方保证不截断。
+    let result = unsafe {
+        libc::poll(
+            fds.as_mut_ptr(),
+            fds.len() as libc::nfds_t,
+            poll_timeout_ms as libc::c_int,
+        )
+    };
     if result < 0 && std::io::Error::last_os_error().raw_os_error() == Some(libc::EINTR) {
         return;
     }
@@ -895,9 +1075,7 @@ fn dump_malloc_info_if_requested() {
     // SAFETY: fopen/malloc_info/fclose 均为 bionic libc 导出的稳定接口；fp
     // 生命周期限定在本函数内，malloc_info 内部仅短暂持有分配器锁。
     unsafe {
-        let path = b"/data/local/tmp/srx-meminfo.xml\0".as_ptr() as *const libc::c_char;
-        let mode = b"w\0".as_ptr() as *const libc::c_char;
-        let fp = libc::fopen(path, mode);
+        let fp = libc::fopen(c"/data/local/tmp/srx-meminfo.xml".as_ptr(), c"w".as_ptr());
         if fp.is_null() {
             log::warn!("daemon meminfo dump fopen failed");
             let _ = std::fs::remove_file(TRIGGER);
@@ -1048,6 +1226,10 @@ fn reconcile_running_apps(
             pre_register_all_configured_apps(SettingsHub::instance(), config_version);
         }
 
+        // 预登记失败重试：开机/media_ready 两波全量登记在竞态窗口失败的应用，由
+        // 周期 reconcile 逐轮限量补登记（队列空时零开销）。
+        drain_pending_policy_retries(config_version);
+
         // companion 与 daemon 可能同时为同一应用发起挂载。全量路径先登记本轮 Auto 应用策略，
         // 让 companion 能从宿主快照确认 uid 后直接接入共享会话。单包增量路径由快速热更新或
         // 完整挂载流程各自完成一次策略注册，跳过这里，避免同一 MT 切换重复触碰宿主控制通道。
@@ -1095,6 +1277,7 @@ fn reconcile_running_apps(
     } else {
         0
     };
+    let mut cycle_wrapped = false;
     for offset in 0..plans.len() {
         let index = (start_index + offset) % plans.len();
         let plan = &plans[index];
@@ -1129,6 +1312,20 @@ fn reconcile_running_apps(
             skipped += 1;
             continue;
         }
+        // 轮转回到本周期已尝试过的计划：本轮触发要处理的计划都已尝试过一次，周期收口。
+        // 该判据与计划数组中的轮转位置无关，替代原先只在周期头位于数组末尾才成立的
+        // `next_index <= head_index`（详见 `cycle_attempted` 字段注释）。
+        //
+        // 必须附加「本轮没有任何计划被延后」的前提。批次限流下每轮只放行
+        // RECONCILE_BATCH_MAX_PLANS 个计划，其余全部走 deferred；此时绕回命中的
+        // 已尝试计划是上一轮放行的那一个，中间那一批只是被限流推后、从未尝试过。
+        // 只看命中与否就会在第二次绕回时误判排空，把整批未尝试的计划留到下一个
+        // 触发周期（CI 实测：planned=36 deferred=35 紧接着 cycle drained，挂载被推迟
+        // 到 30 秒兜底才补做）。带延后即说明本轮仍有未处理计划，不收口。
+        if uses_batch_cursor && deferred == 0 && cursor.attempted_in_cycle(plan) {
+            cycle_wrapped = true;
+            break;
+        }
         if !incremental_change
             && mode != ReconcileMode::Forced
             && batch_requests >= RECONCILE_BATCH_MAX_PLANS
@@ -1161,13 +1358,19 @@ fn reconcile_running_apps(
             skipped += 1;
             continue;
         }
-        match plan.request.operation {
+        let operation = plan.request.operation;
+        let had_mount_state = plan.has_mount_state;
+        match operation {
             MountOperation::Reload => {
                 if execute_mount_request(&plan.request) {
-                    if !plan.has_mount_state && has_mount_state(&plan.request) {
+                    if !had_mount_state && has_mount_state(&plan.request) {
                         crate::runtime_stats::record_runtime_activation();
                     }
                     applied += 1;
+                    // 执行成功即把计划标记为已落地：续跑轮复用同一批计划对象，
+                    // `is_mount_current` 若不更新就会保留枚举时的旧值，让同一计划在
+                    // 本周期内被反复卸载重建（真机实测单 pid 代际每 2~3 秒 +1）。
+                    plans[index].mark_settled(operation);
                 } else if uses_batch_cursor {
                     // 执行失败的计划登记进周期拒绝集合：永久性失败（如 OEM 内核
                     // 拒绝沙盒目录 mkdir，真机实测一台设备 10+ 应用全部失败）若
@@ -1179,9 +1382,11 @@ fn reconcile_running_apps(
                 }
             }
             MountOperation::Disable => {
-                if plan.has_mount_state {
+                if had_mount_state {
                     if execute_mount_request(&plan.request) {
                         disabled += 1;
+                        // 卸载成功后挂载状态已消失，同步清掉，避免续跑轮重复卸载。
+                        plans[index].mark_settled(operation);
                     } else if uses_batch_cursor {
                         cursor.cycle_refused.insert(plan.identity());
                     }
@@ -1195,11 +1400,23 @@ fn reconcile_running_apps(
     // 周期完成判定：批次限流只保证「不阻塞主循环」，不能成为永续轮询的理由。
     // 未配置或被监督拒绝的计划既不 applied 也不 current，deferred 永远不归零——
     // 此前这让 pending 长期为真，主循环以约 1Hz 每轮全量扫 /proc 无限续跑。判据：
-    // 游标轮转已绕回本周期首个尝试计划的位置（或更早），说明本轮触发要处理的
-    // 计划都已被尝试过一次，本周期收口；被拒绝的计划等下一次真实触发（配置、
-    // 宿主、控制事件或 30 秒周期兜底）再进队。执行失败的计划同样登记进拒绝集合，绕回收口后会在新周期里再得到一次尝试。
+    // 本周期内已尝试过的计划被再次命中（轮转绕回），说明本轮触发要处理的计划都已
+    // 被尝试过一次，本周期收口；被拒绝的计划等下一次真实触发（配置、宿主、控制事件
+    // 或 30 秒周期兜底）再进队。执行失败的计划同样登记进拒绝集合，绕回收口后会在
+    // 新周期里再得到一次尝试。
     let plans_len = plans.len();
-    if incomplete_from_batch {
+    if cycle_wrapped {
+        log::info!(
+            "daemon reconcile cycle drained planned={} deferred={} — rest until next event",
+            plans_len,
+            deferred
+        );
+        incomplete_from_batch = false;
+        cursor.close_cycle();
+        // 批次排空即静息：立即把突发期间滞留的分配器空闲页归还内核，
+        // 不等下一个节流窗口。
+        crate::platform::allocator::release_free_pages();
+    } else if incomplete_from_batch {
         if let Some(head) = cursor.cycle_head.clone() {
             let next_index = cursor.next_start_index(&identities);
             let head_index = cursor.position_of(&identities, &head);
@@ -1210,8 +1427,7 @@ fn reconcile_running_apps(
                     deferred
                 );
                 incomplete_from_batch = false;
-                cursor.cycle_head = None;
-                cursor.cycle_refused.clear();
+                cursor.close_cycle();
                 // 批次排空即静息：立即把突发期间滞留的分配器空闲页归还内核，
                 // 不等下一个节流窗口。
                 crate::platform::allocator::release_free_pages();
@@ -1219,8 +1435,7 @@ fn reconcile_running_apps(
         }
     } else {
         // 本轮没有任何批次限流（所有计划都已处理），周期自然结束。
-        cursor.cycle_head = None;
-        cursor.cycle_refused.clear();
+        cursor.close_cycle();
     }
     if incomplete_from_batch {
         // 周期仍在进行：把本轮计划批次放回缓存，续跑轮直接复用，不再重复
@@ -1297,6 +1512,21 @@ impl ReconcilePlan {
 
     fn should_run_in_missing_only(&self) -> bool {
         self.request.operation == MountOperation::Reload && !self.has_mount_state
+    }
+
+    /// 计划已被本轮执行落地：续跑轮复用同一批计划对象，必须就地更新判定字段，
+    /// 否则枚举时的旧值会让同一计划在周期内被反复卸载重建。
+    fn mark_settled(&mut self, operation: MountOperation) {
+        match operation {
+            MountOperation::Reload => {
+                self.is_mount_current = true;
+                self.has_mount_state = true;
+            }
+            MountOperation::Disable => {
+                self.is_mount_current = false;
+                self.has_mount_state = false;
+            }
+        }
     }
 
     /// 幂等跳过：该应用的挂载已按当前配置建立，重挂只会叠加挂载层。
@@ -1448,7 +1678,13 @@ fn pre_register_all_configured_apps(config: &SettingsHub, config_version: u64) {
         if request.operation != MountOperation::Reload {
             continue;
         }
-        crate::daemon_mount::pre_register_host_policy(&request);
+        if crate::daemon_mount::pre_register_host_policy(&request)
+            == crate::daemon_mount::PreRegisterOutcome::NotApplicable
+        {
+            // 竞态窗口失败（典型：FBE 密钥未就绪 errno=126 整批被拒）：进重试队列，
+            // 由周期 reconcile 逐轮补登记，避免应用永久落入 deny_all 空视图。
+            enqueue_policy_retry(&request.package_name, request.uid);
+        }
     }
 }
 
@@ -1465,16 +1701,33 @@ fn register_policy_for_pid_token(token: &str, config_version: u64) {
         log::warn!("register-policy token invalid token={}", token);
         return;
     };
-    let Some(proc) = list_app_processes()
+    let proc = match list_app_processes()
         .into_iter()
         .find(|proc| proc.pid == pid && proc.package_name == package_name)
-    else {
-        log::debug!(
-            "register-policy process gone pkg={} pid={}",
-            package_name,
-            pid
-        );
-        return;
+    {
+        Some(proc) => proc,
+        None => {
+            // companion 在 specialize 早期就发 token，此时进程尚未 setArgV0，
+            // /proc/<pid>/cmdline 还是 zygote——按 cmdline 匹配必然 miss（真机实测：
+            // token 秒达时 100% 命中这条路径）。token 本身来自模块注入的可信通道，
+            // 包名与 pid 语义以 token 为准，这里只从 status 复核 uid 归属即可。
+            match read_process_status(pid) {
+                Some((uid, _)) if uid >= ANDROID_APP_UID_START => AppProcess {
+                    pid,
+                    uid,
+                    package_name: package_name.to_string(),
+                    is_uninterruptible: false,
+                },
+                _ => {
+                    log::debug!(
+                        "register-policy process gone pkg={} pid={}",
+                        package_name,
+                        pid
+                    );
+                    return;
+                }
+            }
+        }
     };
     if should_skip_process(&proc) {
         return;

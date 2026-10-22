@@ -61,6 +61,10 @@ if ($PSCmdlet.ParameterSetName -eq "MessageFile") {
 }
 
 $title = (($message -split "`r?`n", 2)[0]).Trim()
+$messageLines = @($message -split "`r?`n")
+if ($messageLines.Count -gt 1 -and $messageLines[1].Trim() -ne '') {
+    throw "Commit 标题必须独占一段：标题行之后必须是一个空行，再开始正文与字段；否则 git log --oneline 等工具会把整段并进标题显示，标题失去简洁性。"
+}
 if ($paths.Count -gt 0 -and $message -notmatch '(?m)^(?:变更|用户影响)[：:]\s*\S') {
     throw "包含文件改动的 Commit 必须由 AI Agent 在正文中写入 变更： 或 用户影响：，供 CI/Release 更新日志直接使用。"
 }
@@ -109,8 +113,8 @@ foreach ($rawLine in ($message -split "`r?`n")) {
 if ([string]::IsNullOrWhiteSpace($title)) {
     throw "Commit 标题不能为空。"
 }
-if ($title.Length -gt 72) {
-    throw "Commit 标题不得超过 72 个字符；当前为 $($title.Length) 个字符。"
+if ($title.Length -gt 50) {
+    throw "Commit 标题不得超过 50 个字符；当前为 $($title.Length) 个字符。"
 }
 
 $releasePattern = '^Releases: \u53d1\u5e03 \d+\.\d+\.\d+(?:[-+][0-9A-Za-z.-]+)?$'

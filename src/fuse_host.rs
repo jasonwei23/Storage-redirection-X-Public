@@ -24,7 +24,7 @@ const HOST_READY_TIMEOUT_SEC: i64 = 30;
 ///
 /// 接入子进程只做几次本地系统调用（取句柄、mkdir、bind、复核），正常在毫秒级完成；
 /// 这里给的时间只用于兜住内核里卡住的 `mount`，避免挂载 worker 被长期阻塞。
-const HOST_ATTACH_TIMEOUT_SEC: i64 = 10;
+pub(crate) const HOST_ATTACH_TIMEOUT_SEC: i64 = 10;
 /// 宿主恢复失败后的最短重试间隔，避免每个 reconcile 周期重复 fork。
 const HOST_RECOVERY_BACKOFF_MS: u64 = 5_000;
 /// 应用接入共享宿主会话的**关闭开关**环境变量。
@@ -389,10 +389,19 @@ fn host_endpoint_alive(view: &HostSessionView) -> bool {
 ///
 /// 子进程在附着成功后立即退出：挂载归 mount namespace 所有，不随创建它的进程消失，
 /// 而常驻只会白占一个进程并拖住应用命名空间的引用计数（应用退出后残留挂载）。
-pub fn attach_app_to_host(view: &HostSessionView, target_root: &str) -> Option<HostAttach> {
+pub fn attach_app_to_host(
+    view: &HostSessionView,
+    target_root: &str,
+    timeout_sec: i64,
+) -> Option<HostAttach> {
     if target_root.is_empty() {
         return None;
     }
+    // 接入子进程要对 target_root 做 open_tree + move_mount，这条路径遍历应用命名空间里的
+    // FUSE 挂载；共享会话只有一条连接，开机风暴时 fuse_get_req 可能把子进程卡在 D 态，
+    // 只有 SIGKILL 能打断。因此等待窗口必须由调用方（挂载子进程）按自己的剩余预算给出，
+    // 而不是固定 10 秒——固定值比父进程的等待预算还长时，挂载子进程必然先被判卡死杀掉。
+    let timeout_sec = timeout_sec.clamp(1, HOST_ATTACH_TIMEOUT_SEC);
     let mut ready_sockets = [0; 2];
     // SAFETY: ready_sockets 是本地数组，长度合法，socketpair 填充两个 fd。
     if unsafe {
@@ -429,7 +438,10 @@ pub fn attach_app_to_host(view: &HostSessionView, target_root: &str) -> Option<H
         unsafe {
             libc::prctl(libc::PR_SET_NAME, name.as_ptr() as libc::c_ulong, 0, 0, 0);
         }
-        let ok = host_attach_child_main(view, target_root, ready_sockets[1]);
+        // SOCK_DGRAM 对端退出没有 EOF：所有正常失败都必须显式回包，避免
+        // 已退出的接入子进程仍让父进程空等 10 秒，挤占后续应用的挂载窗口。
+        let result = host_attach_child_main(view, target_root);
+        let ok = send_host_attach_result(ready_sockets[1], result) && result == 0;
         host_stage(if ok { "attach_ok" } else { "attach_failed" });
         // SAFETY: _exit 终止子进程，不跑 atexit。
         unsafe { libc::_exit(if ok { 0 } else { 1 }) };
@@ -437,7 +449,7 @@ pub fn attach_app_to_host(view: &HostSessionView, target_root: &str) -> Option<H
 
     // SAFETY: 父进程关闭子端 fd 后等待就绪。
     unsafe { libc::close(ready_sockets[1]) };
-    let ready = recv_host_ready(ready_sockets[0], HOST_ATTACH_TIMEOUT_SEC);
+    let ready = recv_host_ready(ready_sockets[0], timeout_sec);
     // SAFETY: ready_sockets[0] 是父进程持有的有效端点。
     unsafe { libc::close(ready_sockets[0]) };
     // 子进程正常会立刻退出，因此这里以阻塞回收为准；异常路径改用强制回收，两者都不能留下僵尸。
@@ -503,7 +515,7 @@ pub fn attach_app_to_host(view: &HostSessionView, target_root: &str) -> Option<H
             log::warn!(
                 "fuse host attach unavailable child={} timeout_sec={} {}",
                 child,
-                HOST_ATTACH_TIMEOUT_SEC,
+                timeout_sec,
                 reason
             );
             false
@@ -547,7 +559,11 @@ fn reap_attach_child(pid: libc::pid_t) {
 ///
 /// 幂等：目标用户子树已可寻址即视为就绪，直接返回。失败不阻断登记：
 /// 策略构造时探测不到视图会自动回退直连后端的既有行为。
-pub fn ensure_host_media_fuse_view(user_id: i32) -> bool {
+pub fn ensure_host_media_fuse_view(user_id: i32, timeout_sec: i64) -> bool {
+    // 调用方（挂载子进程）受父进程固定预算约束，这里的等待必须随之收敛：
+    // 孙进程在开机风暴期做 FUSE 搬运可能远慢于平时，若仍等满上限会把调用方
+    // 拖过父进程 deadline，被子进程守卫 SIGKILL，本轮挂载整个作废。
+    let timeout_sec = timeout_sec.clamp(1, HOST_ATTACH_TIMEOUT_SEC);
     // 落盘开关：现场排障时创建该文件即可关闭视图绑定（不用重刷模块），删除后恢复。
     if std::path::Path::new("/data/adb/modules/storage.redirect.x/.media_view_disabled").exists() {
         return false;
@@ -641,7 +657,7 @@ pub fn ensure_host_media_fuse_view(user_id: i32) -> bool {
 
     // SAFETY: 父进程关闭子端 fd 后等待就绪。
     unsafe { libc::close(ready_sockets[1]) };
-    let ready = recv_host_ready(ready_sockets[0], HOST_ATTACH_TIMEOUT_SEC);
+    let ready = recv_host_ready(ready_sockets[0], timeout_sec);
     // SAFETY: ready_sockets[0] 是父进程持有的有效端点。
     unsafe { libc::close(ready_sockets[0]) };
     let ok = match ready {
@@ -667,7 +683,7 @@ pub fn ensure_host_media_fuse_view(user_id: i32) -> bool {
             log::warn!(
                 "fuse host media view unavailable child={} timeout_sec={} stage={} {}",
                 child,
-                HOST_ATTACH_TIMEOUT_SEC,
+                timeout_sec,
                 stage,
                 reason
             );
@@ -986,20 +1002,16 @@ const MOVE_MOUNT_F_EMPTY_PATH: libc::c_uint = 0x0000_0004;
 /// `move_mount` 这对 API 的用途：前者在**源命名空间**里克隆出一个不附着于任何命名空间的挂载
 /// （fd 携带），后者在**目标命名空间**里把它附着到目标路径。克隆与原挂载共享同一个 superblock，
 /// 因此 FUSE 请求仍然全部回到同一个宿主会话。
-fn host_attach_child_main(
-    view: &HostSessionView,
-    target_root: &str,
-    ready_sock: libc::c_int,
-) -> bool {
+fn host_attach_child_main(view: &HostSessionView, target_root: &str) -> i32 {
     // 1. 先钉住当前（应用）命名空间：克隆要在宿主命名空间做，句柄是唯一的回头路。
     let Ok(c_app_ns) = CString::new("/proc/self/ns/mnt") else {
-        return false;
+        return -1;
     };
     // SAFETY: c_app_ns 是 NUL 结尾的合法路径。
     let app_ns = unsafe { libc::open(c_app_ns.as_ptr(), libc::O_RDONLY | libc::O_CLOEXEC) };
     if app_ns < 0 {
         log_errno("fuse host attach app ns open failed");
-        return false;
+        return -1;
     }
     // SAFETY: app_ns 是本函数打开的有效 fd，只在切回时使用。
     let app_ns = UniqueFd::new(app_ns);
@@ -1007,24 +1019,24 @@ fn host_attach_child_main(
     // 2. 进入宿主命名空间做克隆。
     let host_ns_path = format!("/proc/{}/ns/mnt", view.child_pid);
     let Ok(c_host_ns) = CString::new(host_ns_path) else {
-        return false;
+        return -1;
     };
     // SAFETY: c_host_ns 是 NUL 结尾的合法路径。
     let host_ns = unsafe { libc::open(c_host_ns.as_ptr(), libc::O_RDONLY | libc::O_CLOEXEC) };
     if host_ns < 0 {
         log_errno("fuse host attach host ns open failed");
-        return false;
+        return -1;
     }
     // SAFETY: host_ns 是本函数打开的有效 namespace fd。
     let host_ns = UniqueFd::new(host_ns);
     // SAFETY: host_ns 是有效的 mount namespace fd。
     if unsafe { libc::setns(host_ns.get(), libc::CLONE_NEWNS) } != 0 {
         log_errno("fuse host attach setns host failed");
-        return false;
+        return -1;
     }
 
     let Ok(c_mount_point) = CString::new(view.mount_point.as_str()) else {
-        return false;
+        return -1;
     };
     let tree_fd = open_detached_mount(&c_mount_point);
 
@@ -1032,7 +1044,7 @@ fn host_attach_child_main(
     // SAFETY: app_ns 是本子进程进入宿主命名空间前钉住的自身命名空间 fd。
     if unsafe { libc::setns(app_ns.get(), libc::CLONE_NEWNS) } != 0 {
         log_errno("fuse host attach setns app failed");
-        return false;
+        return -1;
     }
     if tree_fd < 0 {
         let errno = crate::platform::errno::last();
@@ -1042,7 +1054,7 @@ fn host_attach_child_main(
             errno,
             crate::platform::errno::text(errno)
         );
-        return false;
+        return -1;
     }
     // SAFETY: tree_fd 是 open_tree 返回的有效 fd。
     let tree_fd = UniqueFd::new(tree_fd);
@@ -1057,7 +1069,7 @@ fn host_attach_child_main(
 
     // 4. 目标目录：与应用挂载路径同源，允许已存在。
     let Ok(c_target) = CString::new(target_root) else {
-        return false;
+        return -1;
     };
     // SAFETY: c_target 是 NUL 结尾的合法路径；失败只可能是已存在（后续附着会给出结论）。
     unsafe {
@@ -1076,32 +1088,23 @@ fn host_attach_child_main(
             errno,
             crate::platform::errno::text(errno)
         );
-        if !target_had_dead_layers && errno == libc::ENOTCONN {
-            // 目标路径清理后已确认可达（或本就无死层），ENOTCONN 只能来自宿主 FUSE
-            // 连接死亡：回报父进程终止该宿主，交由自愈通道重建。负值避免与宿主建立
-            // 阶段的正数阶段码混淆。
-            let code = -errno;
-            // SAFETY: ready_sock 是本次接入的有效端点，code 是栈变量。
-            unsafe {
-                libc::send(
-                    ready_sock,
-                    &code as *const i32 as *const libc::c_void,
-                    std::mem::size_of::<i32>(),
-                    0,
-                )
-            };
-        }
-        return false;
+        // 保持 ENOTCONN 的既有分类：目标侧仍有死层时不得误杀健康宿主；
+        // 只有原先会回报 -ENOTCONN 的路径保留该错误码，其余失败回报通用失败。
+        return if !target_had_dead_layers && errno == libc::ENOTCONN {
+            -errno
+        } else {
+            -1
+        };
     }
     if !make_mount_private(&c_target) {
-        return false;
+        return -1;
     }
 
     // 6. 复核。挂载源必须就是本次会话的挂载源：只靠系统调用返回 0 无法区分
     //    "挂在应用视图里" 与 "挂在了别处"，而误判成接入成功会让应用静默失去重定向。
     let Some(live) = crate::mount_ledger::topmost_live_mount(0, target_root) else {
         log::warn!("fuse host attach not visible target={}", target_root);
-        return false;
+        return -1;
     };
     if live.source != view.mount_source {
         log::warn!(
@@ -1111,16 +1114,19 @@ fn host_attach_child_main(
             live.source,
             live.fs_type
         );
-        return false;
+        return -1;
     }
 
-    // 7. 通知父进程，随后自行退出。
-    let ready: i32 = 0;
-    // SAFETY: ready_sock 是本次接入的有效端点，ready 是栈变量。
+    0
+}
+
+/// 接入子进程统一回报结果，成功与失败均只发送一次。
+fn send_host_attach_result(ready_sock: libc::c_int, result: i32) -> bool {
+    // SAFETY: ready_sock 是本次接入的有效端点，result 是调用期间存活的栈变量。
     let sent = unsafe {
         libc::send(
             ready_sock,
-            &ready as *const i32 as *const libc::c_void,
+            &result as *const i32 as *const libc::c_void,
             std::mem::size_of::<i32>(),
             0,
         )
@@ -1528,7 +1534,7 @@ pub fn spawn_fuse_host() -> Option<FuseHost> {
     })
 }
 
-/// 子进程入口：进入私有 namespace、挂直通 FUSE、设 shared，然后常驻。
+/// 子进程入口：进入私有 namespace、收敛为 slave、挂直通 FUSE、设 shared，然后常驻。
 fn fuse_host_child_main(ready_sock: libc::c_int, control_sock: libc::c_int) -> bool {
     // 1. 进入私有 mount namespace；unshare 失败则放弃宿主会话。
     host_stage("before_unshare");
@@ -1540,7 +1546,20 @@ fn fuse_host_child_main(ready_sock: libc::c_int, control_sock: libc::c_int) -> b
         return false;
     }
     host_stage("unshared");
-    // 2. 隔离整棵挂载树，阻断向其它 namespace 传播。
+    // 2. 收敛为 slave：只接收入向挂载事件，不向外传播。
+    //
+    // 这里必须用 `MS_SLAVE` 而不是 `MS_PRIVATE`。`MS_PRIVATE` 会同时切断两个方向，
+    // 于是 init 命名空间在宿主会话建立之后创建的挂载永远进不来。HyperOS 的应用商店
+    // 在每次下载时都会把 `/data/apk-tmp/<pkg>/download` bind 到
+    // `/data/media/0/Android/data/com.xiaomi.market/files/.siexternal`，而宿主后端根
+    // 直连 f2fs（`private_real_root`），一旦错过这个 bind，宿主读到的是 bind 遮蔽
+    // 之前的陈旧目录：真机实测那里残留着若干已卸载应用的下载暂存目录
+    // （`com.kylin.read`、`com.taobao.idlefish` 等），商店校验阶段读不到自己刚下载的
+    // APK，表现为 `failed as error=3` 且不重试。
+    //
+    // 出向隔离不依赖这一步：宿主挂载点在 `mount_host_fuse` 里显式设 shared（只与自身
+    // peer 组互通），应用接入时 `make_mount_private` 又把搬运过去的游离挂载改私有，
+    // 因此宿主与应用的挂载事件不会互相污染。
     let Ok(root) = CString::new("/") else {
         host_stage("root_path_invalid");
         return false;
@@ -1551,16 +1570,16 @@ fn fuse_host_child_main(ready_sock: libc::c_int, control_sock: libc::c_int) -> b
             std::ptr::null(),
             root.as_ptr(),
             std::ptr::null(),
-            (libc::MS_REC | libc::MS_PRIVATE) as libc::c_ulong,
+            (libc::MS_REC | libc::MS_SLAVE) as libc::c_ulong,
             std::ptr::null(),
         )
     } != 0
     {
-        log_errno("fuse host MS_PRIVATE failed");
-        host_stage("private_failed");
+        log_errno("fuse host MS_SLAVE failed");
+        host_stage("slave_failed");
         return false;
     }
-    host_stage("private_ok");
+    host_stage("slave_ok");
 
     // 3. 挂直通宿主 FUSE（mount_host_fuse 内部完成 shared propagation 并常驻）。
     crate::fuse_redirect::config::mount_host_fuse(
@@ -1598,6 +1617,7 @@ fn passthrough_host_config() -> crate::fuse_redirect::FuseRedirectConfig {
         is_monitor_only: false,
         // 宿主会话是直通会话：`redirect_target` 取存储根本身，策略侧据此跳过重定向根推导。
         is_passthrough_host: true,
+        namespace_policy_only: false,
     }
 }
 
@@ -1680,6 +1700,10 @@ pub fn set_global(host: FuseHost) {
         "host_session_ready",
         "srx_fuse_host",
     );
+    // daemon 自身的 mount namespace 直通登记：宿主换代后旧登记随之失效，每代会话
+    // 就绪时重新登记一次。失败不阻断（宿主刚就绪，控制通道理论上可用；失败只损失
+    // uid=0 请求的直通优化，保持原有 namespace miss 回退语义）。
+    crate::fuse_host_control::register_daemon_namespace_passthrough();
 }
 
 /// daemon 侧登记台账：当前宿主会话 pid + 已登记 uid 集合。

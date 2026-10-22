@@ -81,6 +81,9 @@ impl RuntimeFlow {
     pub fn on_load(&mut self, api: abi::Api, env: *mut jni_sys::JNIEnv) {
         Logger::init(Some("zygisk"));
         self.api = Some(api);
+        // 供 hook 运行期（MP 进程 open:create 应答前）连接 companion 代执行
+        // 特权操作；保存本身无成本，仅 MP 进程的 hook 会真正使用。
+        crate::hook::companion_api::save_companion_api(&api);
         self.env = env;
         self.module_dir_fd = -1;
         jni::init_java_vm(env);

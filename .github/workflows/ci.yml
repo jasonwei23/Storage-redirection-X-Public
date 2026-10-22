@@ -29,7 +29,7 @@ env:
 jobs:
   quality:
     if: github.repository == 'z1298808165/Storage-redirection-X-Public' && (github.event_name != 'push' || (!startsWith(github.event.head_commit.message, 'Releases:') && !startsWith(github.event.head_commit.message, 'CI：更新更新清单') && !startsWith(github.event.head_commit.message, '发布：更新更新清单')))
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     timeout-minutes: 15
     steps:
       - name: Checkout repository
@@ -82,7 +82,7 @@ jobs:
 
   prepare:
     if: github.repository == 'z1298808165/Storage-redirection-X-Public' && (github.event_name != 'push' || (!startsWith(github.event.head_commit.message, 'Releases:') && !startsWith(github.event.head_commit.message, 'CI：更新更新清单') && !startsWith(github.event.head_commit.message, '发布：更新更新清单')))
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     timeout-minutes: 15
     outputs:
       version: ${{ steps.version.outputs.version }}
@@ -123,7 +123,7 @@ jobs:
       - quality
       - prepare
     if: github.event_name == 'push' && !contains(github.event.head_commit.message, '仅验证CI') && needs.prepare.outputs.publish_ci == 'true'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     timeout-minutes: 10
     env:
       VERSION: ${{ needs.prepare.outputs.version }}
@@ -148,7 +148,7 @@ jobs:
       - prepare
       - init-ci-release
     if: always() && needs.quality.result == 'success' && needs.prepare.result == 'success' && (needs.init-ci-release.result == 'success' || needs.init-ci-release.result == 'skipped') && needs.prepare.outputs.publish_ci == 'true'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     timeout-minutes: 30
     env:
       VERSION: ${{ needs.prepare.outputs.version }}
@@ -327,7 +327,7 @@ jobs:
       - prepare
       - init-ci-release
     if: always() && needs.quality.result == 'success' && needs.prepare.result == 'success' && (needs.init-ci-release.result == 'success' || needs.init-ci-release.result == 'skipped') && needs.prepare.outputs.publish_ci == 'true'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     timeout-minutes: 30
     env:
       VERSION: ${{ needs.prepare.outputs.version }}
@@ -420,7 +420,7 @@ jobs:
       - quality
       - prepare
     if: always() && needs.quality.result == 'success' && needs.prepare.result == 'success'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     timeout-minutes: 30
     env:
       VERSION: ${{ needs.prepare.outputs.version }}
@@ -541,7 +541,7 @@ jobs:
       - prepare
       - test-flow-build
     if: always() && needs.quality.result == 'success' && needs.prepare.result == 'success' && needs.test-flow-build.result == 'success'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     timeout-minutes: ${{ matrix.android.timeout_minutes }}
     env:
       VERSION: ${{ needs.prepare.outputs.version }}
@@ -745,7 +745,7 @@ jobs:
       - prepare
       - test-flow
     if: always() && needs.prepare.result != 'skipped'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     timeout-minutes: 10
     steps:
       - name: Require all test-flow matrix jobs to pass
@@ -767,7 +767,7 @@ jobs:
       - module
       - app
       - test-flow-required
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     timeout-minutes: 15
     outputs:
       ci_tag: ${{ steps.release.outputs.ci_tag }}
@@ -842,7 +842,7 @@ jobs:
       - create-ci-release
       - update-manifest
     if: always() && github.event_name == 'push' && needs.prepare.result == 'success'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     timeout-minutes: 10
     permissions:
       actions: write
@@ -898,7 +898,7 @@ jobs:
     needs:
       - prepare
       - create-ci-release
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     timeout-minutes: 15
     env:
       VERSION: ${{ needs.prepare.outputs.version }}

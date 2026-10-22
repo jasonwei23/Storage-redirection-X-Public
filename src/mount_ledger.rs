@@ -29,6 +29,9 @@ use crate::platform::paths;
 use std::fs;
 use std::path::PathBuf;
 
+// quality-allow(lint-suppression): 消费方 daemon_mount 仅由 bin #[path] 再编译，
+// lib 视角本 re-export 未使用（两侧编译差异）。
+#[allow(unused_imports)]
 pub use crate::module_mount_source::is_module_redirect_mount;
 
 /// 账本 schema 版本。字段增减时必须同步递增，旧版本账本按不可用处理。
@@ -58,6 +61,8 @@ pub struct NamespaceIdentity {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct LiveMount {
     pub mount_id: u64,
+    /// 父挂载 ID：同挂载点叠放时即下面一层的挂载 ID，用于栈顶判定。
+    pub parent_mount_id: u64,
     pub source: String,
     pub fs_type: String,
     pub root: String,
@@ -146,11 +151,15 @@ pub fn namespace_identity(pid: i32) -> Option<NamespaceIdentity> {
     })
 }
 
-/// 读取指定命名空间内挂载点上的全部挂载记录，按挂载 ID 升序返回。
+/// 读取指定命名空间内挂载点上的全部挂载记录，保持 mountinfo 原始文件序。
 ///
 /// 直接读 `/proc/<pid>/mountinfo` 即可获得目标命名空间的视图，不需要切换调用方自身的
 /// 命名空间，也不会修改任何目录元数据。`pid <= 0` 表示读取调用方自身所在的命名空间，
 /// 用于挂载子进程在 `setns` 之后登记自己刚建立的挂载。
+///
+/// 顺序契约：必须保持文件序——栈顶兜底判定（[`mountinfo::topmost_by_stack`] 的并列
+/// 形态）与既有 /proc/mounts 约定都依赖「后挂的层在文件里靠后」；按挂载 ID 排序会
+/// 破坏该约定（detached tree 搬运的层 ID 与挂载顺序倒挂，真机 2026-10-15）。
 pub fn live_mounts_at(pid: i32, mount_point: &str) -> Vec<LiveMount> {
     let path = if pid > 0 {
         format!("/proc/{pid}/mountinfo")
@@ -164,7 +173,7 @@ pub fn live_mounts_at(pid: i32, mount_point: &str) -> Vec<LiveMount> {
     // 且大小写敏感。否则不同挂载别名会被归一化到同一字符串，使缺失的主入口
     // 误匹配到后端的 /data/media 挂载。见模块级文档中的场景 29 说明。
     let normalized = paths::normalize_syntax(mount_point);
-    let mut mounts = content
+    content
         .lines()
         .filter_map(|line| {
             let entry = mountinfo::parse_entry(line)?;
@@ -173,21 +182,28 @@ pub fn live_mounts_at(pid: i32, mount_point: &str) -> Vec<LiveMount> {
             }
             Some(LiveMount {
                 mount_id: entry.mount_id,
+                parent_mount_id: entry.parent_mount_id,
                 source: mountinfo::unescape_field(entry.source),
                 fs_type: entry.fs_type.to_string(),
                 root: mountinfo::unescape_field(entry.root),
             })
         })
-        .collect::<Vec<_>>();
-    mounts.sort_by_key(|mount| mount.mount_id);
-    mounts
+        .collect()
 }
 
-/// 挂载点上最顶层的一条记录（挂载 ID 最大）。
+/// 挂载点上最顶层的一条记录（按父挂载链判定叠放顺序）。
+///
+/// 挂载 ID 在 detached tree + `move_mount` 搬运形态下不随叠放顺序递增，按最大 ID
+/// 选取会把栈底层（如屏障 tmpfs）当成栈顶。叠层顺序只能按 `parent_mount_id`
+/// 父链判定，详见 [`mountinfo::topmost_by_stack`]。
 pub fn topmost_live_mount(pid: i32, mount_point: &str) -> Option<LiveMount> {
-    live_mounts_at(pid, mount_point)
-        .into_iter()
-        .max_by_key(|mount| mount.mount_id)
+    let mounts = live_mounts_at(pid, mount_point);
+    mountinfo::topmost_by_stack(
+        &mounts,
+        |mount: &LiveMount| mount.mount_id,
+        |mount: &LiveMount| mount.parent_mount_id,
+    )
+    .cloned()
 }
 
 /// 账本文件所在目录。
@@ -324,29 +340,17 @@ pub fn save(ledger: &MountLedger) -> bool {
     true
 }
 
-/// 构造一条当前时刻的挂载身份记录。
+/// 按调用方给定的显式挂载目标登记身份：不经归属谓词，直接取该目标的 topmost 事实。
 ///
-/// 两条挂载路径（daemon 与 companion）共用它：`pid <= 0` 读调用方自身命名空间，而两条路径
-/// 在登记时都已经处于目标应用的命名空间里，因此归属判据一致。
-///
-/// 归属判据用 [`is_module_redirect_mount`]（挂载源 **或** `root` 沙箱路径）而不是只看挂载源：
-/// bind 会继承底层文件系统的源，真机上本模块每一层的 source 都是 `/dev/fuse`，只按源判断会
-/// 让账本**永远登记不到任何挂载明细**，恢复流程因此拿不到「哪一层是我的」，只能走按命名空间
-/// 身份的兜底判定，永远产不出 `Owned`。
-pub fn capture_mount_identity(
-    pid: i32,
-    mount_point: &str,
-    package_name: &str,
-) -> Option<MountIdentity> {
+/// 调用方刚在 `mount_point` 上完成挂载（或确认沿用既有挂载），target 上的 topmost 挂载
+/// 就是本模块的那一层。**不能**改回 [`is_module_redirect_mount`] 归属谓词判定：
+/// private-dir alias bind 的 `root` 形态与系统挂载完全同形（都止于
+/// `Android/{data,media,obb}/<pkg>`），谓词会把它当系统挂载漏掉，账本缺了这层，
+/// cleanup 判 foreign 就永远摘不净，重挂循环不停（真机实测 wetype 等应用每次
+/// reload 都触发 cleanup incomplete）。
+pub fn capture_explicit_mount_identity(pid: i32, mount_point: &str) -> Option<MountIdentity> {
     let live = topmost_live_mount(pid, mount_point)?;
-    if !is_module_redirect_mount(&live.source, &live.root, mount_point, package_name) {
-        // 最顶层不是本模块的挂载时不能登记身份，否则恢复流程会误以为可以摘除。
-        return None;
-    }
     Some(MountIdentity {
-        // 保存真实目标（保留存储别名），而不是别名归一化后的形式：
-        // 否则 /data/media 后端挂载会被折叠成 /storage/emulated，使缺失的主入口
-        // 误以为拥有后端挂载的归属身份。
         mount_point: paths::normalize_syntax(mount_point),
         mount_id: live.mount_id,
         source: live.source,
@@ -382,7 +386,9 @@ pub fn record_mount_identity(
         crate::platform::process_start_time_ticks(target_pid).unwrap_or_default();
     let mut mounts = Vec::new();
     for target in module_paths::normalize_mount_targets(targets) {
-        if let Some(identity) = capture_mount_identity(0, &target, package_name) {
+        // 显式目标是调用方本次挂载创建（或确认沿用）的路径，直接按 topmost 事实登记，
+        // 不走归属谓词（见 capture_explicit_mount_identity 的文档）。
+        if let Some(identity) = capture_explicit_mount_identity(0, &target) {
             mounts.push(identity);
         }
     }

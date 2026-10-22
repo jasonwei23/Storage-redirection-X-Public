@@ -91,7 +91,17 @@ class LoggingArchitectureTest(unittest.TestCase):
         self.assertIn('get("monitor_only")', request)
         policy = read("src/fuse_redirect/policy.rs")
         backend = policy[policy.index("fn backend_decision") : policy.index("fn matches_any")]
-        self.assertLess(backend.index("if self.is_monitor_only"), backend.index("BackendKind::Redirect"))
+        # 2026-10-21 起沙盒命中（仅限配置了 sandboxed_paths 的应用）优先于监视
+        # 直通短路：未配置应用的沙盒索引为空，is_sandbox 恒 false，监视直通
+        # 语义不变；监视分支仍须先于其余映射类 Redirect 分支。
+        self.assertLess(
+            backend.index("let is_sandbox = self.is_mapping_mode_only"),
+            backend.index("if self.is_monitor_only"),
+        )
+        self.assertLess(
+            backend.index("if self.is_monitor_only"),
+            backend.rindex("BackendKind::Redirect"),
+        )
         self.assertIn('"fuse_monitor_only"', policy)
         constructor_start = policy.index("impl RedirectPolicy")
         constructor = policy[constructor_start : policy.index("        let mut path_mappings", constructor_start)]
@@ -123,7 +133,9 @@ class LoggingArchitectureTest(unittest.TestCase):
         slow_collection = script.index("collect_basic_files", main_flow)
         self.assertLess(initial_capture, slow_collection)
         self.assertIn("-t 10000", script)
-        self.assertIn("-t 8000", script)
+        # 高频 OEM Error 日志会在半分钟内耗尽 8000 行，主缓冲快照需 20000 行
+        # 才能覆盖「复现后 1-2 分钟内导出」的窗口。
+        self.assertIn("-t 20000", script)
         self.assertIn("-b crash -d -v threadtime", script)
         self.assertIn('-T "$LOGCAT_CAPTURE_START"', script)
         self.assertIn("tail -n 3000", script)
@@ -145,7 +157,7 @@ class LoggingArchitectureTest(unittest.TestCase):
         ):
             source = read(path)
             self.assertIn("-t 10000", source)
-            self.assertIn("-t 8000", source)
+            self.assertIn("-t 20000", source)
             self.assertIn("logcat-buffers.txt", source)
             self.assertIn("logcat-capture.txt", source)
             self.assertIn("tail -n 3000", source)
@@ -294,7 +306,7 @@ class LoggingArchitectureTest(unittest.TestCase):
         ledger = read("src/mount_ledger.rs")
         for entry in (
             "pub fn record_mount_identity(",
-            "pub fn capture_mount_identity(",
+            "pub fn capture_explicit_mount_identity(",
             "pub fn namespace_identity(",
             "pub fn load(",
             "pub fn save(",
@@ -588,14 +600,15 @@ class LoggingArchitectureTest(unittest.TestCase):
 
         self.assertIn('if root.source == "public_owner"', reconfigure)
         self.assertIn("self.repair_public_owner_root(root)", reconfigure)
-        self.assertIn("self.repair_public_owner_roots_if_due()", reconfigure)
         self.assertIn("public_owner_roots", reconfigure)
-        self.assertIn("fn repair_public_owner_roots_if_due", monitor)
-        self.assertIn("PUBLIC_OWNER_REPAIR_INTERVAL_MS", monitor)
         self.assertIn("MAX_PUBLIC_OWNER_REPAIR_DIRS: usize = 32768", monitor)
+        # 1 秒周期扫描已移除（2026-10-21 用户拍板）：周期入口与节流常量不得回潮，
+        # 建树一次性扫描 + inotify 事件驱动修复 + missing 重试是仅存通道。
+        self.assertNotIn("repair_public_owner_roots_if_due", monitor)
+        self.assertNotIn("PUBLIC_OWNER_REPAIR_INTERVAL_MS", monitor)
+        self.assertNotIn("last_public_owner_repair_ms", monitor)
         reset = monitor[monitor.index("fn reset") : monitor.index("fn repair_public_owner_root")]
         self.assertIn("self.public_owner_roots.clear()", reset)
-        self.assertIn("self.last_public_owner_repair_ms = 0", reset)
         self.assertIn('if root.source == "public_owner"', retry)
         self.assertIn("self.repair_public_owner_root(&root)", retry)
         self.assertIn("self.repair_existing_public_tree(&node)", repair)

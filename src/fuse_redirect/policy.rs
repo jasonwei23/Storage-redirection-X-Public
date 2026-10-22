@@ -9,6 +9,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 
 use super::FuseRedirectConfig;
+use super::backend_overlay;
 
 const FILE_MONITOR_LOG_TAG: &str = "FileMonitorOp";
 const READ_ONLY_DENY_EXTRA: &str = "deny_reason=read_only_rule";
@@ -18,6 +19,25 @@ static NAMESPACE_POLICY_FALLBACKS: AtomicU64 = AtomicU64::new(0);
 static NAMESPACE_POLICY_MISSES: AtomicU64 = AtomicU64::new(0);
 
 static RECENT_MONITOR_CREATES: Lazy<Mutex<HashMap<String, i64>>> =
+    Lazy::new(|| Mutex::new(HashMap::new()));
+
+/// 跨应用只读别名兜底的会话表句柄：共享宿主进程内所有已登记应用的策略。
+///
+/// 由 [`SharedPolicyTable::register`] 首次按 uid 登记时挂入，始终指向同一份活表，
+/// 应用策略的新增与覆盖对兜底解析即时可见。scoped 独立会话进程不经过按 uid 登记，
+/// 表中「其它应用」集合为空，跨应用兜底自然不生效，行为与改动前一致。
+static CROSS_SESSION_POLICY_TABLE: Lazy<Mutex<Option<SharedPolicyTable>>> =
+    Lazy::new(|| Mutex::new(None));
+
+/// 跨应用只读别名兜底的交接信号窗口与容量。
+///
+/// 应用 A 通过 FileProvider 等机制把 fd 交给应用 B 之前，必须先在自己的 FUSE 会话里
+/// 以映射视图路径打开同一个文件；这条访问记录就是「B 正被 A 调用」的唯一可观测等价
+/// 信号（FUSE 层看不到 intent/binder 调用链）。窗口取 60 秒：交接在毫秒级完成，
+/// 窗口只用于吸收 B 侧多轮探测与重试的间隔；容量上限防止长会话进程内无界增长。
+const CROSS_APP_HANDOFF_TTL_MS: i64 = 60_000;
+const CROSS_APP_HANDOFF_CAPACITY: usize = 256;
+static RECENT_CROSS_APP_HANDOFFS: Lazy<Mutex<HashMap<String, i64>>> =
     Lazy::new(|| Mutex::new(HashMap::new()));
 
 pub(super) struct BackendPath {
@@ -42,6 +62,10 @@ pub(super) enum OperationKind {
 struct BackendDecision {
     kind: BackendKind,
     is_read_only: bool,
+    /// 命中 sandboxed_paths 的重定向：监视/直通会话的重定向根是存储根本身，
+    /// 此时 backend 必须落到该应用私有 sdcard 沙盒根，否则 native 层创建会
+    /// 绕过沙盒直落真实路径（2026-10-21 用户反馈的 .xlDownload 侧漏）。
+    is_sandbox: bool,
 }
 
 #[derive(Clone, Default)]
@@ -127,6 +151,13 @@ pub(super) struct RedirectPolicy {
     /// 为空表示宿主命名空间没有可用视图（scoped 会话、视图未绑定），保持直连行为。
     pub(super) media_sqlite_real_root: PathBuf,
     pub(super) redirect_root: PathBuf,
+    /// 重定向根的视图形态（相对存储根，如 `Android/data/<pkg>/sdcard`）。
+    ///
+    /// 应用视图对重定向根自身的再进入（视图里出现同名子树）与根下同后端路径内容一致，
+    /// 但决策路径不同，镜像子树会被反复再映射、逐层自嵌套（真机实测 70+ 层直到
+    /// ENAMETOOLONG）。`backend_for_relative` 用它把再进入路径折叠回根下解析。
+    /// 直通/监视会话的重定向根就是存储根，此处为空串，不折叠。
+    pub(super) redirect_view_rel: String,
     pub(super) rule_prefixes: Vec<RulePrefix>,
     pub(super) allowed_real_paths: Vec<String>,
     pub(super) excluded_real_paths: Vec<String>,
@@ -141,12 +172,18 @@ pub(super) struct RedirectPolicy {
     pub(super) path_mappings: Vec<PathMapping>,
     pub(super) is_mapping_mode_only: bool,
     pub(super) is_monitor_only: bool,
+    /// 监视/直通会话的沙盒 backend 根（该应用私有 sdcard 根）；普通重定向会话为 None。
+    pub(super) sandbox_backend_root: Option<PathBuf>,
     pub(super) is_file_monitor_enabled: bool,
     /// 一律拒绝：路径决策全部失败，调用方据此返回 `ENOENT`。
     ///
     /// 只用于宿主共享会话的"未登记 uid"回退——宁可让调用方读不到、写不进，也不能让它
     /// 直接落到真实存储上。普通策略恒为 `false`。
     deny_all: bool,
+    /// 本策略由哪份配置构建（[`crate::fuse_redirect::config::fuse_config_policy_fingerprint`]）。
+    /// 宿主共享会话跨配置 reload 时，异常回包（EROFS/ENOENT）带上它即可直接判定
+    /// 「当时生效的是旧策略还是新策略」。
+    pub(super) fingerprint: u64,
 }
 
 /// 会话策略注册表：把「一个 FUSE 会话绑定单一应用」扩展为「按调用方 uid 解析」。
@@ -200,6 +237,11 @@ impl SharedPolicyTable {
         let mut table = self.by_uid.write().ok()?;
         table.insert(uid, Arc::clone(&policy));
         drop(table);
+        // 首次按 uid 登记时把活表句柄挂入进程级静态：跨应用只读别名兜底从这份表
+        // 派生「其它应用的映射规则」。重复赋值无副作用，句柄内的 Arc 指向同一份表。
+        if let Ok(mut handle) = CROSS_SESSION_POLICY_TABLE.lock() {
+            *handle = Some(self.clone());
+        }
         if let Some(namespace) = namespace {
             let mut namespaces = self.by_namespace.0.write().ok()?;
             namespaces.insert(namespace, Arc::clone(&policy));
@@ -218,6 +260,32 @@ impl SharedPolicyTable {
             );
         }
         Some(self.by_uid.read().ok()?.len())
+    }
+
+    /// 只登记 mount namespace 维度的策略，不写按 uid 的全局表。
+    ///
+    /// 供 daemon 自身（uid=0）的直通登记使用：按 [`PolicyRegistry::for_request`] 的查找
+    /// 顺序，uid=0 一旦进按 uid 表就会盖住**所有** root 调用方（任何 namespace 的 root
+    /// FUSE 请求都先按 uid 命中），破坏「未登记 uid 一律 deny_all」的 fail-closed 边界。
+    /// 只写 namespace 表时，其它 namespace 的 uid=0 请求仍然走 deny_all 回退。
+    /// 返回 namespace 表大小（>0 即登记成功，供控制通道应答）。
+    pub(crate) fn register_namespace_only(&self, config: FuseRedirectConfig) -> Option<usize> {
+        let namespace = registered_mount_namespace(&config)?;
+        let policy = Arc::new(RedirectPolicy::new(config)?);
+        let (ns_dev, ns_ino, package_name) =
+            (namespace.dev, namespace.ino, policy.package_name.clone());
+        let mut namespaces = self.by_namespace.0.write().ok()?;
+        namespaces.insert(namespace, policy);
+        drop(namespaces);
+        let table = self.by_namespace.0.read().ok()?.len();
+        log::info!(
+            "fuse policy namespace registered (ns-only) ns={}:{} pkg={} table={}",
+            ns_dev,
+            ns_ino,
+            package_name,
+            table
+        );
+        Some(table)
     }
 }
 
@@ -303,6 +371,21 @@ impl PolicyRegistry {
             .and_then(|table| table.get(&uid).cloned())
     }
 
+    /// 按包名反查已登记的属主策略，供宿主共享会话的「系统读取者」路径反解使用：
+    /// MediaProvider 等系统读取者按路径访问 `Android/data/<pkg>/**` 时，需要用
+    /// 目标应用的属主策略解析后端落点，否则 deny_all 回退必然 ENOENT。
+    /// 表规模为已登记应用数（几十级），线性查找代价可忽略。
+    pub(super) fn find_owner_policy_by_package(
+        &self,
+        package_name: &str,
+    ) -> Option<Arc<RedirectPolicy>> {
+        let table = self.by_uid.by_uid.read().ok()?;
+        table
+            .values()
+            .find(|policy| policy.package_name == package_name)
+            .cloned()
+    }
+
     /// 取出可写表句柄，交给宿主会话的控制通道在运行期登记应用策略。
     pub(super) fn shared_table(&self) -> SharedPolicyTable {
         self.by_uid.clone()
@@ -324,6 +407,8 @@ fn request_mount_namespace(pid: u32) -> Option<NamespaceIdentity> {
 
 impl RedirectPolicy {
     pub(super) fn new(config: FuseRedirectConfig) -> Option<Self> {
+        // 指纹须在任何 config 字段被 move 前计算。
+        let fingerprint = super::config::fuse_config_policy_fingerprint(&config);
         let user_id = config.user_id();
         let storage_root = paths::storage_user_root_for_user(user_id);
         let mount_root = super::config::fuse_mount_point(&config, user_id);
@@ -367,21 +452,70 @@ impl RedirectPolicy {
             } else {
                 -1
             };
+            let existed_redirect_root = fs::is_directory(&redirect_root_string);
             if !fs::create_directory(&redirect_root_string, redirect_root_uid)
                 && !fs::is_directory(&redirect_root_string)
             {
-                // errno 区分失败类别：EACCES/EPERM 多为开机期 sepolicy 未就绪的
-                // 竞态（30 秒周期重试可自愈），ENOTDIR/EEXIST 则是路径被普通
-                // 文件占用等配置或环境错误，需要用户侧介入。
-                log::error!(
-                    "fuse redirect target mkdir failed: {} errno={}",
-                    redirect_root_string,
-                    fs::last_create_directory_errno()
-                );
+                // errno 区分失败类别：EACCES/EPERM/ENOKEY/ENOTCONN 是开机竞态
+                // （sepolicy 未就绪、FBE CE 密钥未解锁，30 秒周期重试可自愈；
+                // 真机实测开机 +15s 曾 42 包同秒 ENOKEY 失败），ENOTDIR/EEXIST
+                // 则是路径被普通文件占用等配置或环境错误，需要用户侧介入。
+                let errno = fs::last_create_directory_errno();
+                if fs::errno_is_transient_boot_race(errno) {
+                    log::warn!(
+                        "fuse redirect target mkdir deferred (boot race): {} errno={} {}",
+                        redirect_root_string,
+                        errno,
+                        crate::platform::errno::text(errno)
+                    );
+                } else {
+                    log::error!(
+                        "fuse redirect target mkdir failed: {} errno={} {}",
+                        redirect_root_string,
+                        errno,
+                        crate::platform::errno::text(errno)
+                    );
+                }
                 return None;
             }
             fix_mapped_dir_metadata(&redirect_root_string, config.uid);
+            // 本次初始化新建的私有树重定向根按原生语义补 chmod：create_directory
+            // 的 mkdir(0755) 受 daemon umask 与 setgid 继承影响，会落下 2750 这类
+            // 非原生形态（2026-10-21 duchamp 实测）；既有目录仍交 fix_mapped 的
+            // keep-existing 守卫保留。
+            if !existed_redirect_root
+                && let Some(user_id) =
+                    paths::extract_user_id_from_data_media_path(&redirect_root_string)
+                && is_android_private_backend_path(&redirect_root_string, user_id)
+            {
+                let c_root = CString::new(redirect_root_string.as_str()).ok();
+                if let Some(c_root) = c_root {
+                    // SAFETY: c_root 在调用期间保持有效并以 NUL 结尾。
+                    let _ = unsafe { libc::chmod(c_root.as_ptr(), 0o2770) };
+                }
+            }
             redirect_root_string
+        };
+
+        // 重定向根的视图形态（相对存储根）：sdcard 形态重定向时为
+        // Android/data/<pkg>/sdcard。直通/监视会话的重定向根就是存储根，此处为空串。
+        // 应用视图对重定向根自身的再进入由 backend_for_relative 折叠回根下解析。
+        let redirect_view_rel = paths::relative_child_path(&redirect_storage, &storage_root)
+            .unwrap_or_default()
+            .trim_matches('/')
+            .to_string();
+        // 监视/直通会话的重定向根是存储根，sandboxed_paths 命中时宿主面需要把
+        // backend 换到该应用私有 sdcard 沙盒根（否则 native 层创建绕过沙盒直落
+        // 真实路径——2026-10-21 用户反馈的 .xlDownload 侧漏）。普通重定向会话的
+        // 重定向根本身就是沙盒根，走既有 redirect_backend_for_rel 即可。
+        let sandbox_backend_root = if config.is_mapping_mode_only && redirect_view_rel.is_empty() {
+            Some(PathBuf::from(format!(
+                "{}/Android/data/{}/sdcard",
+                paths::data_media_user_root_for_user(user_id),
+                config.package_name
+            )))
+        } else {
+            None
         };
 
         let mut path_mappings = resolve_path_mappings(
@@ -433,6 +567,8 @@ impl RedirectPolicy {
             private_real_root: PathBuf::from(paths::data_media_user_root_for_user(user_id)),
             media_sqlite_real_root: media_sqlite_view_root_for_user(user_id),
             redirect_root: PathBuf::from(redirect_root_string),
+            redirect_view_rel,
+            sandbox_backend_root,
             rule_prefixes,
             allowed_real_paths,
             excluded_real_paths,
@@ -449,6 +585,7 @@ impl RedirectPolicy {
             is_monitor_only: config.is_monitor_only,
             is_file_monitor_enabled: config.is_file_monitor_enabled,
             deny_all: false,
+            fingerprint,
         })
     }
 
@@ -478,19 +615,73 @@ impl RedirectPolicy {
             return None;
         }
         let rel = sanitize_relative(rel)?;
+        // 自嵌套折叠：应用视图对重定向根自身的再进入（如 sdcard 形态重定向下的
+        // Android/data/<pkg>/sdcard/<rest>）与根下 <rest> 指向同一后端，但决策路径不同，
+        // 镜像子树会被反复再映射、逐层自嵌套（真机实测 70+ 层直到 ENAMETOOLONG，
+        // 文件监视树修复预算反复打满）。剥掉重定向根的视图前缀后按剩余路径解析，
+        // 嵌套层与根层从此等价，物理层不再生长。
+        let full_rel = self.full_storage_rel(&rel);
+        let rel = match self.strip_redirect_view_prefix(&full_rel) {
+            Some(stripped) => self.rel_for_full_storage_rel(&stripped),
+            None => rel,
+        };
         let storage_path = self.storage_path_for_rel(&rel);
         let resolved_storage_path = paths::normalize(&storage_path);
         let decision = self.backend_decision(&resolved_storage_path, operation);
+        let own_mapping_target = self.resolve_mapping(&resolved_storage_path);
+        if own_mapping_target.is_some() {
+            // 本应用经自身映射访问了该视图路径：登记交接信号。应用随后通过
+            // FileProvider 等机制把该路径交给其它应用时，对方会话可以据此在
+            // 窗口内完成跨应用只读解析（见下方跨应用别名兜底）。
+            record_own_mapped_handoff(&resolved_storage_path);
+        }
         let mut backend = match decision.kind {
-            BackendKind::Real => {
-                if let Some(mapped_target) = self.resolve_mapping(&resolved_storage_path) {
-                    self.backend_path_for_storage(&mapped_target, BackendKind::Real)?
+            BackendKind::Real => match &own_mapping_target {
+                Some(mapped_target) => {
+                    self.backend_path_for_storage(mapped_target, BackendKind::Real)?
+                }
+                None => self.real_backend_for_rel(&rel),
+            },
+            BackendKind::Redirect => {
+                if decision.is_sandbox
+                    && let Some(sandbox_root) = &self.sandbox_backend_root
+                {
+                    sandbox_root.join(&rel)
                 } else {
-                    self.real_backend_for_rel(&rel)
+                    self.redirect_backend_for_rel(&rel)
                 }
             }
-            BackendKind::Redirect => self.redirect_backend_for_rel(&rel),
         };
+
+        // 跨应用只读别名兜底：应用 A 把自身映射视图形态的文件路径交给应用 B 时
+        // （fd 的 d_path 保留 A 会话里的视图名），B 的会话没有 A 的映射规则，按该
+        // 路径的 stat/open 全部落 ENOENT（真机：夸克把 QuarkDownloads 下的 APK 交给
+        // R-安装，安装器读不到元数据，安装面板信息空白但安装本身走 fd 流不受影响）。
+        // 这里在 B 的 Read 未命中真实后端时，以「A 最近经自身映射访问过同一路径或
+        // 其祖先」为门控信号，按 A 的映射规则换算出真实后端路径完成只读解析：
+        // - 写操作、目录列举候选集、自身映射命中与真实存在的路径都不受影响；
+        // - 门控不命中时本分支零动作，无关应用拼出的视图路径依旧 ENOENT，与改动
+        //   前完全一致；即便信号在窗口内，能读到的也只是真实后端上本就可见的内容。
+        if matches!(operation, OperationKind::Read)
+            && decision.kind == BackendKind::Real
+            && own_mapping_target.is_none()
+            && has_recent_cross_app_handoff(&resolved_storage_path)
+            && !backend.exists()
+            && let Some(alias_target) = self.resolve_cross_app_read_alias(&resolved_storage_path)
+            && let Some(alias_backend) =
+                self.backend_path_for_storage(&alias_target, BackendKind::Real)
+            && alias_backend.exists()
+        {
+            log::debug!(
+                "fuse cross-app alias read pkg={} uid={} path={} alias={} fp={:016x}",
+                self.package_name,
+                self.uid,
+                resolved_storage_path,
+                alias_backend.display(),
+                self.fingerprint
+            );
+            backend = alias_backend;
+        }
 
         // 分享应用传递的文件路径时，目标应用的 scoped FUSE 仍会套用自身的
         // sandboxed_paths。若发送方文件尚未在目标应用沙箱中建立同名副本，目标
@@ -540,6 +731,45 @@ impl RedirectPolicy {
         None
     }
 
+    /// 在其它已登记应用策略的映射里解析跨应用只读别名目标。
+    ///
+    /// 遍历宿主进程按 uid 策略表中**其它应用**的 `path_mappings`，取请求侧命中的
+    /// 最长规则换算目标路径；无匹配返回 `None`。调用方必须已确认 Read 兜底前提
+    /// （自身映射未命中、真实后端不存在、交接信号在窗口内）。
+    fn resolve_cross_app_read_alias(&self, storage_path: &str) -> Option<String> {
+        let guard = CROSS_SESSION_POLICY_TABLE.lock().ok()?;
+        let table = guard.as_ref()?;
+        let by_uid = table.by_uid.read().ok()?;
+        let mut matched: Option<(&PathMapping, usize)> = None;
+        for (uid, policy) in by_uid.iter() {
+            if *uid == self.uid as u32 {
+                continue;
+            }
+            for mapping in &policy.path_mappings {
+                if !paths::matches(&mapping.request_path, storage_path, true) {
+                    continue;
+                }
+                let request_len = mapping.request_path.len();
+                let is_longer = match &matched {
+                    Some((_, best_len)) => request_len > *best_len,
+                    None => true,
+                };
+                if is_longer {
+                    matched = Some((mapping, request_len));
+                }
+            }
+        }
+        let (mapping, _) = matched?;
+        let Some(suffix) = paths::child_suffix(storage_path, &mapping.request_path) else {
+            return Some(mapping.final_path.clone());
+        };
+        Some(format!(
+            "{}{}",
+            mapping.final_path.trim_end_matches('/'),
+            suffix
+        ))
+    }
+
     fn is_read_only(&self, storage_path: &str) -> bool {
         if let Some(mapped_target) = self.resolve_mapping(storage_path) {
             if self.matches_any(&self.excluded_real_index, &mapped_target) {
@@ -570,16 +800,26 @@ impl RedirectPolicy {
 
     fn backend_decision(&self, storage_path: &str, operation: OperationKind) -> BackendDecision {
         let is_read_only = self.is_read_only(storage_path);
-        let kind = if self.is_monitor_only
-            || self.resolve_mapping(storage_path).is_some()
+        let mapping_hit = self.resolve_mapping(storage_path).is_some();
+        // sandboxed_paths 优先于监视/直通会话短路：系统代写组件（共享 media uid
+        // 等监视会话）对配置沙盒路径的访问也必须重定向进私有沙盒，否则 native
+        // 层创建会绕过沙盒直落真实路径。命中与排除的判定口径与下方
+        // mapping_mode_only 分支保持一致。映射优先于沙盒（场景 15 契约）：命中
+        // 映射规则的路径由 Real 分支按映射目标解析，沙盒只接管未命中映射的路径
+        // ——此前沙盒判定整体前置曾把「映射+沙盒双命中」劫进私有沙盒根。
+        let is_sandbox = self.is_mapping_mode_only
+            && !mapping_hit
+            && self.matches_any(&self.sandboxed_index, storage_path)
+            && !self.matches_any(&self.sandboxed_excluded_index, storage_path);
+        let kind = if is_sandbox {
+            BackendKind::Redirect
+        } else if self.is_monitor_only
+            || mapping_hit
             || self.is_own_private_storage_path(storage_path)
         {
             BackendKind::Real
         } else if self.is_mapping_mode_only {
-            if self.is_foreign_private_storage_path(storage_path)
-                || (self.matches_any(&self.sandboxed_index, storage_path)
-                    && !self.matches_any(&self.sandboxed_excluded_index, storage_path))
-            {
+            if self.is_foreign_private_storage_path(storage_path) {
                 BackendKind::Redirect
             } else {
                 BackendKind::Real
@@ -595,7 +835,11 @@ impl RedirectPolicy {
         } else {
             BackendKind::Redirect
         };
-        BackendDecision { kind, is_read_only }
+        BackendDecision {
+            kind,
+            is_read_only,
+            is_sandbox,
+        }
     }
 
     fn matches_any(&self, index: &RuleIndex, storage_path: &str) -> bool {
@@ -686,9 +930,15 @@ impl RedirectPolicy {
 
     pub(super) fn real_backend_for_storage_rel(&self, rel: &str) -> PathBuf {
         if rel.is_empty() {
-            return self.real_root.clone();
+            return backend_overlay::overlay_backend_path(&self.real_root)
+                .unwrap_or_else(|| self.real_root.clone());
         }
-        self.real_backend_root_for_storage_rel(rel).join(rel)
+        let joined = self.real_backend_root_for_storage_rel(rel).join(rel);
+        // 覆盖挂载感知：HyperOS 等系统会在 init 命名空间把下载暂存目录 bind 到
+        // `/data/media/...` 子树（如应用商店 `.siexternal`），应用命名空间里的
+        // scoped 会话按普通路径解析会落到被遮蔽的真实目录，与宿主/MP 读侧分裂。
+        // 命中覆盖挂载时改写到物理源路径，未命中保持原路径（CI 断言不受影响）。
+        backend_overlay::overlay_backend_path(&joined).unwrap_or(joined)
     }
 
     // 按相对路径选择真实后端根：应用自有私有目录走 private_real_root 直连 f2fs，
@@ -722,6 +972,18 @@ impl RedirectPolicy {
     pub(super) fn media_sqlite_view_root(&self) -> Option<&Path> {
         (!self.media_sqlite_real_root.as_os_str().is_empty())
             .then_some(self.media_sqlite_real_root.as_path())
+    }
+
+    /// 自有 media sqlite `-shm` 是否必须走宿主用户态通道（禁止 passthrough backing）。
+    ///
+    /// `-shm` 的毒化防御（ftruncate 钳制）只覆盖 FUSE SETATTR 通道；passthrough
+    /// backing fd 上的 ftruncate 绕过宿主直落 f2fs。应用的 WAL 能力探针恰以截小
+    /// `-shm` 判定介质可用性，放行 passthrough 会让每次建连的探针重新制造毒化
+    /// inode，自愈只能救到下一次打开——表现就是跨应用共享库反复掉登录。
+    /// 与 [`Self::should_heal_media_sqlite_shm_rel`] 同一判定集合（纯路径形态，
+    /// 不含尺寸）。
+    pub(super) fn should_exclude_media_sqlite_shm_passthrough_rel(&self, rel: &str) -> bool {
+        self.should_heal_media_sqlite_shm_rel(rel)
     }
 
     /// 是否应在共享 FUSE 中检查并自愈 SQLite `-shm` 边车路径。
@@ -789,10 +1051,45 @@ impl RedirectPolicy {
 
     pub(super) fn redirect_backend_for_storage_rel(&self, rel: &str) -> PathBuf {
         if rel.is_empty() {
-            self.redirect_root.clone()
-        } else {
-            self.redirect_root.join(rel)
+            return backend_overlay::overlay_backend_path(&self.redirect_root)
+                .unwrap_or_else(|| self.redirect_root.clone());
         }
+        let joined = self.redirect_root.join(rel);
+        // 与 real 后端同口径：重定向根同样落在 `/data/media/...` 物理树上，
+        // 需要经过同一套覆盖挂载感知解析（见 real_backend_for_storage_rel 注释）。
+        backend_overlay::overlay_backend_path(&joined).unwrap_or(joined)
+    }
+
+    /// 折叠视图对重定向根自身的再进入：`<redirect_view_rel>/<rest>` → `<rest>`。
+    ///
+    /// 入参/出参都是全存储相对路径（含 mount_rel 前缀）。重定向根视图形态为空
+    /// （直通/监视会话）时不折叠。
+    fn strip_redirect_view_prefix(&self, full_rel: &str) -> Option<String> {
+        let prefix = self.redirect_view_rel.as_str();
+        if prefix.is_empty() {
+            return None;
+        }
+        if full_rel == prefix {
+            return Some(String::new());
+        }
+        let rest = full_rel.strip_prefix(prefix)?.strip_prefix('/')?;
+        Some(rest.to_string())
+    }
+
+    /// 把全存储相对路径还原为 FUSE 根相对路径（mount_rel 非空时剥掉其前缀）。
+    fn rel_for_full_storage_rel(&self, full_rel: &str) -> String {
+        if self.mount_rel.is_empty() {
+            return full_rel.to_string();
+        }
+        if full_rel.is_empty() {
+            return String::new();
+        }
+        paths::relative_child_path(
+            &paths::join(&self.storage_root, full_rel),
+            &paths::join(&self.storage_root, &self.mount_rel),
+        )
+        .map(str::to_string)
+        .unwrap_or_else(|| full_rel.to_string())
     }
 
     pub(super) fn backend_path_for_storage(
@@ -1014,6 +1311,67 @@ impl RedirectPolicy {
             return false;
         };
         !is_android_app_private_relative_path(relative)
+    }
+}
+
+/// 登记本应用经自身映射访问过的视图路径，供跨应用只读别名兜底做交接门控。
+///
+/// 应用 A 通过 FileProvider 把 fd 交给应用 B 之前，必须先在自己的 FUSE 会话里以
+/// 映射视图路径打开同一个文件；这条访问记录就是「B 正被 A 调用」的唯一可观测
+/// 等价信号（FUSE 层看不到 intent/binder 调用链）。记录按精确路径写入，A 侧的
+/// 组件级解析会自然把祖先目录一并登记；消费侧（[`has_recent_cross_app_handoff`]）
+/// 再沿祖先链回溯匹配。
+fn record_own_mapped_handoff(storage_path: &str) {
+    let key = paths::match_key(storage_path);
+    let Ok(mut handoffs) = RECENT_CROSS_APP_HANDOFFS.lock() else {
+        return;
+    };
+    let now = paths::monotonic_ms();
+    handoffs.insert(key, now);
+    if handoffs.len() <= CROSS_APP_HANDOFF_CAPACITY {
+        return;
+    }
+    handoffs.retain(|_, at| now - *at < CROSS_APP_HANDOFF_TTL_MS);
+    if handoffs.len() <= CROSS_APP_HANDOFF_CAPACITY {
+        return;
+    }
+    // 容量兜底：全部未过期时驱逐最旧一条，避免长会话进程内无界增长。
+    if let Some(oldest) = handoffs
+        .iter()
+        .min_by_key(|(_, at)| **at)
+        .map(|(key, _)| key.clone())
+    {
+        handoffs.remove(&oldest);
+    }
+}
+
+/// 是否存在近窗口内其它应用经自身映射访问过该路径或其祖先的交接信号。
+///
+/// 沿祖先链回溯是必须的：FUSE LOOKUP 按组件逐级解析，A 交给 B 的是完整文件路径，
+/// 但 B 的会话要先解析 `QuarkDownloads`、`CloudDrive` 等中间目录才能走到文件。
+fn has_recent_cross_app_handoff(storage_path: &str) -> bool {
+    let Ok(handoffs) = RECENT_CROSS_APP_HANDOFFS.lock() else {
+        return false;
+    };
+    // 空表快速路径：设备上没有任何应用经自身映射产生交接记录时，热路径上
+    // 不为每次 Read 请求构造 match_key（含一次分配）。
+    if handoffs.is_empty() {
+        return false;
+    }
+    let now = paths::monotonic_ms();
+    let mut current = storage_path.trim_end_matches('/');
+    loop {
+        if handoffs
+            .get(&paths::match_key(current))
+            .is_some_and(|at| now - *at < CROSS_APP_HANDOFF_TTL_MS)
+        {
+            return true;
+        }
+        match current.rfind('/') {
+            // 只在还有父目录时继续回溯；根路径（rfind == 0）与无分隔符路径终止。
+            Some(pos) if pos > 0 => current = &current[..pos],
+            _ => return false,
+        }
     }
 }
 
@@ -1363,9 +1721,20 @@ pub(super) fn fix_mapped_dir_metadata(path: &str, owner_uid: i32) {
             log::debug!("fuse keep existing Android private metadata path={}", path);
             return;
         }
+        // 私有树（含包根）对齐原生 02770；此前包根会被打成 MAPPED_DIR_MODE
+        // 0o2773（others 可写可穿越），与 MediaProvider 原生语义相悖——
+        // 2026-10-21 用户反馈「微信私有目录 2773」即此来源。
+        let mode = if let Some(user_id) = paths::extract_user_id_from_data_media_path(path)
+            && is_android_private_backend_path(path, user_id)
+        {
+            0o2770
+        } else {
+            super::MAPPED_DIR_MODE
+        };
         // SAFETY: c_path 以 NUL 结尾，并在 chown/chmod 调用期间保持有效。
         let _ = unsafe { libc::chown(c_path.as_ptr(), owner_uid as u32, super::MEDIA_RW_GID) };
-        let _ = unsafe { libc::chmod(c_path.as_ptr(), super::MAPPED_DIR_MODE) };
+        // SAFETY: c_path 以 NUL 结尾，并在 chmod 调用期间保持有效。
+        let _ = unsafe { libc::chmod(c_path.as_ptr(), mode) };
     }
 }
 

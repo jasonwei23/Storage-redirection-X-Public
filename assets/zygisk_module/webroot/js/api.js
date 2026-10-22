@@ -229,7 +229,7 @@ const NativeBridge = {
             finish(0, result, "");
           }
         } catch (e) {
-          cleanup();
+          // 兼容调用同样受原超时保护；这里只切换签名，不能提前清除计时器。
           try {
             const result = ksu.exec(cmd, finish);
             if (result && typeof result.then === "function") {
@@ -351,6 +351,15 @@ function srxCtlCommand(action) {
   return "/system/bin/sh " + shellQuote(SRXCTL) + " " + action;
 }
 
+/**
+ * 从 exec 失败信息中提取 srxctl 输出的重挂失败原因令牌（remount_reason=<key>）。
+ * exec 在非零退出码时只把 stderr 作为 Error message 抛出，因此令牌必须从 stderr 文本里解析。
+ */
+function extractRemountReason(text) {
+  const match = /remount_reason=([a-z0-9-]+)/.exec(String(text || ""));
+  return match ? match[1] : "";
+}
+
 function withSrxCtlFallback(action, fallback) {
   return (
     "if [ -r " +
@@ -361,6 +370,17 @@ function withSrxCtlFallback(action, fallback) {
     fallback +
     "; fi"
   );
+}
+
+/** 解析 srxctl host-status 输出为结构化状态；未知输出一律归为 unknown。 */
+function parseStorageBackendStatus(output) {
+  const text = String(output || "").trim();
+  if (text === "inactive") return { state: "inactive", pid: null, policies: null };
+  const match = /^active pid=(\d+) policies=(\d+)$/.exec(text);
+  if (match) {
+    return { state: "active", pid: Number(match[1]), policies: Number(match[2]) };
+  }
+  return { state: "unknown", pid: null, policies: null };
 }
 
 function isManagedTempPath(path) {
@@ -917,9 +937,9 @@ const Api = {
   },
 
   /** 以字符串形式读取文件内容 */
-  async readFile(path) {
+  async readFile(path, options) {
     try {
-      return await this.exec(shellCommand("cat", path) + " 2>/dev/null");
+      return await this.exec(shellCommand("cat", path) + " 2>/dev/null", options);
     } catch {
       return "";
     }
@@ -935,19 +955,21 @@ const Api = {
     }
   },
 
-  /** 读取当前日志及全部轮转备份，按时间顺序合并。 */
+  /** 从当前日志与轮转备份读取最近记录，避免把全部历史传入 WebView。 */
   async readFileWithBackups(path) {
+    const lines = 1000;
     const command =
       "base=" +
       shellQuote(path) +
       '; { for f in "$base".*; do [ -f "$f" ] || continue; suffix="${f##*.}"; case "$suffix" in ' +
       "''|*[!0-9]*) continue;; esac; printf '%s\\t%s\\n' \"$suffix\" \"$f\"; done | " +
-      'sort -rn | while IFS="$(printf \'\\t\')" read -r _ f; do cat "$f"; done; cat "$base" 2>/dev/null; }';
-    try {
-      return await this.exec(command);
-    } catch {
-      return "";
-    }
+      'sort -rn | while IFS="$(printf \'\\t\')" read -r _ f; do tail -n ' +
+      lines +
+      ' "$f" 2>/dev/null; done; tail -n ' +
+      lines +
+      ' "$base" 2>/dev/null; } | tail -n ' +
+      lines;
+    return await this.exec(command, { timeoutMs: 10000 });
   },
 
   /** 将内容写入文件 */
@@ -1251,7 +1273,7 @@ const Api = {
       'logcat -g > "$stage/logcat-buffers.txt" 2>&1 || true; ' +
       'logcat -b main,system,crash -d -t 10000 -v threadtime -s StorageRedirect:V SRX:V FileMonitorOp:I Stats:I AndroidRuntime:E DEBUG:F libc:F ActivityManager:I WindowManager:I MediaProvider:V ExternalStorage:V DocumentsUI:V Vold:V > "$stage/logcat-srx-filtered.txt" 2>&1 || true; ' +
       'logcat -b crash -d -v threadtime > "$stage/logcat-crash.txt" 2>&1 || true; ' +
-      'logcat -b main,system -d -t 8000 -v threadtime > "$stage/logcat-main-system-context.txt" 2>&1 || true; ' +
+      'logcat -b main,system -d -t 20000 -v threadtime > "$stage/logcat-main-system-context.txt" 2>&1 || true; ' +
       'logcat -b events -d -t 1500 -v threadtime > "$stage/logcat-events.txt" 2>&1 || true; ' +
       'echo "initial_capture_completed_at=$(date "+%Y-%m-%d %H:%M:%S %z" 2>/dev/null || date 2>/dev/null)" >> "$stage/state/logcat-capture.txt"; ' +
       diagnosticProgressCommand(progress, 18, "files", "正在复制模块日志和配置") +
@@ -1590,7 +1612,9 @@ const Api = {
   async readMonitorFilters(options) {
     if (options?.force) this.invalidateMonitorFiltersCache();
     if (this._monitorFiltersCache) return JSON.parse(JSON.stringify(this._monitorFiltersCache));
-    const content = await this.readFile(FILE_MONITOR_FILTERS_CONFIG);
+    const content = await this.readFile(FILE_MONITOR_FILTERS_CONFIG, {
+      timeoutMs: options?.timeoutMs,
+    });
     if (!content) {
       this._monitorFiltersCache = JSON.parse(JSON.stringify(DEFAULT_FILE_MONITOR_FILTERS));
       return JSON.parse(JSON.stringify(this._monitorFiltersCache));
@@ -2072,9 +2096,10 @@ const Api = {
 
   async ensureLogCollectors() {
     try {
-      if (await this.fileExists(SRXCTL)) {
-        await this.exec(srxCtlCommand("ensure-collectors"));
-      }
+      await this.exec(
+        "if [ -r " + shellQuote(SRXCTL) + " ]; then " + srxCtlCommand("ensure-collectors") + "; fi",
+        { timeoutMs: 5000 },
+      );
     } catch {}
   },
 
@@ -2344,12 +2369,24 @@ const Api = {
         timeoutMs: 30_000,
       });
       return { ok: true };
-    } catch {
-      return { ok: false };
+    } catch (error) {
+      return { ok: false, failureReason: extractRemountReason(error?.message) };
     } finally {
       try {
         await this.ensureLogCollectors();
       } catch {}
+    }
+  },
+
+  /** 读取共享宿主会话状态指示，供概览页展示；读取失败按 unknown 处理。 */
+  async readStorageBackendStatus() {
+    try {
+      const out = await this.exec(withSrxCtlFallback("host-status", "echo unknown"), {
+        timeoutMs: 10_000,
+      });
+      return parseStorageBackendStatus(out);
+    } catch {
+      return { state: "unknown", pid: null, policies: null };
     }
   },
 

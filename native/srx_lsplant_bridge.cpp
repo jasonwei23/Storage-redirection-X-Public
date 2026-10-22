@@ -401,8 +401,7 @@ int SrxFuseFixReplyCreate(void *req, const void *entry,
 int SrxFuseFixPassthroughEnable(void *req, unsigned int fd) {
   if (g_orig_fuse_passthrough_enable == nullptr)
     return -ENOSYS;
-  if ((g_fuse_fix_reply_open_stub != nullptr || g_fuse_fix_reply_create_stub != nullptr) &&
-      ShouldDisableFusePassthroughForFd(static_cast<int>(fd), "passthrough_enable")) {
+  if (ShouldDisableFusePassthroughForFd(static_cast<int>(fd), "passthrough_enable")) {
     return 1;
   }
   return g_orig_fuse_passthrough_enable(req, fd);
@@ -411,8 +410,7 @@ int SrxFuseFixPassthroughEnable(void *req, unsigned int fd) {
 int SrxFuseFixPassthroughOpen(void *req, int fd) {
   if (g_orig_fuse_passthrough_open == nullptr)
     return -ENOSYS;
-  if ((g_fuse_fix_reply_open_stub != nullptr || g_fuse_fix_reply_create_stub != nullptr) &&
-      ShouldDisableFusePassthroughForFd(fd, "passthrough_open")) {
+  if (ShouldDisableFusePassthroughForFd(fd, "passthrough_open")) {
     return 1;
   }
   return g_orig_fuse_passthrough_open(req, fd);

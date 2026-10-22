@@ -3,7 +3,7 @@
 本文记录 FUSE 挂载从“每个应用各自起一个服务”演进到“共享宿主会话 + 独立监督与
 namespace 注入”的架构、根因分析和当前实现边界。早期分阶段迁移计划保留作为设计历史；其中身份账本、策略注册表、共享宿主接入和基础监督已经落地，文中的“目标架构”应按当前状态阅读。
 
-参考实现：`huniangitb/Fuse-Proxy`（Android 13+ 用户态 FUSE 代理 + 挂载命名空间隔离）。
+参考实现：`huniangitb/Fuse-Proxy`（Android 13+ 用户态 FUSE 代理 + 挂载命名空间隔离）。本项目的共享宿主会话设计参考了该项目的思路并按实际架构适配，在此致谢。
 该项目的 `injector` / `fuse_daemon` 分离结构是本方案的直接参照，差异见 §3。
 
 ---
@@ -377,5 +377,5 @@ CI 测试流为共享宿主增加**轻量时间点快照**：每个 Android job 
 - **普通应用不安装 native/inline/PLT hook**：本改造全部走 companion mount / mount
   namespace / FUSE 路径，未新增任何进程内 hook；
 - **测试流同时识别两类 FUSE 挂载**：`srx_fuse_redirect` 表示 scoped 回退会话，`srx_fuse_host` 表示共享宿主会话；场景断言不能只匹配其中一种。
-- **能力熔断快照语义不变**：`fuse_capability` 的 `state`/`reason`/`fail_count` 未改动。
+- **能力熔断快照**：共享宿主改造本身未改快照语义；后续 `schema=3` 已引入按应用分桶（设备级 `unavailable` 需 ≥2 个不同应用失败）与 `retry_at_ms` 退避自愈，当前语义见 [存储后端架构](storage-backend.md)。
 - **后端选择仍由 `auto` 统一控制**：文档、测试和诊断不应把 FUSE 或 namespace 单独描述成所有设备的固定后端。

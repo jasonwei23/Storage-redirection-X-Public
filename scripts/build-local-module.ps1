@@ -576,8 +576,37 @@ function Get-AdbDevices {
 function Confirm-YesNo {
     param([string]$Prompt)
 
-    $answer = Read-Host "$Prompt [y/N]"
-    return $answer -match '^(y|yes)$'
+    # 限时确认：15 秒内无输入按确认处理，回车等同确认，仅显式 n/no 拒绝。
+    # 无人值守场景（CI、计划任务、AI Agent 代跑）不能永久卡在交互确认上。
+    $timeoutMs = 15000
+    Write-Host "$Prompt [y/N]（15 秒内无输入自动确认）"
+    $readTask = [System.Threading.Tasks.Task]::Factory.StartNew({
+        try {
+            [Console]::In.ReadLine()
+        } catch {
+            $null
+        }
+    })
+    try {
+        if (-not $readTask.Wait($timeoutMs)) {
+            Write-Host "等待输入超时，按确认继续。"
+            return $true
+        }
+    } catch {
+        # stdin 已关闭导致读取任务出错（非交互管道/无人值守环境）：按确认继续。
+        Write-Host "无交互输入可用，按确认继续。"
+        return $true
+    }
+    if ($readTask.IsFaulted -or $readTask.IsCanceled) {
+        # stdin 已关闭（非交互管道/无人值守环境）：按确认继续。
+        Write-Host "无交互输入可用，按确认继续。"
+        return $true
+    }
+    $answer = $readTask.Result
+    if ([string]::IsNullOrWhiteSpace($answer)) {
+        return $true
+    }
+    return -not ($answer -match '^(n|no)$')
 }
 
 function Invoke-AdbChecked {

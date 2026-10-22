@@ -371,14 +371,23 @@ pub(super) fn resolve_system_writer_caller_context(
     }
 
     if !effective_caller_package.is_empty() {
-        if hub.get_current_caller_package().is_empty() || is_caller_from_mapping_request_owner {
-            hub.set_current_caller_package(&effective_caller_package);
-        }
-        if (hub.get_current_caller_uid() < writer::ANDROID_APP_UID_START
-            || is_caller_from_mapping_request_owner)
-            && effective_caller_uid >= writer::ANDROID_APP_UID_START
-        {
-            hub.set_current_caller_uid(effective_caller_uid);
+        if is_caller_from_mapping_request_owner {
+            // 映射请求侧归属必须保留来源标记：MediaProvider 的 FuseDaemon 在
+            // create/mkdir 之后用原始路径回查 attr 时没有外部调用方信号，查询回退
+            // 只能靠这条归属解析到映射目标，否则应答会 ENOENT。
+            hub.set_current_caller_from_mapping_request_owner(
+                &effective_caller_package,
+                effective_caller_uid,
+            );
+        } else {
+            if hub.get_current_caller_package().is_empty() {
+                hub.set_current_caller_package(&effective_caller_package);
+            }
+            if hub.get_current_caller_uid() < writer::ANDROID_APP_UID_START
+                && effective_caller_uid >= writer::ANDROID_APP_UID_START
+            {
+                hub.set_current_caller_uid(effective_caller_uid);
+            }
         }
     }
 
@@ -538,7 +547,10 @@ fn resolve_redirect_owner_package_by_path(user_id: i32, normalized_path: &str) -
         .resolve_redirect_package_by_path_for_user(synthetic_uid, normalized_path)
 }
 
-fn resolve_mapping_request_owner_package_by_path(user_id: i32, normalized_path: &str) -> String {
+pub(super) fn resolve_mapping_request_owner_package_by_path(
+    user_id: i32,
+    normalized_path: &str,
+) -> String {
     if user_id < 0 || normalized_path.is_empty() {
         return String::new();
     }

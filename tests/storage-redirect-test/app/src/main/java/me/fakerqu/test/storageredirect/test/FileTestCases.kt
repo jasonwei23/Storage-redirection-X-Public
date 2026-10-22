@@ -107,7 +107,7 @@ class FileTestCases(
         val target = File(targetPath)
         if (!target.isFile) {
           return@measure TestCase.FILE_READ.fail(
-              message = "file does not exist",
+              message = "file does not exist [" + mountInfoSnapshot().take(1200) + "]",
               metadata = mapOf("path" to targetPath),
           )
         }

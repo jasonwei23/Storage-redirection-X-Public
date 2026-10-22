@@ -30,13 +30,15 @@ pub mod paths_roots;
 pub mod paths_rules;
 #[path = "platform/paths_safety.rs"]
 pub mod paths_safety;
+#[path = "platform/uid.rs"]
+pub mod uid;
 #[path = "platform/unique_fd.rs"]
 pub mod unique_fd;
 
 use std::ffi::{CStr, CString};
 use std::sync::atomic::{AtomicBool, Ordering};
 
-pub const ANDROID_USER_ID_OFFSET: i32 = 100000;
+pub use uid::{ANDROID_USER_ID_OFFSET, user_id_from_uid};
 pub const MIN_SUPPORTED_API_LEVEL: i32 = 31;
 const ISOLATED_APP_ID_START: i32 = 99000;
 const ISOLATED_APP_ID_END: i32 = 99999;
@@ -133,14 +135,6 @@ pub fn is_process_instance_alive(pid: i32, start_time_ticks: u64) -> bool {
 /// 依赖 `/proc` 的存在性判断它是否已经消失。
 pub fn process_exists(pid: i32) -> bool {
     process_start_time_ticks(pid).is_some()
-}
-
-pub fn user_id_from_uid(uid: i32) -> i32 {
-    if uid >= 0 {
-        uid / ANDROID_USER_ID_OFFSET
-    } else {
-        0
-    }
 }
 
 // 隔离进程 UID（app_id 99000-99999）无存储访问权限

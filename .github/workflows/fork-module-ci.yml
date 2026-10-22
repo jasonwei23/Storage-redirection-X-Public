@@ -1,0 +1,107 @@
+name: Fork 模块构建
+
+on:
+  pull_request:
+    branches: [SRX-R]
+  push:
+    branches: [SRX-R, "fix/**"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: fork-module-${{ github.head_ref || github.ref_name }}
+  cancel-in-progress: true
+
+env:
+  SRX_NDK_VERSION: "30.0.16248370"
+  SRX_ANDROID_PLATFORM: "platforms;android-37.0"
+  SRX_ANDROID_BUILD_TOOLS: "build-tools;35.0.0"
+
+jobs:
+  module:
+    # 上游构建包含发布任务且限定仓库名称，fork 使用独立的只读构建并上传刷入包。
+    if: github.repository == 'jasonwei23/Storage-redirection-X-Public'
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+
+      - name: 安装 JDK
+        uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: 21
+
+      - name: 安装固定 Rust 工具链
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: nightly-2026-07-14
+          targets: aarch64-linux-android
+          components: clippy, rustfmt
+
+      - name: 执行仓库回归与格式检查
+        run: |
+          cargo fmt --all -- --check
+          python -m unittest discover -s .github/tests -p 'test_*.py' -v
+          node scripts/verify-webui-structure.js
+          node scripts/verify-webui-config-fixtures.js
+
+      - name: 检查增量代码质量
+        shell: pwsh
+        run: |
+          $baseRef = '${{ github.event.pull_request.base.sha || github.event.before }}'
+          if ([string]::IsNullOrWhiteSpace($baseRef) -or $baseRef -match '^0+$') {
+            $baseRef = 'HEAD^'
+          }
+          ./scripts/validate-inline-tests.ps1 -Ref HEAD
+          ./scripts/validate-code-quality.ps1 -BaseRef $baseRef -Ref HEAD
+
+      - name: 安装 Android SDK
+        uses: android-actions/setup-android@v4
+        with:
+          packages: platform-tools
+
+      - name: 安装 Android 编译依赖
+        run: |
+          sdkmanager "$SRX_ANDROID_PLATFORM" "$SRX_ANDROID_BUILD_TOOLS" "ndk;$SRX_NDK_VERSION"
+          echo "ANDROID_NDK_HOME=$ANDROID_HOME/ndk/$SRX_NDK_VERSION" >> "$GITHUB_ENV"
+          echo "$ANDROID_HOME/ndk/$SRX_NDK_VERSION/toolchains/llvm/prebuilt/linux-x86_64/bin" >> "$GITHUB_PATH"
+          sudo apt-get update
+          sudo apt-get install -y cmake ninja-build
+          mkdir -p .cargo
+          printf '[target.aarch64-linux-android]\nlinker = "aarch64-linux-android29-clang"\n' > .cargo/config.toml
+
+      - name: 确定测试包版本
+        id: version
+        run: python .github/scripts/resolve_build_version.py --format github >> "$GITHUB_OUTPUT"
+
+      - name: 构建并打包 arm64 模块
+        env:
+          CXXFLAGS: "-Wno-error=unused-but-set-variable"
+          MODULE_VERSION: ${{ steps.version.outputs.version }}-fork.${{ github.run_number }}
+          MODULE_VERSION_CODE: ${{ steps.version.outputs.version_code }}
+        run: |
+          cargo clippy --locked --target aarch64-linux-android --release --all-targets -- -D warnings
+          cargo build --locked --target aarch64-linux-android --release
+          bash .github/scripts/package_module.sh \
+            "$MODULE_VERSION" "$MODULE_VERSION_CODE" \
+            target/aarch64-linux-android/release/libsrx_core.so \
+            target/aarch64-linux-android/release/srx_daemon \
+            "build/storage.redirect.x-v${MODULE_VERSION}.zip"
+          python .github/scripts/generate_changelog.py --mode ci \
+            --version "$MODULE_VERSION" --output build/CHANGELOG.md
+
+      - name: 上传可安装模块包
+        uses: actions/upload-artifact@v4
+        with:
+          name: storage-redirect-x-arm64
+          path: |
+            build/storage.redirect.x-*.zip
+            build/CHANGELOG.md
+          if-no-files-found: error
+          retention-days: 14

@@ -43,6 +43,7 @@ pub unsafe extern "C" fn hooked_truncate(pathname: *const c_char, length: off_t)
                     pathname,
                     log_flags: 0,
                     extra_tail: Some(format!("length={}", length)),
+                    redirect_mutation: false,
                 },
                 |call_path| {
                     runtime::call_prev(
@@ -89,6 +90,7 @@ pub unsafe extern "C" fn hooked_truncate64(pathname: *const c_char, length: off_
                     pathname,
                     log_flags: 0,
                     extra_tail: Some(format!("length={}", length)),
+                    redirect_mutation: false,
                 },
                 |call_path| {
                     runtime::call_prev(
@@ -203,6 +205,7 @@ pub unsafe extern "C" fn hooked_chmod(pathname: *const c_char, mode: mode_t) -> 
                     pathname,
                     log_flags: mode as i32,
                     extra_tail: Some(format!("mode=0{:o}", mode)),
+                    redirect_mutation: false,
                 },
                 |call_path| {
                     runtime::call_prev(
@@ -295,6 +298,7 @@ pub unsafe extern "C" fn hooked_fchmodat(
                     pathname,
                     log_flags: flags,
                     extra_tail: Some(format!("mode=0{:o}|flags=0x{:x}", mode, flags)),
+                    redirect_mutation: false,
                 },
                 |call_path| {
                     runtime::call_prev(
@@ -355,6 +359,7 @@ pub unsafe extern "C" fn hooked_utimensat(
                     pathname,
                     log_flags: flags,
                     extra_tail: Some(format!("flags=0x{:x}", flags)),
+                    redirect_mutation: false,
                 },
                 |call_path| {
                     runtime::call_prev(

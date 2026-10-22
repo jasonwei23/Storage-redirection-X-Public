@@ -226,13 +226,12 @@ class ScenarioConsistencyTest(unittest.TestCase):
         self.assertIn("let removed_backend =", media)
 
     def test_kernelsu_zygisk_next_default_uses_existing_release_tag(self) -> None:
+        # KernelSU 实验 workflow 已于 2026-10-16 移除，Zygisk Next 的默认地址只剩
+        # 安装脚本一处；A17 分片在正式矩阵里仍按 root_method=ksu 调用该脚本。
         installer = read(".github/tests/install-storage-redirect-module-ksu.sh")
-        workflow = read(".github/workflows/ci-kernelsu-a17.yml")
         expected = "https://github.com/LSPosed/ZygiskNext/releases/download/v1.5.0/Zygisk-Next-1.5.0-843-5217106-release.zip"
         self.assertIn(expected, installer)
-        self.assertIn(expected, workflow)
         self.assertNotIn("releases/download/1.5.0/", installer)
-        self.assertNotIn("releases/download/1.5.0/", workflow)
 
     def test_shared_host_precedes_namespace_redirect(self) -> None:
         daemon = read("src/daemon_mount.rs")
@@ -806,9 +805,10 @@ class ScenarioConsistencyTest(unittest.TestCase):
         self.assertNotIn("libc::MS_BIND", attach)
 
         # 登记必须有应答：只按 `send` 是否成功判断，会让应用在策略尚未进宿主会话时接入，
-        # 结果是整片 ENOENT（未登记即拒绝）。应答带 uid，因为控制通道被所有挂载 worker 共用。
+        # 结果是整片 ENOENT（未登记即拒绝）。应答带 uid，因为控制通道被所有挂载 worker 共用；
+        # 等待受 ack 预算约束（按父进程 deadline 派生的 ack_remaining_ms），不无界阻塞。
         self.assertIn("fn await_policy_ack(", host)
-        self.assertIn("await_policy_ack(fd, config.uid)", host)
+        self.assertIn("await_policy_ack(fd, config.uid, ack_remaining_ms)", host)
         ack = section(host, "fn await_policy_ack(", "/// 把某个应用的策略登记到共享宿主会话")
         self.assertIn("if ack_uid != uid {", ack)
 
@@ -837,7 +837,11 @@ class ScenarioConsistencyTest(unittest.TestCase):
             daemon_src, "pub(crate) fn pre_register_host_policy(", "fn write_mount_state("
         )
         self.assertIn("fuse_config_from_request(request,None,None)", "".join(pre_register.split()))
-        self.assertIn("register_app_policy(&config, request.policy_fingerprint)", pre_register)
+        # 登记必须带指纹与 ack 预算（8992240b 起签名含 ack_budget_ms），缺预算会把
+        # 开机风暴期的登记挂死在共享 dgram 上，被父进程误判 child stuck 后 SIGKILL。
+        self.assertIn("register_app_policy(", pre_register)
+        self.assertIn("request.policy_fingerprint,", pre_register)
+        self.assertIn("HOST_POLICY_ACK_BUDGET_MAX_MS", pre_register)
         self.assertIn("request.policy_fingerprint", pre_register)
         self.assertIn("view.policy_fingerprints.get(&(request.uid as u32))", pre_register)
         collapse = section(
@@ -906,13 +910,18 @@ class ScenarioConsistencyTest(unittest.TestCase):
         # 都不得再直读会话绑定策略的字段，一律经注册表取值。
         source = read("src/fuse_redirect/mod.rs")
         # `shared_table()` 与 `for_uid_exact()` 都是注册表出口：前者交给宿主登记，后者用于
-        # root 子进程跨 namespace 接续已由 inode/path 记住的应用策略；除它们之外的 `self.policy.`
-        # 仍然只能走 `for_request` / `session`。
+        # root 子进程跨 namespace 接续已由 inode/path 记住的应用策略（含 2026-10-21 fd 属主
+        # 回退按 inode 属主 uid 解析）；除它们之外的 `self.policy.` 仍然只能走 `for_request` /
+        # `session`。
+        # `find_owner_policy_by_package()` 是系统读取者路径反解出口（2026-10-21）：跨进程
+        # fd 的文件身份在 open 时刻固定，fstat/getxattr 不能按请求者 uid 重路由，只能按
+        # inode 属主包经注册表解析；仅限 Read 且由 is_system_reader_uid 门控。
         allowed = (
             "self.policy.for_request(req.uid(), req.pid())",
             "self.policy.session()",
             "self.policy.shared_table()",
-            "self.policy.for_uid_exact(cached_uid)",
+            "self.policy.for_uid_exact(",
+            "self.policy.find_owner_policy_by_package(",
         )
         for number, line in enumerate(source.splitlines(), 1):
             if "self.policy." not in line:
@@ -2071,8 +2080,10 @@ class ScenarioConsistencyTest(unittest.TestCase):
             source, "pub fn app_redirect_mounts_in(", "\n}\n")
         self.assertIn("is_module_redirect_mount(", app_mounts)
         # 三个调用点都要把挂载点传进去，漏一个就会在那条路径上失配。
+        # mount_ledger 的登记已改为 capture_explicit_mount_identity（不经归属谓词，
+        # 直接取显式目标的 topmost 事实），不再调用 is_module_redirect_mount；
+        # 谓词调用点只剩 daemon_mount 的摘除归属。
         for path, anchor, target_arg in (
-            ("src/mount_ledger.rs", "pub fn capture_mount_identity(", "mount_point,"),
             ("src/daemon_mount.rs", "fn clear_mount_target_stack_verified(", "target,"),
         ):
             body = section(read(path), anchor, "\n}\n")
@@ -2095,9 +2106,13 @@ class ScenarioConsistencyTest(unittest.TestCase):
         self.assertNotIn("is_module_mount_source(", clear)
 
         ledger = read("src/mount_ledger.rs")
-        capture = section(ledger, "pub fn capture_mount_identity(", "\n/// 按本次挂载的目标集合登记账本")
-        self.assertIn("is_module_redirect_mount(", capture)
-        self.assertIn("package_name: &str", capture)
+        capture = section(
+            ledger, "pub fn capture_explicit_mount_identity(", "\n/// 按本次挂载的目标集合登记账本"
+        )
+        # 登记必须走显式目标的 topmost 事实，不得经归属谓词：private-dir alias bind
+        # 的 root 形态与系统挂载完全同形，谓词会把它漏出账本，cleanup 判 foreign
+        # 永不完整、重挂循环不停（真机实测 wetype 等应用每次 reload 都触发）。
+        self.assertNotIn("is_module_redirect_mount(", capture)
         # `root` 是判据的唯一可靠依据，`LiveMount` 必须把它读出来。
         self.assertIn("pub root: String", ledger)
 

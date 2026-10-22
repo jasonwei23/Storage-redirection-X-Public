@@ -1,4 +1,7 @@
-//! 自动路径元数据修正的实验开关。
+//! 自动路径元数据修正的实验开关与共享属主修复实现。
+//!
+//! 本模块同时被 lib（zygisk 注入侧）与 bin（srx_daemon）通过 `#[path]` 引入，
+//! 只能依赖双侧都存在的模块：`crate::redirect::policy`、`crate::platform`。
 
 /// 是否允许模块自动调整重定向后端的 owner、group 和 mode。
 ///

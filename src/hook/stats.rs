@@ -296,6 +296,18 @@ impl InterceptHub {
         context::get_current_caller_uid()
     }
 
+    pub fn set_current_caller_from_mapping_request_owner(
+        &self,
+        caller_package: &str,
+        caller_uid: i32,
+    ) {
+        context::set_current_caller_from_mapping_request_owner(caller_package, caller_uid);
+    }
+
+    pub fn is_current_caller_from_mapping_request_owner(&self) -> bool {
+        context::is_current_caller_from_mapping_request_owner()
+    }
+
     pub fn clear_current_caller(&self) {
         context::clear_current_caller();
     }

@@ -234,8 +234,21 @@ public class Hooker {
         // 这里若继续尝试映射文件，可能把未配置应用的原图读取带入其它调用方
         // 的路径提示或映射目标，导致缩略图可见但原图打开失败。
         recordProviderOpenPath(this, args, actualArgs, callerUid);
-        Object result = callBackupPassthrough(args);
+        Object result;
+        try {
+          result = callBackupPassthrough(args);
+        } catch (Throwable passthroughFailure) {
+          // 与重定向分支同款的静默失败：未开启重定向的调用方（QQ/B 站图片走这里）
+          // open 被拒时应用侧只会看到空图，此前这里不留任何痕迹。
+          logOpenBackupFailure(callerUid, passthroughFailure);
+          throw passthroughFailure;
+        }
+        if (result == null) {
+          // MediaProvider 的 open 正常路径要么返回 fd 要么抛异常，null 属于异常信号。
+          logOpenBackupFailure(callerUid, null);
+        }
         if (result != null) recordProviderOpenSuccess(this, args, actualArgs, result, callerUid);
+        logOpenResult("passthrough", result);
         return result;
       }
       captureMediaSourceFileDescriptor(this, actualArgs, callerUid);
@@ -606,6 +619,9 @@ public class Hooker {
     Object[] actualArgs = unwrapArgs(args);
     ContentValues values = findContentValues(actualArgs);
     if (values == null) return callBackup(args);
+    Integer scopedUid = MEDIA_PROVIDER_CALLER_UID.get();
+    int callerUid = scopedUid == null ? android.os.Binder.getCallingUid() : scopedUid.intValue();
+    if (callerUid < ANDROID_APP_UID_START) return callBackup(args);
     MediaFileBuildContext pendingContext = MEDIA_FILE_BUILD_CONTEXT.get();
     if ("update".equals(mutationMethod)
         && pendingContext != null
@@ -617,12 +633,11 @@ public class Hooker {
         values.put(MediaStore.MediaColumns.RELATIVE_PATH, pendingRelative);
         patchDirectoryColumns(values, pendingRelative);
         logInfo("media pending column path patched to=" + pendingContext.publicPath);
-        return callBackup(args);
+        Object result = callBackup(args);
+        restoreMediaStoreVolumePrefix(values, callerUid);
+        return result;
       }
     }
-    Integer scopedUid = MEDIA_PROVIDER_CALLER_UID.get();
-    int callerUid = scopedUid == null ? android.os.Binder.getCallingUid() : scopedUid.intValue();
-    if (callerUid < ANDROID_APP_UID_START) return callBackup(args);
     String relativePath = values.getAsString(MediaStore.MediaColumns.RELATIVE_PATH);
     if (relativePath == null || relativePath.length() == 0) {
       relativePath = relativePathFromDirectoryColumns(values);
@@ -669,6 +684,8 @@ public class Hooker {
       return callBackup(args);
     } finally {
       restoreMediaFileBuildValues(args);
+      // FileUtils 的上下文可能已被消费；ensureFileColumns 最后一次写入仍需修正卷前缀。
+      restoreMediaStoreVolumePrefix(values, callerUid);
       restoreContentValue(
           values, MediaStore.MediaColumns.RELATIVE_PATH, hadRelative, originalRelative);
       restoreContentValue(values, "primary_directory", hadPrimary, originalPrimary);
@@ -740,8 +757,17 @@ public class Hooker {
       if (actualArgs.length == 0 || !(actualArgs[0] instanceof ContentValues)) return;
       if (context.publicPath == null || context.publicPath.length() == 0) return;
       ContentValues values = (ContentValues) actualArgs[0];
-      values.put(MediaStore.MediaColumns.DATA, context.publicPath);
-      String relativePath = mediaStoreRelativePath(context.publicPath);
+      String publicPath = context.publicPath;
+      String builtPath = values.getAsString(MediaStore.MediaColumns.DATA);
+      // 保留系统生成的 pending、重名避让和文件名清洗结果，只恢复逻辑父目录。
+      if (builtPath != null && builtPath.lastIndexOf('/') >= 0) {
+        int parentEnd = publicPath.lastIndexOf('/');
+        publicPath =
+            publicPath.substring(0, parentEnd + 1)
+                + builtPath.substring(builtPath.lastIndexOf('/') + 1);
+      }
+      values.put(MediaStore.MediaColumns.DATA, publicPath);
+      String relativePath = mediaStoreRelativePath(publicPath);
       if (relativePath != null) values.put(MediaStore.MediaColumns.RELATIVE_PATH, relativePath);
     } finally {
       MEDIA_FILE_BUILD_CONTEXT.remove();
@@ -2013,6 +2039,8 @@ public class Hooker {
 
   private static native boolean allowsPublicMappingTarget(String path, int callerUid);
 
+  private static native boolean allowsOwnAndroidPrivatePath(String path, int callerUid);
+
   private static native boolean isRedirectEnabledForCallerUid(int callerUid);
 
   private static native void captureBinderCaller(int callerUid, int callerPid);
@@ -2235,8 +2263,22 @@ public class Hooker {
     // 映射目标由该应用的 path_mappings 明确产生。MediaProvider 在 FUSE 层仍按目标
     // 公共目录做权限校验时，写入请求也要沿用映射授权，否则 QQ 的分片临时文件会被
     // 误判为“无权写入公共目录”。
+    // 应用自身 Android/data、obb 私有目录的读写是 Android 语义本来就允许的操作，
+    // 但 MediaProvider 的身份判定在调用方解析高压失效时可能误拒，导致应用读不到
+    // 自己的媒体文件；放行口径与其自身 bypass 判定一致（路径属主包与调用 UID 匹配）。
     return allowsPublicMappingTargetSafe(request.path, request.callerUid)
-        || allowsPublicMappingTargetSafe(request.ioPath, request.callerUid);
+        || allowsPublicMappingTargetSafe(request.ioPath, request.callerUid)
+        || allowsOwnAndroidPrivatePathSafe(request.path, request.callerUid)
+        || allowsOwnAndroidPrivatePathSafe(request.ioPath, request.callerUid);
+  }
+
+  private static boolean allowsOwnAndroidPrivatePathSafe(String path, int callerUid) {
+    if (path == null || path.length() == 0) return false;
+    try {
+      return allowsOwnAndroidPrivatePath(path, callerUid);
+    } catch (Throwable ignored) {
+      return false;
+    }
   }
 
   private static boolean allowsPublicMappingTargetSafe(String path, int callerUid) {
@@ -3106,6 +3148,8 @@ public class Hooker {
         patched = copyIfNeeded(patched, values);
         patched.put("relative_path", mappedRelative);
         patchDirectoryColumns(patched, mappedRelative);
+        relativeSource = patched;
+        relativePath = mappedRelative;
       }
     }
     // insert 且未提供 _data 时补一个公共形态的 _data。MediaProvider 的 ensureFileColumns
@@ -4412,6 +4456,9 @@ public class Hooker {
     else if (relative.startsWith("/" + absoluteRoot))
       relative = relative.substring(absoluteRoot.length() + 1);
     String name = displayName != null && displayName.length() > 0 ? displayName : ".srx_probe";
+    // DISPLAY_NAME 是文件名：系统把分隔符清洗为下划线，探测时也不能将其变成子目录。
+    // 保留原字段交由 MediaProvider 完成其余文件名清洗，只在探测路径中消除分隔符。
+    name = name.replace('/', '_').replace('\\', '_');
     return "/storage/emulated/" + userId + "/" + relative + "/" + name;
   }
 
@@ -4732,6 +4779,7 @@ public class Hooker {
               + source
               + " class="
               + (result == null ? "null" : result.getClass().getName())
+              + describeOpenResultDetail(result)
               + " n="
               + OPEN_RESULT_LOG_COUNT);
     } catch (Throwable ignored) {
@@ -4739,13 +4787,43 @@ public class Hooker {
   }
 
   /**
+   * 给出 open 结果的关键观测量：fd 号、声明长度与起始偏移。
+   *
+   * <p>排查图片加载失败时，只有 class 名无法区分「fd 从未产出」（open 阶段就失败） 与「fd 已产出但后续读取/解码失败」（open 正常，问题在数据面）。 长度异常（0
+   * 或远小于图片体积）还能暴露 fd 指向了错误文件或被截断的文件。
+   */
+  private static String describeOpenResultDetail(Object result) {
+    try {
+      if (result instanceof ParcelFileDescriptor) {
+        ParcelFileDescriptor pfd = (ParcelFileDescriptor) result;
+        return " fd=" + pfd.getFd() + " len=" + pfd.getStatSize();
+      }
+      if (result instanceof AssetFileDescriptor) {
+        AssetFileDescriptor afd = (AssetFileDescriptor) result;
+        ParcelFileDescriptor pfd = afd.getParcelFileDescriptor();
+        return " fd="
+            + (pfd == null ? -1 : pfd.getFd())
+            + " len="
+            + afd.getLength()
+            + " start="
+            + afd.getStartOffset();
+      }
+    } catch (Throwable ignored) {
+    }
+    return "";
+  }
+
+  /**
    * 记录「原始 open 没有产出结果」。`failure == null` 表示原始调用返回了 null 而不是抛异常。
    *
    * <p>这条日志刻意不受 OPEN_RESULT_LOG_COUNT 之类的上限约束：它只在失败路径上产生，量很小；而一旦被
    * 上限截断就再也看不到失败原因——真机上排查时正是如此，普通请求在场景早期就把上限用完了。
+   *
+   * <p>同样刻意不受 shouldLog()（verbose 调试开关）约束：开关是进程内 AtomicBool， boot 早期 specialize 的进程可能因配置不可读而永久停在
+   * false（实测反馈设备上 MediaProvider 进程整个生命周期静默，open 失败完全不可见）。失败日志是排查
+   * 「图片加载不了」类问题的唯一线索，量又小（仅失败路径），必须始终落盘。
    */
   private static void logOpenBackupFailure(int callerUid, Throwable failure) {
-    if (!shouldLog()) return;
     try {
       android.util.Log.w(
           "SRX",

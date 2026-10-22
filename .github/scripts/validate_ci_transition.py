@@ -5,7 +5,9 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import re
+import sys
 from pathlib import Path
 
 import resolve_build_version
@@ -37,7 +39,16 @@ def stable_manifest_version(path: Path = Path("update.json")) -> str | None:
     return version if isinstance(version, str) else None
 
 
-def should_skip_ci(message: str) -> bool:
+def should_skip_ci(message: str, event_name: str = "push") -> bool:
+    """该提交在当前触发方式下是否应跳过 CI 版本解析。
+
+    `[skip ci]` 与工作流专用前缀只对 **push** 有意义：push 场景要么由 GitHub
+    原生跳过、要么由 job 级 `if` 排除。`workflow_dispatch` 是显式要求跑 CI
+    （例如只跑场景 29 的单点回归），分支顶端恰好是这类提交时不能连带跳过版本
+    解析——否则 prepare 输出空版本号，下游构建与发布拿到空版本。
+    """
+    if event_name != "push":
+        return False
     subject = message.splitlines()[0].strip() if message.splitlines() else ""
     return bool(SKIP_CI_PATTERN.search(message)) or subject.startswith(WORKFLOW_SKIP_PREFIXES)
 
@@ -60,8 +71,14 @@ def main() -> None:
     args = parser.parse_args()
 
     message = resolve_build_version.run_git(["log", "-1", "--pretty=%B"], check=False)
-    if should_skip_ci(message):
-        print("CI version transition check skipped because the target commit does not trigger CI.")
+    if should_skip_ci(message, os.environ.get("GITHUB_EVENT_NAME", "push")):
+        # 说明文本必须走 stderr：`--format github` 时 stdout 被重定向进
+        # $GITHUB_OUTPUT，任何非 key=value 行都会让 file command 直接报
+        # "Invalid format" 并让 prepare 失败（2026-10-16 run 38886902444）。
+        print(
+            "CI version transition check skipped because the target commit does not trigger CI.",
+            file=sys.stderr,
+        )
         return
 
     base_version = resolve_build_version.read_current_cargo_version()

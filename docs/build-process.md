@@ -97,6 +97,8 @@ pwsh -NoProfile -ExecutionPolicy Bypass -File .\scripts\verify-test-flow.ps1
 
 ### 版本号规则
 
+版本号采用语义化版本 `主版本.次版本.修订号`（MAJOR.MINOR.PATCH）：缺陷修复递增修订号，新增功能或较大优化递增次版本，不兼容变更或核心架构重写递增主版本；纯文档、CI 与测试流变更不递增版本号。本项目自 `v2.0.0` 起使用独立版本线，与上游项目的版本号相互独立。次版本或修订号达到 99 时必须进位到更高一位（见下方 `versionCode` 布局）。
+
 `Cargo.toml` 中的 `[package].version` 是当前目标基础版本。提交前需要进入下一轮测试时，先手动修改 `Cargo.toml` 版本并提交；CI 不再自动把补丁号加 1。
 
 CI 和本地测试构建默认生成预发布版本：
@@ -111,15 +113,15 @@ CI 和本地测试构建默认生成预发布版本：
 
 本地脚本按同一规则解析：工作区干净时说明当前提交对应的构建已经产出，直接复用记录中的最高序号，`-SkipBuild` 复用现有产物也不会推进版本；存在未提交改动时才算作下一次构建，避免本地测试包与最后一次 CI 包版本号冲突。
 
-CI 版本名中的 `N` 不设上限，可以连续生成 `1.2.58-ci.100`、`1.2.58-ci.101` 等版本。Android `versionCode` 规则仍确保正式版可覆盖安装：正式版使用 `major * 1000000 + minor * 10000 + patch * 100`；`ci.1` 到 `ci.99` 使用 `baseCode - 100 + N`；`ci.100` 及以后固定使用 `baseCode - 1`。因此超过 99 后版本先后由完整的 SemVer 版本名判断，正式版 `versionCode` 始终高于同一基础版本的 CI 包。
+CI 版本名中的 `N` 不设上限，可以连续生成 `2.0.0-ci.100`、`2.0.0-ci.101` 等版本。Android `versionCode` 规则仍确保正式版可覆盖安装：正式版使用 `major * 1000000 + minor * 10000 + patch * 100`；`ci.1` 到 `ci.99` 使用 `baseCode - 100 + N`；`ci.100` 及以后固定使用 `baseCode - 1`。因此超过 99 后版本先后由完整的 SemVer 版本名判断，正式版 `versionCode` 始终高于同一基础版本的 CI 包。
 
-正式 Release 仍使用纯基础版本，例如 `1.2.57`，tag 必须是 `v1.2.57`。如需查看当前仓库会解析出的版本，可运行：
+正式 Release 仍使用纯基础版本，例如 `2.0.0`，tag 必须是 `v2.0.0`。如需查看当前仓库会解析出的版本，可运行：
 
 ```powershell
 py .github\scripts\resolve_build_version.py --include-dirty --format json
 ```
 
-从 CI 转正式版时保持同一目标基础版本：例如 `Cargo.toml` 为 `1.2.58` 时，CI 产出 `1.2.58-ci.N`，正式发布仍使用 `1.2.58` 和 tag `v1.2.58`，不额外增加补丁号。正式版发布完成后，如果继续触发普通 CI，才把 `Cargo.toml` 提升到下一个目标版本，例如改为 `1.2.59` 并从 `1.2.59-ci.1` 开始。`.github/scripts/validate_ci_transition.py` 会在 CI `prepare` 和本地公开同步前检查这一转换；跳过 CI 的提交不执行检查。
+从 CI 转正式版时保持同一目标基础版本：例如 `Cargo.toml` 为 `2.0.0` 时，CI 产出 `2.0.0-ci.N`，正式发布仍使用 `2.0.0` 和 tag `v2.0.0`，不额外增加补丁号。正式版发布完成后，如果继续触发普通 CI，才把 `Cargo.toml` 提升到下一个目标版本（按语义化版本判据递增对应位），例如改为 `2.0.1` 并从 `2.0.1-ci.1` 开始。`.github/scripts/validate_ci_transition.py` 会在 CI `prepare` 和本地公开同步前检查这一转换；跳过 CI 的提交不执行检查。
 
 ### 更新清单
 
@@ -151,12 +153,13 @@ CI 构建成功后会把测试版信息写入 `beta`；正式 Release 成功后�
   "schema": 1,
   "repository": "owner/repo",
   "stable": {
-    "version": "1.2.57",
-    "tag": "v1.2.57",
-    "title": "Storage Redirect X v1.2.57",
-    "url": "https://github.com/owner/repo/releases/tag/v1.2.57",
+    "version": "2.0.0",
+    "tag": "v2.0.0",
+    // quality-allow(chinese-language): Storage Redirect X 是产品名，示例保留真实发布标题格式。
+    "title": "Storage Redirect X v2.0.0",
+    "url": "https://github.com/owner/repo/releases/tag/v2.0.0",
     "prerelease": false,
-    "downloadUrl": "https://github.com/owner/repo/releases/download/v1.2.57/storage-redirect-x-manager-v1.2.57.apk"
+    "downloadUrl": "https://github.com/owner/repo/releases/download/v2.0.0/storage-redirect-x-manager-v2.0.0.apk"
   },
   "beta": null,
   "releases": []

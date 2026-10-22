@@ -222,13 +222,16 @@ function Exit-DeviceRunLock {
 function Write-DeviceConfig {
     param([string]$Json)
     $encoded = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($Json))
-    Invoke-Su "mkdir -p /data/adb/modules/storage.redirect.x/config/apps; printf '%s' '$encoded' | base64 -d > '$Config'; chmod 644 '$Config'" | Out-Null
+    # 原子落盘（与 .sh 的 adb_write_file 同步）：truncate-then-write 的写入窗口会让
+    # daemon 的 reload 撞上半截内容，应用被误判未配置后整个场景保持该状态（EROFS/ENOENT，
+    # 应用重启救不回）。tmp 名不带 .json 后缀，避免进入指纹的 app 配置枚举。
+    Invoke-Su "mkdir -p /data/adb/modules/storage.redirect.x/config/apps; printf '%s' '$encoded' | base64 -d > '$Config.tmp.$PID'; mv -f '$Config.tmp.$PID' '$Config'; chmod 644 '$Config'" | Out-Null
 }
 
 function Write-CrossAppReadOnlyConfig {
     $json = '{"users":{"0":{"enabled":true,"read_only_paths":["DCIM","Pictures"]}}}'
     $encoded = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($json))
-    Invoke-Su "printf '%s' '$encoded' | base64 -d > '$ReadOnlyOwnerConfig'; chmod 644 '$ReadOnlyOwnerConfig'" | Out-Null
+    Invoke-Su "printf '%s' '$encoded' | base64 -d > '$ReadOnlyOwnerConfig.tmp.$PID'; mv -f '$ReadOnlyOwnerConfig.tmp.$PID' '$ReadOnlyOwnerConfig'; chmod 644 '$ReadOnlyOwnerConfig'" | Out-Null
 }
 
 function Clear-CrossAppReadOnlyConfig {
@@ -238,7 +241,7 @@ function Clear-CrossAppReadOnlyConfig {
 function Write-GlobalConfig {
     param([string]$Json)
     $encoded = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($Json))
-    Invoke-Su "mkdir -p /data/adb/modules/storage.redirect.x/config; printf '%s' '$encoded' | base64 -d > '$GlobalConfig'; chmod 644 '$GlobalConfig'" | Out-Null
+    Invoke-Su "mkdir -p /data/adb/modules/storage.redirect.x/config; printf '%s' '$encoded' | base64 -d > '$GlobalConfig.tmp.$PID'; mv -f '$GlobalConfig.tmp.$PID' '$GlobalConfig'; chmod 644 '$GlobalConfig'" | Out-Null
 }
 
 function Get-TestGlobalConfig {
@@ -1014,6 +1017,28 @@ function Test-MediaProviderIsLazy {
     return -not [string]::IsNullOrEmpty($sdk) -and [int]$sdk -ge 37
 }
 
+# MediaProvider 就绪缓存：与 .sh 的 media_provider_ready_cached 对等。全量 URI
+# 探测 ~10s，系统代写监视场景（26/27）每个用例前重复探测成为最大耗时项。按
+# provider 进程 PID 缓存就绪结论，PID 变化自动失效；场景 32/33 的进程内热重载
+# 不换 PID，显式绕过缓存直连探测。
+$script:MediaProviderReadyCachePid = ""
+function Wait-MediaProviderReadyCached {
+    param([string]$Label, [int]$TimeoutSeconds = 120)
+    $scenario = Get-ScenarioFromLabel $Label
+    if ($scenario -in @(32, 33)) {
+        return (Wait-MediaProviderReady -Label $Label -TimeoutSeconds $TimeoutSeconds)
+    }
+    $currentPid = Get-MediaProviderPid
+    if (-not [string]::IsNullOrEmpty($currentPid) -and $currentPid -eq $script:MediaProviderReadyCachePid) {
+        return $true
+    }
+    if (Wait-MediaProviderReady -Label $Label -TimeoutSeconds $TimeoutSeconds) {
+        $script:MediaProviderReadyCachePid = $currentPid
+        return $true
+    }
+    return $false
+}
+
 function Wait-MediaProviderHookReady {
     param(
         [string]$Label,
@@ -1162,6 +1187,8 @@ function Clear-Targets {
     # 后端侧也要按通配扫一遍：下面的目录清单同样是手工维护的，漏项会让残留避开清理
     # （可见路径已被扫过，但后端那一份是独立的目录树）。两条路径都要动态枚举才能保证不漏。
     Invoke-Su "for d in '$BackendRoot/Download'/Srt* '$BackendRoot/Pictures'/Srt* '$BackendRoot/DCIM'/Srt* '$BackendRoot/Documents'/Srt* '$BackendRoot/Movies'/Srt* '$BackendRoot/Music'/Srt*; do [ -d `"`$d`" ] && rm -rf `"`$d`"; done 2>/dev/null || true" | Out-Null
+    # 仅映射模式属主漂移夹具（场景 6）：后端自有目录下的独立夹具，按精确路径清理。
+    Invoke-Su "rm -rf '$BackendRoot/Android/data/$AppId/files/SrtDrift' 2>/dev/null || true" | Out-Null
     Invoke-Su "rm -rf '$BackendRoot/Documents/SrtMediaRoutingProbe' '$BackendPrivateRoot/Documents/SrtMediaRoutingProbe'" | Out-Null
     Invoke-Su "rm -rf '$BackendRoot/Download/SrtProbe' '$BackendRoot/Download/SrtOther' '$BackendRoot/Download/SrtOtherMapped' '$BackendRoot/Download/SrtMapOnlyMapped' '$BackendRoot/Download/SrtReadOnly' '$BackendRoot/Download/SrtMapRO' '$BackendRoot/Download/SrtAllow' '$BackendRoot/Download/SrtLegacy' '$BackendRoot/Download/SrtQMark' '$BackendRoot/Download/SrtLongest' '$BackendRoot/Download/SrtLongestBase' '$BackendRoot/Download/SrtLongestDeep' '$BackendRoot/Download/SrtPriority' '$BackendRoot/Download/SrtPriorityMapped' '$BackendRoot/Pictures/SrtLocked' '$BackendPrivateRoot/Download/SrtProbe' '$BackendPrivateRoot/Download/SrtOther' '$BackendPrivateRoot/Download/SrtOtherMapped' '$BackendPrivateRoot/Download/SrtMapOnlyMapped' '$BackendPrivateRoot/Download/SrtReadOnly' '$BackendPrivateRoot/Download/SrtMapRO' '$BackendPrivateRoot/Download/SrtAllow' '$BackendPrivateRoot/Download/SrtLegacy' '$BackendPrivateRoot/Download/SrtQMark' '$BackendPrivateRoot/Download/SrtLongest' '$BackendPrivateRoot/Download/SrtLongestBase' '$BackendPrivateRoot/Download/SrtLongestDeep' '$BackendPrivateRoot/Download/SrtPriority' '$BackendPrivateRoot/Download/SrtPriorityMapped' '$BackendPrivateRoot/Pictures/SrtLocked'; rm -f '$BackendRoot/Download/$AllowPartFile' '$BackendPrivateRoot/Download/$AllowPartFile' '$BackendRoot/Download/$QMarkSingleFile' '$BackendPrivateRoot/Download/$QMarkSingleFile' '$BackendRoot/Download/$QMarkDoubleFile' '$BackendPrivateRoot/Download/$QMarkDoubleFile' '$BackendRoot/Download/Test/$TestFile' '$BackendPrivateRoot/Download/Test/$TestFile' '$BackendRoot/Download/Test/$HotBeforeFile' '$BackendRoot/Download/Test/$HotAfterFile' '$BackendPrivateRoot/Download/Test/$HotBeforeFile' '$BackendPrivateRoot/Download/Test/$HotAfterFile' '$BackendRoot/.xldownload/$TestFile' '$BackendRoot/.xlDownload/$TestFile' '$BackendPrivateRoot/.xldownload/$TestFile' '$BackendPrivateRoot/.xlDownload/$TestFile'" | Out-Null
     Invoke-Su "mkdir -p '$BackendRoot/Download/SrtProbe' '$BackendRoot/Download/Test' '$BackendRoot/Download/SrtMapOnlyMapped' '$BackendRoot/Download/SrtReadOnly' '$BackendRoot/Download/SrtMapRO' '$BackendRoot/Download/SrtAllow/tmp' '$BackendRoot/Download/SrtLegacy/tmp' '$BackendRoot/Download/SrtQMark/Keep1' '$BackendRoot/Download/SrtQMark/Keep12' '$BackendRoot/Download/SrtLongest/Deep' '$BackendRoot/Download/SrtLongestBase' '$BackendRoot/Download/SrtLongestDeep' '$BackendRoot/Download/SrtPriority' '$BackendRoot/Download/SrtPriorityMapped' '$BackendRoot/Pictures/SrtLocked' '$BackendRoot/.xldownload' '$BackendRoot/.xlDownload' '$BackendPrivateRoot/Download/SrtProbe' '$BackendPrivateRoot/Download/Test' '$BackendPrivateRoot/Download/SrtMapOnlyMapped' '$BackendPrivateRoot/Download/SrtReadOnly' '$BackendPrivateRoot/Download/SrtMapRO' '$BackendPrivateRoot/Download/SrtAllow/tmp' '$BackendPrivateRoot/Download/SrtLegacy/tmp' '$BackendPrivateRoot/Download/SrtQMark/Keep1' '$BackendPrivateRoot/Download/SrtQMark/Keep12' '$BackendPrivateRoot/Download/SrtLongest/Deep' '$BackendPrivateRoot/Download/SrtLongestBase' '$BackendPrivateRoot/Download/SrtLongestDeep' '$BackendPrivateRoot/Download/SrtPriority' '$BackendPrivateRoot/Download/SrtPriorityMapped' '$BackendPrivateRoot/Pictures/SrtLocked' '$BackendPrivateRoot/.xldownload' '$BackendPrivateRoot/.xlDownload'; chmod -R 777 '$BackendRoot/Download/SrtProbe' '$BackendRoot/Download/Test' '$BackendRoot/Download/SrtMapOnlyMapped' '$BackendRoot/Download/SrtReadOnly' '$BackendRoot/Download/SrtMapRO' '$BackendRoot/Download/SrtAllow' '$BackendRoot/Download/SrtLegacy' '$BackendRoot/Download/SrtQMark' '$BackendRoot/Download/SrtLongest' '$BackendRoot/Download/SrtLongestBase' '$BackendRoot/Download/SrtLongestDeep' '$BackendRoot/Download/SrtPriority' '$BackendRoot/Download/SrtPriorityMapped' '$BackendRoot/Pictures/SrtLocked' '$BackendPrivateRoot/Download/SrtProbe' '$BackendPrivateRoot/Download/Test' '$BackendPrivateRoot/Download/SrtMapOnlyMapped' '$BackendPrivateRoot/Download/SrtReadOnly' '$BackendPrivateRoot/Download/SrtMapRO' '$BackendPrivateRoot/Download/SrtAllow' '$BackendPrivateRoot/Download/SrtLegacy' '$BackendPrivateRoot/Download/SrtQMark' '$BackendPrivateRoot/Download/SrtLongest' '$BackendPrivateRoot/Download/SrtLongestBase' '$BackendPrivateRoot/Download/SrtLongestDeep' '$BackendPrivateRoot/Download/SrtPriority' '$BackendPrivateRoot/Download/SrtPriorityMapped' '$BackendPrivateRoot/Pictures/SrtLocked' 2>/dev/null || true; chmod 777 '$BackendRoot/.xldownload' '$BackendRoot/.xlDownload' '$BackendPrivateRoot/.xldownload' '$BackendPrivateRoot/.xlDownload' 2>/dev/null || true" | Out-Null
@@ -1210,6 +1237,8 @@ function Remove-TestTargetArtifacts {
     # 后端侧也要按通配扫一遍：下面的目录清单同样是手工维护的，漏项会让残留避开清理
     # （可见路径已被扫过，但后端那一份是独立的目录树）。两条路径都要动态枚举才能保证不漏。
     Invoke-Su "for d in '$BackendRoot/Download'/Srt* '$BackendRoot/Pictures'/Srt* '$BackendRoot/DCIM'/Srt* '$BackendRoot/Documents'/Srt* '$BackendRoot/Movies'/Srt* '$BackendRoot/Music'/Srt*; do [ -d `"`$d`" ] && rm -rf `"`$d`"; done 2>/dev/null || true" | Out-Null
+    # 仅映射模式属主漂移夹具（场景 6）：后端自有目录下的独立夹具，按精确路径清理。
+    Invoke-Su "rm -rf '$BackendRoot/Android/data/$AppId/files/SrtDrift' 2>/dev/null || true" | Out-Null
     Invoke-Su "rm -rf '$BackendRoot/Documents/SrtMediaRoutingProbe' '$BackendPrivateRoot/Documents/SrtMediaRoutingProbe'" | Out-Null
     Invoke-Su "rm -rf '$BackendRoot/Download/SrtProbe' '$BackendRoot/Download/SrtOther' '$BackendRoot/Download/SrtOtherMapped' '$BackendRoot/Download/SrtMapOnlyMapped' '$BackendRoot/Download/SrtReadOnly' '$BackendRoot/Download/SrtMapRO' '$BackendRoot/Download/SrtAllow' '$BackendRoot/Download/SrtLegacy' '$BackendRoot/Download/SrtQMark' '$BackendRoot/Download/SrtLongest' '$BackendRoot/Download/SrtLongestBase' '$BackendRoot/Download/SrtLongestDeep' '$BackendRoot/Download/SrtPriority' '$BackendRoot/Download/SrtPriorityMapped' '$BackendRoot/Download/Test' '$BackendRoot/.xldownload' '$BackendRoot/.xlDownload' '$BackendRoot/Pictures/SrtLocked' '$BackendPrivateRoot/Download/SrtProbe' '$BackendPrivateRoot/Download/SrtOther' '$BackendPrivateRoot/Download/SrtOtherMapped' '$BackendPrivateRoot/Download/SrtMapOnlyMapped' '$BackendPrivateRoot/Download/SrtReadOnly' '$BackendPrivateRoot/Download/SrtMapRO' '$BackendPrivateRoot/Download/SrtAllow' '$BackendPrivateRoot/Download/SrtLegacy' '$BackendPrivateRoot/Download/SrtQMark' '$BackendPrivateRoot/Download/SrtLongest' '$BackendPrivateRoot/Download/SrtLongestBase' '$BackendPrivateRoot/Download/SrtLongestDeep' '$BackendPrivateRoot/Download/SrtPriority' '$BackendPrivateRoot/Download/SrtPriorityMapped' '$BackendPrivateRoot/Download/Test' '$BackendPrivateRoot/.xldownload' '$BackendPrivateRoot/.xlDownload' '$BackendPrivateRoot/Pictures/SrtLocked'; rm -f '$BackendRoot/Download/$AllowPartFile' '$BackendPrivateRoot/Download/$AllowPartFile' '$BackendRoot/Download/$QMarkSingleFile' '$BackendPrivateRoot/Download/$QMarkSingleFile' '$BackendRoot/Download/$QMarkDoubleFile' '$BackendPrivateRoot/Download/$QMarkDoubleFile'" | Out-Null
     Invoke-Su "rm -f '$BackendRoot/Download/$QMarkFileSingleFile' '$BackendPrivateRoot/Download/$QMarkFileSingleFile'" | Out-Null
@@ -1987,7 +2016,7 @@ function Get-ScenarioTitle {
         3 { "path mapping to Download/Test" }
         4 { "mapping priority over allow Download" }
         5 { "allow Download keeps real path" }
-        6 { "mapping_mode_only unmatched stays real" }
+        6 { "mapping_mode_only unmatched stays real and drifted own dir stays inert" }
         7 { "mapping_mode_only mapped path maps" }
         8 { "FUSE mapping_mode_only sandbox hit with unmatched sibling kept real" }
         9 { "read_only_paths deny writes" }
@@ -2147,7 +2176,7 @@ function Invoke-MediaStoreDownloadCreateCase {
     $lastResult = $null
     for ($attempt = 1; $attempt -le 3; $attempt++) {
         if (-not (Wait-Storage "scenario-$Scenario-$Label-mediastore-storage")) { return $false }
-        if (-not (Wait-MediaProviderReady "scenario-$Scenario-$Label-mediastore-provider")) { return $false }
+        if (-not (Wait-MediaProviderReadyCached "scenario-$Scenario-$Label-mediastore-provider")) { return $false }
         $lastResult = Invoke-ServiceCase "scenario-$Scenario" $Label "mediastore_create_download" $extras "^PASS \[mediastore_create_download\]"
         if ($lastResult.Ok) { return $lastResult }
         if ($attempt -lt 3) {
@@ -2170,7 +2199,7 @@ function Invoke-MediaStoreImageRelativeDataCreateCase {
     $lastResult = $null
     for ($attempt = 1; $attempt -le 3; $attempt++) {
         if (-not (Wait-Storage "scenario-$Scenario-$Label-mediastore-relative-storage")) { return $false }
-        if (-not (Wait-MediaProviderReady "scenario-$Scenario-$Label-mediastore-relative-provider")) { return $false }
+        if (-not (Wait-MediaProviderReadyCached "scenario-$Scenario-$Label-mediastore-relative-provider")) { return $false }
         $lastResult = Invoke-ServiceCase "scenario-$Scenario" $Label "mediastore_create_image_relative_data" @{ file_name = $FileName; relative_path = $RelativeDataDir } "^PASS \[mediastore_create_image_relative_data\]"
         if ($lastResult.Ok) { return $lastResult }
         if ($attempt -lt 3) {
@@ -2289,6 +2318,46 @@ function Invoke-StandardScenario {
     if ($Scenario -eq 5) {
         $ok = (Test-PublicDirectoryOwner "scenario-$Scenario" "download-owner" "$BackendRoot/Download") -and $ok
     }
+    if ($Scenario -eq 6) { $ok = (Invoke-OwnerDriftOwnDirScenario $Scenario) -and $ok }
+    $ok
+}
+
+# 仅映射模式自有目录属主漂移契约（2026-10-21 起契约反转）：
+# 历史背景是真机 2026-10-17 用户反馈——MediaProvider 代写把应用自有
+# Android/data/<pkg> 子树属主写成 media_rw，原生 FUSE 对属主非本应用的私有
+# 目录只给 others 位，应用访问全部 EACCES。当时的守卫是「浅层属主修复链」，
+# 该链已随 2026-10-20「属主修复体系全面拆除」决定移除；存量漂移改由一次性
+# 迁移（owner-migration-1023）在模块升级重启时修复，运行期不再改写属主。
+# 本场景在应用启动前注入
+# 1023 属主损伤，断言 2026-10-21 起的新契约：旧「浅层属主修复链」已随拆除决定
+# 移除，存量漂移由一次性迁移（owner-migration-1023）在模块升级重启时修复，运行
+# 期守护与应用都不改写私有树属主——应用对漂移目录的读写被原生 DAC 拒绝（各
+# Android 腿一致），后端属主保持 1023；修复链一旦回潮场景当场报错。
+function Set-OwnerDriftFixture {
+    param([string]$Label)
+    $driftBackend = "$BackendRoot/Android/data/$AppId/files/SrtDrift"
+    if (-not (Test-Su "rm -rf '$driftBackend'; mkdir -p '$driftBackend' && printf 'srt-drift-payload' > '$driftBackend/srt_drift_existing.txt' && chown -R 1023:1023 '$driftBackend' && chmod 2771 '$driftBackend' && chmod 660 '$driftBackend/srt_drift_existing.txt' && [ `$(stat -c %u '$driftBackend/srt_drift_existing.txt') -eq 1023 ]")) {
+        throw "owner_drift_fixture_failed label=$Label path=$driftBackend"
+    }
+}
+
+function Invoke-OwnerDriftOwnDirScenario {
+    param([int]$Scenario)
+    $driftVisible = "$RealRoot/Android/data/$AppId/files/SrtDrift"
+    $driftBackend = "$BackendRoot/Android/data/$AppId/files/SrtDrift"
+    $ok = $true
+    # 漂移目录的读与新建写入都必须被原生 DAC 拒绝：任何 PASS 都说明有链路在
+    # 改写属主或绕过 DAC 放行。
+    $ok = (Invoke-ServiceCase "scenario-$Scenario" "own-drift-read-denied" "file_read" @{ file_path = "$driftVisible/srt_drift_existing.txt" } "^FAIL \[file_read\]").Ok -and $ok
+    $ok = (Invoke-ServiceCase "scenario-$Scenario" "own-drift-write-denied" "file_write" @{ file_path = "$driftVisible/srt_drift_probe.txt"; payload = $Payload; expected_payload = $Payload } "^FAIL \[file_write\]").Ok -and $ok
+    # 后端属主必须保持注入的 1023：守护与应用都不得改写私有树属主（拆除契约）。
+    $ownerIntact = Test-Su "[ \$(stat -c %u '$driftBackend/srt_drift_existing.txt') -eq 1023 ]"
+    if (-not $ownerIntact) {
+        $script:Failures.Add("scenario-$Scenario/owner-drift-repaired-unexpectedly") | Out-Null
+        Write-Host "  - scenario-$Scenario/owner-drift-repaired-unexpectedly backend=$driftBackend"
+        return $false
+    }
+    Write-Host "  - scenario-$Scenario/owner-drift-inert"
     $ok
 }
 
@@ -2881,6 +2950,7 @@ function Invoke-Scenario {
     Apply-ScenarioConfig $Scenario
     Clear-Targets
     if ($Scenario -eq 9) { Set-ReadOnlySeed }
+    if ($Scenario -eq 6) { Set-OwnerDriftFixture "scenario-$Scenario" }
     if ($Scenario -eq 10) { Set-MappedReadOnlyTargets }
     if ($Scenario -eq 21) { Set-MountNamespaceReadOnlySeed }
     if ($Scenario -in @(28, 31)) { Set-ReadOnlyMediaImage }

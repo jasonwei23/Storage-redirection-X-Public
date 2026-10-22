@@ -41,6 +41,44 @@ pub fn sort_path_mappings_longest_request_first_case_insensitive(mappings: &mut 
     });
 }
 
+/// 判定映射表里是否存在「存储视图根之外」的一侧。
+///
+/// request 或 target 解析后落在私有 fs（如 `/data/user/0/<pkg>/files`、
+/// `/data/data/<pkg>/code_cache`）的映射，只能靠应用命名空间 bind 挂载实现；
+/// 共享宿主策略层只覆盖存储视图内的路径。宿主预接入（preattach）成功会短路
+/// 整个 planner，这类映射会被整体丢弃，因此命中时调用方必须放弃 preattach、
+/// 回落 planner 流程（planner 内部仍会优先宿主接入）。
+pub fn mappings_need_namespace_mount(
+    uid: i32,
+    app_data_dir: &str,
+    redirect_target: &str,
+    path_mappings: &[PathMapping],
+) -> bool {
+    if path_mappings.is_empty() {
+        return false;
+    }
+    let user_id = crate::platform::user_id_from_uid(uid);
+    let storage_root = paths::storage_user_root_for_user(user_id);
+    path_mappings.iter().any(|mapping| {
+        [&mapping.request_path, &mapping.final_path]
+            .iter()
+            .any(|raw| {
+                let resolved = paths::resolve_user_path(
+                    &paths::resolve_placeholders(
+                        &paths::normalize(raw),
+                        app_data_dir,
+                        redirect_target,
+                    ),
+                    user_id,
+                );
+                !resolved.is_empty()
+                    && !paths::has_unsafe_segments(&resolved)
+                    && paths::is_absolute(&resolved)
+                    && !paths::is_same_or_child(&resolved, &storage_root)
+            })
+    })
+}
+
 pub fn sort_path_mappings_shortest_request_first(mappings: &mut [PathMapping]) {
     mappings.sort_by(|a, b| {
         if a.request_path.len() != b.request_path.len() {

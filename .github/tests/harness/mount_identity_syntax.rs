@@ -11,7 +11,7 @@
 //   内部的 umount 链路 / log / last_errno）用最小桩顶替。
 //
 // 被测修复点（来自主代理对 src 的修改）：
-//   1. live_mounts_at / capture_mount_identity / classify_mount 改用 normalize_syntax（保留存储别名、
+//   1. live_mounts_at / capture_explicit_mount_identity / classify_mount 改用 normalize_syntax（保留存储别名、
 //      大小写敏感），不再把 /data/media 折叠成 /storage/emulated；
 //   2. encode 写 schema=2，decode 拒绝旧 schema；
 //   3. clear_previous_mounts 改为按"已降序的目标列表"正向遍历（不再 .rev()）。
@@ -30,6 +30,8 @@ mod platform {
         // 数据类型的副本（非匹配实现）：字段与 src/platform/mountinfo.rs 一致。
         pub struct MountInfoEntry<'a> {
             pub mount_id: u64,
+            pub parent_mount_id: u64,
+            pub dev: &'a str,
             pub root: &'a str,
             pub target: &'a str,
             pub fs_type: &'a str,
@@ -41,6 +43,14 @@ mod platform {
 
     pub mod paths {
         // __INJECT_PATHS__
+
+        pub fn storage_alias_roots_for_user(_user_id: i32) -> Vec<String> {
+            vec!["/storage/emulated/0".to_string()]
+        }
+    }
+
+    pub fn user_id_from_uid(uid: i32) -> i32 {
+        if uid >= 0 { uid / 100000 } else { 0 }
     }
 
     pub mod module_paths {
@@ -123,6 +133,7 @@ pub struct NamespaceIdentity {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct LiveMount {
     pub mount_id: u64,
+    pub parent_mount_id: u64,
     pub source: String,
     pub fs_type: String,
     pub root: String,
@@ -198,7 +209,9 @@ pub struct MountRequest {
     pub operation: MountOperation,
     pub package_name: String,
     pub pid: i32,
+    pub uid: i32,
     pub redirect_target: String,
+    pub path_mappings: Vec<String>,
 }
 
 pub struct MountForkPlan {
@@ -281,6 +294,7 @@ fn set_mountinfo(s: &str) {
 fn mk_live(mount_id: u64, source: &str, root: &str) -> LiveMount {
     LiveMount {
         mount_id,
+        parent_mount_id: 0,
         source: source.to_string(),
         fs_type: "fuse.srx".to_string(),
         root: root.to_string(),
@@ -367,7 +381,7 @@ fn main() {
     set_mountinfo(
         "300 99 0:1 /Download/SrtProbe /data/media/0/Download/SrtProbe - fuse.srx srx_fuse_probe\n",
     );
-    match capture_mount_identity(0, "/data/media/0/Download/SrtProbe", "pkg") {
+    match capture_explicit_mount_identity(0, "/data/media/0/Download/SrtProbe") {
         Some(identity) if identity.mount_point == "/data/media/0/Download/SrtProbe"
             && identity.mount_id == 300 =>
         {
@@ -384,7 +398,7 @@ fn main() {
     set_mountinfo(
         "301 99 0:1 /Download/SrtProbe /storage/emulated/0/Download/SrtProbe - fuse.srx srx_fuse_probe\n",
     );
-    match capture_mount_identity(0, "/storage/emulated/0/Download/SrtProbe", "pkg") {
+    match capture_explicit_mount_identity(0, "/storage/emulated/0/Download/SrtProbe") {
         Some(identity) if identity.mount_point == "/storage/emulated/0/Download/SrtProbe" => {
             println!(
                 "PASS capture_preserves_storage_alias: 落盘 mount_point={}",
@@ -504,7 +518,9 @@ fn main() {
         operation: MountOperation::Reload,
         package_name: "pkg".to_string(),
         pid: 1,
+        uid: 10000,
         redirect_target: String::new(),
+        path_mappings: Vec::new(),
     };
     let plan = MountForkPlan {
         state_path: "/x".to_string(),

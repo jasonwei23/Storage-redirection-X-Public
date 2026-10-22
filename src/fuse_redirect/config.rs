@@ -155,6 +155,14 @@ pub struct FuseRedirectConfig {
     /// 宿主会话把整个存储根以真实后端暴露出来，供各应用 namespace 复用同一份 FUSE 会话；
     /// 它不做任何重定向，`redirect_target` 因此就是存储根本身。普通应用配置恒为 `false`。
     pub is_passthrough_host: bool,
+    /// 只登记 mount namespace 维度的策略，不写按 uid 的全局表。
+    ///
+    /// 供 daemon 自身（uid=0）使用：文件监视等 root FUSE 请求按调用方 namespace 精确回查
+    /// 策略，而 uid=0 绝不允许进按 uid 表（否则任何 root 进程都会拿到这份策略，破坏
+    /// 「未登记 uid 一律 deny_all」的 fail-closed 边界）。序列化时恒缺席，普通应用配置
+    /// 与策略指纹不受影响。
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub namespace_policy_only: bool,
 }
 
 impl FuseRedirectConfig {
@@ -210,14 +218,27 @@ pub fn fuse_config_from_request<R: MountRequestFields + ?Sized>(
         is_mapping_mode_only: request.is_mapping_mode_only(),
         is_monitor_only: request.is_monitor_only(),
         is_passthrough_host: false,
+        namespace_policy_only: false,
     }
 }
 
 /// 计算单个 UID 策略的稳定指纹，供 daemon 与 companion 校验宿主策略新鲜度。
 pub fn request_policy_fingerprint<R: MountRequestFields + ?Sized>(request: &R) -> u64 {
+    let mut config = fuse_config_from_request(request, None, None);
+    config.app_pid = 0;
+    config.app_start_time_ticks = None;
+    fuse_config_policy_fingerprint(&config)
+}
+
+/// 对一份已归一的宿主策略配置计算内容指纹（与 [`request_policy_fingerprint`] 同一哈希核）。
+///
+/// 宿主侧用它给 [`RedirectPolicy`](super::policy::RedirectPolicy) 标注「本策略由哪份配置
+/// 构建」，在只读拒绝/ENOENT 等异常回包处打出该指纹，即可直接判定「当时生效的是旧策略
+/// 还是新策略」，不必再从指纹去重链路反推。
+pub fn fuse_config_policy_fingerprint(config: &FuseRedirectConfig) -> u64 {
     use std::hash::{Hash, Hasher};
 
-    let mut config = fuse_config_from_request(request, None, None);
+    let mut config = config.clone();
     config.app_pid = 0;
     config.app_start_time_ticks = None;
     if config.is_monitor_only {
@@ -427,22 +448,28 @@ pub fn scoped_mount_allowed_for_scope(scope: &str, mode: StorageBackendMode) -> 
     };
     // 诊断：视图根上是否会有 scoped FUSE 层完全取决于这里的结论。Android 13 场景 29 的映射
     // 只落地后端别名，而通过的 Android 14 在视图根上多一层 FUSE（0:88 vs 254:40）。
+    // 该判定在每个挂载请求路径上都会执行（应用启动风暴期可达每秒数十次），正常放行
+    // （verdict=true 且无预算/失败信号）不产生任何新信息，全量打印会形成日志风暴并放大
+    // CPU 占用；只在否定或带失败信号时打印，保留排障所需的全部异常证据。
     let snapshot = load_fuse_capability_snapshot();
-    let capability_text = match snapshot.capability {
-        FuseCapability::Unknown => "unknown",
-        FuseCapability::Available => "available",
-        FuseCapability::Unavailable => "unavailable",
-    };
-    log::warn!(
-        "scoped gate diag scope={} mode={} verdict={} capability={} present={} budget_exhausted={} scope_failures={}",
-        scope,
-        mode.as_str(),
-        verdict,
-        capability_text,
-        snapshot.present,
-        snapshot.scope_budget_exhausted(scope),
-        snapshot.scope_failures_for(scope)
-    );
+    let budget_exhausted = snapshot.scope_budget_exhausted(scope);
+    if !verdict || budget_exhausted {
+        let capability_text = match snapshot.capability {
+            FuseCapability::Unknown => "unknown",
+            FuseCapability::Available => "available",
+            FuseCapability::Unavailable => "unavailable",
+        };
+        log::warn!(
+            "scoped gate diag scope={} mode={} verdict={} capability={} present={} budget_exhausted={} scope_failures={}",
+            scope,
+            mode.as_str(),
+            verdict,
+            capability_text,
+            snapshot.present,
+            budget_exhausted,
+            snapshot.scope_failures_for(scope)
+        );
+    }
     verdict
 }
 
@@ -728,6 +755,126 @@ fn fuse_first_capability_available() -> bool {
     true
 }
 
+/// 探测大核 CPU 集合（cpuinfo_max_freq 等于全机最高频率的 CPU）。
+///
+/// MTK/高通大小核架构上，FUSE 事件循环线程被调度到 LITTLE 核时吞吐损失可达
+/// 1.5 倍以上（真机 2026-10-15：fuser-0/3/6 挤在同一个 2.2GHz 小核上）。探测失败
+/// 或单核设备返回 None，调用方保持默认亲和性。
+fn big_core_cpu_mask() -> Option<u64> {
+    let mut max_freq: u64 = 0;
+    let mut freqs: Vec<(u32, u64)> = Vec::new();
+    for cpu in 0..32u32 {
+        let path = format!("/sys/devices/system/cpu/cpu{cpu}/cpufreq/cpuinfo_max_freq");
+        let Ok(text) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+        let Ok(freq) = text.trim().parse::<u64>() else {
+            continue;
+        };
+        max_freq = max_freq.max(freq);
+        freqs.push((cpu, freq));
+    }
+    if freqs.is_empty() || max_freq == 0 {
+        return None;
+    }
+    let mut mask: u64 = 0;
+    for (cpu, freq) in &freqs {
+        if *freq == max_freq {
+            mask |= 1 << cpu;
+        }
+    }
+    (mask != 0).then_some(mask)
+}
+
+/// 把当前线程（及其后续派生的会话线程）绑定到大核。
+///
+/// spawn_mount2 派生的事件循环线程继承调用线程的亲和性掩码，因此在 mount 前设置
+/// 一次即可覆盖全部会话线程。绑定失败（mask 越界、权限）静默跳过。
+/// 挂载成功后放宽本 FUSE 连接的回写脏页配额。
+///
+/// 内核 fuse 默认把每个连接 BDI 的 `max_ratio` 限为 1：应用对挂载点的脏页被
+/// balance_dirty_pages 严厉限流，回写流水线长期缺请求（实测 daemon 侧 recv
+/// 平均阻塞 2.4ms 等内核提交下一个请求），大块顺序写吞吐被腰斩。MediaProvider
+/// 的系统 FUSE 由 AOSP 把该值调到 40，这就是两者持续写差距的主因。真机
+/// 2026-10-15：max_ratio 1→40 后 1M 持续写 461→1002MB/s、4K 写 559→934MB/s。
+/// 每个新连接默认回落为 1，因此必须在每次挂载成功后设置；失败只降级不影响功能。
+fn set_bdi_max_ratio(mount_point: &str, session_source: &str) {
+    const TARGET_RATIO: &str = "40";
+    let device = bdi_device_for_mount(mount_point, session_source);
+    let Some(device) = device else {
+        log::debug!("fuse session bdi device not found mp={mount_point} source={session_source}");
+        return;
+    };
+    let sysfs = format!("/sys/class/bdi/{device}/max_ratio");
+    if let Err(error) = std::fs::write(&sysfs, TARGET_RATIO) {
+        log::debug!("fuse session bdi max_ratio write failed path={sysfs} err={error}");
+    } else {
+        log::info!("fuse session bdi max_ratio set dev={device} ratio={TARGET_RATIO}");
+    }
+}
+
+/// 解析本会话挂载对应的 BDI 设备号（形如 0:142）。
+///
+/// 优先 `stat` 挂载点取 `st_dev`；但宿主会话存在孤儿挂载形态（mountinfo 里有记录、
+/// 底层挂载点目录已被清理，路径查找 ENOENT），此时回退为按挂载源匹配 `/proc/self/
+/// mountinfo`——源串含本进程 pid（`srx_fuse_host[<pid>]` / scoped 形式），唯一可归属。
+fn bdi_device_for_mount(mount_point: &str, session_source: &str) -> Option<String> {
+    if let Ok(c_path) = CString::new(mount_point) {
+        // SAFETY: c_path 为合法 NUL 结尾字符串，stat 写入 MaybeUninit 结构体。
+        let mut stat_buf = std::mem::MaybeUninit::<libc::stat>::uninit();
+        // SAFETY: 同上，参数均指向合法内存。
+        if unsafe { libc::stat(c_path.as_ptr(), stat_buf.as_mut_ptr()) } == 0 {
+            // SAFETY: stat 成功后结构体已初始化。
+            let stat = unsafe { stat_buf.assume_init() };
+            return Some(format!(
+                "{}:{}",
+                libc::major(stat.st_dev),
+                libc::minor(stat.st_dev)
+            ));
+        }
+    }
+    let content = std::fs::read_to_string("/proc/self/mountinfo").ok()?;
+    content.lines().find_map(|line| {
+        let separator = line.find(" - ")?;
+        let mut before = line[..separator].split_whitespace();
+        before.next()?;
+        before.next()?;
+        let dev = before.next()?;
+        let mut after = line[separator + 3..].split_whitespace();
+        let fs_type = after.next()?;
+        let source = after.next()?;
+        if fs_type == "fuse" && source == session_source {
+            Some(dev.to_string())
+        } else {
+            None
+        }
+    })
+}
+
+fn pin_current_thread_to_big_cores() {
+    let Some(mask) = big_core_cpu_mask() else {
+        log::warn!("fuse session big core detect failed — pin skipped");
+        return;
+    };
+    // SAFETY: cpu_set_t 为纯 POD 位图结构，全零初始化是合法的空 CPU 集合。
+    let mut set: libc::cpu_set_t = unsafe { std::mem::zeroed() };
+    for bit in 0..64u32 {
+        if mask & (1 << bit) != 0 {
+            // SAFETY: bit < 64 < CPU_SETSIZE，set 已零初始化，CPU_SET 写入范围内。
+            unsafe { libc::CPU_SET(bit as usize, &mut set) };
+        }
+    }
+    // SAFETY: set 为完整初始化的 cpu_set_t，size 与类型匹配。
+    let result =
+        unsafe { libc::sched_setaffinity(0, std::mem::size_of::<libc::cpu_set_t>(), &set) };
+    if result != 0 {
+        // 绑定失败只降级为默认调度（部分机型热管控会动态重置核掩码，属正常现象）。
+        log::warn!("fuse session big core pin failed mask={mask:#x}");
+    } else {
+        log::debug!("fuse session big core pin mask={mask:#x}");
+    }
+}
+
 pub fn mount_blocking_with_ready(
     config: FuseRedirectConfig,
     ready_sock: Option<libc::c_int>,
@@ -771,6 +918,8 @@ pub fn mount_blocking_with_ready(
             return false;
         }
     };
+    // 事件循环线程继承调用线程亲和性：先绑大核再挂载，避免 fuser 线程被调度到 LITTLE 核。
+    pin_current_thread_to_big_cores();
     let mut mount_options = fuser::Config::default();
     mount_options.mount_options = vec![
         MountOption::FSName(session_mount_source.clone()),
@@ -782,7 +931,7 @@ pub fn mount_blocking_with_ready(
         MountOption::Async,
     ];
     mount_options.acl = SessionACL::All;
-    mount_options.n_threads = Some(4);
+    mount_options.n_threads = Some(8);
     mount_options.clone_fd = true;
 
     // 挂载点日志描述的是会话绑定策略，与调用方 uid 无关，因此固定取注册表的会话项。
@@ -841,6 +990,8 @@ pub fn mount_blocking_with_ready(
         session_mount_identity.mount_id,
         session_mount_identity.source
     );
+    // 本连接的 BDI 脏页配额默认被内核限为 1%，回写流水线会饿死；挂载稳定后放宽。
+    set_bdi_max_ratio(&mount_point, &session_mount_identity.source);
     send_ready_result(ready_sock, 0);
 
     loop {
@@ -941,6 +1092,8 @@ pub fn mount_host_fuse(
     // 交出 `fs` 之前取出按 uid 策略表句柄：宿主会话运行期靠它接收应用策略。
     let policy_table = fs.policy_table();
     crate::fuse_host::host_stage("policy_ok");
+    // 与 scoped 会话同口径：宿主事件循环线程同样继承大核亲和性。
+    pin_current_thread_to_big_cores();
     let mut mount_options = fuser::Config::default();
     mount_options.mount_options = vec![
         MountOption::FSName(session_mount_source.clone()),
@@ -952,7 +1105,7 @@ pub fn mount_host_fuse(
         MountOption::Async,
     ];
     mount_options.acl = SessionACL::All;
-    mount_options.n_threads = Some(4);
+    mount_options.n_threads = Some(8);
     mount_options.clone_fd = true;
 
     let background = match fuser::spawn_mount2(fs, host_mount_point, &mount_options) {
@@ -987,6 +1140,8 @@ pub fn mount_host_fuse(
         return false;
     };
     crate::fuse_host::host_stage("stable_ok");
+    // 与 scoped 会话同口径：宿主连接的 BDI 脏页配额同样默认被限为 1%。
+    set_bdi_max_ratio(host_mount_point, &identity.source);
 
     // 宿主挂载点必须显式设为 shared propagation：`MS_REC|MS_PRIVATE` 只切断向外传播，
     // 不会让子 namespace 得见该挂载；缺了 shared，应用侧的 MS_BIND 会静默失败。参考
@@ -1225,8 +1380,11 @@ pub fn is_host_mount_source(source: &str) -> bool {
 }
 
 /// `/proc/self/mountinfo` 中一条挂载记录里用于判定挂载归属的字段。
+#[derive(Clone)]
 struct MountEntry {
     mount_id: u64,
+    /// 父挂载 ID：同挂载点叠放时即下面一层的挂载 ID，用于栈顶判定。
+    parent_mount_id: u64,
     fs_type: String,
     source: String,
 }
@@ -1291,7 +1449,7 @@ fn wait_for_stable_session_mount(mount_point: &str, source: &str) -> Option<Scop
 /// 读取当前挂载表中指定挂载点上的全部记录。
 ///
 /// 同一路径可能叠着多层挂载（daemon 重挂载期间旧会话与新会话并存），因此返回列表，由
-/// [`topmost_mount_entry`] 按挂载 ID 选出最顶层的一条。
+/// [`topmost_mount_entry`] 选出最顶层的一条。
 fn mount_entries_at(mount_point: &str) -> Vec<MountEntry> {
     let Ok(content) = std::fs::read_to_string("/proc/self/mountinfo") else {
         return Vec::new();
@@ -1309,6 +1467,7 @@ fn mount_entries_at(mount_point: &str) -> Vec<MountEntry> {
             }
             Some(MountEntry {
                 mount_id: entry.mount_id,
+                parent_mount_id: entry.parent_mount_id,
                 fs_type: entry.fs_type.to_string(),
                 source: mountinfo::unescape_field(entry.source),
             })
@@ -1316,11 +1475,21 @@ fn mount_entries_at(mount_point: &str) -> Vec<MountEntry> {
         .collect()
 }
 
-/// 返回挂载点上最顶层的挂载记录（挂载 ID 最大的一条）。
+/// 返回挂载点上最顶层的挂载记录（按父挂载链判定叠放顺序）。
+///
+/// 挂载 ID 在 detached tree + `move_mount` 搬运形态下不随叠放顺序递增（真机
+/// 2026-10-15：scoped FUSE 层 id=233 小于其下屏障层 id=10034，按最大 ID 选取把栈底
+/// 屏障当成栈顶，健康会话被误判 not stable 后终止，留下 ENOTCONN 死挂载导致应用商店
+/// 更新全部失败）。叠层顺序只能按 `parent_mount_id` 父链判定，详见
+/// [`mountinfo::topmost_by_stack`]。
 fn topmost_mount_entry(mount_point: &str) -> Option<MountEntry> {
-    mount_entries_at(mount_point)
-        .into_iter()
-        .max_by_key(|entry| entry.mount_id)
+    let entries = mount_entries_at(mount_point);
+    mountinfo::topmost_by_stack(
+        &entries,
+        |entry: &MountEntry| entry.mount_id,
+        |entry: &MountEntry| entry.parent_mount_id,
+    )
+    .cloned()
 }
 
 /// 判断挂载点当前由谁持有。
@@ -1474,6 +1643,21 @@ pub fn scoped_mount_roots_for_hybrid_rules(
             .chain(sandbox_include_rules)
             .chain(mapping_wildcard_rules),
     );
+    // 请求侧在共享存储之外、目标侧在共享存储之内的映射不会成为通配根，但其目标侧
+    // 正是应用实际访问的路径，必须显式成为 scoped FUSE 根，否则该路径不在 FUSE
+    // 视图内：规则表里查不到映射、目标侧目录也不会被创建，应用一律 ENOENT。
+    for (request, final_path) in &scoped_path_mappings {
+        if paths::contains_wildcards(request) || paths::is_same_or_child(request, &storage_root) {
+            continue;
+        }
+        if paths::contains_wildcards(final_path)
+            || paths::eq_ignore_case(final_path, &storage_root)
+            || !paths::is_child(final_path, &storage_root)
+        {
+            continue;
+        }
+        roots.push(final_path.clone());
+    }
     // 诊断：混合规则下是否产生 scoped FUSE 根，直接决定视图根上会不会多一层 FUSE bind。
     // Android 13 场景 29 的映射只落地后端别名，而通过的 Android 14 在视图根上多一层
     // FUSE（设备号 0:88 vs 视图根的 254:40），因此需要确认该平台是否本就走不到 FUSE。
@@ -1554,6 +1738,37 @@ pub fn scoped_mount_roots_for_hybrid_rules(
     compacted
 }
 
+/// 一条映射在 scoped FUSE 侧是否可用，以及它为挂载根贡献的路径。
+///
+/// 两侧都在共享存储之内的映射按常规处理，由请求侧承接（请求侧本身在 FUSE
+/// 视图内）。请求侧在共享存储之外、但目标侧落在共享存储之内的映射（典型形态：
+/// `/data/user/0/<pkg>/cache` → `Android/data/<pkg>/cache`）不能整条丢弃——应用
+/// 访问的是目标侧路径，丢弃后目标侧目录不会进入 FUSE 视图，应用读目标侧得到
+/// ENOENT（真机：TG 读不到 `Android/data/nu.gpu.nagram/cache/*.jpg`，全部
+/// open failed: ENOENT）。这类映射由目标侧提供挂载根，使目标侧路径进入 FUSE
+/// 视图并解析到真实后端。
+///
+/// 目标侧在共享存储之外的映射一律返回 `None`（维持既有丢弃行为）：scoped FUSE
+/// 的后端以共享存储为根，无法表达存储外目标，策略层的 `resolve_storage_rule`
+/// 同样会拒绝；若在这里放行，带通配的请求侧会经通配根推导在公共目录上扩大
+/// FUSE 接管范围，而策略表里却没有对应规则。这类映射仍由挂载层 namespace bind
+/// 直接承接（`mount/map.rs` 不做存储内归属过滤），行为与改动前一致。
+///
+/// 返回 `None` 表示该映射无法由 scoped FUSE 承接。
+fn scoped_mapping_mount_contribution(
+    request_path: &str,
+    final_path: &str,
+    storage_root: &str,
+) -> Option<Option<String>> {
+    let request_in_storage = paths::is_same_or_child(request_path, storage_root);
+    let final_in_storage = paths::is_same_or_child(final_path, storage_root);
+    match (request_in_storage, final_in_storage) {
+        (true, true) => Some(Some(request_path.to_string())),
+        (false, true) => Some(Some(final_path.to_string())),
+        (true, false) | (false, false) => None,
+    }
+}
+
 fn resolve_scoped_path_mappings(
     path_mappings: &[crate::domain::PathMapping],
     user_id: i32,
@@ -1561,14 +1776,17 @@ fn resolve_scoped_path_mappings(
 ) -> Vec<(String, String)> {
     let mut resolved = Vec::with_capacity(path_mappings.len());
     for mapping in path_mappings {
-        let request_path = resolve_scoped_rule_path(&mapping.request_path, user_id, storage_root);
+        let request_path = resolve_scoped_rule_path_allowing_private_data(
+            &mapping.request_path,
+            user_id,
+            storage_root,
+        );
         let final_path = resolve_scoped_rule_path(&mapping.final_path, user_id, storage_root);
         if request_path.is_empty()
             || final_path.is_empty()
             || paths::is_application_private_root(&request_path)
             || paths::eq_ignore_case(&request_path, &final_path)
-            || !paths::is_same_or_child(&request_path, storage_root)
-            || !paths::is_same_or_child(&final_path, storage_root)
+            || scoped_mapping_mount_contribution(&request_path, &final_path, storage_root).is_none()
         {
             continue;
         }
@@ -1595,16 +1813,34 @@ fn resolve_concrete_scoped_rule_parent(path: &str, user_id: i32, storage_root: &
 }
 
 fn resolve_scoped_rule_path(path: &str, user_id: i32, storage_root: &str) -> String {
+    let resolved = resolve_scoped_rule_path_allowing_private_data(path, user_id, storage_root);
+    if resolved.is_empty() {
+        return String::new();
+    }
+    if !paths::is_child(&resolved, storage_root) && !paths::eq_ignore_case(&resolved, storage_root)
+    {
+        return String::new();
+    }
+    resolved
+}
+
+/// 与 [`resolve_scoped_rule_path`] 相同，但允许解析结果落在共享存储之外。
+///
+/// 用于「请求侧在应用私有数据目录、目标侧在共享存储」的映射：请求侧
+/// （`/data/user/0/<pkg>/<sub>`）本就必须在存储外才有意义，若沿用要求结果
+/// 落在存储根之内的解析，规则会在进入挂载根判定之前就被清空，映射被整条
+/// 丢弃。这里只放宽归属要求，不放宽路径安全检查。
+fn resolve_scoped_rule_path_allowing_private_data(
+    path: &str,
+    user_id: i32,
+    storage_root: &str,
+) -> String {
     let mut resolved = paths::resolve_user_path(&paths::normalize(path), user_id);
     if resolved.is_empty() || paths::has_unsafe_segments(&resolved) {
         return String::new();
     }
     if !paths::is_absolute(&resolved) {
         resolved = paths::normalize(&paths::join(storage_root, &resolved));
-    }
-    if !paths::is_child(&resolved, storage_root) && !paths::eq_ignore_case(&resolved, storage_root)
-    {
-        return String::new();
     }
     resolved
 }

@@ -53,6 +53,8 @@ const MAX_TRACKED_SENDERS: usize = 256;
 const TAG_FILE_MONITOR: &str = "FileMonitorOp";
 const TAG_STATS: &str = "Stats";
 const TAG_CONTROL: &str = "Control";
+/// MP hook 进程请求 daemon（root）代修属主的通道标签；与 src/logging.rs 的
+/// 待代修路径队列上限：恶意/异常发送方在 per-uid 限流之外再受总量约束。
 const CONTROL_CLEAR_MONITOR: &str = "clear-monitor";
 const CONTROL_CLEAR_MONITOR_PREFIX: &str = "clear-monitor:";
 const CONTROL_FLUSH_ALL: &str = "flush-all";
@@ -63,6 +65,7 @@ const STATS_SCHEMA: &str = "2";
 
 static RECONCILE_REQUEST: OnceLock<Mutex<Option<String>>> = OnceLock::new();
 static POLICY_REGISTER_REQUEST: OnceLock<Mutex<Option<String>>> = OnceLock::new();
+static OWNER_FIX_REQUESTS: OnceLock<Mutex<Vec<String>>> = OnceLock::new();
 static DAEMON_WAKE_EVENTFD: AtomicI32 = AtomicI32::new(-1);
 
 pub fn set_daemon_wake_eventfd(fd: i32) {
@@ -419,6 +422,7 @@ impl LogState {
             TAG_FILE_MONITOR => {
                 if self.allow_from_sender(sender_uid) {
                     self.monitor.append(message);
+                    register_request_path_hint(message);
                 }
             }
             TAG_STATS => {
@@ -502,6 +506,12 @@ impl LogState {
                     && let Ok(mut slot) = policy_register_request_slot().lock()
                 {
                     *slot = Some(token);
+                    // 必须唤醒主循环：应用刚启动、companion 的宿主视图等待预算只有秒级，
+                    // 若只入队不唤醒，token 要等下一个无关事件（配置写入/宿主事件/周期
+                    // reconcile 唤醒点）才被取走，真机实测可积压 13-28s——期间应用要么
+                    // 被测试流杀掉（token 永远落在 process gone），要么在裸屏障上撞出
+                    // ENOENT。与上方 reconcile-running 分支的唤醒语义保持一致。
+                    wake_daemon();
                 }
             }
             _ => {}
@@ -546,6 +556,69 @@ impl LogState {
             self.flush_pending();
         }
     }
+}
+
+/// 从台账行登记请求侧 path hint。
+///
+/// `.recent_path_caller_hint` 此前设计为由 MediaProvider 进程在记录台账时直写
+/// （temp+rename），但 logs 目录为 root 属主且 SELinux 标签对 MediaProvider 域
+/// 不可写，直写始终静默失败，daemon 监视侧
+/// `has_recent_public_path_request` 的「请求已记录则抑制观察记录」去重因此从未
+/// 生效。台账行本身经私有日志通道进入本进程（root），在此对请求侧写入类记录
+/// 补登记 hint：MediaProvider 侧直写保留为兜底，跨进程去重以本路径为准。
+///
+/// 只处理写入类 op_filter（mkdir / provider_open 写形态 / 原生 open 写形态，
+/// open 写形态映射到 provider_open 对应值登记），与请求侧 hint 原有登记范围
+/// 一致；行内字段带 `|` 的路径会被 hint 校验拒绝，天然安全。登记失败（包名
+/// 无效、路径非公共存储、caller_uid 非应用 uid 等）时静默跳过，不影响台账落盘。
+fn register_request_path_hint(message: &str) {
+    if !message.contains("event_role=request") {
+        return;
+    }
+    // 行格式：时间戳|进程包名|目标包名|OP|路径|ret=..|k=v...；额外字段从下标 5 起。
+    let fields: Vec<&str> = message.split('|').collect();
+    if fields.len() < 6 {
+        return;
+    }
+    let Some(op_filter) = fields
+        .iter()
+        .skip(5)
+        .find_map(|field| field.strip_prefix("op_filter="))
+    else {
+        return;
+    };
+    let (source, hint_op_filter) = match op_filter {
+        "mkdir" => ("provider_mkdir", "mkdir"),
+        "provider_open" | "provider_open:create" | "provider_open:write" => {
+            ("provider_open", op_filter)
+        }
+        // 原生 hook 的写入类 open（映射路径等场景）：请求行本就是台账对这次
+        // 写入的记录，映射到 provider_open 写形态登记 hint，让纯映射路径的
+        // request/观察记录也走同一套 10 秒窗口去重。
+        "open:create" => ("provider_open", "provider_open:create"),
+        "open:write" => ("provider_open", "provider_open:write"),
+        _ => return,
+    };
+    let caller_uid = fields
+        .iter()
+        .skip(5)
+        .find_map(|field| field.strip_prefix("caller_uid="))
+        .and_then(|value| value.parse::<i32>().ok())
+        .unwrap_or(-1);
+    let correlation_id = fields
+        .iter()
+        .skip(5)
+        .find_map(|field| field.strip_prefix("correlation_id="))
+        .unwrap_or("");
+    crate::monitor::remember_public_path_caller_hint_with_op_filter(
+        fields[4],
+        fields[2],
+        caller_uid,
+        source,
+        "high",
+        hint_op_filter,
+        correlation_id,
+    );
 }
 
 struct RollingLog {
