@@ -12,6 +12,27 @@ static FORK_CHILD_HOOK_BYPASS: AtomicU64 = AtomicU64::new(0);
 const ANDROID_APP_UID_START: i32 = 10000;
 const MEDIA_RW_GID: u32 = 1023;
 const STORAGE_DIR_MODE: mode_t = 0o2773;
+/// 私有树目录的原生 MediaProvider 语义（owner→group 镜像、others 清零）。
+/// auto-mkdir 曾对私有树沿用公共目标的 0o2773（others 可写可穿越），与原生
+/// 02770 相悖且弱化隔离——用户 2026-10-21 反馈的微信私有目录 2773 即此来源。
+const PRIVATE_TREE_DIR_MODE: mode_t = 0o2770;
+
+/// 按路径形态派生 auto-mkdir 的目录 mode：私有树（Android/{data,media,obb}）
+/// 对齐原生 02770，其余（公共重定向目标等）维持 0o2773。
+fn redirect_mkdir_mode_for(path: &str, base: mode_t) -> mode_t {
+    let normalized = crate::platform::paths::normalize(path);
+    if let Some(rest) = normalized.strip_prefix("/data/media/") {
+        let mut parts = rest.split('/');
+        if let Some(user) = parts.next()
+            && user.chars().all(|ch| ch.is_ascii_digit())
+            && parts.next() == Some("Android")
+            && matches!(parts.next(), Some("data" | "media" | "obb"))
+        {
+            return PRIVATE_TREE_DIR_MODE;
+        }
+    }
+    base
+}
 const PRIVATE_CHILD_DIR_REQUIRED_MODE: mode_t = 0o2751;
 const PRIVATE_CHILD_FILE_REQUIRED_MODE: mode_t = 0o664;
 
@@ -588,13 +609,28 @@ fn chown_private_path_if_needed(
     if error_no == libc::EPERM || error_no == libc::EACCES {
         chmod_private_node_if_needed(&c_path, path, &st, owner_package, private_root);
         // 进程内 lchown 被 EPERM 拒绝（MP 等普通 uid 无 CAP_CHOWN，真机 2026-10-18
-        // 实证 media.module 全链 denied）：优先经 companion（root）对 open fd
-        // 即时 fchown——fd 在应用拿到之前已是正确属主，零竞态零扫描；companion
-        // 不可用时回退 daemon 代修请求（异步，主循环 ≤1s 消费）。
+        // 实证 media.module 全链 denied）：经 companion（root）对 open fd 即时
+        // fchown——fd 在应用拿到之前已是正确属主，零竞态零扫描。
         if fd >= 0 && crate::hook::companion_api::companion_fchown(fd, owner_uid) {
             return;
         }
-        crate::logging::send_owner_fix_request(path);
+        // 目录（mkdir/mkdirat 钩子不持有 fd）此前在此处静默失败：无 CAP_CHOWN
+        // 的代写进程对私有树目录的属主修复全部落空，累积成 uid=1023/2773 的
+        // 漂移目录（2026-10-21 用户反馈）。就地打开一个只读 fd 交给 companion
+        // fchown，补上「目录无 fd 通道」的结构性缺口；文件路径 O_DIRECTORY
+        // 打开会 ENOTDIR，回退普通只读打开再试一次。
+        if fd < 0
+            && open_fd_for_owner_fix(path, true)
+                .or_else(|| open_fd_for_owner_fix(path, false))
+                .is_some_and(|opened| {
+                    let fixed = crate::hook::companion_api::companion_fchown(opened, owner_uid);
+                    // SAFETY: opened 是刚打开的合法 fd，close 不借用其它数据。
+                    unsafe { libc::close(opened) };
+                    fixed
+                })
+        {
+            return;
+        }
     }
     if error_no != libc::ENOENT && error_no != libc::EPERM && error_no != libc::EACCES {
         log::warn!(
@@ -605,6 +641,18 @@ fn chown_private_path_if_needed(
             error_no
         );
     }
+}
+
+/// 为无 fd 的属主修复目标打开一个只读 fd（目录用 O_DIRECTORY，文件回退普通打开）。
+fn open_fd_for_owner_fix(path: &str, directory: bool) -> Option<libc::c_int> {
+    let mut flags = libc::O_RDONLY | libc::O_CLOEXEC;
+    if directory {
+        flags |= libc::O_DIRECTORY;
+    }
+    let c_path = CString::new(path).ok()?;
+    // SAFETY: c_path 以 NUL 结尾且在调用期间保持有效，open 只返回新 fd。
+    let opened = unsafe { libc::open(c_path.as_ptr(), flags) };
+    (opened >= 0).then_some(opened)
 }
 
 fn chmod_private_node_if_needed(
@@ -754,6 +802,7 @@ fn normalize_redirect_dir_metadata(path: &str, mode: mode_t, owner: Option<&Redi
         return;
     };
 
+    let mode = redirect_mkdir_mode_for(path, mode);
     let ret = unsafe { libc::chmod(c_path.as_ptr(), mode) };
     if ret != 0 {
         let error_no = current_errno();
@@ -920,9 +969,20 @@ fn create_parent_dirs_recursive(path: &str, mode: mode_t, owner: Option<&Redirec
 
     create_parent_dirs_recursive(&parent, mode, owner);
 
-    let ret = unsafe { libc::mkdirat(AT_FDCWD, c_parent.as_ptr(), mode) };
+    // SAFETY: c_parent 以 NUL 结尾并在调用期间保持有效；mode 由路径形态派生。
+    let ret = unsafe {
+        libc::mkdirat(
+            AT_FDCWD,
+            c_parent.as_ptr(),
+            redirect_mkdir_mode_for(&parent, mode),
+        )
+    };
     if ret == 0 {
         normalize_redirect_dir_metadata(&parent, mode, owner);
+        // 自动补建的父目录逐级交由系统代写属主治理：链中间层不经过 open/mkdir
+        // 钩子触发面，漏掉就会残留 media_rw 属主（uid=1023/2773 签名，2026-10-21
+        // 用户反馈）。治理入口自带系统代写进程门控与 errno 保存，应用进程内零开销。
+        fix_system_writer_android_private_owner(&parent, true, -1);
         log::debug!("auto mkdir parent {}", parent);
         return;
     }
@@ -958,9 +1018,18 @@ fn create_parent_dirs_recursive_until(
 
     create_parent_dirs_recursive_until(&parent, stop_dir, mode, owner);
 
-    let ret = unsafe { libc::mkdirat(AT_FDCWD, c_parent.as_ptr(), mode) };
+    // SAFETY: c_parent 以 NUL 结尾并在调用期间保持有效；mode 由路径形态派生。
+    let ret = unsafe {
+        libc::mkdirat(
+            AT_FDCWD,
+            c_parent.as_ptr(),
+            redirect_mkdir_mode_for(&parent, mode),
+        )
+    };
     if ret == 0 {
         normalize_redirect_dir_metadata(&parent, mode, owner);
+        // 同 create_parent_dirs_recursive：存储父链每一级都要过属主治理。
+        fix_system_writer_android_private_owner(&parent, true, -1);
         log::debug!("auto mkdir storage parent {}", parent);
         return;
     }

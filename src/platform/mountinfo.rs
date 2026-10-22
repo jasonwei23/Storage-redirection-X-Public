@@ -13,6 +13,9 @@ pub struct MountInfoEntry<'a> {
     pub mount_id: u64,
     /// 父挂载 ID：本层挂载所叠在的那一层（同挂载点叠放时即下面一层）的挂载 ID。
     pub parent_mount_id: u64,
+    /// 设备号（`major:minor`）。同一文件系统内 bind 前后的层共享同一设备号，
+    /// 覆盖挂载感知的源路径换算用它寻找该文件系统根（`root=="/"`）的挂载点。
+    pub dev: &'a str,
     /// 挂载在文件系统内的根，未展开八进制转义。
     pub root: &'a str,
     /// 挂载点，未展开八进制转义。
@@ -29,7 +32,7 @@ pub fn parse_entry(line: &str) -> Option<MountInfoEntry<'_>> {
     let mut before_fields = line[..separator].split_whitespace();
     let mount_id = before_fields.next()?.parse::<u64>().ok()?;
     let parent_mount_id = before_fields.next()?.parse::<u64>().ok()?;
-    before_fields.next()?;
+    let dev = before_fields.next()?;
     let root = before_fields.next()?;
     let target = before_fields.next()?;
     let mut after_fields = line[separator + 3..].split_whitespace();
@@ -38,6 +41,7 @@ pub fn parse_entry(line: &str) -> Option<MountInfoEntry<'_>> {
     Some(MountInfoEntry {
         mount_id,
         parent_mount_id,
+        dev,
         root,
         target,
         fs_type,

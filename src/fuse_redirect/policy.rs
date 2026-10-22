@@ -9,6 +9,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 
 use super::FuseRedirectConfig;
+use super::backend_overlay;
 
 const FILE_MONITOR_LOG_TAG: &str = "FileMonitorOp";
 const READ_ONLY_DENY_EXTRA: &str = "deny_reason=read_only_rule";
@@ -61,6 +62,10 @@ pub(super) enum OperationKind {
 struct BackendDecision {
     kind: BackendKind,
     is_read_only: bool,
+    /// 命中 sandboxed_paths 的重定向：监视/直通会话的重定向根是存储根本身，
+    /// 此时 backend 必须落到该应用私有 sdcard 沙盒根，否则 native 层创建会
+    /// 绕过沙盒直落真实路径（2026-10-21 用户反馈的 .xlDownload 侧漏）。
+    is_sandbox: bool,
 }
 
 #[derive(Clone, Default)]
@@ -167,6 +172,8 @@ pub(super) struct RedirectPolicy {
     pub(super) path_mappings: Vec<PathMapping>,
     pub(super) is_mapping_mode_only: bool,
     pub(super) is_monitor_only: bool,
+    /// 监视/直通会话的沙盒 backend 根（该应用私有 sdcard 根）；普通重定向会话为 None。
+    pub(super) sandbox_backend_root: Option<PathBuf>,
     pub(super) is_file_monitor_enabled: bool,
     /// 一律拒绝：路径决策全部失败，调用方据此返回 `ENOENT`。
     ///
@@ -364,6 +371,21 @@ impl PolicyRegistry {
             .and_then(|table| table.get(&uid).cloned())
     }
 
+    /// 按包名反查已登记的属主策略，供宿主共享会话的「系统读取者」路径反解使用：
+    /// MediaProvider 等系统读取者按路径访问 `Android/data/<pkg>/**` 时，需要用
+    /// 目标应用的属主策略解析后端落点，否则 deny_all 回退必然 ENOENT。
+    /// 表规模为已登记应用数（几十级），线性查找代价可忽略。
+    pub(super) fn find_owner_policy_by_package(
+        &self,
+        package_name: &str,
+    ) -> Option<Arc<RedirectPolicy>> {
+        let table = self.by_uid.by_uid.read().ok()?;
+        table
+            .values()
+            .find(|policy| policy.package_name == package_name)
+            .cloned()
+    }
+
     /// 取出可写表句柄，交给宿主会话的控制通道在运行期登记应用策略。
     pub(super) fn shared_table(&self) -> SharedPolicyTable {
         self.by_uid.clone()
@@ -430,6 +452,7 @@ impl RedirectPolicy {
             } else {
                 -1
             };
+            let existed_redirect_root = fs::is_directory(&redirect_root_string);
             if !fs::create_directory(&redirect_root_string, redirect_root_uid)
                 && !fs::is_directory(&redirect_root_string)
             {
@@ -456,6 +479,21 @@ impl RedirectPolicy {
                 return None;
             }
             fix_mapped_dir_metadata(&redirect_root_string, config.uid);
+            // 本次初始化新建的私有树重定向根按原生语义补 chmod：create_directory
+            // 的 mkdir(0755) 受 daemon umask 与 setgid 继承影响，会落下 2750 这类
+            // 非原生形态（2026-10-21 duchamp 实测）；既有目录仍交 fix_mapped 的
+            // keep-existing 守卫保留。
+            if !existed_redirect_root
+                && let Some(user_id) =
+                    paths::extract_user_id_from_data_media_path(&redirect_root_string)
+                && is_android_private_backend_path(&redirect_root_string, user_id)
+            {
+                let c_root = CString::new(redirect_root_string.as_str()).ok();
+                if let Some(c_root) = c_root {
+                    // SAFETY: c_root 在调用期间保持有效并以 NUL 结尾。
+                    let _ = unsafe { libc::chmod(c_root.as_ptr(), 0o2770) };
+                }
+            }
             redirect_root_string
         };
 
@@ -466,6 +504,19 @@ impl RedirectPolicy {
             .unwrap_or_default()
             .trim_matches('/')
             .to_string();
+        // 监视/直通会话的重定向根是存储根，sandboxed_paths 命中时宿主面需要把
+        // backend 换到该应用私有 sdcard 沙盒根（否则 native 层创建绕过沙盒直落
+        // 真实路径——2026-10-21 用户反馈的 .xlDownload 侧漏）。普通重定向会话的
+        // 重定向根本身就是沙盒根，走既有 redirect_backend_for_rel 即可。
+        let sandbox_backend_root = if config.is_mapping_mode_only && redirect_view_rel.is_empty() {
+            Some(PathBuf::from(format!(
+                "{}/Android/data/{}/sdcard",
+                paths::data_media_user_root_for_user(user_id),
+                config.package_name
+            )))
+        } else {
+            None
+        };
 
         let mut path_mappings = resolve_path_mappings(
             &config.path_mappings,
@@ -517,6 +568,7 @@ impl RedirectPolicy {
             media_sqlite_real_root: media_sqlite_view_root_for_user(user_id),
             redirect_root: PathBuf::from(redirect_root_string),
             redirect_view_rel,
+            sandbox_backend_root,
             rule_prefixes,
             allowed_real_paths,
             excluded_real_paths,
@@ -590,7 +642,15 @@ impl RedirectPolicy {
                 }
                 None => self.real_backend_for_rel(&rel),
             },
-            BackendKind::Redirect => self.redirect_backend_for_rel(&rel),
+            BackendKind::Redirect => {
+                if decision.is_sandbox
+                    && let Some(sandbox_root) = &self.sandbox_backend_root
+                {
+                    sandbox_root.join(&rel)
+                } else {
+                    self.redirect_backend_for_rel(&rel)
+                }
+            }
         };
 
         // 跨应用只读别名兜底：应用 A 把自身映射视图形态的文件路径交给应用 B 时
@@ -740,16 +800,26 @@ impl RedirectPolicy {
 
     fn backend_decision(&self, storage_path: &str, operation: OperationKind) -> BackendDecision {
         let is_read_only = self.is_read_only(storage_path);
-        let kind = if self.is_monitor_only
-            || self.resolve_mapping(storage_path).is_some()
+        let mapping_hit = self.resolve_mapping(storage_path).is_some();
+        // sandboxed_paths 优先于监视/直通会话短路：系统代写组件（共享 media uid
+        // 等监视会话）对配置沙盒路径的访问也必须重定向进私有沙盒，否则 native
+        // 层创建会绕过沙盒直落真实路径。命中与排除的判定口径与下方
+        // mapping_mode_only 分支保持一致。映射优先于沙盒（场景 15 契约）：命中
+        // 映射规则的路径由 Real 分支按映射目标解析，沙盒只接管未命中映射的路径
+        // ——此前沙盒判定整体前置曾把「映射+沙盒双命中」劫进私有沙盒根。
+        let is_sandbox = self.is_mapping_mode_only
+            && !mapping_hit
+            && self.matches_any(&self.sandboxed_index, storage_path)
+            && !self.matches_any(&self.sandboxed_excluded_index, storage_path);
+        let kind = if is_sandbox {
+            BackendKind::Redirect
+        } else if self.is_monitor_only
+            || mapping_hit
             || self.is_own_private_storage_path(storage_path)
         {
             BackendKind::Real
         } else if self.is_mapping_mode_only {
-            if self.is_foreign_private_storage_path(storage_path)
-                || (self.matches_any(&self.sandboxed_index, storage_path)
-                    && !self.matches_any(&self.sandboxed_excluded_index, storage_path))
-            {
+            if self.is_foreign_private_storage_path(storage_path) {
                 BackendKind::Redirect
             } else {
                 BackendKind::Real
@@ -765,7 +835,11 @@ impl RedirectPolicy {
         } else {
             BackendKind::Redirect
         };
-        BackendDecision { kind, is_read_only }
+        BackendDecision {
+            kind,
+            is_read_only,
+            is_sandbox,
+        }
     }
 
     fn matches_any(&self, index: &RuleIndex, storage_path: &str) -> bool {
@@ -856,9 +930,15 @@ impl RedirectPolicy {
 
     pub(super) fn real_backend_for_storage_rel(&self, rel: &str) -> PathBuf {
         if rel.is_empty() {
-            return self.real_root.clone();
+            return backend_overlay::overlay_backend_path(&self.real_root)
+                .unwrap_or_else(|| self.real_root.clone());
         }
-        self.real_backend_root_for_storage_rel(rel).join(rel)
+        let joined = self.real_backend_root_for_storage_rel(rel).join(rel);
+        // 覆盖挂载感知：HyperOS 等系统会在 init 命名空间把下载暂存目录 bind 到
+        // `/data/media/...` 子树（如应用商店 `.siexternal`），应用命名空间里的
+        // scoped 会话按普通路径解析会落到被遮蔽的真实目录，与宿主/MP 读侧分裂。
+        // 命中覆盖挂载时改写到物理源路径，未命中保持原路径（CI 断言不受影响）。
+        backend_overlay::overlay_backend_path(&joined).unwrap_or(joined)
     }
 
     // 按相对路径选择真实后端根：应用自有私有目录走 private_real_root 直连 f2fs，
@@ -971,10 +1051,13 @@ impl RedirectPolicy {
 
     pub(super) fn redirect_backend_for_storage_rel(&self, rel: &str) -> PathBuf {
         if rel.is_empty() {
-            self.redirect_root.clone()
-        } else {
-            self.redirect_root.join(rel)
+            return backend_overlay::overlay_backend_path(&self.redirect_root)
+                .unwrap_or_else(|| self.redirect_root.clone());
         }
+        let joined = self.redirect_root.join(rel);
+        // 与 real 后端同口径：重定向根同样落在 `/data/media/...` 物理树上，
+        // 需要经过同一套覆盖挂载感知解析（见 real_backend_for_storage_rel 注释）。
+        backend_overlay::overlay_backend_path(&joined).unwrap_or(joined)
     }
 
     /// 折叠视图对重定向根自身的再进入：`<redirect_view_rel>/<rest>` → `<rest>`。
@@ -1638,9 +1721,20 @@ pub(super) fn fix_mapped_dir_metadata(path: &str, owner_uid: i32) {
             log::debug!("fuse keep existing Android private metadata path={}", path);
             return;
         }
+        // 私有树（含包根）对齐原生 02770；此前包根会被打成 MAPPED_DIR_MODE
+        // 0o2773（others 可写可穿越），与 MediaProvider 原生语义相悖——
+        // 2026-10-21 用户反馈「微信私有目录 2773」即此来源。
+        let mode = if let Some(user_id) = paths::extract_user_id_from_data_media_path(path)
+            && is_android_private_backend_path(path, user_id)
+        {
+            0o2770
+        } else {
+            super::MAPPED_DIR_MODE
+        };
         // SAFETY: c_path 以 NUL 结尾，并在 chown/chmod 调用期间保持有效。
         let _ = unsafe { libc::chown(c_path.as_ptr(), owner_uid as u32, super::MEDIA_RW_GID) };
-        let _ = unsafe { libc::chmod(c_path.as_ptr(), super::MAPPED_DIR_MODE) };
+        // SAFETY: c_path 以 NUL 结尾，并在 chmod 调用期间保持有效。
+        let _ = unsafe { libc::chmod(c_path.as_ptr(), mode) };
     }
 }
 

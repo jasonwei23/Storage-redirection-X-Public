@@ -506,7 +506,7 @@ scenario_title() {
     3) echo "启用路径映射，验证 SrtProbe 写入真实 Test" ;;
     4) echo "路径映射叠加真实路径放行，验证映射优先级" ;;
     5) echo "放行真实 Download，验证保持原路径写入" ;;
-    6) echo "仅映射模式，未命中映射路径保持真实且自有目录属主漂移自动修复" ;;
+    6) echo "仅映射模式，未命中映射路径保持真实且自有目录属主漂移不被自动修复" ;;
     7) echo "仅映射模式，命中映射路径应写入映射目标" ;;
     8) echo "FUSE 仅映射模式：命中 sandbox 规则且同级未命中路径保持真实" ;;
     9) echo "read_only_paths 允许读取但拒绝写入、删除、mkdir、rename" ;;
@@ -3429,14 +3429,17 @@ run_mediastore_open_typed_collection_scenario() {
   fi
 }
 
-# 仅映射模式自有目录属主漂移回归（真机 2026-10-17 用户反馈，A17/SDK37）：
-# MediaProvider 代写会把应用自有 Android/data/<pkg> 子树属主写成 media_rw，
-# A17 原生 FUSE 对属主非本应用的私有目录只给 others 位——应用首波访问全部
-# EACCES（nagram 目录探针失败致文件/存储统计不可见、Unity 游戏存档回退内部
-# 存储）。修复是新进程挂载应答前的浅层属主修复：本场景在应用启动前注入
-# 1023 属主损伤，启动后应用必须能读写该目录，且后端属主必须已修回应用 uid。
-# A13-16 原生 FUSE 不做 owner==app 强校验，应用读写用例恒过；后端属主断言
-# 保证修复链路在所有 Android 腿都有回归信号。
+# 仅映射模式自有目录属主漂移契约（2026-10-21 起契约反转）：
+# 历史背景是真机 2026-10-17 用户反馈——MediaProvider 代写把应用自有
+# Android/data/<pkg> 子树属主写成 media_rw，原生 FUSE 对属主非本应用的私有
+# 目录只给 others 位，应用访问全部 EACCES。当时的守卫是「浅层属主修复链」，
+# 该链已随 2026-10-20「属主修复体系全面拆除」决定移除（本末倒置：模块不应
+# 周期性改写应用私有树属主）；存量漂移改由一次性迁移（owner-migration-1023，
+# 模块升级重启时执行）修复，源头新增由 MP writer 即时 fd 治理防住，运行期
+# 守护与应用都不再改写私有树属主。
+# 本场景在应用启动前注入 1023 属主损伤，断言新契约：应用对漂移目录的读写被
+# 原生 DAC 拒绝（各 Android 腿一致），后端属主保持 1023 不被任何链路改写——
+# 一旦修复链回潮（读用例转 PASS 或属主被修回），场景当场报错，属防回潮守卫。
 prepare_owner_drift_fixture() {
   local label="$1"
   local drift_backend="${BACKEND_ROOT}/Android/data/${APP_ID}/files/SrtDrift"
@@ -3450,15 +3453,16 @@ run_owner_drift_own_dir_scenario() {
   local scenario="$1"
   local drift_visible="/storage/emulated/0/Android/data/${APP_ID}/files/SrtDrift"
   local drift_backend="${BACKEND_ROOT}/Android/data/${APP_ID}/files/SrtDrift"
-  run_service_case "$scenario" "own-drift-read" "file_read" '^PASS \[file_read\]' --es file_path "$drift_visible/srt_drift_existing.txt" || return 1
-  run_service_case "$scenario" "own-drift-write" "file_write" '^PASS \[file_write\]' --es file_path "$drift_visible/srt_drift_probe.txt" --es payload "$PAYLOAD" --es expected_payload "$PAYLOAD" || return 1
-  # 后端属主必须已从注入的 media_rw 修回应用 uid：以包目录顶层属主为基准比对，
-  # 顶层属主异常时（应为应用 uid）同样判失败。
-  if ! adb_su "top_uid=\$(stat -c %u '${BACKEND_ROOT}/Android/data/${APP_ID}'); file_uid=\$(stat -c %u '$drift_backend/srt_drift_existing.txt'); [ -n \"\$top_uid\" ] && [ \"\$top_uid\" != '1023' ] && [ \"\$top_uid\" = \"\$file_uid\" ]"; then
-    echo "owner_drift_not_repaired scenario=${scenario} backend=${drift_backend}" >&2
+  # 漂移目录的读与新建写入都必须被原生 DAC 拒绝：属主 1023 的私有目录对应用
+  # uid 只暴露 others 位。任何 PASS 都说明有链路在改写属主或绕过 DAC 放行。
+  run_service_case "$scenario" "own-drift-read-denied" "file_read" '^FAIL \[file_read\]' --es file_path "$drift_visible/srt_drift_existing.txt" || return 1
+  run_service_case "$scenario" "own-drift-write-denied" "file_write" '^FAIL \[file_write\]' --es file_path "$drift_visible/srt_drift_probe.txt" --es payload "$PAYLOAD" --es expected_payload "$PAYLOAD" || return 1
+  # 后端属主必须保持注入的 1023：守护与应用都不得改写私有树属主（拆除契约）。
+  if ! adb_su "[ \"\$(stat -c %u '$drift_backend/srt_drift_existing.txt')\" = '1023' ]"; then
+    echo "owner_drift_repaired_unexpectedly scenario=${scenario} backend=${drift_backend}" >&2
     return 1
   fi
-  echo "owner_drift_repaired scenario=${scenario}"
+  echo "owner_drift_inert scenario=${scenario}"
 }
 
 run_scenario() {
@@ -3536,7 +3540,7 @@ run_scenario() {
   clean_results
   case "$scenario" in
     6)
-      echo "step 5/7: 验证未命中映射路径保持真实与自有目录属主漂移修复"
+      echo "step 5/7: 验证未命中映射路径保持真实与自有目录属主漂移不被自动修复"
       if ! run_standard_scenario "$scenario"; then
         return 1
       fi

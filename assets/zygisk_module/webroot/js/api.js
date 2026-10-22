@@ -351,6 +351,15 @@ function srxCtlCommand(action) {
   return "/system/bin/sh " + shellQuote(SRXCTL) + " " + action;
 }
 
+/**
+ * 从 exec 失败信息中提取 srxctl 输出的重挂失败原因令牌（remount_reason=<key>）。
+ * exec 在非零退出码时只把 stderr 作为 Error message 抛出，因此令牌必须从 stderr 文本里解析。
+ */
+function extractRemountReason(text) {
+  const match = /remount_reason=([a-z0-9-]+)/.exec(String(text || ""));
+  return match ? match[1] : "";
+}
+
 function withSrxCtlFallback(action, fallback) {
   return (
     "if [ -r " +
@@ -361,6 +370,17 @@ function withSrxCtlFallback(action, fallback) {
     fallback +
     "; fi"
   );
+}
+
+/** 解析 srxctl host-status 输出为结构化状态；未知输出一律归为 unknown。 */
+function parseStorageBackendStatus(output) {
+  const text = String(output || "").trim();
+  if (text === "inactive") return { state: "inactive", pid: null, policies: null };
+  const match = /^active pid=(\d+) policies=(\d+)$/.exec(text);
+  if (match) {
+    return { state: "active", pid: Number(match[1]), policies: Number(match[2]) };
+  }
+  return { state: "unknown", pid: null, policies: null };
 }
 
 function isManagedTempPath(path) {
@@ -2349,12 +2369,24 @@ const Api = {
         timeoutMs: 30_000,
       });
       return { ok: true };
-    } catch {
-      return { ok: false };
+    } catch (error) {
+      return { ok: false, failureReason: extractRemountReason(error?.message) };
     } finally {
       try {
         await this.ensureLogCollectors();
       } catch {}
+    }
+  },
+
+  /** 读取共享宿主会话状态指示，供概览页展示；读取失败按 unknown 处理。 */
+  async readStorageBackendStatus() {
+    try {
+      const out = await this.exec(withSrxCtlFallback("host-status", "echo unknown"), {
+        timeoutMs: 10_000,
+      });
+      return parseStorageBackendStatus(out);
+    } catch {
+      return { state: "unknown", pid: null, policies: null };
     }
   },
 

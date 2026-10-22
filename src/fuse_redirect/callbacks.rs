@@ -18,17 +18,17 @@ use super::metadata::{
 use super::perf::DirectoryCacheMissReason;
 use super::policy::OperationKind;
 use super::{
-    CachedDirCandidates, DIR_CANDIDATE_CACHE_TTL, DirEntry, DirEntryCandidate,
-    DirectorySourceSignature, DirectorySourceState, FUSE_READ_BUFFER, FuseRedirectFs, FuseState,
-    MAX_READ_SIZE, MEDIA_RW_GID, MEDIA_RW_UID, NewEntryRoute, OpenFile, ROOT_INO, TTL,
+    ATTR_TTL, CachedDirCandidates, DIR_CANDIDATE_CACHE_TTL, DirEntry, DirEntryCandidate,
+    DirectorySourceSignature, DirectorySourceState, ENTRY_TTL, FUSE_READ_BUFFER, FuseRedirectFs,
+    FuseState, MAX_READ_SIZE, MEDIA_RW_GID, MEDIA_RW_UID, NewEntryRoute, OpenFile, ROOT_INO,
     estimate_cached_dir_candidates_bytes,
 };
 use crate::platform::paths;
 use fuser::{
     AccessFlags, CopyFileRangeFlags, Errno, FileHandle, FileType, Filesystem, FopenFlags,
     Generation, INodeNo, InitFlags, KernelConfig, LockOwner, OpenFlags, RenameFlags, ReplyAttr,
-    ReplyCreate, ReplyData, ReplyDirectory, ReplyDirectoryPlus, ReplyEmpty, ReplyEntry, ReplyOpen,
-    ReplyStatfs, ReplyWrite, Request, TimeOrNow, WriteFlags,
+    ReplyCreate, ReplyData, ReplyDirectory, ReplyDirectoryPlus, ReplyEmpty, ReplyEntry, ReplyLseek,
+    ReplyOpen, ReplyStatfs, ReplyWrite, ReplyXattr, Request, TimeOrNow, WriteFlags,
 };
 use std::collections::HashMap;
 use std::ffi::OsStr;
@@ -233,6 +233,12 @@ fn write_full_at(file: &File, mut data: &[u8], mut offset: u64) -> std::io::Resu
     Ok(total)
 }
 
+/// xattr 首查/取值两段式应答的中间产物：`size==0` 的探测请求回长度，其余回数据。
+pub(super) enum XattrOutcome {
+    Size(u32),
+    Data(Vec<u8>),
+}
+
 impl Filesystem for FuseRedirectFs {
     fn init(&mut self, _req: &Request, config: &mut KernelConfig) -> std::io::Result<()> {
         // 三层判定（自动开启，兼容性由端到端探针保障）：
@@ -271,6 +277,8 @@ impl Filesystem for FuseRedirectFs {
             passthrough_enabled && config.add_capabilities(InitFlags::FUSE_PASSTHROUGH).is_ok();
         self.passthrough_enabled
             .store(passthrough_negotiated, Ordering::Relaxed);
+        self.writeback_enabled
+            .store(writeback_enabled, Ordering::Relaxed);
         log::info!(
             "fuse init pkg={} kernel_abi={} passthrough_supported={} passthrough_enabled={} passthrough_negotiated={} probe_state={:?} passthrough_disabled_by_marker={} stack_depth={} max_background={} congestion={} max_write={} writeback={}",
             self.policy.session().package_name,
@@ -292,6 +300,7 @@ impl Filesystem for FuseRedirectFs {
     fn lookup(&self, req: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEntry) {
         let _perf = self.perf.observe(&self.perf.lookup_calls);
         let Some(parent_rel) = self.path_for_ino(parent) else {
+            self.log_reply_error("lookup", req.uid(), None, Errno::ENOENT);
             reply.error(Errno::ENOENT);
             return;
         };
@@ -308,7 +317,7 @@ impl Filesystem for FuseRedirectFs {
                         &policy.package_name,
                     );
                 }
-                self.reply_entry_for_rel(&policy, &rel, reply)
+                self.reply_entry_for_rel(req.uid(), &policy, &rel, reply)
             }
             Err(errno) => {
                 Self::log_new_entry_errno(
@@ -331,13 +340,30 @@ impl Filesystem for FuseRedirectFs {
 
     fn getattr(&self, req: &Request, ino: INodeNo, _fh: Option<FileHandle>, reply: ReplyAttr) {
         let _perf = self.perf.observe(&self.perf.metadata_calls);
-        let policy = self.policy_for_read_request(req, Some(ino), None);
+        let mut policy = self.policy_for_read_request(req, Some(ino), None);
+        // fstat on open fd：fd 可能已跨进程（binder dup），按请求者 uid 重新路由
+        // 会把合法 fstat 打成 ENOENT，回退到 inode 属主策略（文件身份已固定）。
+        // 不以 fh 是否存在为门控：内核对 fstat 未必置 FUSE_GETATTR_FH，而非属主
+        // 经路径 lookup 根本拿不到属主私有 inode，能引用该 ino 即 fd 途径。
+        if let Some(owner_policy) = self.inode_owner_policy_for_fd_stat(ino, req.uid()) {
+            policy = owner_policy;
+        }
+        // 宿主共享会话的系统读取者路径反解：MP 扫描/元数据协商对重定向树的
+        if let Some(rel) = self.path_for_ino(ino)
+            && let Some(owner_policy) = self.system_reader_policy_on_miss(req.uid(), &policy, &rel)
+        {
+            policy = owner_policy;
+        }
         match self
             .backend_for_ino(&policy, ino)
             .and_then(|backend| self.visible_attr_for_backend(&policy, ino, &backend))
         {
-            Ok(attr) => reply.attr(&TTL, &attr),
-            Err(errno) => reply.error(errno),
+            Ok(attr) => reply.attr(&ATTR_TTL, &attr),
+            Err(errno) => {
+                let rel = self.path_for_ino(ino);
+                self.log_reply_error("getattr", req.uid(), rel.as_deref(), errno);
+                reply.error(errno)
+            }
         }
     }
 
@@ -356,7 +382,7 @@ impl Filesystem for FuseRedirectFs {
 
     fn opendir(&self, req: &Request, ino: INodeNo, _flags: OpenFlags, reply: ReplyOpen) {
         let _perf = self.perf.observe(&self.perf.open_calls);
-        let policy = self.policy_for_read_request(req, Some(ino), None);
+        let mut policy = self.policy_for_read_request(req, Some(ino), None);
         let track_dir_perf = crate::logging::is_debug_logging_enabled();
         let first_lock_started = track_dir_perf.then(std::time::Instant::now);
         let (mut rel, mut path_version) = {
@@ -365,8 +391,15 @@ impl Filesystem for FuseRedirectFs {
                 reply.error(Errno::ENOENT);
                 return;
             };
-            let version = state.inode_path_versions.get(&ino.0).copied().unwrap_or(0);
-            (rel, version)
+            // MP 扫描重定向树目录靠系统读取者重试才能看到条目；rel 在锁内一并取出。
+            if let Some(owner_policy) = self.system_reader_policy_on_miss(req.uid(), &policy, &rel)
+            {
+                policy = owner_policy;
+            }
+            (
+                rel,
+                state.inode_path_versions.get(&ino.0).copied().unwrap_or(0),
+            )
         };
         let mut lock_wait_ns = elapsed_ns(first_lock_started);
         let mut scan_ns = 0u64;
@@ -577,7 +610,7 @@ impl Filesystem for FuseRedirectFs {
                 entry.ino,
                 (index + 1) as u64,
                 &entry.name,
-                &TTL,
+                &ENTRY_TTL,
                 &attr,
                 Generation(0),
             ) {
@@ -606,11 +639,18 @@ impl Filesystem for FuseRedirectFs {
         let _perf = self.perf.observe(&self.perf.open_calls);
         let is_create = open_flags_create(flags.0);
         let is_mutation = open_flags_write(flags.0) || is_create;
-        let policy = if is_mutation {
+        let mut policy = if is_mutation {
             self.policy_for_request(req)
         } else {
             self.policy_for_read_request(req, Some(ino), None)
         };
+        // 读取类 open 走系统读取者 miss 重试；写入类保持宿主拒绝语义。
+        if !is_mutation
+            && let Some(rel) = self.path_for_ino(ino)
+            && let Some(owner_policy) = self.system_reader_policy_on_miss(req.uid(), &policy, &rel)
+        {
+            policy = owner_policy;
+        }
         let backend = match self.backend_for_ino(&policy, ino) {
             Ok(backend) => backend,
             Err(errno) => {
@@ -699,11 +739,11 @@ impl Filesystem for FuseRedirectFs {
                         backend.rel,
                         error
                     );
-                    reply.opened(FileHandle(fh), FopenFlags::empty());
+                    reply.opened(FileHandle(fh), self.file_open_flags());
                 }
             }
         } else {
-            reply.opened(FileHandle(fh), FopenFlags::empty());
+            reply.opened(FileHandle(fh), self.file_open_flags());
         }
     }
 
@@ -969,6 +1009,310 @@ impl Filesystem for FuseRedirectFs {
         }
     }
 
+    fn fallocate(
+        &self,
+        _req: &Request,
+        _ino: INodeNo,
+        fh: FileHandle,
+        offset: u64,
+        length: u64,
+        mode: i32,
+        reply: ReplyEmpty,
+    ) {
+        let _perf = self.perf.observe(&self.perf.mutation_calls);
+        // 原生 MP FUSE 支持 fallocate（MPEG4Writer 录制预分配依赖它，真机 2026-10-20
+        // 实证：缺失时返回 EOPNOTSUPP，写入方降级为无预分配路径）。这里透传到后端
+        // fd，与原生语义对齐。
+        let Some(file) = ({
+            let state = self.state.read().unwrap_or_else(|err| err.into_inner());
+            let Some(open_file) = state.files.get(&fh.into()) else {
+                reply.error(Errno::EBADF);
+                return;
+            };
+            if open_file.is_read_only {
+                reply.error(Errno::EBADF);
+                return;
+            }
+            open_file.file.clone()
+        }) else {
+            reply.error(Errno::ENOSYS);
+            return;
+        };
+        let Some(offset) = libc::off_t::try_from(offset).ok() else {
+            reply.error(Errno::EINVAL);
+            return;
+        };
+        let Some(length) = libc::off_t::try_from(length).ok() else {
+            reply.error(Errno::EINVAL);
+            return;
+        };
+        // SAFETY: file 的 RawFd 在调用期间有效；fallocate 仅按 (offset, length) 操作空间分配。
+        let ret = unsafe { libc::fallocate(file.as_raw_fd(), mode, offset, length) };
+        if ret == 0 {
+            reply.ok();
+        } else {
+            reply.error(errno_from_code(last_errno()));
+        }
+    }
+
+    fn symlink(
+        &self,
+        req: &Request,
+        parent: INodeNo,
+        link_name: &OsStr,
+        target: &Path,
+        reply: ReplyEntry,
+    ) {
+        let _perf = self.perf.observe(&self.perf.mutation_calls);
+        let NewEntryRoute {
+            policy,
+            rel,
+            backend,
+        } = match self.route_new_entry(req, parent, link_name, "symlink") {
+            Ok(route) => route,
+            Err(errno) => {
+                Self::log_new_entry_errno(&self.policy_for_request(req), link_name, errno);
+                reply.error(errno);
+                return;
+            }
+        };
+        let target_bytes = target.as_os_str().as_bytes();
+        let c_target = match std::ffi::CString::new(target_bytes) {
+            Ok(value) => value,
+            Err(_) => {
+                reply.error(Errno::EINVAL);
+                return;
+            }
+        };
+        let c_path = match cstring_path(&backend.path) {
+            Ok(path) => path,
+            Err(errno) => {
+                reply.error(errno);
+                return;
+            }
+        };
+        // SAFETY: 两个 CString 在调用期间存活且以 NUL 结尾，symlink 只读取不写入。
+        let ret = unsafe { libc::symlink(c_target.as_ptr(), c_path.as_ptr()) };
+        if ret != 0 {
+            reply.error(errno_from_code(last_errno()));
+            return;
+        }
+        fix_path_metadata(
+            &backend.path,
+            policy.uid,
+            0o777,
+            backend.is_shared_public_backend,
+            false,
+        );
+        self.invalidate_dir_candidate_cache();
+        let ino = {
+            let mut state = self.state.write().unwrap_or_else(|err| err.into_inner());
+            let ino = Self::ino_for_path_locked(&mut state, &rel);
+            // 同 create：登记属主供跨进程 fstat 回退。
+            Self::remember_policy_for_inode_locked(&mut state, ino, &rel, &policy);
+            Self::add_lookup_locked(&mut state, ino);
+            ino
+        };
+        match self.visible_attr_for_backend(&policy, ino, &backend) {
+            Ok(attr) => reply.entry(&ENTRY_TTL, &attr, Generation(0)),
+            Err(errno) => {
+                let mut state = self.state.write().unwrap_or_else(|err| err.into_inner());
+                Self::remove_lookup_locked(&mut state, ino, 1);
+                reply.error(errno);
+            }
+        }
+    }
+
+    fn getxattr(&self, req: &Request, ino: INodeNo, name: &OsStr, size: u32, reply: ReplyXattr) {
+        let policy = self.policy_for_fd_stat_or_request(req, ino);
+        let outcome = self.with_backend_for_xattr(&policy, ino, "getxattr", |c_path| {
+            let c_name = match std::ffi::CString::new(name.as_bytes()) {
+                Ok(value) => value,
+                Err(_) => return Err(Errno::EINVAL),
+            };
+            // SAFETY: c_path/c_name 在调用期间存活且以 NUL 结尾；首查长度，空缓冲合法。
+            let needed = unsafe {
+                libc::lgetxattr(c_path.as_ptr(), c_name.as_ptr(), std::ptr::null_mut(), 0)
+            };
+            if needed < 0 {
+                return Err(errno_from_code(last_errno()));
+            }
+            if size == 0 {
+                return Ok(XattrOutcome::Size(needed as u32));
+            }
+            if (needed as u64) > size as u64 {
+                return Err(Errno::ERANGE);
+            }
+            let mut buffer = vec![0u8; needed as usize];
+            // SAFETY: buffer 长度即上面查得的 needed，lgetxattr 只写入 buffer 范围内。
+            let written = unsafe {
+                libc::lgetxattr(
+                    c_path.as_ptr(),
+                    c_name.as_ptr(),
+                    buffer.as_mut_ptr() as *mut libc::c_void,
+                    buffer.len(),
+                )
+            };
+            if written < 0 {
+                return Err(errno_from_code(last_errno()));
+            }
+            buffer.truncate(written as usize);
+            Ok(XattrOutcome::Data(buffer))
+        });
+        match outcome {
+            Ok(XattrOutcome::Size(value)) => reply.size(value),
+            Ok(XattrOutcome::Data(bytes)) => reply.data(&bytes),
+            Err(errno) => reply.error(errno),
+        }
+    }
+
+    fn setxattr(
+        &self,
+        req: &Request,
+        ino: INodeNo,
+        name: &OsStr,
+        value: &[u8],
+        flags: i32,
+        position: u32,
+        reply: ReplyEmpty,
+    ) {
+        if position != 0 {
+            // position 仅 pwritev 风格的 resource fork 语义使用，Linux 上恒为 0。
+            reply.error(Errno::EINVAL);
+            return;
+        }
+        let policy = self.policy_for_fd_stat_or_request(req, ino);
+        let outcome = self.with_backend_for_xattr(&policy, ino, "setxattr", |c_path| {
+            let c_name = match std::ffi::CString::new(name.as_bytes()) {
+                Ok(value) => value,
+                Err(_) => return Err(Errno::EINVAL),
+            };
+            // SAFETY: c_path/c_name 存活且以 NUL 结尾；value 为调用方传入的只读缓冲。
+            let ret = unsafe {
+                libc::lsetxattr(
+                    c_path.as_ptr(),
+                    c_name.as_ptr(),
+                    value.as_ptr() as *const libc::c_void,
+                    value.len(),
+                    flags,
+                )
+            };
+            if ret == 0 {
+                Ok(XattrOutcome::Data(Vec::new()))
+            } else {
+                Err(errno_from_code(last_errno()))
+            }
+        });
+        match outcome {
+            Ok(_) => reply.ok(),
+            Err(errno) => reply.error(errno),
+        }
+    }
+
+    fn listxattr(&self, req: &Request, ino: INodeNo, size: u32, reply: ReplyXattr) {
+        let policy = self.policy_for_fd_stat_or_request(req, ino);
+        let outcome = self.with_backend_for_xattr(&policy, ino, "listxattr", |c_path| {
+            // SAFETY: c_path 存活且以 NUL 结尾；首查长度，空缓冲合法。
+            let needed = unsafe { libc::llistxattr(c_path.as_ptr(), std::ptr::null_mut(), 0) };
+            if needed < 0 {
+                return Err(errno_from_code(last_errno()));
+            }
+            if size == 0 {
+                return Ok(XattrOutcome::Size(needed as u32));
+            }
+            if (needed as u64) > size as u64 {
+                return Err(Errno::ERANGE);
+            }
+            let mut buffer = vec![0u8; needed as usize];
+            // SAFETY: buffer 长度即上面查得的 needed，llistxattr 只写入 buffer 范围内。
+            let written = unsafe {
+                libc::llistxattr(
+                    c_path.as_ptr(),
+                    buffer.as_mut_ptr() as *mut libc::c_char,
+                    buffer.len(),
+                )
+            };
+            if written < 0 {
+                return Err(errno_from_code(last_errno()));
+            }
+            buffer.truncate(written as usize);
+            Ok(XattrOutcome::Data(buffer))
+        });
+        match outcome {
+            Ok(XattrOutcome::Size(value)) => reply.size(value),
+            Ok(XattrOutcome::Data(bytes)) => reply.data(&bytes),
+            Err(errno) => reply.error(errno),
+        }
+    }
+
+    fn removexattr(&self, req: &Request, ino: INodeNo, name: &OsStr, reply: ReplyEmpty) {
+        let policy = self.policy_for_fd_stat_or_request(req, ino);
+        let outcome = self.with_backend_for_xattr(&policy, ino, "removexattr", |c_path| {
+            let c_name = match std::ffi::CString::new(name.as_bytes()) {
+                Ok(value) => value,
+                Err(_) => return Err(Errno::EINVAL),
+            };
+            // SAFETY: c_path/c_name 存活且以 NUL 结尾，lremovexattr 只读取。
+            let ret = unsafe { libc::lremovexattr(c_path.as_ptr(), c_name.as_ptr()) };
+            if ret == 0 {
+                Ok(XattrOutcome::Data(Vec::new()))
+            } else {
+                Err(errno_from_code(last_errno()))
+            }
+        });
+        match outcome {
+            Ok(_) => reply.ok(),
+            Err(errno) => reply.error(errno),
+        }
+    }
+
+    fn lseek(
+        &self,
+        _req: &Request,
+        _ino: INodeNo,
+        fh: FileHandle,
+        offset: i64,
+        whence: i32,
+        reply: ReplyLseek,
+    ) {
+        let file = {
+            let state = self.state.read().unwrap_or_else(|err| err.into_inner());
+            match state.files.get(&fh.into()).and_then(|f| f.file.clone()) {
+                Some(file) => file,
+                None => {
+                    reply.error(Errno::EBADF);
+                    return;
+                }
+            }
+        };
+        // 内核仅对 SEEK_HOLE/SEEK_DATA 下发 FUSE lseek（普通定位在页缓存层完成）。
+        // 后端文件非稀疏语义：DATA 返回起始偏移，HOLE 返回文件尾（EOF 处的洞）。
+        let size = match file.metadata() {
+            Ok(metadata) => metadata.len() as i64,
+            Err(error) => {
+                reply.error(errno_from_io(error));
+                return;
+            }
+        };
+        match whence {
+            libc::SEEK_DATA => {
+                if offset >= size {
+                    reply.error(Errno::ENXIO);
+                } else {
+                    reply.offset(offset.max(0));
+                }
+            }
+            libc::SEEK_HOLE => {
+                if offset >= size {
+                    reply.error(Errno::ENXIO);
+                } else {
+                    reply.offset(size);
+                }
+            }
+            _ => reply.error(Errno::EINVAL),
+        }
+    }
+
     fn create(
         &self,
         req: &Request,
@@ -1021,6 +1365,9 @@ impl Filesystem for FuseRedirectFs {
         let ino = {
             let mut state = self.state.write().unwrap_or_else(|err| err.into_inner());
             let ino = Self::ino_for_path_locked(&mut state, &rel);
+            // 登记属主：该文件 fd 经 binder 跨进程后，fstat（GETATTR 带 fh）
+            // 需要回退到创建者策略而不是按请求者 uid 重路由。
+            Self::remember_policy_for_inode_locked(&mut state, ino, &rel, &policy);
             Self::add_lookup_locked(&mut state, ino);
             ino
         };
@@ -1065,11 +1412,11 @@ impl Filesystem for FuseRedirectFs {
                         }
                     }
                     reply.created_passthrough(
-                        &TTL,
+                        &ATTR_TTL,
                         &attr,
                         Generation(0),
                         FileHandle(fh),
-                        FopenFlags::empty(),
+                        self.file_open_flags(),
                         &backing,
                     );
                 }
@@ -1082,21 +1429,21 @@ impl Filesystem for FuseRedirectFs {
                         error
                     );
                     reply.created(
-                        &TTL,
+                        &ATTR_TTL,
                         &attr,
                         Generation(0),
                         FileHandle(fh),
-                        FopenFlags::empty(),
+                        self.file_open_flags(),
                     );
                 }
             }
         } else {
             reply.created(
-                &TTL,
+                &ATTR_TTL,
                 &attr,
                 Generation(0),
                 FileHandle(fh),
-                FopenFlags::empty(),
+                self.file_open_flags(),
             );
         }
     }
@@ -1153,13 +1500,15 @@ impl Filesystem for FuseRedirectFs {
         let ino = {
             let mut state = self.state.write().unwrap_or_else(|err| err.into_inner());
             let ino = Self::ino_for_path_locked(&mut state, &rel);
+            // 同 create：登记属主供跨进程 fstat 回退。
+            Self::remember_policy_for_inode_locked(&mut state, ino, &rel, &policy);
             Self::add_lookup_locked(&mut state, ino);
             ino
         };
         match self.attr_for_backend(&policy, ino, &backend) {
             Ok(attr) => {
                 policy.emit_monitor_create(&backend);
-                reply.entry(&TTL, &attr, Generation(0));
+                reply.entry(&ENTRY_TTL, &attr, Generation(0));
             }
             Err(errno) => {
                 let mut state = self.state.write().unwrap_or_else(|err| err.into_inner());
@@ -1206,7 +1555,7 @@ impl Filesystem for FuseRedirectFs {
         }
         self.invalidate_dir_candidate_cache();
         policy.emit_monitor_create(&backend);
-        self.reply_entry_for_rel(&policy, &rel, reply);
+        self.reply_entry_for_rel(req.uid(), &policy, &rel, reply);
     }
 
     fn unlink(&self, req: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEmpty) {
@@ -1348,10 +1697,17 @@ impl Filesystem for FuseRedirectFs {
         reply: ReplyAttr,
     ) {
         let _perf = self.perf.observe(&self.perf.mutation_calls);
-        let policy = self.policy_for_request(req);
+        let mut policy = self.policy_for_request(req);
+        // ftruncate/fchmod 等经跨进程 fd 到达时同样不能按请求者 uid 重路由
+        // （fstat 同理，见 getattr 的属主回退注释）。
+        if let Some(owner_policy) = self.inode_owner_policy_for_fd_stat(ino, req.uid()) {
+            policy = owner_policy;
+        }
         let backend = match self.backend_for_ino(&policy, ino) {
             Ok(backend) => backend,
             Err(errno) => {
+                let rel = self.path_for_ino(ino);
+                self.log_reply_error("setattr", req.uid(), rel.as_deref(), errno);
                 reply.error(errno);
                 return;
             }
@@ -1431,20 +1787,27 @@ impl Filesystem for FuseRedirectFs {
         }
 
         match self.attr_for_backend(&policy, ino, &backend) {
-            Ok(attr) => reply.attr(&TTL, &attr),
+            Ok(attr) => reply.attr(&ATTR_TTL, &attr),
             Err(errno) => reply.error(errno),
         }
     }
 
     fn access(&self, req: &Request, ino: INodeNo, mask: AccessFlags, reply: ReplyEmpty) {
-        let policy = if mask.contains(AccessFlags::W_OK) {
+        let mut policy = if mask.contains(AccessFlags::W_OK) {
             self.policy_for_request(req)
         } else {
             self.policy_for_read_request(req, Some(ino), None)
         };
+        if let Some(rel) = self.path_for_ino(ino)
+            && let Some(owner_policy) = self.system_reader_policy_on_miss(req.uid(), &policy, &rel)
+        {
+            policy = owner_policy;
+        }
         let backend = match self.backend_for_ino(&policy, ino) {
             Ok(backend) => backend,
             Err(errno) => {
+                let rel = self.path_for_ino(ino);
+                self.log_reply_error("access", req.uid(), rel.as_deref(), errno);
                 reply.error(errno);
                 return;
             }

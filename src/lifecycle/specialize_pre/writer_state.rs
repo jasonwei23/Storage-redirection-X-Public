@@ -107,6 +107,9 @@ pub(super) fn should_defer_media_boot_extras_for_state(
 }
 
 pub(super) fn should_install_java_hook_for_writer(context: &SystemWriterContext) -> bool {
+    if super::mp_hooks_disabled() {
+        return false;
+    }
     // MediaProvider 的 ContentValues 路径补丁需要 Java hook。Android 13
     // 上 MediaProvider 可能在模块配置写入前就已经启动，且测试/部分设备
     // 不能安全重启该进程；因此 Java mutation hook 需要在 MediaProvider

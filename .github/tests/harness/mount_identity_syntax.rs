@@ -31,6 +31,7 @@ mod platform {
         pub struct MountInfoEntry<'a> {
             pub mount_id: u64,
             pub parent_mount_id: u64,
+            pub dev: &'a str,
             pub root: &'a str,
             pub target: &'a str,
             pub fs_type: &'a str,

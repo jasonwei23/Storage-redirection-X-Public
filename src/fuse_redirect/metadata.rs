@@ -32,7 +32,6 @@ pub(super) fn fix_path_metadata(
         owner_uid as u32
     };
     if let Ok(c_path) = cstring_path(path) {
-        // SAFETY: c_path 以 NUL 结尾，并在 chown 调用期间保持有效。
         let _ = unsafe { libc::chown(c_path.as_ptr(), effective_uid, MEDIA_RW_GID) };
     }
     let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode));
@@ -61,12 +60,14 @@ pub(super) fn fix_existing_path_metadata(
 
 pub(super) fn adjust_metadata_mode(mode: u32, is_shared_public_backend: bool, is_dir: bool) -> u32 {
     let mode = mode & 0o7777;
-    if !is_shared_public_backend {
-        return mode;
-    }
-    if is_dir {
+    if is_shared_public_backend && is_dir {
         return SHARED_PUBLIC_DIR_MODE;
     }
+    // 私有树与公共文件统一做 owner→group 位镜像并清 others：原生 MP FUSE 对
+    // 应用新建条目不透传调用方请求 mode，而是按 media_rw 可管理的语义派生
+    // （真机 2026-10-20 实证：同一 app 显式 0600 创建录制文件，原生结果
+    // 0660/目录 02770）。宿主此前对私有树透传 0600，media_rw 组位归零导致
+    // MP 侧后续读取被 DAC 拒——QQ 相机录制收尾即因此误报「录制异常」。
     let owner_bits_for_group = (mode & 0o700) >> 3;
     (mode | owner_bits_for_group) & !0o007
 }

@@ -54,10 +54,7 @@ const TAG_FILE_MONITOR: &str = "FileMonitorOp";
 const TAG_STATS: &str = "Stats";
 const TAG_CONTROL: &str = "Control";
 /// MP hook 进程请求 daemon（root）代修属主的通道标签；与 src/logging.rs 的
-/// OWNER_FIX_LOG_TAG 保持字面一致。
-const TAG_OWNER_FIX: &str = "OwnerFix";
 /// 待代修路径队列上限：恶意/异常发送方在 per-uid 限流之外再受总量约束。
-const OWNER_FIX_REQUEST_LIMIT: usize = 256;
 const CONTROL_CLEAR_MONITOR: &str = "clear-monitor";
 const CONTROL_CLEAR_MONITOR_PREFIX: &str = "clear-monitor:";
 const CONTROL_FLUSH_ALL: &str = "flush-all";
@@ -106,36 +103,6 @@ pub fn take_policy_register_request() -> Option<String> {
         .lock()
         .ok()
         .and_then(|mut slot| slot.take())
-}
-
-fn owner_fix_requests_slot() -> &'static Mutex<Vec<String>> {
-    OWNER_FIX_REQUESTS.get_or_init(|| Mutex::new(Vec::new()))
-}
-
-/// 取出待 daemon（root）代修的属主修复请求。
-///
-/// 请求由 MP hook 在进程内 lchown 被 EPERM 拒绝时发出（普通 uid 无 CAP_CHOWN），
-/// 只有路径本身；daemon 侧执行时重新校验路径形态并推导应用 uid，不信任包内
-/// 任何 uid 字段，伪造者最多让 daemon 把某应用私有树修回其应用 uid，与正常
-/// 修复行为等价，无提权面。
-pub fn take_owner_fix_requests() -> Vec<String> {
-    owner_fix_requests_slot()
-        .lock()
-        .map(|mut queue| std::mem::take(&mut *queue))
-        .unwrap_or_default()
-}
-
-fn queue_owner_fix_request(backend_path: String) {
-    let mut queue = match owner_fix_requests_slot().lock() {
-        Ok(queue) => queue,
-        Err(_) => return,
-    };
-    if queue.len() >= OWNER_FIX_REQUEST_LIMIT || queue.contains(&backend_path) {
-        return;
-    }
-    queue.push(backend_path);
-    drop(queue);
-    wake_daemon();
 }
 
 pub fn start() -> io::Result<()> {
@@ -461,15 +428,6 @@ impl LogState {
             TAG_STATS => {
                 if self.allow_from_sender(sender_uid) {
                     self.add_stats(message);
-                }
-            }
-            TAG_OWNER_FIX => {
-                // 消息体就是 /data/media/... 后端路径；daemon 消费时重新校验。
-                if self.allow_from_sender(sender_uid)
-                    && message.starts_with("/data/media/")
-                    && !message.contains('\n')
-                {
-                    queue_owner_fix_request(message.to_string());
                 }
             }
             TAG_CONTROL => {

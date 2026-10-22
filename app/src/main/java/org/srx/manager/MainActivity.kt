@@ -45,12 +45,6 @@ import androidx.compose.ui.unit.dp
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.compose.LifecycleEventEffect
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
-import androidx.lifecycle.viewmodel.navigation3.rememberViewModelStoreNavEntryDecorator
-import androidx.navigation3.runtime.NavBackStack
-import androidx.navigation3.runtime.NavKey
-import androidx.navigation3.runtime.entryProvider
-import androidx.navigation3.runtime.rememberSaveableStateHolderNavEntryDecorator
-import androidx.navigation3.ui.NavDisplay
 import androidx.navigationevent.NavigationEventInfo
 import androidx.navigationevent.compose.NavigationBackHandler
 import androidx.navigationevent.compose.NavigationEventState
@@ -58,6 +52,7 @@ import androidx.navigationevent.compose.rememberNavigationEventState
 import com.kyant.backdrop.backdrops.layerBackdrop as kyantLayerBackdrop
 import com.kyant.backdrop.backdrops.rememberCombinedBackdrop as rememberKyantCombinedBackdrop
 import com.kyant.backdrop.backdrops.rememberLayerBackdrop as rememberKyantLayerBackdrop
+import kotlinx.serialization.Serializable
 import org.srx.manager.data.AppFilter
 import org.srx.manager.data.ConfigTemplate
 import org.srx.manager.data.UiPreferences
@@ -84,6 +79,9 @@ import top.yukonga.miuix.kmp.icon.extended.GridView
 import top.yukonga.miuix.kmp.icon.extended.ListView
 import top.yukonga.miuix.kmp.icon.extended.Notes
 import top.yukonga.miuix.kmp.icon.extended.Settings
+import top.yukonga.miuix.kmp.nav.core.NavDisplay
+import top.yukonga.miuix.kmp.nav.core.NavKey
+import top.yukonga.miuix.kmp.nav.core.rememberNavBackStack
 import top.yukonga.miuix.kmp.shader.isRenderEffectSupported
 
 class MainActivity : ComponentActivity() {
@@ -124,16 +122,18 @@ internal enum class Page(val label: String, val icon: ImageVector) {
   Settings("设置", MiuixIcons.Settings),
 }
 
+// miuix-nav 的回栈依赖 kotlinx.serialization 做状态恢复，路由必须可序列化。
+@Serializable
 private sealed interface SrxRoute : NavKey {
-  data object Main : SrxRoute
+  @Serializable data object Main : SrxRoute
 
-  data object About : SrxRoute
+  @Serializable data object About : SrxRoute
 
-  data object Update : SrxRoute
+  @Serializable data object Update : SrxRoute
 
-  data object Theme : SrxRoute
+  @Serializable data object Theme : SrxRoute
 
-  data class AppConfig(val packageName: String) : SrxRoute
+  @Serializable data class AppConfig(val packageName: String) : SrxRoute
 }
 
 private fun toggleSelectedPackage(selected: List<String>, packageName: String): List<String> =
@@ -179,9 +179,10 @@ private fun SrxManagerApp(
   var page by rememberSaveable { mutableStateOf(Page.Dashboard) }
   var pageHistory by rememberSaveable { mutableStateOf<List<Page>>(emptyList()) }
   var themeRouteOpen by rememberSaveable { mutableStateOf(false) }
-  val navBackStack = remember {
-    NavBackStack<SrxRoute>(SrxRoute.Main).apply { if (themeRouteOpen) add(SrxRoute.Theme) }
-  }
+  val navBackStack =
+      rememberNavBackStack<SrxRoute>(SrxRoute.Main).apply {
+        if (themeRouteOpen) add(SrxRoute.Theme)
+      }
   var showRootDialog by remember { mutableStateOf(false) }
   var toast by remember { mutableStateOf<String?>(null) }
   var pendingRestoreUri by remember { mutableStateOf<Uri?>(null) }
@@ -506,95 +507,88 @@ private fun SrxManagerApp(
             NavDisplay(
                 backStack = navBackStack,
                 modifier = Modifier.fillMaxSize(),
-                entryDecorators =
-                    listOf(
-                        rememberSaveableStateHolderNavEntryDecorator(),
-                        rememberViewModelStoreNavEntryDecorator(),
-                    ),
                 onBack = { if (!state.busy) popNavBackStack() },
-                entryProvider =
-                    entryProvider {
-                      entry<SrxRoute.Main> { PageContent(page) }
-                      entry<SrxRoute.About> {
-                        AboutScreen(
-                            onBack = ::popNavBackStack,
-                        )
-                      }
-                      entry<SrxRoute.Update> {
-                        UpdateScreen(
-                            prefs = prefs,
-                            moduleVersion = state.dashboard.version,
-                            updateCheckRunning = state.updateCheckRunning,
-                            onBack = ::popNavBackStack,
-                            onAutoCheckUpdates = viewModel::setAutoCheckUpdates,
-                            onUpdateChannel = viewModel::setUpdateChannel,
-                            onCheckNow = { viewModel.checkForUpdates(manual = true) },
-                        )
-                      }
-                      entry<SrxRoute.Theme> {
-                        ThemeSettingsScreen(
-                            prefs = prefs,
-                            onBack = ::popNavBackStack,
-                            onFloating = viewModel::setFloatingBottomBar,
-                            onLiquid = viewModel::setLiquidGlass,
-                            onBlurEffect = viewModel::setBlurEffect,
-                            onDynamicColor = viewModel::setDynamicColor,
-                            onAccentColor = viewModel::setAccentColor,
-                            onColorStyle = viewModel::setColorStyle,
-                            onColorSpec = viewModel::setColorSpec,
-                            onThemeMode = viewModel::setThemeMode,
-                            onPredictiveBack = { enabled ->
-                              themeRouteOpen = true
-                              startupUpdateCheckDone = true
-                              viewModel.setPredictiveBack(enabled)
-                              syncPredictiveBackEnabled(context.applicationInfo, enabled)
-                              (context as? ComponentActivity)?.recreate()
-                            },
-                            onPageScale = viewModel::setPageScale,
-                        )
-                      }
-                      entry<SrxRoute.AppConfig> {
-                        val currentApp = state.currentApp
-                        val currentConfig = state.currentConfig
-                        if (
-                            currentApp != null &&
-                                currentConfig != null &&
-                                currentApp.packageName == it.packageName
-                        ) {
-                          AppConfigScreen(
-                              state = state,
-                              app = currentApp,
-                              config = currentConfig,
-                              prefs = prefs,
-                              onBack = ::popNavBackStack,
-                              onSave = { viewModel.saveCurrentConfig() },
-                              onDelete = viewModel::deleteCurrentConfig,
-                              onSaveTemplate = viewModel::saveCurrentConfigAsTemplate,
-                              onApplyTemplate = viewModel::applyTemplateToCurrentApp,
-                              onProfileChange = viewModel::updateProfile,
-                              onAddAllowed = viewModel::addAllowedPath,
-                              onAddSandbox = viewModel::addSandboxPath,
-                              onUpdateAllowed = viewModel::updateAllowedPath,
-                              onUpdateSandbox = viewModel::updateSandboxPath,
-                              onRemoveAllowed = viewModel::removeAllowedPath,
-                              onRemoveSandbox = viewModel::removeSandboxPath,
-                              onSetReadOnlyEnabled = viewModel::setReadOnlyEnabled,
-                              onAddReadOnly = viewModel::addReadOnlyPath,
-                              onUpdateReadOnly = viewModel::updateReadOnlyPath,
-                              onRemoveReadOnly = viewModel::removeReadOnlyPath,
-                              onAddMapping = viewModel::addMapping,
-                              onUpdateMapping = viewModel::updateMapping,
-                              onRemoveMapping = viewModel::removeMapping,
-                              onListDirectories = viewModel::listStorageDirectories,
-                          )
-                        } else {
-                          Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
-                            InfiniteProgressIndicator()
-                          }
-                        }
-                      }
+            ) {
+              entry<SrxRoute.Main> { PageContent(page) }
+              entry<SrxRoute.About> {
+                AboutScreen(
+                    onBack = ::popNavBackStack,
+                )
+              }
+              entry<SrxRoute.Update> {
+                UpdateScreen(
+                    prefs = prefs,
+                    moduleVersion = state.dashboard.version,
+                    updateCheckRunning = state.updateCheckRunning,
+                    onBack = ::popNavBackStack,
+                    onAutoCheckUpdates = viewModel::setAutoCheckUpdates,
+                    onUpdateChannel = viewModel::setUpdateChannel,
+                    onCheckNow = { viewModel.checkForUpdates(manual = true) },
+                )
+              }
+              entry<SrxRoute.Theme> {
+                ThemeSettingsScreen(
+                    prefs = prefs,
+                    onBack = ::popNavBackStack,
+                    onFloating = viewModel::setFloatingBottomBar,
+                    onLiquid = viewModel::setLiquidGlass,
+                    onBlurEffect = viewModel::setBlurEffect,
+                    onDynamicColor = viewModel::setDynamicColor,
+                    onAccentColor = viewModel::setAccentColor,
+                    onColorStyle = viewModel::setColorStyle,
+                    onColorSpec = viewModel::setColorSpec,
+                    onThemeMode = viewModel::setThemeMode,
+                    onPredictiveBack = { enabled ->
+                      themeRouteOpen = true
+                      startupUpdateCheckDone = true
+                      viewModel.setPredictiveBack(enabled)
+                      syncPredictiveBackEnabled(context.applicationInfo, enabled)
+                      (context as? ComponentActivity)?.recreate()
                     },
-            )
+                    onPageScale = viewModel::setPageScale,
+                )
+              }
+              entry<SrxRoute.AppConfig> { route ->
+                val currentApp = state.currentApp
+                val currentConfig = state.currentConfig
+                if (
+                    currentApp != null &&
+                        currentConfig != null &&
+                        currentApp.packageName == route.packageName
+                ) {
+                  AppConfigScreen(
+                      state = state,
+                      app = currentApp,
+                      config = currentConfig,
+                      prefs = prefs,
+                      onBack = ::popNavBackStack,
+                      onSave = { viewModel.saveCurrentConfig() },
+                      onDelete = viewModel::deleteCurrentConfig,
+                      onSaveTemplate = viewModel::saveCurrentConfigAsTemplate,
+                      onApplyTemplate = viewModel::applyTemplateToCurrentApp,
+                      onProfileChange = viewModel::updateProfile,
+                      onAddAllowed = viewModel::addAllowedPath,
+                      onAddSandbox = viewModel::addSandboxPath,
+                      onUpdateAllowed = viewModel::updateAllowedPath,
+                      onUpdateSandbox = viewModel::updateSandboxPath,
+                      onRemoveAllowed = viewModel::removeAllowedPath,
+                      onRemoveSandbox = viewModel::removeSandboxPath,
+                      onSetReadOnlyEnabled = viewModel::setReadOnlyEnabled,
+                      onAddReadOnly = viewModel::addReadOnlyPath,
+                      onUpdateReadOnly = viewModel::updateReadOnlyPath,
+                      onRemoveReadOnly = viewModel::removeReadOnlyPath,
+                      onAddMapping = viewModel::addMapping,
+                      onUpdateMapping = viewModel::updateMapping,
+                      onRemoveMapping = viewModel::removeMapping,
+                      onListDirectories = viewModel::listStorageDirectories,
+                  )
+                } else {
+                  Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+                    InfiniteProgressIndicator()
+                  }
+                }
+              }
+            }
           }
         }
 

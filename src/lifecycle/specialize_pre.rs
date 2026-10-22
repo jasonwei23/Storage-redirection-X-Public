@@ -753,7 +753,43 @@ impl RuntimeFlow {
     }
 }
 
+/// 诊断开关：`.disable_mp_hooks` 存在时跳过 MediaProvider 进程内全部模块 hook
+/// （Java hook / PLT hook / fuse-fix），用于二分定位「hook 引发应用行为异常」类
+/// 问题；正常构建与用户环境不存在该文件，零影响。
+pub(crate) fn mp_hooks_disabled() -> bool {
+    std::path::Path::new(crate::platform::module_paths::MODULE_DIR)
+        .join(".disable_mp_hooks")
+        .exists()
+}
+
+/// 诊断开关：`.disable_fuse_fix` 只跳过 fuse-fix（对 MP 原生 FuseDaemon 的
+/// native 补丁），Java hook 与 PLT hook 保持安装。
+pub(crate) fn fuse_fix_disabled() -> bool {
+    std::path::Path::new(crate::platform::module_paths::MODULE_DIR)
+        .join(".disable_fuse_fix")
+        .exists()
+}
+
+/// 诊断开关：`.disable_plt_hook` 只跳过 MP 的 PLT/media-runtime hook。
+pub(crate) fn plt_hook_disabled() -> bool {
+    std::path::Path::new(crate::platform::module_paths::MODULE_DIR)
+        .join(".disable_plt_hook")
+        .exists()
+}
+
+/// 诊断开关：`.disable_java_hook` 只跳过 MP 的 Java hook（LSPlant）。
+pub(crate) fn java_hook_disabled() -> bool {
+    std::path::Path::new(crate::platform::module_paths::MODULE_DIR)
+        .join(".disable_java_hook")
+        .exists()
+}
+
 fn install_java_hook(env: *mut jni_sys::JNIEnv) {
+    if java_hook_disabled() {
+        log::info!("java hook skip: disabled by diagnostic marker");
+        record_media_hook_install_state("java_hook_disabled");
+        return;
+    }
     // MediaProvider 主进程的 Java hook 保持启用
     // 用于 Caller 识别，工作稳定
     if !java_hook::is_available() {

@@ -120,7 +120,11 @@ class GenerateChangelogTest(unittest.TestCase):
             self.assertNotIn("COPILOT_PAT", workflow)
             self.assertNotIn("prompt-output", workflow)
             self.assertNotIn("analysis-file", workflow)
-        self.assertNotIn('cp "$RELEASE_NOTES" build/changelog.md', release)
+        # 正式 Release 优先采用 AI Agent 审查后的 docs/release-notes 覆盖正文，
+        # 并必须经过 validate_release_notes.py 校验；CI 构建正文不得使用覆盖。
+        self.assertIn('RELEASE_NOTES="docs/release-notes/v${VERSION}.md"', release)
+        self.assertIn("validate_release_notes.py", release)
+        self.assertNotIn('RELEASE_NOTES="docs/release-notes', ci)
 
     def test_release_notes_validator_accepts_final_result_sections(self) -> None:
         markdown = """# Storage Redirect X v1.2.58

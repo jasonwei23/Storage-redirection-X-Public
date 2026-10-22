@@ -1,0 +1,18 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="robots" content="noindex">
+  <title>Storage Redirect X - 最新 CI Build</title>
+</head>
+<body>
+  <p>正在跳转到最新 CI Build Release…（若无自动跳转，请前往
+    <a href="https://github.com/z1298808165/Storage-redirection-X-Public/releases">Releases</a>）</p>
+  <script>
+    fetch('https://raw.githubusercontent.com/z1298808165/Storage-redirection-X-Public/SRX-R/update.json', { cache: 'no-store' })
+      .then(function (r) { return r.json(); })
+      .then(function (d) { window.location.replace(d.beta.url); })
+      .catch(function () { window.location.href = 'https://github.com/z1298808165/Storage-redirection-X-Public/releases'; });
+  </script>
+</body>
+</html>

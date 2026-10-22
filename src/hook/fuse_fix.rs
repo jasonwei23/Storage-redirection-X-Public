@@ -168,7 +168,14 @@ fn install_target_if_enabled() {
         .filter(|probe| {
             matches!(
                 probe.as_str(),
-                "core" | "extended" | "all" | "all_compare" | "late"
+                "core"
+                    | "extended"
+                    | "all"
+                    | "all_compare"
+                    | "late"
+                    | "reply"
+                    | "passthrough"
+                    | "openwithfuse"
             )
         });
     if let Some(probe) = native_probe.as_deref() {
@@ -200,7 +207,7 @@ fn install_target_if_enabled() {
             unsafe { srx_fuse_fix_is_installed() }
         );
     }
-    if native_probe.is_none() || native_probe.as_deref() == Some("all_compare") {
+    if native_probe.as_deref() == Some("all_compare") {
         register_compare_hooks_once();
     }
     if RETRY_COUNT.load(Ordering::Relaxed) >= MAX_RETRY_COUNT {
@@ -239,13 +246,21 @@ fn install_target_if_enabled() {
                 is_bpf_backing_path,
             )
         };
+    // 默认与 reply 档：core-3 + reply×2。真机 2026-10-20 A/B（QQ 相机录制）：
+    // should_open_with_fuse 与 passthrough×2 单独安装即可令录制「首次成功后续
+    // 全败」（签名核对无误，疑为 inline 跳板对这几个函数的扰动），reply×2 与
+    // core-3 无此问题；默认安装剔除三者，全量保留在 all/all_compare 调试档。
+    let extended_slots_disabled = !matches!(
+        native_probe.as_deref(),
+        Some("all") | Some("all_compare") | Some("late")
+    );
     let (
         should_open_with_fuse,
         reply_open_slot,
         reply_create_slot,
         passthrough_enable_slot,
         passthrough_open_slot,
-    ) = if native_probe.as_deref() == Some("core") {
+    ) = if extended_slots_disabled {
         (
             std::ptr::null_mut(),
             std::ptr::null_mut(),
@@ -261,6 +276,33 @@ fn install_target_if_enabled() {
             passthrough_enable_slot,
             passthrough_open_slot,
         )
+    };
+    // 细分档位：reply 只保留 reply×2；passthrough 只保留 passthrough×2；
+    // openwithfuse 只保留 should_open_with_fuse。其余五件套槽位保持 null。
+    let reply_open_slot = if matches!(native_probe.as_deref(), None | Some("reply")) {
+        find_first_plt_slot(&elf, "fuse_reply_open")
+    } else {
+        reply_open_slot
+    };
+    let reply_create_slot = if matches!(native_probe.as_deref(), None | Some("reply")) {
+        find_first_plt_slot(&elf, "fuse_reply_create")
+    } else {
+        reply_create_slot
+    };
+    let passthrough_enable_slot = if native_probe.as_deref() == Some("passthrough") {
+        find_first_plt_slot(&elf, "fuse_passthrough_enable")
+    } else {
+        passthrough_enable_slot
+    };
+    let passthrough_open_slot = if native_probe.as_deref() == Some("passthrough") {
+        find_first_plt_slot(&elf, "fuse_passthrough_open")
+    } else {
+        passthrough_open_slot
+    };
+    let should_open_with_fuse = if native_probe.as_deref() == Some("openwithfuse") {
+        find_any(&elf, SHOULD_OPEN_WITH_FUSE_SYMBOLS)
+    } else {
+        should_open_with_fuse
     };
     if native_probe.is_some() {
         log::warn!(

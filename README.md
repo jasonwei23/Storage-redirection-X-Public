@@ -1,27 +1,120 @@
-# Storage Redirect X
+<!-- quality-allow(chinese-language): 头部为居中排版 HTML 块，结构性标签与徽章为机器元素。 -->
+<div align="center">
+  <img src="assets/zygisk_module/webroot/logo.png" width="128" alt="Storage Redirect X"/>
+  <!-- quality-allow(chinese-language): Storage Redirect X 为产品名，标题保留原名。 -->
+  <h1>Storage Redirect X</h1>
+  <p><b>一套面向 Android 的存储重定向方案 —— 让应用的存储访问回到它该在的地方。</b></p>
+  <p>
+    <a href="https://github.com/z1298808165/Storage-redirection-X-Public/releases/latest"><img src="https://img.shields.io/badge/dynamic/json?url=https%3A%2F%2Fraw.githubusercontent.com%2Fz1298808165%2FStorage-redirection-X-Public%2FSRX-R%2Fupdate.json&query=%24.stable.title&style=flat-square&label=%E6%AD%A3%E5%BC%8F%E7%89%88" alt="正式版"/></a>
+    <a href="https://z1298808165.github.io/Storage-redirection-X-Public/ci-latest.html"><img src="https://img.shields.io/badge/dynamic/json?url=https%3A%2F%2Fraw.githubusercontent.com%2Fz1298808165%2FStorage-redirection-X-Public%2FSRX-R%2Fupdate.json&query=%24.beta.title&style=flat-square&label=CI%20%E6%9E%84%E5%BB%BA" alt="CI 构建"/></a>
+    <!-- quality-allow(chinese-language): 平台徽章为 shields 机器标签，保留英文。 -->
+    <a href="https://github.com/z1298808165/Storage-redirection-X-Public/releases"><img src="https://img.shields.io/badge/Android-13%20--%2017-blue?style=flat-square" alt="Android 13-17"/></a>
+    <a href="#下载与安装"><img src="https://img.shields.io/badge/Root-Magisk%20%7C%20KernelSU%20%7C%20APatch-red?style=flat-square" alt="Root"/></a>
+    <a href="#下载与安装"><img src="https://img.shields.io/badge/Zygisk-%E7%8E%AF%E5%A2%83%E5%BF%85%E9%9C%80-orange?style=flat-square" alt="Zygisk"/></a>
+    <!-- quality-allow(chinese-language): 协议徽章为 shields 机器标签，保留英文。 -->
+    <a href="LICENSE"><img src="https://img.shields.io/badge/License-GPL--3.0--or--later-green?style=flat-square" alt="License"/></a>
+  </p>
+</div>
 
-Storage Redirect X 的核心 Zygisk 模块，负责文件系统重定向、MediaProvider query hook、系统媒体服务代写路径处理和路径过滤。
 
-## 分支说明
 
-本分支基于原作者在正式开源前提供给本人的早期源码版本，并在此基础上进行了大量功能性修改。由于改动范围远超常规 PR 所能覆盖，且与原作者后续开源的正式版本存在较大差异，因此本分支不适合直接向原仓库发起 Pull Request，而是作为个人深度定制版保留。
+---
 
-## 模块能力
+Storage Redirect X 是一个 Zygisk 模块，负责文件系统重定向、MediaProvider query hook、系统媒体服务代写路径处理和路径过滤。通过 mount namespace 与 scoped FUSE 双后端，把应用在公共存储的读写改写到应用私有目录，同时保留配置模板、备份还原、文件监视与管理界面等完整配套。
 
-- 文件系统重定向：按用户、应用和路径规则重定向存储访问。
-- MediaProvider 查询 Hook：让系统媒体服务能配合重定向后的路径工作。
-- 系统 writer 代写处理：覆盖 `com.android.providers.media.module` 等系统进程按调用方写入的场景。
-- 路径过滤：支持路径映射、真实路径放行、`!` 排除规则和仅映射模式下的局部沙盒路径；路径映射可在应用可见的公共存储路径与应用私有 namespace 路径之间建立定向映射。
-- FUSE 兼容保护：内置 FuseFixer-compatible 保护，可通过全局配置关闭。
-- 配置模板与备份还原：WebUI 和管理 App 支持保存、应用、批量应用配置模板，并可导出和还原互通的 ZIP 备份。
+> **本仓库是深度定制版。** 基于原作者在正式开源前提供的早期源码，并在此基础上进行了大量功能性修改。改动范围远超常规 PR 所能覆盖，与原作者后续开源的 [正式版本](https://github.com/Kindness-Kismet/Storage-redirection-X-Public) 存在较大差异，因此作为个人深度定制分支独立维护，不适合直接向原仓库发起 Pull Request。
 
-## 开源协议
+## ✨ 功能特性
 
-本仓库是基于 [Storage-redirection-X-Public](https://github.com/Kindness-Kismet/Storage-redirection-X-Public) 的修改版本。除单独标注的第三方组件或文件外，SRX Core 源码按 `GPL-3.0-or-later` 发布，详见 [LICENSE](LICENSE) 和 GPL 正文 [COPYING](COPYING)。
+- **🗂 完整隔离重定向** —— 应用在公共存储的写入默认进入应用私有沙盒，公共目录不再被乱写。
+- **🎯 精准路径映射** —— 公共路径与应用私有目录（含 `/data/data`、`/data/user` namespace 路径）之间按需互相映射，支持嵌套映射链与 `*`、`?` 通配。
+- **🔓 真实路径放行** —— `allowed_real_paths` 按需恢复真实目录，支持 `!` 排除规则。
+- **🔒 只读保护** —— 指定目录保持可读、禁止写入，映射入口同样继承只读语义。
+- **⚙️ 双存储后端** —— 按设备能力与规则复杂度在 scoped FUSE 与 mount namespace 之间自动选择，多应用会话收敛到共享宿主进程。
+- **📝 文件监视** —— 记录应用与系统代写链路的文件操作、发起应用与最终落点，支持按应用与操作过滤。
+- **🧩 配置模板** —— 保存、复用、批量应用一整份应用配置，配置修改热重载。
+- **💾 备份还原** —— 导出 `.srxbak.zip` 单文件备份，管理 App 与 WebUI 互通互还原。
+- **🆕 新装应用自动重定向** —— 安装新应用后按模板自动完成配置。
+- **🖥 双端管理界面** —— 原生管理 App（液态玻璃界面）与模块内置 WebUI。
 
-分发修改版或二进制构建时，必须按 `GPL-3.0-or-later` 提供对应源码并保留同等协议义务。模块刷入包会包含 `LICENSE` 和 `COPYING`，管理 App 和 WebUI 的“关于与开源协议”页面也会列出上游来源和协议。
+## 🧭 两种工作模式
 
-## 映射是如何工作的
+| | **完整隔离模式** | **仅映射模式** |
+| --- | --- | --- |
+| 适用场景 | 减少应用在公共目录乱写 | 只改写指定目录，其余保持原样 |
+| 未命中规则的行为 | 进入应用沙盒 | 保持真实路径 |
+| 放行规则 `allowed_real_paths` | 有效，支持 `!` 排除 | 无需配置（本来就放行） |
+| 局部沙盒 `sandboxed_paths` | 不适用 | 可选，命中后仍进沙盒 |
+| 路径映射 `path_mappings` | 有效 | 有效，优先级最高 |
+
+## 📥 下载与安装
+
+**支持的版本：Android 13 ~ 17**（公开测试流对 Android 17 模拟器使用 KernelSU 方案，真机以实际验证为准）。
+
+**环境要求：已解锁 Bootloader 并获取 Root，且具备可用的 Zygisk 环境。** 本模块不支持无 Root 环境。
+
+| 管理器 | Zygisk 环境 |
+| --- | --- |
+| Magisk | 在 Magisk 设置中开启内置「Zygisk」，或刷入 Zygisk Next 替代 |
+| KernelSU | 刷入 [Zygisk Next](https://github.com/Dr-TSNG/ZygiskNext)（推荐） |
+| APatch | 刷入 [Zygisk Next](https://github.com/Dr-TSNG/ZygiskNext) |
+
+| 文件 | 说明 |
+| --- | --- |
+| `storage.redirect.x-v<版本>.zip` | 模块刷入包，在管理器中刷入 |
+| `storage-redirect-x-manager-v<版本>.apk` | 管理 App，刷入模块后按需安装 |
+
+**正式版**
+
+1. 前往 [Releases](https://github.com/z1298808165/Storage-redirection-X-Public/releases) 下载模块 zip。
+2. 确认 Zygisk 环境就绪后，在 Magisk / KernelSU / APatch 管理器中刷入模块，重启设备。
+3. 打开模块 WebUI 或安装管理 App，为需要的应用配置重定向。
+
+**CI 测试版**
+
+1. 前往 [Releases](https://github.com/z1298808165/Storage-redirection-X-Public/releases) 中以 `ci-build-*` 为标签的 Pre-release（例如「CI Build 1.2.60-ci.50」），下载模块 zip 与管理 APK。
+2. 刷入与升级方式同上；更新日志见 Release 说明。
+
+**检查更新**：在管理 App「关于」页点击检查更新，或直接关注本仓库 Releases。
+
+## 🚀 快速上手
+
+为应用创建 `/data/adb/modules/storage.redirect.x/config/apps/<包名>.json`：
+
+```json
+{
+  "users": {
+    "0": {
+      // quality-allow(chinese-language): enabled 为配置字段名，最小示例保留原文。
+      "enabled": true
+    }
+  }
+}
+```
+
+这份最小配置会让应用进入完整隔离模式：除明确放行或映射的路径外，其余 `/storage/emulated/<用户>/` 下的访问都会进入应用沙盒。也可以在管理 App / WebUI 中直接勾选启用，无需手写配置。
+
+修改配置后推荐在模块操作里执行「重载重定向」，或通过管理应用保存配置触发热重载。
+
+## 📖 详细文档
+
+> **使用前建议阅读**：[运行时配置说明](docs/runtime-configuration.md) · [排障说明](docs/troubleshooting.md)
+
+| 文档 | 内容 |
+| --- | --- |
+| [运行时配置说明](docs/runtime-configuration.md) | 全部配置字段与语义 |
+| [设备侧测试说明](docs/device-testing.md) | 测试流场景与本地验证 |
+| [构建流程](docs/build-process.md) | 版本号规则与构建链路 |
+| [构建环境](docs/build-environment.md) | 本地开发环境搭建 |
+| [模块打包](docs/module-packaging.md) | 刷入包内容与结构 |
+| [存储后端架构](docs/storage-backend.md) | scoped FUSE / 共享宿主 / namespace 的自动选择与维护边界 |
+| [共享宿主 FUSE 架构设计](docs/shared-fuse-daemon-architecture.md) | 共享 FUSE 会话的设计、失效窗口分析与落地边界 |
+| [上游 Hook 依赖说明](docs/upstream-hook-dependencies.md) | native hook 能力的上游依赖 |
+
+以下章节保留完整配置细节，点击展开：
+
+<details>
+<summary><b>🗺 映射是如何工作的</b></summary>
 
 假设应用包名是 `com.example`，用户是 `0`。开启重定向后，默认重定向根目录是：
 
@@ -85,9 +178,9 @@ Storage Redirect X 的核心 Zygisk 模块，负责文件系统重定向、Media
 
 启用重定向时，当前应用自己的 `Android/data/<包名>`、`Android/media/<包名>` 和 `Android/obb/<包名>` 子树默认保持真实路径。这是应用私有目录的系统语义，不等同于把整个 `Android` 目录加入 `allowed_real_paths`；其它应用包名的私有目录仍按正常规则处理。
 
-### 任意路径映射
+#### 任意路径映射
 
-`path_mappings` 的请求路径和目标路径分别独立解析，既可以填写相对共享存储路径，也可以填写受支持的绝对路径。因此可以把公共存储、`Android/data|media|obb/<包名>` 下的应用私有目录，以及 `/data/user/<用户>/<包名>/...`、`/data/data/<包名>/...` 等应用私有 namespace 路径按需互相映射。这里的“任意”是指在路径校验和当前应用 mount namespace 可见范围内任意组合，并不表示可以越过 namespace 或访问任意系统路径。
+`path_mappings` 的请求路径和目标路径分别独立解析，既可以填写相对共享存储路径，也可以填写受支持的绝对路径。因此可以把公共存储、`Android/data|media|obb/<包名>` 下的应用私有目录，以及 `/data/user/<用户>/<包名>/...`、`/data/data/<包名>/...` 等应用私有 namespace 路径按需互相映射。这里的"任意"是指在路径校验和当前应用 mount namespace 可见范围内任意组合，并不表示可以越过 namespace 或访问任意系统路径。
 
 应用私有根目录本身不作为映射入口，但其子路径仍支持通配映射，例如 `Android/data/com.example.app/file/* -> Download/AAA`；已有私有子目录在元数据准备阶段保留属主和权限；包名根仍有初始化处理，不表示所有历史权限均已自动恢复。
 
@@ -105,7 +198,10 @@ Storage Redirect X 的核心 Zygisk 模块，负责文件系统重定向、Media
 
 相对请求路径按当前用户的共享存储根解析；绝对路径按应用自身的 mount namespace 解析。映射仍受路径安全校验、循环检测和最大映射链深度限制。
 
-## 手动配置
+</details>
+
+<details>
+<summary><b>🛠 手动配置</b></summary>
 
 设备上的配置目录：
 
@@ -119,7 +215,7 @@ Storage Redirect X 的核心 Zygisk 模块，负责文件系统重定向、Media
 
 配置支持多用户，每个用户对应 `users.<userId>`。常见用户 id 是主用户 `0`，工作资料或多开用户可能是 `10`、`11` 等。
 
-### 全局配置 `global.json`
+#### 全局配置 `global.json`
 
 ```json
 {
@@ -141,7 +237,7 @@ Storage Redirect X 的核心 Zygisk 模块，负责文件系统重定向、Media
 - `auto_enable_new_apps_template_id`：新应用自动重定向启用时使用的配置模板 ID。为空时使用仅开启重定向的默认配置。
 - `app_config_auto_save`：控制 WebUI 应用配置页是否在每次配置操作结束后自动保存。缺失、格式错误或不可读时，默认值为 `false`，即仍需点击保存按钮。
 
-### 应用配置 `apps/<包名>.json`
+#### 应用配置 `apps/<包名>.json`
 
 完整配置示例：
 
@@ -205,7 +301,7 @@ Storage Redirect X 的核心 Zygisk 模块，负责文件系统重定向、Media
 }
 ```
 
-### 最小可用样板
+#### 最小可用样板
 
 ```json
 {
@@ -219,7 +315,7 @@ Storage Redirect X 的核心 Zygisk 模块，负责文件系统重定向、Media
 
 这个配置会让应用进入完整隔离模式：除明确放行或映射的路径外，其余 `/storage/emulated/<user>/` 下的访问都会进入应用沙盒。
 
-### 多用户样板
+#### 多用户样板
 
 ```json
 {
@@ -240,15 +336,18 @@ Storage Redirect X 的核心 Zygisk 模块，负责文件系统重定向、Media
 }
 ```
 
-### 手动改配置后如何生效
+#### 手动改配置后如何生效
 
 - 推荐：在模块操作里执行 `重载重定向`，或通过管理应用保存配置。
 - 备选：手动停止目标应用、重启相关媒体服务进程，或直接重启设备。
 - 只修改 `/data/adb/modules/storage.redirect.x/config/apps/*.json` 通常不需要刷入模块；WebUI 和管理 App 保存配置或批量应用模板后会触发配置热重载，但已运行进程可能仍需要重启后才完全使用新配置。
 
-## 功能使用说明
+</details>
 
-### 完整隔离模式
+<details>
+<summary><b>📌 功能使用说明</b></summary>
+
+#### 完整隔离模式
 
 默认模式是完整隔离模式，即 `mapping_mode_only=false`。适合希望减少应用在公共目录乱写的场景。
 
@@ -274,9 +373,9 @@ Storage Redirect X 的核心 Zygisk 模块，负责文件系统重定向、Media
 - 当前应用自己的 `Android/data|media|obb/<包名>` 子树：保持真实路径。
 - 其他路径：进入 `/storage/emulated/<user>/Android/data/<package>/sdcard/...`。
 
-### 仅映射模式 `mapping_mode_only`
+#### 仅映射模式 `mapping_mode_only`
 
-仅映射模式适合“只想改写几个目录，不想把整包存储访问隔离”的场景。
+仅映射模式适合"只想改写几个目录，不想把整包存储访问隔离"的场景。
 
 ```json
 {
@@ -298,7 +397,7 @@ Storage Redirect X 的核心 Zygisk 模块，负责文件系统重定向、Media
 - 未命中映射：保持原路径，不进入默认应用沙盒。
 - `allowed_real_paths` 在这个模式下不再承担放行意义，因为未命中映射本来就会放行。
 
-### 局部沙盒路径 `sandboxed_paths`
+#### 局部沙盒路径 `sandboxed_paths`
 
 `mapping_mode_only=true` 时，如果某些应用仍会在存储根目录创建杂乱目录，可以用 `sandboxed_paths` 指定这些路径继续进入应用沙盒。
 
@@ -333,9 +432,9 @@ Storage Redirect X 的核心 Zygisk 模块，负责文件系统重定向、Media
 
 映射优先级高于 `sandboxed_paths`。如果同一路径既命中 `path_mappings` 又命中 `sandboxed_paths`，最终走映射目标。
 
-### 只读模式 `read_only_paths`
+#### 只读模式 `read_only_paths`
 
-`read_only_paths` 用来把某些真实目录保持可读但禁止写入。管理 App 和 WebUI 会把它做成独立的“只读模式”开关和路径区域；打开后只读路径写入 `read_only_paths`，不会混入“允许路径”列表展示。
+`read_only_paths` 用来把某些真实目录保持可读但禁止写入。管理 App 和 WebUI 会把它做成独立的"只读模式"开关和路径区域；打开后只读路径写入 `read_only_paths`，不会混入"允许路径"列表展示。
 
 ```json
 {
@@ -357,7 +456,7 @@ Storage Redirect X 的核心 Zygisk 模块，负责文件系统重定向、Media
 - 自动模式下，设备支持且规则需要动态匹配时使用 scoped FUSE；FUSE 不可用、服务启动失败或规则不需要用户态转发时使用 mount namespace。最终后端和 FUSE 会话信息会写入运行日志。
 - 只读 mount 会在允许路径、排除路径和显式映射之后应用，确保只读层尽量成为最终生效层。
 
-### FuseFixer 兼容保护
+#### FuseFixer 兼容保护
 
 SRX 内置 FUSE 兼容保护由 `global.json` 中的 `fuse_fix_enabled` 控制。它主要用于减少 MediaProvider/FUSE 路径检查中默认可忽略 Unicode 码点带来的访问异常。
 
@@ -372,7 +471,7 @@ SRX 内置 FUSE 兼容保护由 `global.json` 中的 `fuse_fix_enabled` 控制�
 - 默认保持开启。
 - 该能力由 SRX 内置实现，和 MediaProvider/FUSE 调用方识别 hook 并行工作。
 
-### 文件监控 `file_monitor_enabled`
+#### 文件监控 `file_monitor_enabled`
 
 `file_monitor_enabled=true` 会启用文件创建监控，便于观察已启用应用和系统代写链路的文件操作、发起应用与最终落地路径。普通应用自身写入由 `srx_daemon` 通过 inotify 在进程外采集，不给普通应用安装 monitor/PLT hook；这是为了避免普通应用因 native/图形/加固运行时兼容问题出现无法打开或闪退。系统代写链路只在真实 MediaProvider/FUSE 服务端保留进程内 hook，以便识别 MediaProvider/FUSE 的真实调用方；DownloadProvider、ExternalStorageProvider、MTP 等桥接进程交由 daemon 和 MediaProvider 侧记录兜底。
 
@@ -382,9 +481,9 @@ SRX 内置 FUSE 兼容保护由 `global.json` 中的 `fuse_fix_enabled` 控制�
 }
 ```
 
-默认普通调试日志较少；需要更详细日志和采集脚本时，在设置页“模块设置”中打开“详细日志”，定位结束后关闭即可。
+默认普通调试日志较少；需要更详细日志和采集脚本时，在设置页"模块设置"中打开"详细日志"，定位结束后关闭即可。
 
-### 配置模板
+#### 配置模板
 
 配置模板用于复用一整份应用配置，内容等同于 `apps/<包名>.json` 的 `users` 配置集合。模板保存在：
 
@@ -394,25 +493,28 @@ SRX 内置 FUSE 兼容保护由 `global.json` 中的 `fuse_fix_enabled` 控制�
 
 使用入口：
 
-- 应用配置页：点击右上角“配置模板”按钮，可以把当前应用配置保存为一个命名模板，也可以选择已有模板覆盖当前应用配置。
-- 应用列表页：长按应用进入多选模式；管理 App 会用底部批量操作栏临时替代底部导航，WebUI 会在底部导航上方显示批量操作栏。选择多个应用后点击“应用模板”，选择已有模板并确认后会批量覆盖这些应用的配置。
-- 设置页：在“配置模板”区域可以查看已添加的模板、直接添加空模板、重命名模板或删除模板。
+- 应用配置页：点击右上角"配置模板"按钮，可以把当前应用配置保存为一个命名模板，也可以选择已有模板覆盖当前应用配置。
+- 应用列表页：长按应用进入多选模式；管理 App 会用底部批量操作栏临时替代底部导航，WebUI 会在底部导航上方显示批量操作栏。选择多个应用后点击"应用模板"，选择已有模板并确认后会批量覆盖这些应用的配置。
+- 设置页：在"配置模板"区域可以查看已添加的模板、直接添加空模板、重命名模板或删除模板。
 
 批量应用模板会先写入临时暂存目录，再一次性提交到对应的 `apps/<包名>.json` 并触发一次配置热重载，避免大量应用逐个写入时重复触发热重载。执行期间 WebUI 和管理 App 会显示等待动画并阻止其它操作；WebUI 还会显示批量写入进度。模板覆盖的是应用配置本身，不会合并到旧配置；覆盖后如目标应用已经在运行，仍建议重启目标应用或相关媒体进程，确保进程完全使用新配置。
 
-### WebUI 与管理应用备份还原
+#### WebUI 与管理应用备份还原
 
-设置页的“备份还原”区域可以导出一个 `.srxbak.zip` 单文件备份。备份包是通用 ZIP 格式，内部固定包含 `backup.json`，内容覆盖 `global.json`、`templates.json` 和所有 `apps/*.json` 应用配置；管理 App 导出的备份还会包含预测性返回手势这类本地 UI 偏好。WebUI 和管理 App 使用同一套备份格式，导出的备份可以相互还原。备份文件带有模块标识、格式版本和完整性校验，还原时会先校验文件格式、模块 id、配置字段和校验值，避免把其它模块或损坏文件误写入配置目录。旧版 `.srxbak.json` 备份仍可导入。
+设置页的"备份还原"区域可以导出一个 `.srxbak.zip` 单文件备份。备份包是通用 ZIP 格式，内部固定包含 `backup.json`，内容覆盖 `global.json`、`templates.json` 和所有 `apps/*.json` 应用配置；管理 App 导出的备份还会包含预测性返回手势这类本地 UI 偏好。WebUI 和管理 App 使用同一套备份格式，导出的备份可以相互还原。备份文件带有模块标识、格式版本和完整性校验，还原时会先校验文件格式、模块 id、配置字段和校验值，避免把其它模块或损坏文件误写入配置目录。旧版 `.srxbak.json` 备份仍可导入。
 
 使用建议：
 
-- 迁移设备或升级前，先点“备份”导出备份文件。
-- 还原时点“还原”，通过管理器或系统文件选择器选择 `.srxbak.zip`；旧 `.srxbak.json` 也可以选择还原。
+- 迁移设备或升级前，先点"备份"导出备份文件。
+- 还原时点"还原"，通过管理器或系统文件选择器选择 `.srxbak.zip`；旧 `.srxbak.json` 也可以选择还原。
 - 还原会覆盖当前全局设置、配置模板和全部应用配置；管理 App 还原时也会恢复备份中的预测性返回手势偏好。还原后建议重启已配置应用、相关媒体进程或设备，让已运行进程完全使用新配置。
 - 备份只包含 SRX 配置和少量管理界面偏好，不包含应用私有文件、日志、模块二进制或临时运行状态。
-- 需要分享排障材料时使用设置页右上角的文件图标导出“日志包”，不要用备份文件代替日志包。日志包会导出模块日志、轮转历史、运行状态和最近 logcat。
+- 需要分享排障材料时使用设置页右上角的文件图标导出"日志包"，不要用备份文件代替日志包。日志包会导出模块日志、轮转历史、运行状态和最近 logcat。
 
-## 路径规则
+</details>
+
+<details>
+<summary><b>📐 路径规则</b></summary>
 
 所有配置路径都遵循以下规则：
 
@@ -455,7 +557,9 @@ SRX 内置 FUSE 兼容保护由 `global.json` 中的 `fuse_fix_enabled` 控制�
 | `*` | 匹配任意字符，例如 `!Download/*.tmp`。 |
 | `?` | 匹配单个字符，例如 `!DCIM/Camera/IMG_????.jpg`。 |
 
-## 紧急恢复
+</details>
+
+## 🆘 紧急恢复
 
 如果模块导致设备 bootloop，可创建 `disable` 文件禁用模块：
 
@@ -472,16 +576,21 @@ su -c 'touch /data/adb/modules/storage.redirect.x/disable && reboot'
 
 公开仓库的问题反馈请使用 [问题反馈模板](https://github.com/z1298808165/Storage-redirection-X-Public/issues/new/choose)。提交前请先在管理应用中开启详细日志，完整复现问题，再导出日志包；不要用 `.srxbak.zip` 备份文件替代日志包。
 
-## 开发文档
-
-- [构建环境](docs/build-environment.md)
-- [构建流程](docs/build-process.md)
-- [模块打包](docs/module-packaging.md)
-- [运行时配置说明](docs/runtime-configuration.md)
-- [FUSE-first 迁移架构](docs/fuse-first-migration.md)
-- [上游 Hook 依赖说明](docs/upstream-hook-dependencies.md)
-- [设备侧测试说明](docs/device-testing.md)
-
-## 测试流
+## 🧪 测试流
 
 设备侧回归测试 APP 已集成在 `tests/storage-redirect-test/`，场景脚本位于 `.github/tests/`。公开仓库的 PR、CI Build 和 Release workflow 会运行测试流门禁；CI/Release 会先构建一次 x86_64 测试模块和测试 APK，再以 Android 版本为矩阵维度（Android 13/14/15/16/17 x86_64 模拟器）各自执行完整 scenario 1-37，矩阵跨版本 fail-fast（任一版本失败即取消其余版本），单个 Android 版本内失败快速停止。Android 17（API 37.0）并入同一矩阵，不再单独成 job，仍由 `Test-flow required gate` 校验。全部场景通过后才会发布 CI 资产、更新 `update.json` 或创建正式 Release。本地需要预检或复现时，可运行 `scripts/verify-test-flow.sh`，Windows PowerShell 环境可运行 `scripts/verify-test-flow.ps1`。详见 [设备侧测试说明](docs/device-testing.md)。
+
+## 🙏 致谢
+
+- [Storage-redirection-X-Public](https://github.com/Kindness-Kismet/Storage-redirection-X-Public)：本项目的上游来源
+- [Magisk](https://github.com/topjohnwu/Magisk) / [KernelSU](https://github.com/tiann/KernelSU) / [APatch](https://github.com/bmax121/APatch)：Root 与模块加载环境
+- [Zygisk](https://github.com/topjohnwu/Magisk) 与 [Zygisk Next](https://github.com/Dr-TSNG/ZygiskNext)：Zygisk 注入环境
+- [LSPlant](https://github.com/LSPosed/LSPlant)：Java 层 hook 框架
+- [libfuse](https://github.com/libfuse/libfuse)：scoped FUSE 会话实现的基础
+- [Fuse-Proxy](https://github.com/huniangitb/Fuse-Proxy)：共享宿主 FUSE 会话设计的参考实现
+
+## 📄 开源协议
+
+本仓库是基于 [Storage-redirection-X-Public](https://github.com/Kindness-Kismet/Storage-redirection-X-Public) 的修改版本。除单独标注的第三方组件或文件外，SRX Core 源码按 `GPL-3.0-or-later` 发布，详见 [LICENSE](LICENSE) 和 GPL 正文 [COPYING](COPYING)。
+
+分发修改版或二进制构建时，必须按 `GPL-3.0-or-later` 提供对应源码并保留同等协议义务。模块刷入包会包含 `LICENSE` 和 `COPYING`，管理 App 和 WebUI 的"关于与开源协议"页面也会列出上游来源和协议。

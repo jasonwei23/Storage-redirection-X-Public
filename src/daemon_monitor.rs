@@ -14,7 +14,6 @@ use events::{
     should_skip_ambiguous_allowed_real_path_event, should_skip_ambiguous_read_only_path_event,
     should_skip_public_root_event_identity,
 };
-pub(crate) use events::{repair_app_private_owners, repair_requested_backend_owner};
 use roots::{
     build_private_category_owner_roots, build_private_owner_repair_roots,
     build_public_owner_repair_root, build_watch_roots, dedup_roots, is_self_nested_redirect_path,
@@ -53,8 +52,6 @@ const MAX_PRE_RESET_DRAIN_ROUNDS: usize = 4;
 /// 会反复触发全扫，反而延长处理时间、加剧溢出。
 const OVERFLOW_RESYNC_MIN_INTERVAL_MS: i64 = 30_000;
 const MAX_PUBLIC_OWNER_REPAIR_DIRS: usize = 32768;
-/// 公共 owner 修复不安装 inotify watch，使用有界周期扫描覆盖运行期间新建的目录。
-const PUBLIC_OWNER_REPAIR_INTERVAL_MS: i64 = 1000;
 
 /// 死监视条目对账周期。inotify 队列溢出会丢弃 IN_IGNORED/IN_DELETE 事件，
 /// `watch_nodes` 中对应条目从此无人删除；内核复用 wd 后新目录的节点又推进
@@ -62,7 +59,7 @@ const PUBLIC_OWNER_REPAIR_INTERVAL_MS: i64 = 1000;
 /// ~12 个节点，监视树内存 121MB，而全新树只需 15MB）。按分钟级对账即可把
 /// 滞留控制在一个小窗口内。
 const PRUNE_DEAD_WATCHES_INTERVAL_MS: i64 = 60_000;
-/// 公共 owner 修复扫描在目录数没有变化时的记录间隔（扫描每 1 秒一轮，约 5 分钟）。
+/// 公共 owner 修复扫描在目录数没有变化时的记录间隔（建树与事件驱动轮次，约 5 分钟）。
 const PUBLIC_OWNER_REPAIR_LOG_HEARTBEAT: u64 = 300;
 /// 创建/写入观察事件的延迟裁决窗口：请求行（hook→socket→日志线程登记 hint）
 /// 晚于 inotify 事件到达是固有顺序，窗口内等 hint 落位后再裁决是否抑制。
@@ -249,7 +246,6 @@ pub struct RegularAppMonitor {
     last_overflow_resync_ms: i64,
     /// 配置未变化而直接沿用现有监视树的次数，用于限频输出排查日志。
     unchanged_reconfigure_count: u32,
-    last_public_owner_repair_ms: i64,
     /// 上次死监视条目对账时间，用于节流。
     last_prune_dead_ms: i64,
     /// 各公共 owner 根上次扫描到的目录数，用于只在覆盖范围变化时记录扫描摘要。
@@ -289,7 +285,6 @@ impl RegularAppMonitor {
             add_watch_error_count: 0,
             last_overflow_resync_ms: 0,
             unchanged_reconfigure_count: 0,
-            last_public_owner_repair_ms: 0,
             last_prune_dead_ms: 0,
             public_owner_repair_log_dirs: HashMap::new(),
             public_owner_repair_log_count: 0,
@@ -319,7 +314,9 @@ impl RegularAppMonitor {
             if self.should_retry_missing_roots() {
                 self.retry_missing_watch_roots();
             }
-            self.repair_public_owner_roots_if_due();
+            // 公共 owner 的 1 秒周期扫描已移除（2026-10-21 用户拍板）：建树时的
+            // 一次性全树扫描 + inotify 事件驱动修复（含 missing 重试与溢出补偿）
+            // 已覆盖新建目录与属主回退，周期性全树遍历只剩 I/O 开销。
             self.prune_dead_watches_if_due();
             // 排查用：按 2 的幂限频记录一次「配置未变化、沿用现有监视树」。
             // 汇总日志缺失时需要区分两种情形：reconfigure 每轮都在走这条捷径
@@ -452,7 +449,6 @@ impl RegularAppMonitor {
             }
         }
         self.missing_watch_roots = missing_watch_roots;
-        self.last_public_owner_repair_ms = paths::monotonic_ms();
 
         log::info!(
             "daemon monitor roots={} applied={} missing={} watches={} capacity_limited={} version={:x}",
@@ -478,14 +474,12 @@ impl RegularAppMonitor {
         let previous_missing = self.missing_watch_roots.len();
         let mut still_missing = Vec::new();
         let mut applied_roots = 0usize;
-        let mut repaired_public_root = false;
         let mut expansion_roots = Vec::new();
         let mut roots = std::mem::take(&mut self.missing_watch_roots).into_iter();
         while let Some(root) = roots.next() {
             if root.source == "public_owner" {
                 if self.repair_public_owner_root(&root) {
                     applied_roots = applied_roots.saturating_add(1);
-                    repaired_public_root = true;
                 } else {
                     still_missing.push(root);
                 }
@@ -523,9 +517,6 @@ impl RegularAppMonitor {
         }
         self.missing_roots = still_missing.len();
         self.missing_watch_roots = still_missing;
-        if repaired_public_root {
-            self.last_public_owner_repair_ms = paths::monotonic_ms();
-        }
         if applied_roots > 0 || self.missing_roots != previous_missing {
             log::info!(
                 "daemon monitor retry missing previous={} applied={} remaining={} watches={} capacity_limited={} version={:x}",
@@ -726,7 +717,6 @@ impl RegularAppMonitor {
         self.public_owner_roots.clear();
         self.missing_roots = 0;
         self.capacity_limited = false;
-        self.last_public_owner_repair_ms = 0;
         self.public_owner_repair_log_dirs.clear();
         self.public_owner_repair_log_count = 0;
     }
@@ -753,20 +743,6 @@ impl RegularAppMonitor {
         );
         self.repair_existing_public_tree(&node);
         true
-    }
-
-    fn repair_public_owner_roots_if_due(&mut self) {
-        if self.public_owner_roots.is_empty() {
-            return;
-        }
-        let now = paths::monotonic_ms();
-        if now.saturating_sub(self.last_public_owner_repair_ms) < PUBLIC_OWNER_REPAIR_INTERVAL_MS {
-            return;
-        }
-        self.last_public_owner_repair_ms = now;
-        for root in self.public_owner_roots.clone() {
-            self.repair_public_owner_root(&root);
-        }
     }
 
     /// 按节流周期对账内核 live wd 集合，剪除已死亡的监视条目。
@@ -957,6 +933,14 @@ impl RegularAppMonitor {
     }
 
     fn repair_existing_public_tree(&mut self, root: &WatchNode) {
+        // CE 未解锁窗口内 /data/media 已挂载但目录名是 fscrypt 密文，无法从名字
+        // 识别 Android/{data,media,obb} 私有树——此时执行公共归一会把解锁后属于
+        // 应用私有树的全部目录 chown 成 media_rw（2026-10-19 用户 A17 设备 5857
+        // 条乱码路径 fix 实证，重启后私有目录属主变 1023 的根因）。密钥就绪前
+        // 直接跳过本轮，解锁后下一轮（1s 周期）自动恢复。
+        if !crate::daemon::media_ce_storage_ready() {
+            return;
+        }
         let mut stack = vec![root.clone()];
         let mut repaired = 0usize;
         let mut scanned_entries = 0usize;

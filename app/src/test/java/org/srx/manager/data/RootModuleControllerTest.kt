@@ -139,6 +139,54 @@ class RootModuleControllerTest {
   }
 
   @Test
+  fun restartMediaProviderParsesFailureReason() = runBlocking {
+    val cases =
+        mapOf(
+            "remount_reason=provider-not-running\n" to "provider-not-running",
+            "remount_reason=daemon-not-running\n" to "daemon-not-running",
+            "remount_reason=remount-timeout\n" to "remount-timeout",
+            "" to null,
+        )
+
+    cases.forEach { (stdout, expected) ->
+      val shell = CapturingShell(ShellResult(1, stdout, ""))
+      val controller = RootModuleController(shell)
+
+      val restart = controller.restartMediaProvider()
+
+      assertTrue(!restart.success)
+      assertEquals(expected, restart.failureReason)
+    }
+  }
+
+  @Test
+  fun storageBackendStatusParsesHostStatusOutput() = runBlocking {
+    val shell = CapturingShell(ShellResult(0, "active pid=1234 policies=2\n", ""))
+    val controller = RootModuleController(shell)
+
+    assertEquals(
+        StorageBackendStatus(active = true, pid = 1234, policyCount = 2),
+        controller.storageBackendStatus(),
+    )
+    assertEquals(
+        "if [ -r ${shellQuote(SrxCtlPath)} ]; then /system/bin/sh ${shellQuote(SrxCtlPath)} host-status; else echo unknown; fi",
+        shell.invocations.single().command,
+    )
+  }
+
+  @Test
+  fun storageBackendStatusHandlesInactiveAndUnknown() = runBlocking {
+    val inactiveShell = CapturingShell(ShellResult(0, "inactive\n", ""))
+    assertEquals(
+        StorageBackendStatus(active = false),
+        RootModuleController(inactiveShell).storageBackendStatus(),
+    )
+
+    val unknownShell = CapturingShell(ShellResult(0, "unknown\n", ""))
+    assertEquals(null, RootModuleController(unknownShell).storageBackendStatus())
+  }
+
+  @Test
   fun ensureLogCollectorsUsesSrxctlWithLegacyFallback() = runBlocking {
     val shell = CapturingShell(ShellResult(0, "", ""))
     val controller = RootModuleController(shell)

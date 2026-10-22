@@ -43,6 +43,7 @@ import org.srx.manager.GlassTextButton
 import org.srx.manager.R
 import org.srx.manager.data.GlobalConfig
 import org.srx.manager.data.ModuleStatus
+import org.srx.manager.data.StorageBackendStatus
 import org.srx.manager.glassPanel
 import org.srx.manager.glassSurfaceColor
 import org.srx.manager.isSrxBackdropEffectEnabled
@@ -71,6 +72,14 @@ internal fun moduleStatusUi(status: ModuleStatus): StatusUi =
       ModuleStatus.Unknown -> StatusUi("状态未知", srxWarningColor())
     }
 
+/** 共享宿主状态指示的展示文本；读取失败时按未知展示为 --。 */
+internal fun storageBackendStatusText(storageBackend: StorageBackendStatus?): String =
+    when {
+      storageBackend == null -> "--"
+      storageBackend.active -> "运行中"
+      else -> "未运行"
+    }
+
 @Composable
 @OptIn(ExperimentalLayoutApi::class)
 internal fun ModuleStatusCard(
@@ -78,6 +87,7 @@ internal fun ModuleStatusCard(
     globalConfig: GlobalConfig,
     enabledApps: Int,
     runtimeActivations: String,
+    storageBackend: StorageBackendStatus?,
     onToggleModule: (Boolean) -> Unit,
     onRuntimeActivationClick: () -> Unit,
     onRuntimeActivationLongClick: () -> Unit,
@@ -158,6 +168,12 @@ internal fun ModuleStatusCard(
                     onClick = onRuntimeActivationClick,
                 ),
         )
+        Box(
+            Modifier.width(1.dp)
+                .height(52.dp)
+                .background(colors.onSurface.copy(alpha = if (isSrxDarkTheme()) 0.045f else 0.06f)),
+        )
+        MetricBox("共享宿主", storageBackendStatusText(storageBackend), Modifier.weight(1f))
       }
     }
   }
@@ -200,9 +216,9 @@ internal fun ModuleToggleConfirmDialog(
 ) {
   val message =
       if (enable) {
-        "启动模块会恢复运行时并重启 MediaProvider，普通应用进程保持运行。媒体访问可能短暂不可用，是否继续？"
+        "启动模块会恢复运行时并请求 MediaProvider 在原进程内热重载，普通应用进程保持运行。媒体访问可能短暂抖动，是否继续？"
       } else {
-        "停止模块会停止运行时并重启 MediaProvider，普通应用进程保持运行。媒体访问可能短暂不可用，是否继续？"
+        "停止模块会停止运行时并请求 MediaProvider 在原进程内热重载，普通应用进程保持运行。媒体访问可能短暂抖动，是否继续？"
       }
   CenteredDialog(
       show = show,

@@ -317,46 +317,6 @@ unsafe fn resolve_system_writer_query_path(
     }
 }
 
-/// MP 进程内对私有树查询结果的属主伪装（视图层放行）。
-///
-/// 背景（真机 2026-10-18）：A17 原生 MP FUSE 挂载带 default_permissions，应用
-/// 对 `Android/{data,media,obb}/<pkg>` 内 media_rw 属主条目的读写由内核基于
-/// FUSE 返回的 attr 做 DAC 拒绝；companion fchown 只在新代写时修正真实属主，
-/// 历史存量在读取路径上无触发点。此处对 stat 类查询把返回的 `st_uid` 改写为
-/// 归属包 uid——**仅在 FUSE caller 就是该包应用时**，内核与应用即认为
-/// 「caller 是属主」，读取/写入/列目录全部放行；真实磁盘属主不改动。
-/// 归属 uid 解析失败或 caller 与归属不符（如其它应用探测）时不伪装。
-unsafe fn masquerade_owner_for_system_writer_query(
-    hub: &crate::hook::stats::InterceptHub,
-    path: *const c_char,
-    uid_out: &mut dyn FnMut(u32),
-) {
-    // SAFETY: path 由调用方从 hook 参数透传，非空且在调用期间有效。
-    let Some(path) = (unsafe { resolve_system_writer_query_path(AT_FDCWD, path) }) else {
-        return;
-    };
-    if path.is_empty() {
-        return;
-    }
-    let storage_path = crate::platform::paths::data_media_to_storage_path(&path);
-    let owner_package = crate::platform::paths::extract_android_private_path_owner(&storage_path);
-    if owner_package.is_empty()
-        || policy::is_media_intermediate_package(&owner_package)
-        || policy::is_system_writer_package(&owner_package)
-    {
-        return;
-    }
-    let caller_uid = hub.get_current_caller_uid();
-    if caller_uid < writer::ANDROID_APP_UID_START {
-        return;
-    }
-    let owner_uid = policy::get_fresh_uid_for_package(&owner_package);
-    if owner_uid != caller_uid {
-        return;
-    }
-    uid_out(caller_uid as u32);
-}
-
 unsafe fn call_statx_syscall(
     dirfd: c_int,
     pathname: *const c_char,
@@ -409,7 +369,7 @@ pub unsafe extern "C" fn hooked_stat(pathname: *const c_char, statbuf: *mut libc
                 });
             }
             runtime::with_redirected_path(hub, "stat", pathname, |final_path| {
-                let ret = runtime::call_prev(
+                runtime::call_prev(
                     self_ptr,
                     || libc::stat(final_path, statbuf),
                     |prev| {
@@ -417,13 +377,7 @@ pub unsafe extern "C" fn hooked_stat(pathname: *const c_char, statbuf: *mut libc
                             std::mem::transmute(prev);
                         f(final_path, statbuf)
                     },
-                );
-                if ret == 0 && !statbuf.is_null() {
-                    masquerade_owner_for_system_writer_query(hub, final_path, &mut |uid| {
-                        (*statbuf).st_uid = uid;
-                    });
-                }
-                ret
+                )
             })
         },
     )
@@ -471,7 +425,7 @@ pub unsafe extern "C" fn hooked_lstat(pathname: *const c_char, statbuf: *mut lib
                 });
             }
             runtime::with_redirected_path(hub, "lstat", pathname, |final_path| {
-                let ret = runtime::call_prev(
+                runtime::call_prev(
                     self_ptr,
                     || libc::lstat(final_path, statbuf),
                     |prev| {
@@ -479,13 +433,7 @@ pub unsafe extern "C" fn hooked_lstat(pathname: *const c_char, statbuf: *mut lib
                             std::mem::transmute(prev);
                         f(final_path, statbuf)
                     },
-                );
-                if ret == 0 && !statbuf.is_null() {
-                    masquerade_owner_for_system_writer_query(hub, final_path, &mut |uid| {
-                        (*statbuf).st_uid = uid;
-                    });
-                }
-                ret
+                )
             })
         },
     )
@@ -544,7 +492,7 @@ pub unsafe extern "C" fn hooked_fstatat(
                 });
             }
             runtime::with_redirected_path(hub, "fstatat", pathname, |final_path| {
-                let ret = runtime::call_prev(
+                runtime::call_prev(
                     self_ptr,
                     || libc::fstatat(dirfd, final_path, statbuf, flags),
                     |prev| {
@@ -556,13 +504,7 @@ pub unsafe extern "C" fn hooked_fstatat(
                         ) -> c_int = std::mem::transmute(prev);
                         f(dirfd, final_path, statbuf, flags)
                     },
-                );
-                if ret == 0 && !statbuf.is_null() {
-                    masquerade_owner_for_system_writer_query(hub, final_path, &mut |uid| {
-                        (*statbuf).st_uid = uid;
-                    });
-                }
-                ret
+                )
             })
         },
     )
@@ -744,7 +686,7 @@ pub unsafe extern "C" fn hooked_statx(
                 });
             }
             runtime::with_redirected_path(hub, "statx", pathname, |final_path| {
-                let ret = runtime::call_prev(
+                runtime::call_prev(
                     self_ptr,
                     || call_statx_syscall(dirfd, final_path, flags, mask, statxbuf),
                     |prev| {
@@ -757,15 +699,7 @@ pub unsafe extern "C" fn hooked_statx(
                         ) -> c_int = std::mem::transmute(prev);
                         f(dirfd, final_path, flags, mask, statxbuf)
                     },
-                );
-                if ret == 0 && !statxbuf.is_null() {
-                    masquerade_owner_for_system_writer_query(hub, final_path, &mut |uid| {
-                        (*statxbuf).stx_uid = uid;
-                        (*statxbuf).stx_mask |= libc::STATX_UID;
-                        (*statxbuf).stx_attributes_mask |= libc::STATX_UID as u64;
-                    });
-                }
-                ret
+                )
             })
         },
     )
