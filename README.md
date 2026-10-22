@@ -5,8 +5,8 @@
   <h1>Storage Redirect X</h1>
   <p><b>一套面向 Android 的存储重定向方案 —— 让应用的存储访问回到它该在的地方。</b></p>
   <p>
-    <a href="https://github.com/z1298808165/Storage-redirection-X-Public/releases"><img src="https://img.shields.io/github/v/release/z1298808165/Storage-redirection-X-Public?style=flat-square&label=%E6%AD%A3%E5%BC%8F%E7%89%88" alt="正式版"/></a>
-    <a href="https://github.com/z1298808165/Storage-redirection-X-Public/actions/workflows/ci.yml"><img src="https://img.shields.io/github/v/tag/z1298808165/Storage-redirection-X-Public?filter=ci-build-*&style=flat-square&label=CI%20%E6%9E%84%E5%BB%BA" alt="CI 构建"/></a>
+    <a href="https://github.com/z1298808165/Storage-redirection-X-Public/releases/latest"><img src="https://img.shields.io/badge/dynamic/json?url=https%3A%2F%2Fraw.githubusercontent.com%2Fz1298808165%2FStorage-redirection-X-Public%2FSRX-R%2Fupdate.json&query=%24.stable.title&style=flat-square&label=%E6%AD%A3%E5%BC%8F%E7%89%88" alt="正式版"/></a>
+    <a href="https://github.com/z1298808165/Storage-redirection-X-Public/releases"><img src="https://img.shields.io/badge/dynamic/json?url=https%3A%2F%2Fraw.githubusercontent.com%2Fz1298808165%2FStorage-redirection-X-Public%2FSRX-R%2Fupdate.json&query=%24.beta.title&style=flat-square&label=CI%20%E6%9E%84%E5%BB%BA" alt="CI 构建"/></a>
     <!-- quality-allow(chinese-language): 平台徽章为 shields 机器标签，保留英文。 -->
     <a href="https://github.com/z1298808165/Storage-redirection-X-Public/releases"><img src="https://img.shields.io/badge/Android-13%20--%2017-blue?style=flat-square" alt="Android 13-17"/></a>
     <a href="#下载与安装"><img src="https://img.shields.io/badge/Root-Magisk%20%7C%20KernelSU%20%7C%20APatch-red?style=flat-square" alt="Root"/></a>
