@@ -87,7 +87,11 @@ pub unsafe extern "C" fn hooked_open(pathname: *const c_char, flags: c_int, mode
         |hub| {
             hub.increment_open_calls();
             if runtime::should_resolve_caller_context(hub) {
-                super::super::caller::update_caller_package_for_current_thread(hub);
+                if super::super::monitor::has_write_intent_flags(flags) {
+                    super::super::caller::update_caller_for_mutation(hub, pathname);
+                } else {
+                    super::super::caller::update_caller_package_for_current_thread(hub);
+                }
             }
 
             handle_open_like(hub, "open", pathname, flags, true, |call_path| {
@@ -108,7 +112,11 @@ pub unsafe extern "C" fn hooked_openat(
         |hub| {
             hub.increment_openat_calls();
             if runtime::should_resolve_caller_context(hub) {
-                super::super::caller::update_caller_package_for_current_thread(hub);
+                if super::super::monitor::has_write_intent_flags(flags) {
+                    super::super::caller::update_caller_for_mutation(hub, pathname);
+                } else {
+                    super::super::caller::update_caller_package_for_current_thread(hub);
+                }
             }
 
             handle_openat_like(
@@ -134,7 +142,17 @@ pub unsafe extern "C" fn hooked_openat2(
         |hub| {
             hub.increment_openat_calls();
             if runtime::should_resolve_caller_context(hub) {
-                super::super::caller::update_caller_package_for_current_thread(hub);
+                // SAFETY: how 非空时按 OpenHow 布局读取 flags 字段，指针有效性
+                // 由 openat2 调用方保证；空指针按无写意图处理。
+                let write_intent = !how.is_null()
+                    && unsafe {
+                        super::super::monitor::has_write_intent_flags((*how).flags as i32)
+                    };
+                if write_intent {
+                    super::super::caller::update_caller_for_mutation(hub, pathname);
+                } else {
+                    super::super::caller::update_caller_package_for_current_thread(hub);
+                }
             }
 
             if pathname.is_null() || how.is_null() {
@@ -576,7 +594,7 @@ fn should_redirect_open_operation(
     flags: c_int,
 ) -> bool {
     should_redirect_open_operation_for_mode(
-        hub.is_monitor_only(),
+        hub.effective_monitor_only(),
         hub.is_app_write_only(),
         is_system_writer,
         flags,
@@ -971,7 +989,7 @@ pub unsafe extern "C" fn hooked_creat(pathname: *const c_char, mode: mode_t) -> 
         |hub| {
             hub.increment_open_calls();
             if runtime::should_resolve_caller_context(hub) {
-                super::super::caller::update_caller_package_for_current_thread(hub);
+                super::super::caller::update_caller_for_mutation(hub, pathname);
             }
 
             handle_open_like(hub, "creat", pathname, creat_flags, false, |call_path| {

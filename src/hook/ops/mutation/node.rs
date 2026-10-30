@@ -29,9 +29,7 @@ pub unsafe extern "C" fn hooked_mknod(
         },
         |hub| {
             hub.increment_mkdir_calls();
-            if runtime::should_resolve_caller_context(hub) {
-                crate::hook::caller::update_caller_package_for_current_thread(hub);
-            }
+            crate::hook::caller::update_caller_for_mutation(hub, pathname);
 
             handle_mknod_like(hub, "mknod", AT_FDCWD, pathname, mode, |call_path| {
                 runtime::call_prev(
@@ -73,9 +71,7 @@ pub unsafe extern "C" fn hooked_mknodat(
         },
         |hub| {
             hub.increment_mkdir_calls();
-            if runtime::should_resolve_caller_context(hub) {
-                crate::hook::caller::update_caller_package_for_current_thread(hub);
-            }
+            crate::hook::caller::update_caller_for_mutation(hub, pathname);
 
             handle_mknod_like(hub, "mknodat", dirfd, pathname, mode, |call_path| {
                 runtime::call_prev(
@@ -128,7 +124,7 @@ where
         mode as i32,
     );
 
-    if hub.is_monitor_only() && !should_enforce_monitor_only_writer_policy(hub) {
+    if hub.effective_monitor_only() && !should_enforce_monitor_only_writer_policy(hub) {
         let result = call_original(pathname);
         let error_no = runtime::errno_for_result(result);
         monitor::record_mkdir_result(hub, op_name, path_for_decision.as_ref(), result, error_no);

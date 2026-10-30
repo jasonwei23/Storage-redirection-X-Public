@@ -1,15 +1,18 @@
 use super::apply_targets::{
     build_allowed_real_source_candidates, build_mapping_source_roots, build_read_only_source_roots,
     collect_restored_read_only_excluded_children, detach_mount_if_present,
-    is_covered_by_scoped_fuse_mount, mount_source_for_target_from_mountinfo, mountinfo_has_target,
-    mountinfo_root_is_app_sandbox, mountinfo_root_matches_data_backend,
-    namespace_mappings_outside_scoped_fuse, path_overlaps_mapping_request,
-    path_shadows_mapping_request, read_mountinfo,
+    is_covered_by_scoped_fuse_mount, mount_source_for_target_from_mountinfo,
+    mountinfo_has_own_private_restore_layer, mountinfo_has_target, mountinfo_root_is_app_sandbox,
+    mountinfo_root_matches_data_backend, namespace_mappings_outside_scoped_fuse,
+    path_overlaps_mapping_request, path_shadows_mapping_request, read_mountinfo,
 };
 use super::map::PathMappingApplyOptions;
 use super::{MountPlanner, concrete_mount_fallback_parent};
 use crate::domain::PathMapping;
 use crate::platform::{fs, module_paths, paths};
+
+/// Android 应用 uid 起点。低于该值的是系统 uid，不具备 app-specific 外部存储语义。
+const SYSTEM_UID_LIMIT: i32 = 10000;
 
 impl MountPlanner {
     fn prepare_real_storage_anchor(&mut self, storage_path: &str) -> Option<String> {
@@ -398,6 +401,15 @@ impl MountPlanner {
 
         log::info!("android root stays redirected unless allowed explicitly");
         self.ensure_scoped_fuse_mount_points(scoped_fuse_roots, &storage_path);
+        // 自有私有目录恢复必须在放行/映射 bind **之前**执行：映射目标若落在自有
+        // 目录子树下（场景 35 的 Android/data/<pkg>/... → Download/...），映射 bind
+        // 要叠在恢复 bind 之上才会生效；恢复放在末尾则会反过来遮蔽先放的映射
+        // bind（CI A17 场景 35 实证：写入成功但映射目标缺失）。namespace 形态下
+        // apply 之后没有会遮蔽存储根的挂载，这里恢复即终态；宿主接管/scoped 形态
+        // 中 apply 阶段的恢复可能被随后的视图根 FUSE 遮蔽（真机 2026-10-25 实证：
+        // 同一构建时而生效时而丢失），由调用方在全部挂载动作结束后调用
+        // [`Self::restore_own_private_system_view`] 幂等补挂（same_mount_identity
+        // 判定已恢复时不再叠层）。
         self.restore_own_private_directories(&storage_path, &data_media_root, scoped_fuse_roots);
 
         let restored_allowed_paths = self.restore_allowed_real_paths(
@@ -660,27 +672,72 @@ impl MountPlanner {
         true
     }
 
-    // 把应用自己包名的私有目录（Android/data|media|obb/<pkg>）bind 回系统存储视图。
-    // 这些目录属于 app-specific 外部存储，系统 MediaProvider 已按包名隔离，本就不该
-    // 被重定向；而 storage root 整体 bind 到沙箱时会把它们一并带走，应用保存或下载
-    // 到自己私有目录的文件会多套一层 sdcard/。这里在整体重定向之后优先从挂载前保存的
-    // 系统 FUSE 锚点恢复；不能直接绑定 /data/media 的 f2fs 后端，否则目标会带着
-    // media_rw_data_file 上下文绕过 MediaProvider FUSE，普通应用即使目录属于自身 UID
-    // 仍会被 SELinux 拒绝。后端路径只用于创建缺失的包名根。
+    // 把应用自己包名的 `Android/media/<pkg>` 恢复成系统存储视图（`data`/`obb` 保持
+    // f2fs 直连，原因见下方清单处的注释）。这些目录属于 app-specific 外部存储，系统
+    // MediaProvider 已按包名隔离，本就不该被重定向；而 storage root 整体 bind 到沙箱时
+    // 会把它们一并带走，应用保存或下载到自己私有目录的文件会多套一层 sdcard/。这里在
+    // 整体重定向之后优先从挂载前保存的系统 FUSE 锚点恢复；不能直接绑定 /data/media 的
+    // f2fs 后端，否则目标会带着 media_rw_data_file 上下文绕过 MediaProvider FUSE，
+    // 普通应用即使目录属于自身 UID 仍会被 SELinux 拒绝。后端路径只用于创建缺失的包名根。
+    //
+    // 覆盖形态不再构成跳过理由（2026-10-25）：整根由共享宿主 FUSE 接管时，自有私有
+    // 目录若留在宿主层，后端是 f2fs 直连；未接管的消费方（MediaProvider 自身、跨进程
+    // 管理器、Shizuku/shell）经系统 MediaProvider FUSE 访问同一物理文件时属于**另一层
+    // 内核缓存**。SQLite 的 WAL 依赖跨进程共享的 `-shm` mmap 与页内锁，两层页缓存之间
+    // 完全不可见：一方判定 WAL 无效后回滚到上一次 checkpoint 的主库（真机 XRadiant 的
+    // 主库曾被回落到 4096B 空 schema 页），表现为掉登录、数据丢失、打库卡等锁。
+    // 只有「该目录自身被单独挂成 scoped FUSE 根」时仍跳过——那种形态下再叠 bind 会让
+    // 已启动的 FUSE 服务空转，清理账本也对不上。
     fn restore_own_private_directories(
         &self,
         storage_path: &str,
         data_media_root: &str,
         scoped_fuse_roots: &[String],
-    ) {
+    ) -> usize {
+        // 恢复三类自有私有目录（`Android/{data,media,obb}/<pkg>`）。
+        //
+        // namespace 形态下 storage root 整体 bind 到沙箱（`Android/data/<pkg>/sdcard`），
+        // 自有私有目录若不 bind 回真实位置，应用保存/下载到自己私有目录的文件会多套
+        // 一层 sdcard/ 且真实路径缺失（CI A17 场景 34 实证：写入成功但可见层与后端
+        // 双双查无此文件）。2026-10-25 曾把恢复收窄到仅 media，依据是「data 恢复让
+        // 沙箱根在 MP 重启后 ENOTCONN（真机场景 2/3/4/12 全灭）」——该观察与同会话
+        // 后来定位的 `prepare_real_storage_anchor` 摘根缺陷同场发生，属误归因；
+        // 恢复三类目录的全量 CI（run 40167024322，场景 1-38+40 五版本）是绿的。
+        //
+        // `Android/media/<pkg>` 无条件恢复（XRadiant/Sen 这类跨进程共享数据库场景，
+        // 两层页缓存分裂见下）。`data`/`obb` 在被 scoped FUSE 覆盖时跳过：那种形态
+        // 下自有私有路径由 srx FUSE 数据面按真实路径处理，再叠 bind 会绕开引擎、
+        // 让监视记录与清理账本对不上。
         let private_roots = [
             format!("Android/data/{}", self.package_name),
             format!("Android/media/{}", self.package_name),
             format!("Android/obb/{}", self.package_name),
         ];
+        let mut restored_count = 0usize;
+        // 系统 uid 没有 app-specific 外部存储语义：它们在 `/data/media/<user>/Android`
+        // 下没有按包名隔离的目录，逐个 mkdir 只会在开机风暴期刷出成片告警。
+        if self.app_uid < SYSTEM_UID_LIMIT {
+            return 0;
+        }
+        // 源必须是**系统视图锚点**：`real_storage_anchor` 在部分形态下会被污染成沙箱、
+        // 或退回 `/data/media` 的 f2fs 后端锚点，用它 bind 会把自有私有目录重新拉出系统
+        // FUSE 层，回到「宿主 FUSE 与系统 FUSE 各持一层页缓存」的分裂形态。
+        let Some(system_view) = self.ensure_system_view_anchor() else {
+            log::warn!(
+                "own private system view anchor unavailable pkg={}",
+                self.package_name
+            );
+            return 0;
+        };
         for relative in private_roots {
             let storage_target = paths::join(storage_path, &relative);
-            if is_covered_by_scoped_fuse_mount(&storage_target, scoped_fuse_roots) {
+            let is_media = relative.starts_with("Android/media/");
+            if scoped_fuse_roots
+                .iter()
+                .any(|root| paths::eq_ignore_case(&storage_target, root))
+                || (!is_media
+                    && is_covered_by_scoped_fuse_mount(&storage_target, scoped_fuse_roots))
+            {
                 log::info!(
                     "skip own private restore (handled by scoped fuse): {}",
                     storage_target
@@ -689,50 +746,188 @@ impl MountPlanner {
             }
 
             let backend_source = paths::join(data_media_root, &relative);
-            // MediaProvider 可能尚未为包名下的任意子目录建立真实目录；先由守护进程
-            // 在当前 mount namespace 中显式创建完整后端路径，再执行元数据修正。
-            if !fs::create_directory(&backend_source, self.app_uid)
-                || !self.ensure_writable_mapped_directory(&backend_source, self.app_uid)
-            {
-                log::warn!("own private source mkdir failed: {}", backend_source);
+            // 只恢复**已存在**的自有目录：原生行为下应用不写就不会有
+            // `Android/{data,media,obb}/<pkg>`，这里无条件 mkdir 会让每个被管理的
+            // 应用在真实后端留一个空目录（2026-10-27 issue #2 用户复测实证：
+            // `Android/media` 下出现全量空目录）。应用真正创建该目录后（经宿主
+            // 数据面的 Real 直写，属原生允许路径），下一次挂载事件/reconcile 会在
+            // 此恢复系统视图绑定，内容落点与跨进程共享语义不受影响。
+            if !fs::is_directory(&backend_source) {
+                log::debug!(
+                    "own private backend absent, skip restore: {}",
+                    backend_source
+                );
                 continue;
             }
-            // 三类自有私有目录统一保留系统 FUSE 的访问控制与上下文。
-            // 锚点缺失时不把 /data/media 直接暴露给应用；保留诊断并等待后续恢复。
-            let Some(source) = self
-                .real_storage_anchor()
-                .as_ref()
-                .map(|anchor| paths::join(anchor, &relative))
-                .filter(|path| fs::is_directory(path))
-            else {
-                log::warn!("own private FUSE anchor unavailable: {}", storage_target);
+            // 元数据修正只针对已存在的目录，不再承担创建职责。
+            if !self.ensure_writable_mapped_directory(&backend_source, self.app_uid) {
+                log::debug!(
+                    "own private backend metadata fix skipped: {}",
+                    backend_source
+                );
+            }
+            // 三类自有私有目录统一保留系统 FUSE 的访问控制与上下文：源取系统视图锚点，
+            // 缺失时不把 /data/media 直接暴露给应用，保留诊断等待后续恢复。
+            let source = paths::join(&system_view, &relative);
+            if !fs::is_directory(&source) {
+                log::warn!("own private system view missing: {}", source);
                 continue;
-            };
+            }
             // metadata_operations_path 将 storage alias 转到 /data/media；但在包名
             // 根尚未挂载子目录时，需要先在当前 namespace 的可见路径创建挂载点，
             // 否则 bind 只能覆盖包名根，应用后续创建 QQfile_recv 会得到 ENOENT。
-            if !fs::create_directory(&storage_target, -1)
-                || !self.ensure_directory_exists(&storage_target, true)
-            {
-                log::warn!("own private target mkdir failed: {}", storage_target);
+            //
+            // 只在换算后的后端路径上创建，不再先对视图路径直接 mkdir：apply 阶段
+            // `/storage/emulated/<user>` 可能还是沙箱 bind、或指向尚未启动的 FUSE，
+            // 对该路径 mkdir 会失败并短路掉本可成功的后端创建（真机 2026-10-25：
+            // `own private target mkdir failed` → 恢复计数恒为 0）。
+            if !self.ensure_directory_exists(&storage_target, true) {
+                log::warn!(
+                    "own private target mkdir failed: {} errno={}",
+                    storage_target,
+                    fs::last_create_directory_errno()
+                );
                 continue;
             }
 
             let mut is_restored = false;
-            let _ = self.bind_mount_with_storage_aliases(
+            // 幂等：热重载与 reconcile 会重复进入这里，已经指向系统视图（与源同一
+            // dev+ino）时不再叠一层 bind，否则同一 target 上的层数会随重挂次数增长。
+            // 已在系统视图上时属主通常也已对齐（见 restore 后的归一化），跳过扫描。
+            //
+            // dev+ino 之外再比 mountinfo root 形态（真机 2026-10-27 issue #2 实证）：
+            // 应用视图的 `/storage/emulated/<user>` 上叠着 MediaProvider 的二级用户
+            // FUSE 视图（fs 0:340），锚点 system_view 是 0:294 的 bind，stat 的 dev
+            // 恒不相等，仅凭 dev+ino 会把「已恢复」判成「未恢复」，每轮 reconcile
+            // 全量重 bind（单包媒体目录一小时内 18 次、含同秒并发 3 次），层数叠加
+            // 且 MP FUSE 请求风暴最终把 FuseDaemon 拖挂（`__fuse_simple_request`
+            // 永久停等 → 全局存储停摆）。root 精确等于 `/<user>/<relative>` 的记录
+            // 存在即视为已恢复；MP 若在其上重建用户视图，内容仍经其视图取自同一棵
+            // 底层树，重复 bind 只会触发下一轮重建循环。
+            let expected_restore_root = format!("/{}/{}", self.user_id, relative);
+            let restore_mountinfo = read_mountinfo().unwrap_or_default();
+            if same_mount_identity(&storage_target, &source)
+                || mountinfo_has_own_private_restore_layer(
+                    &restore_mountinfo,
+                    &storage_target,
+                    &expected_restore_root,
+                )
+            {
+                log::debug!("own private already on system view {}", storage_target);
+                restored_count += 1;
+                continue;
+            }
+            let _ = self.bind_own_private_restore(
                 &source,
                 &storage_target,
                 true,
-                super::PrimaryMountFailure::StopCurrentTarget,
-                None,
+                Some("own private restore failed"),
                 Some("own private alias restore failed"),
                 Some("own private alias restore ok"),
                 Some(&mut is_restored),
             );
             if is_restored {
                 log::info!("own private restored {}", storage_target);
+                // **不做属主归一**：原生 MediaProvider FUSE 下文件的属主是创建者
+                // 应用 uid（duchamp A16 原生对照实证：9 月20 日微信经原生 FUSE 创建
+                // 的 `Android/media/com.tencent.mm` 属主为微信 uid，组 media_rw），
+                // 访问放行由 MP 权限层（media 子树共享，见 MP hook 放行）与宿主
+                // 数据面的 root 身份保证，不依赖 DAC 属主。此前的整树 chown 到
+                // 宿主包 uid 会与 companion fchown 的创建者 uid 语义来回翻转
+                // （2026-10-27 issue #2 用户实测：media 文件属主随写入/恢复交替
+                // 变化），并破坏跨应用共享场景（插件写的文件被改成宿主包 uid）。
+                //
+                // **只归一化 media 子树**的历史约束随之失效一并移除；`data`/`obb`
+                // 的属组漂移仍由一次性迁移（owner-migration）与场景 6 的
+                // 「漂移不被运行期修复」契约管辖，本就未做运行期修复。
+                restored_count += 1;
+            } else {
+                // 失败必须留痕：这条恢复是跨进程 SQLite 共享缓存层的唯一保证，
+                // 静默失败会直接回到两层页缓存分裂（真机表现为每隔若干次热重载
+                // 掉一次登录）。
+                log::warn!(
+                    "own private restore failed target={} source={} errno={}",
+                    storage_target,
+                    source,
+                    fs::last_create_directory_errno()
+                );
             }
         }
+        restored_count
+    }
+
+    /// 共享宿主预接入（整根由宿主 FUSE 接管）之后恢复自有私有目录的系统视图。
+    ///
+    /// 预接入分支直接短路 planner，不经过 [`Self::apply_sdcard_redirect`]，因此此前
+    /// 完全不会执行自有私有目录恢复：`Android/{data,media,obb}/<pkg>` 留在宿主 FUSE
+    /// 内、后端是 f2fs 直连，与未接管消费方经系统 MediaProvider FUSE 的访问分成两层
+    /// 内核缓存（SQLite `-shm` 的 mmap 与页内锁跨不过去 → WAL 被判无效 → 回滚空主库）。
+    ///
+    /// **不能复用 [`Self::prepare_real_storage_anchor`]**：该函数在「存储根已重定向」
+    /// 分支会先 detach 存储根、用真实视图重建锚点、再把沙箱绑回，那是给
+    /// `apply_sdcard_redirect` 准备的序列。预接入路径的存储根是共享宿主 FUSE，
+    /// 照搬会把宿主会话摘掉并换成普通 f2fs bind（真机 2026-10-25 实测：支付宝
+    /// `/storage/emulated/0` 从 `srx_fuse_host` 变成 `254:58 /media/0/.../sdcard`）。
+    /// 这里只做「从当前命名空间里未被重定向覆盖的系统视图根建一个私有锚点」，
+    /// 全程不触碰存储根。
+    /// 参数 `scoped_fuse_roots` 是本轮规划的 scoped FUSE 根：`data`/`obb` 被其覆盖时
+    /// 跳过恢复（自有私有路径由 srx FUSE 数据面按真实路径处理），media 无条件恢复。
+    pub fn restore_own_private_system_view(&mut self, scoped_fuse_roots: &[String]) -> usize {
+        // 系统 uid（<10000）没有 app-specific 外部存储语义，也不该去创建
+        // `/data/media/<user>/Android/{data,media,obb}/<pkg>`；跳过可避免开机时整片
+        // 系统服务刷出 `own private source mkdir failed`。
+        if self.app_uid < SYSTEM_UID_LIMIT {
+            return 0;
+        }
+        let storage_path = paths::storage_user_root_for_user(self.user_id);
+        let data_media_root = paths::data_media_user_root_for_user(self.user_id);
+        self.restore_own_private_directories(&storage_path, &data_media_root, scoped_fuse_roots)
+    }
+
+    /// 建立（或复用）指向系统存储视图的私有锚点，返回**存储根结构**的路径。
+    ///
+    /// 源取 `/mnt/user/<user>/emulated`：它在应用命名空间里恒为一层未被模块覆盖的
+    /// MediaProvider FUSE 视图（模块只覆盖 `<user>` 子树与存储根，不覆盖 emulated
+    /// 本身）。整根 bind 之后，锚点下多一层 `<user>` 才是存储根结构，因此返回
+    /// `<anchor>/<user>`；该层次不经过被覆盖的路径解析，是干净的系统视图。
+    ///
+    /// 锚点根与 `real_storage` 分开存放（见 `module_paths::SYSTEM_VIEW_TMP_DIR`），
+    /// 避免与「存储根结构」语义的既有锚点互相覆盖。
+    fn ensure_system_view_anchor(&self) -> Option<String> {
+        let anchor_root = paths::join(module_paths::SYSTEM_VIEW_TMP_DIR, &self.user_id.to_string());
+        let user_view = paths::join(&anchor_root, &self.user_id.to_string());
+        let source = format!("/mnt/user/{}/emulated", self.user_id);
+        if !fs::is_directory(&source) {
+            log::warn!("system view source unavailable: {}", source);
+            return None;
+        }
+        if same_mount_identity(&anchor_root, &source)
+            && fs::is_directory(&paths::join(&user_view, "Android"))
+        {
+            return Some(user_view);
+        }
+        // 锚点是模块私有路径，不承载任何应用可见路径：上一轮遗留（可能已被污染成沙箱
+        // 或 f2fs 后端）可以安全摘除后重建，摘除窗口内没有应用 IO 经过它。
+        detach_mount_if_present(&anchor_root);
+        if !fs::create_directory(&anchor_root, -1) && !fs::is_directory(&anchor_root) {
+            log::warn!("system view anchor mkdir failed: {}", anchor_root);
+            return None;
+        }
+        // **必须非递归 bind**：模块会把 `/mnt/user/<user>/emulated/<user>` 换成自己的
+        // FUSE（别名路径也要走重定向），递归 bind 会把这个子挂载一并复制到锚点里，
+        // 锚点下的 `<user>` 仍然是模块层，取的还是 f2fs 直连后端——等于没恢复（真机
+        // 2026-10-25 实测：`tmp/system_view/0/0` 变成 `srx_fuse_host[...]`）。
+        // 非递归 bind 只复制该挂载本身，锚点内 `<user>` 回落到 MediaProvider FUSE 的
+        // 普通目录节点，正是需要的干净系统视图。
+        if !self.bind_mount(&source, &anchor_root, false) {
+            log::warn!(
+                "system view anchor bind failed anchor={} source={}",
+                anchor_root,
+                source
+            );
+            return None;
+        }
+        Some(user_view)
     }
 
     fn ensure_scoped_fuse_mount_points(&self, scoped_fuse_roots: &[String], storage_path: &str) {
@@ -1429,4 +1624,17 @@ impl MountPlanner {
         }
         shadowed
     }
+}
+
+/// 两个路径是否指向同一个挂载对象。
+///
+/// 用作自有私有目录恢复的幂等判据：bind 生效后 `stat` 返回的是源侧的 dev+ino，
+/// 与源路径完全一致；未 bind 时两侧分别是存储视图与系统 FUSE 锚点，dev 必然不同。
+fn same_mount_identity(left: &str, right: &str) -> bool {
+    use std::os::unix::fs::MetadataExt as _;
+    let (Ok(left_meta), Ok(right_meta)) = (std::fs::metadata(left), std::fs::metadata(right))
+    else {
+        return false;
+    };
+    left_meta.dev() == right_meta.dev() && left_meta.ino() == right_meta.ino()
 }

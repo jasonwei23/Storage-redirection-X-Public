@@ -361,17 +361,34 @@ pub struct HostAttach {
 ///
 /// attach 上报的 ENOTCONN 有两类来源：宿主 FUSE endpoint 已死（进程假活、连接已断），
 /// 或目标应用 namespace 里残留的死挂载层（路径解析穿过它时报错，宿主本身健康）。
-/// 宿主挂载点位于 daemon/companion 自身可访问的模块目录内，stat 它不经过任何应用
-/// 视图，是区分两类故障最直接的探针。两类故障的处理完全不同：前者必须撤销快照并
-/// 终止假活宿主；后者杀宿主只会触发"恢复→再被杀"的循环，把能力快照的退避越推越深。
+/// 宿主挂载点位于 daemon/companion 自身可访问的模块目录内，对它发起一次**必然穿透到
+/// FUSE 连接**的探测，是区分两类故障最直接的探针。两类故障的处理完全不同：前者必须
+/// 撤销快照并终止假活宿主；后者杀宿主只会触发"恢复→再被杀"的循环，把能力快照的
+/// 退避越推越深。
+///
+/// 探测不能只 `stat` 挂载点本身：根 dentry 的属性缓存在连接死亡后仍然有效，僵死的
+/// 宿主会因此被误判存活（真机实证：duchamp 2026-10-22 13:22，MediaProvider 重启后宿主
+/// media 视图连接死亡，`endpoint=alive` 误判使 attach 反复 ENOTCONN，直到宿主进程
+/// 自己退出才恢复）。这里改为 lookup 一个**必然不存在**的探测名——该操作无法走任何
+/// 缓存，必须由宿主 FUSE 连接真实应答：连接健康时返回 ENOENT，连接僵死时返回
+/// ENOTCONN/EIO 或超时。探测名意外存在同样视为存活（连接应答了请求即证明健康）。
 fn host_endpoint_alive(view: &HostSessionView) -> bool {
-    let Ok(c_path) = CString::new(view.mount_point.as_str()) else {
+    let Ok(c_path) = CString::new(format!("{}/.srx_endpoint_probe", view.mount_point)) else {
         return false;
     };
     let mut buf = std::mem::MaybeUninit::<libc::stat>::uninit();
-    // SAFETY: c_path 是 NUL 结尾的合法路径；buf 指向本栈帧的未初始化缓冲，stat 返回 0
-    // 时由内核完整写入。
-    unsafe { libc::stat(c_path.as_ptr(), buf.as_mut_ptr()) == 0 }
+    // SAFETY: 探测路径是 NUL 结尾的合法路径；buf 指向本栈帧的未初始化缓冲，stat 返回
+    // 0 时由内核完整写入；探测名不存在时返回 ENOENT，不产生副作用。
+    match unsafe { libc::stat(c_path.as_ptr(), buf.as_mut_ptr()) } {
+        0 => {
+            // 探测名真实存在（历史残留）：连接应答了 lookup，宿主健康；顺手清掉残留，
+            // 恢复"探测名必然不存在"的前提。
+            // SAFETY: c_path 是 NUL 结尾的合法路径；unlink 只移除该探测名自身。
+            unsafe { libc::unlink(c_path.as_ptr()) };
+            true
+        }
+        _ => crate::platform::errno::last() == libc::ENOENT,
+    }
 }
 
 /// 把应用的存储视图接入共享宿主会话。
@@ -1117,7 +1134,110 @@ fn host_attach_child_main(view: &HostSessionView, target_root: &str) -> i32 {
         return -1;
     }
 
+    // 7. 覆盖存储别名族。主目标之外的同义存储出口（`/mnt/user/<user>/emulated/<user>` 等）
+    //    仍指向系统 MediaProvider FUSE（pass_through 甚至直通 f2fs 后端），走别名写入的
+    //    组件会完全绕开宿主策略落到真实存储。失败不回滚：主目标已成功，别名只补覆盖面。
+    attach_host_view_to_storage_aliases(target_root, view);
+
     0
+}
+
+/// 解析存储视图根路径里的用户号（`/storage/emulated/<user>` → `Some(user)`）。
+fn storage_user_id_from_view_root(target_root: &str) -> Option<i32> {
+    target_root
+        .strip_prefix("/storage/emulated/")
+        .filter(|rest| !rest.is_empty() && rest.bytes().all(|byte| byte.is_ascii_digit()))
+        .and_then(|rest| rest.parse::<i32>().ok())
+}
+
+/// 把宿主视图同步覆盖到存储别名族（collapsed hybrid FUSE 形态的收尾步骤）。
+///
+/// 共享宿主接入默认只把视图根挂到主存储根（`/storage/emulated/<user>`）。但同一棵存储树
+/// 在应用命名空间里还有一整族等价别名（`/mnt/user/<user>/emulated/<user>`、
+/// `/mnt/installer/...`、`/mnt/androidwritable/...`、`/mnt/pass_through/...`），它们仍指向
+/// 系统 MediaProvider FUSE（pass_through 直通 f2fs 后端）。走别名写入的组件（真机实证：
+/// QQ connect SDK 的 xlog 经别名写 `Tencent/msflogs`，2026-10-22 在 `/data/media/0/Tencent`
+/// 真实落盘且零监视记录）会完全绕开宿主策略。命名空间 bind 后端经
+/// `mount::alias::bind_mount_with_storage_aliases` 覆盖同一族别名；宿主接入此前漏掉这一步。
+///
+/// 语义与 `mount::alias` 对齐：
+/// - 不存在的别名目标（lstat 失败，如 `/mnt/runtime/*`）跳过；
+/// - 解析后与主目标同真实路径的符号别名（`/storage/self/primary`、
+///   `/storage/emulated/legacy`）去重跳过；
+/// - `/data/media/<user>` 后端别名不覆盖：把宿主视图叠到真实后端上，应用命名空间内的
+///   后端直连路径会被策略视图遮蔽（bind 后端按 self-shadowing 跳过同一目标）；
+/// - 别名上残留的本模块死层先摘除（与主目标同一套 [`clear_dead_srx_layers_at_target`]）；
+/// - 单个别名失败只告警不回滚：主目标已成功，别名失败不能让整个接入作废。
+fn attach_host_view_to_storage_aliases(target_root: &str, view: &HostSessionView) {
+    let Some(user_id) = storage_user_id_from_view_root(target_root) else {
+        // 非视图根目标（按目录 scoped 根）不展开别名：scoped 会话的别名覆盖仍由
+        // 命名空间 bind 路径承担，这里不改变既有语义。
+        return;
+    };
+    let Ok(primary_real) = std::fs::canonicalize(target_root) else {
+        return;
+    };
+    for alias_root in paths::storage_alias_roots_for_user(user_id) {
+        if alias_root == target_root {
+            continue;
+        }
+        if paths::is_same_or_child(&alias_root, &paths::data_media_user_root_for_user(user_id)) {
+            continue;
+        }
+        // 存在性检查用 lstat 语义：符号别名（primary/legacy）即便悬空也进入去重判定，
+        // 不在这里对存储 FUSE 发起真实 I/O。
+        if std::fs::symlink_metadata(&alias_root).is_err() {
+            continue;
+        }
+        let Ok(alias_real) = std::fs::canonicalize(&alias_root) else {
+            continue;
+        };
+        if alias_real == primary_real {
+            continue;
+        }
+        // 幂等：顶层已是当前会话的视图就不再叠加（宿主换代重接入时同一会话源不重复 bind）。
+        if let Some(live) = crate::mount_ledger::topmost_live_mount(0, &alias_root)
+            && live.source == view.mount_source
+        {
+            continue;
+        }
+        clear_dead_srx_layers_at_target(&alias_root);
+        let Ok(c_source) = CString::new(target_root) else {
+            continue;
+        };
+        let Ok(c_alias) = CString::new(alias_root.as_str()) else {
+            continue;
+        };
+        // SAFETY: 源与目标都是 NUL 结尾的合法路径；同一命名空间内的 bind 不跨命名空间
+        // （跨命名空间 MS_BIND 会 EINVAL，见 host_attach_child_main 的说明），此时主目标
+        // 挂载已属于应用命名空间，bind 合法。
+        if unsafe {
+            libc::mount(
+                c_source.as_ptr(),
+                c_alias.as_ptr(),
+                std::ptr::null(),
+                libc::MS_BIND as libc::c_ulong,
+                std::ptr::null(),
+            )
+        } != 0
+        {
+            log::warn!(
+                "fuse host attach alias bind failed target={} errno={} {}",
+                alias_root,
+                crate::platform::errno::last(),
+                crate::platform::errno::text(crate::platform::errno::last())
+            );
+            continue;
+        }
+        if !make_mount_private(&c_alias) {
+            continue;
+        }
+        log::info!(
+            "fuse host attach alias bound target={} host={}",
+            alias_root,
+            view.child_pid
+        );
+    }
 }
 
 /// 接入子进程统一回报结果，成功与失败均只发送一次。

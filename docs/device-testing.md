@@ -43,12 +43,12 @@ pwsh -NoProfile -ExecutionPolicy Bypass -File .\scripts\verify-test-flow.ps1
 6. 安装本仓库内置测试 APP。
 7. 运行 `.github/tests/run-storage-redirect-scenarios.sh` 或 PowerShell 等价脚本。
 
-公开仓库 PR、CI Build 和 Release workflow 会强制执行测试流门禁。CI/Release 会先构建一次 x86_64 测试模块 zip 和测试 APK，再把 Android 13/14/15/16/17 模拟器组成并行矩阵运行，每个 Android 版本各自执行完整 scenario 1-37。Android 17（API 37.0）已经并入同一测试矩阵，不再是独立 job；`Test-flow required gate` 统一校验五个平台，任一失败都会拦住 CI 资产发布与正式 Release。CI/Release 只有在全部测试流场景通过后才会继续发布 CI 资产、更新 `update.json` 或创建正式 Release。测试流失败时保留 GitHub Actions 失败记录、日志和已上传的排障 artifact，由后续提交修复。
+公开仓库 PR、CI Build 和 Release workflow 会强制执行测试流门禁。CI/Release 会先构建一次 x86_64 测试模块 zip 和测试 APK，再把 Android 13/14/15/16/17 模拟器组成并行矩阵运行，每个 Android 版本各自执行完整 scenario 1-40。Android 17（API 37.0）已经并入同一测试矩阵，不再是独立 job；`Test-flow required gate` 统一校验五个平台，任一失败都会拦住 CI 资产发布与正式 Release。CI/Release 只有在全部测试流场景通过后才会继续发布 CI 资产、更新 `update.json` 或创建正式 Release。测试流失败时保留 GitHub Actions 失败记录、日志和已上传的排障 artifact，由后续提交修复。
 
 完整设备侧通过标准是：
 
 - `basic/all` 通过。
-- 当前模块跑完 scenario 1-37。场景脚本不按 FUSE 支持能力跳过任何场景，全部使用 `auto` 后端，实际后端由运行时日志和 mountinfo 记录。
+- 当前模块跑完 scenario 1-40。场景脚本不按 FUSE 支持能力跳过任何场景，全部使用 `auto` 后端，实际后端由运行时日志和 mountinfo 记录。
 - 脚本最后输出 `ALL_SCENARIOS_PASSED`。
 - 本地完整回归退出前执行白名单清理，恢复原全局配置和测试 APP 配置，并重启 MediaProvider；CI/Release 使用临时模拟器，设置 `SRT_SKIP_FINAL_CLEANUP=1` 跳过最终清理，避免清理耗时或清理阶段误报影响测试结论。
 
@@ -178,8 +178,9 @@ Remove-Item Env:SRT_SCENARIOS
 | 变量或参数 | 用途 |
 | --- | --- |
 | `-SkipBasicAll` | 跳过 `basic/all`，只跑场景脚本。 |
-| `-Scenarios 9,17` / `SRT_SCENARIOS=9,17` | 只跑指定场景，范围为 1-37。 |
-| `SRT_SCENARIOS=all` | 按当前场景清单执行全部场景；当前等价于 1-37。与其它场景号混用会报错。 |
+| `-Scenarios 9,17` / `SRT_SCENARIOS=9,17` | 只跑指定场景，范围为 1-40。 |
+| `SRT_SCENARIOS=all` | 按当前场景清单执行全部场景；当前等价于 1-40。与其它场景号混用会报错。不设置时默认也是全场景。 |
+| `SRT_VERSION_SCENARIO_EXCLUDE=39` | 版本级场景排除：从已确定的范围里剔除指定场景（默认仍是全场景）。它是剔除而不是替换，因此不会收窄 `SRT_SCENARIOS` 或 dispatch 输入的范围；仅用于某个版本确实无法验证的场景，当前矩阵未使用。 |
 | `-FreshAppPerCase` / `SRT_FRESH_APP_PER_CASE=1` | 每个服务用例前都冷启动测试 APP，这是默认行为，用于避免跨用例进程状态污染。需要调试复用进程时可设 `SRT_FRESH_APP_PER_CASE=0`；scenario 29 会临时保持同一进程以验证配置热更新。 |
 | `SRT_FAIL_FAST=1` | 某个场景失败后立即停止当前 Android 测试 job。CI/Release 默认开启，便于尽快暴露首个失败点。 |
 | `SRT_SCENARIO_TIMEOUT_SECONDS=300` | 设置单个场景超时秒数。CI/Release 默认 300 秒，本地默认 600 秒。 |
@@ -187,9 +188,47 @@ Remove-Item Env:SRT_SCENARIOS
 | `SRT_FILE_MONITOR_ENABLED=1` | 调试非监控场景时也开启全局文件监控；正式回归通常保持默认。 |
 | `SRT_RESULT_POLL_MS`、`SRT_APP_LAUNCH_SETTLE_MS`、`SRT_SERVICE_CASE_SETTLE_MS`、`SRT_MOUNT_CONFIRM_TIMEOUT_MS` | 调整结果轮询、启动缓冲、用例间缓冲和等待 mount 日志的时间。 |
 
-CI/Release 以 Android 版本为矩阵维度运行测试流：Android 13/14/15/16/17 x86_64 模拟器各自执行完整 scenario 1-37，矩阵跨版本 fail-fast（任一版本失败即取消其余版本），并在单个 Android 版本内按场景顺序快速失败。这只改变执行调度，不减少覆盖范围；scenario 1-37 必须在 Android 13/14/15/16/17 x86_64 模拟器上全部通过。
+### 场景范围的触发条件
 
-Android 17（API 37.0）已并入上面的矩阵（不再是独立 job），与主矩阵一同被 `Test-flow required gate` 校验并执行同一套 scenario 1-37。它与其他版本有三处执行环境差异：
+范围只由运行参数决定，仓库里不写死场景清单（矩阵字段只用于「某版本确实无法验证」的剔除，且当前未使用）：
+
+| 触发入口 | 写法 | 实际范围 |
+| --- | --- | --- |
+| 默认（push、未传参） | — | 全场景 1-40 |
+| 手动触发 workflow | `workflow_dispatch` 的 `scenarios` 输入：`29`、`29,34`、`all` | 指定场景；`all` 表示全量 |
+| 提交信息标记 | 标题或正文写「单场景 29」「单场景 29,34」 | 只跑指定场景 |
+| 本地运行 | `SRT_SCENARIOS=29`（sh）或 `-Scenarios 29`（PowerShell） | 同上 |
+| 环境级限制（可选） | `SRT_VERSION_SCENARIO_EXCLUDE=39` 或矩阵字段 `version_scenario_exclude` | 从已确定范围里剔除，不改变范围定义 |
+
+优先级：`workflow_dispatch` 输入 > 提交信息标记 > 全量；范围确定后脚本再应用版本级剔除。范围受限时 `prepare` 会把 `publish_ci` 置为 false，CI 资产与 `update.json` 都不发布，只做验证。非法范围（非数字、越界、空元素、`all` 与具体编号混用）直接失败，不会静默回退全量。
+
+具体操作与判据：
+
+```bash
+# 方式一（有代码改动时首选）：提交信息带标记，推送后直接用同一轮 push CI
+git commit -m "修复：修正挂载确认日志读取 单场景 24"
+# 多场景：单场景 3,24
+
+# 方式二（只复跑既有提交、没有新代码）：手动派发公开仓库的测试流
+gh workflow run ci.yml --repo z1298808165/Storage-redirection-X-Public --ref SRX-R -f scenarios=24
+# 多场景：-f scenarios=3,24；全量：-f scenarios=all
+# Actions 页面点 "Run workflow" 填写 scenarios 输入，效果相同
+
+# 确认实际范围（权威来源是 prepare 输出的范围与脚本启动打印）
+gh run view <run-id> --log | grep -E "scenario_scope|Resolve scenario scope"
+
+# 本地验证（不经 CI）
+SRT_SCENARIOS=24 bash .github/tests/run-storage-redirect-scenarios.sh
+```
+
+- 一次验证只选一种入口，禁止「带标记推送 + 手动派发」同时进行；出现两轮 run 时先确认事件来源，不要用取消第二轮掩盖范围错误。
+- 窄场景验证不产生可发布资产（`publish_ci=false`），不能作为发布门禁通过的依据；合并或发布前必须有一次全量 1-40 通过记录。
+
+矩阵当前不含任何版本级排除项：Android 13/14/15/16/17 都执行全量 1-40，包含依赖下载的场景 39。
+
+CI/Release 以 Android 版本为矩阵维度运行测试流：Android 13/14/15/16/17 x86_64 模拟器各自执行完整 scenario 1-40，矩阵跨版本 fail-fast（任一版本失败即取消其余版本），并在单个 Android 版本内按场景顺序快速失败。这只改变执行调度，不减少覆盖范围；scenario 1-40 必须在 Android 13/14/15/16/17 x86_64 模拟器上全部通过。
+
+Android 17（API 37.0）已并入上面的矩阵（不再是独立 job），与主矩阵一同被 `Test-flow required gate` 校验并执行同一套 scenario 1-40（包含场景 39；该版本曾因镜像网络验证失败被临时排除，现已恢复）。它与其他版本还有三处执行环境差异：
 
 - **设备侧图形读回保护**：Android 17 系统镜像的 `mapper.ranchu` gralloc 未实现 DMA 颜色缓冲读回，而 emulator 的 gfxstream 后端仍会广播 `ReadColorBufferDMA` 特性。SystemUI 的 `RegionSampling` 与 system_server 的 `TaskSnapshotPersister` 触发读回后会命中 `Assertion failed: !rcEnc->featureInfo()->hasReadColorBufferDma`，并连带重启 framework。测试脚本在设备 SDK 版本为 37 时先执行 `service call window 137 i32 0` 关闭 task snapshot，再 `pm disable-user com.android.systemui` 关闭 SystemUI，并在模块安装重启 framework 后重新应用，直到确认 task snapshot 已关闭且 SystemUI 处于 disabled 状态才继续。该缺陷与 GPU 模式无关，保护逻辑仅在检测到 `ro.build.version.sdk = 37` 时生效。保护过程写入设备侧 `test-flow-graphics-state.txt`（该文件目前不在任何 job 的 artifact 上传清单内，排障需结合 job 日志中的 `android17:` 行）。
 - **注入方案与启动参数**：Android 17 矩阵条目使用 KernelSU 方案（`root_method: ksu`，AVD 镜像打 KernelSU 补丁，ksud 负责安装模块与 Zygisk Next），root shell 走 `su 0 sh -c`（`ADB_ROOT_MODE=su0`）；其余版本仍由安装脚本按 Magisk 探测完成注入。模拟器启动超时放宽到 1800 秒并保留系统动画（其余版本为 1500 秒、关闭动画），GPU 模式固定 `swiftshader_indirect`。
@@ -237,6 +276,8 @@ Android 17（API 37.0）已并入上面的矩阵（不再是独立 job），与�
 | 35 | 任意路径映射矩阵：验证公共存储、`Android/data|media|obb/<包名>`、`/data/user`、`/data/data` 及公共路径之间的相对/绝对映射。 |
 | 36 | 映射应用私有别名后，仍可写入 MediaProvider 已创建的现有文件。 |
 | 37 | 父路径先映射到中间目录后，中间目录下的子路径继续命中下一条映射并落到最终目录。 |
+| 38 | 下载提供器（com.android.providers.downloads）自身配置 `sandboxed_paths` 后必须由模块接管原生写入，两种拓扑都算通过：companion mount 成功（`perf companion mount pkg=... ok=true`）或进程内 per-caller hook（`hook refresh start profile=system-writer pkg=...`，此时 pre 阶段直接跳过 companion mount）。出现 `attach skipped ... policy_registration_failed`、`sandbox=0` 挂载请求，或下载提供器自己起模块 FUSE 会话即回归（2026-10-21 真机侧漏回归；2026-10-26 场景 39 让提供器改走 system-writer hook 后同步放宽判据）。 |
+| 39 | 下载提供器（共享 uid 代写者）经 DownloadManager 异步下载公共路径时，按发起者（测试 APP）的 `path_mappings` 把目标改写到映射目标落盘，真实请求路径零穿透；文件出现在真实请求路径或下载失败即按源归因回归（2026-10-24 真机：误归因组内成员、行数据反查未触发）。 |
 
 场景脚本会同时检查测试 APP 视角和 root 视角的物理落点或拒绝结果；文件监控场景还会检查 `/data/adb/modules/storage.redirect.x/logs/file_monitor.log` 中的成功或失败记录。默认情况下，非文件监控场景会关闭 `file_monitor_enabled`，文件监控场景会显式开启它。
 ## 手动运行用例
@@ -368,7 +409,16 @@ adb -s $Serial shell am start-foreground-service -n me.fakerqu.test.storageredir
 
 ## 查看结果和日志
 
-测试 APP 结果文件可能出现在以下位置，场景脚本会自动查找：
+### 测试产物落盘位置
+
+测试流产生的宿主侧产物（场景结果文件 `scenario-*-result.txt`、诊断文件 `test-flow-*.txt`、`media-health.txt` 等）统一写入 `temp/test-flow/<启动时间戳>/`：
+
+- 每次运行（完整回归、窄场景、单场景）各自创建一个独立的时间戳目录，同一天的多次运行互不覆盖；
+- `run-android-test-flow.sh` 在启动时创建目录并通过 `SRT_ARTIFACT_DIR` 环境变量注入子脚本，场景脚本与诊断脚本共用同一目录；直接运行 `run-storage-redirect-scenarios.sh` 或 `run-storage-redirect-scenarios.ps1` 时由脚本自行创建；
+- CI 的 `Upload test-flow artifacts` 步骤按 `temp/test-flow/**` 收集上传；
+- 不得向仓库根目录或脚本当前目录新增产物落盘点（规范见 `AGENTS.md`「测试流产物落盘」）；`temp/` 已被 git 忽略，无需提交。
+
+设备侧结果文件可能出现在以下位置，场景脚本会自动查找：
 
 ```text
 /sdcard/Android/data/me.fakerqu.test.storageredirect/files/test_case_result

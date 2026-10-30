@@ -17,6 +17,10 @@ data class TestCaseArgs(
     val length: Long? = null,
     val mode: Int? = null,
     val keepPending: Boolean = false,
+    val url: String? = null,
+    // 映射形态下下载代写落点在映射目标，请求路径的应用视图可能不可见；
+    // 场景断言由脚本对映射目标与零穿透负责，用例仅校验下载状态。
+    val requireDestinationVisible: Boolean = true,
 ) {
   fun payloadOr(default: ByteArray): ByteArray = payload ?: default
 
@@ -35,6 +39,8 @@ data class TestCaseArgs(
     const val EXTRA_LENGTH = "length"
     const val EXTRA_MODE = "mode"
     const val EXTRA_KEEP_PENDING = "keep_pending"
+    const val EXTRA_URL = "url"
+    const val EXTRA_REQUIRE_DESTINATION_VISIBLE = "require_destination_visible"
 
     fun fromIntent(intent: Intent?): TestCaseArgs {
       if (intent == null) return TestCaseArgs()
@@ -55,6 +61,11 @@ data class TestCaseArgs(
               intent.getStringExtra(EXTRA_KEEP_PENDING)?.lowercase()?.let {
                 it == "1" || it == "true" || it == "yes"
               } ?: false,
+          url = intent.getStringExtra(EXTRA_URL),
+          requireDestinationVisible =
+              intent.getStringExtra(EXTRA_REQUIRE_DESTINATION_VISIBLE)?.lowercase()?.let {
+                it != "0" && it != "false" && it != "no"
+              } ?: true,
       )
     }
 
@@ -76,6 +87,8 @@ data class TestCaseArgs(
               EXTRA_LENGTH,
               EXTRA_MODE,
               EXTRA_KEEP_PENDING,
+              EXTRA_URL,
+              EXTRA_REQUIRE_DESTINATION_VISIBLE,
               me.fakerqu.test.storageredirect.receiver.TestCaseReceiver.EXTRA_TEST_CASE,
           )
           .forEach { key -> from.getStringExtra(key)?.let { to.putExtra(key, it) } }

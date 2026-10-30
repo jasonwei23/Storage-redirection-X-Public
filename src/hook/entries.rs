@@ -46,7 +46,7 @@ const PROFILE_READ_RUNTIME: HookProfileSet =
 const PROFILE_BINDER_WRITER: HookProfileSet =
     HookProfileSet::from_profile(HookProfile::SystemWriter).with(HookProfile::SystemWriterBootLite);
 const PROFILE_LATE_LOAD_REFRESH: HookProfileSet =
-    HookProfileSet::from_profile(HookProfile::AppWrite);
+    HookProfileSet::from_profile(HookProfile::AppWrite).with(HookProfile::FuseFix);
 
 pub struct HookEntry {
     pub symbol: &'static str,
@@ -167,6 +167,14 @@ pub fn build_hook_entries() -> Vec<HookEntry> {
             symbol: "statx",
             new_func: super::ops::query::hooked_statx as *mut _,
             is_optional: true,
+            profiles: PROFILE_FULL_WRITER,
+        },
+        HookEntry {
+            // bionic 的 realpath 逐级走内部 __lstat，PLT 侧看不到；不单独 hook 就无法
+            // 让 File.getCanonicalPath() 解析映射请求侧目录（File.mkdirs 因此返回 false）。
+            symbol: "realpath",
+            new_func: super::ops::query::hooked_realpath as *mut _,
+            is_optional: false,
             profiles: PROFILE_FULL_WRITER,
         },
         HookEntry {

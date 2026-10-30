@@ -24,9 +24,7 @@ pub unsafe extern "C" fn hooked_rename(oldpath: *const c_char, newpath: *const c
         || call_rename(oldpath, newpath),
         |hub| {
             hub.increment_rename_calls();
-            if runtime::should_resolve_caller_context(hub) {
-                caller::update_caller_package_for_current_thread(hub);
-            }
+            caller::update_caller_for_mutation(hub, newpath);
 
             handle_rename_like(
                 hub,
@@ -67,9 +65,7 @@ pub unsafe extern "C" fn hooked_renameat(
         || call_original(oldpath, newpath),
         |hub| {
             hub.increment_rename_calls();
-            if runtime::should_resolve_caller_context(hub) {
-                caller::update_caller_package_for_current_thread(hub);
-            }
+            caller::update_caller_for_mutation(hub, newpath);
 
             handle_rename_like(
                 hub,
@@ -125,9 +121,7 @@ pub unsafe extern "C" fn hooked_renameat2(
         || call_original(oldpath, newpath),
         |hub| {
             hub.increment_rename_calls();
-            if runtime::should_resolve_caller_context(hub) {
-                caller::update_caller_package_for_current_thread(hub);
-            }
+            caller::update_caller_for_mutation(hub, newpath);
 
             handle_rename_like(
                 hub,
@@ -406,7 +400,7 @@ fn process_redirect_path_for_rename(
 }
 
 fn should_apply_rename_policy(hub: &crate::hook::stats::InterceptHub) -> bool {
-    should_apply_rename_policy_for_mode(hub.is_monitor_only(), &hub.get_package_name())
+    should_apply_rename_policy_for_mode(hub.effective_monitor_only(), &hub.get_package_name())
 }
 
 fn should_apply_rename_policy_for_mode(is_monitor_only: bool, package_name: &str) -> bool {

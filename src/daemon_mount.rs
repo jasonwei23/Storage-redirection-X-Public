@@ -1062,6 +1062,17 @@ fn handle_child_process(request: &MountRequest, plan: &MountForkPlan, sock: c_in
         if !write_mount_state(request, plan, &mounted_targets, &fuse_children) {
             log::warn!("daemon mount state save failed pid={}", request.pid);
         }
+        // 自有私有目录恢复放在所有存储根挂载动作之后（与 companion 路径同顺序）：
+        // 提前到 apply 阶段做会被随后的视图根 FUSE 挂载整体遮蔽。scoped 根透传给
+        // data/obb 的覆盖跳过判据，语义与失败留痕见
+        // `MountPlanner::restore_own_private_system_view`。
+        let restored_own_private = planner.restore_own_private_system_view(scoped_fuse_roots);
+        log::info!(
+            "own private system view restored count={} pkg={} pid={}",
+            restored_own_private,
+            request.package_name,
+            request.pid
+        );
         record_mount_identity(request, &mounted_targets, &fuse_children);
         let _ = send_mount_result(sock, 0);
         unsafe { close(sock) };
@@ -1521,6 +1532,9 @@ fn run_passthrough_probe(
         backend_root.trim_end_matches('/'),
         PASSTHROUGH_PROBE_REL
     );
+    // 历史残留自愈：上次探测若在删除前被中断（进程被杀、系统重启），探针文件
+    // 会遗留在存储根。先清一次旧残留再写入本次探针，保证异常路径不累积垃圾。
+    let _ = std::fs::remove_file(&probe_backend);
     if let Err(error) = std::fs::write(&probe_backend, b"srx1") {
         log::warn!(
             "passthrough probe file create failed pkg={} path={} err={}",

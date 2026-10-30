@@ -238,6 +238,64 @@ pub fn clear_fuse_caller_uid() {
     FUSE_CALLER_PID.with(|cell| cell.set(-1));
 }
 
+/// 系统 uid FUSE 请求的跨线程接力槽。
+///
+/// MediaProvider 侧读 /dev/fuse 的线程（libappfuse 桥）与处理请求、执行后端
+/// mkdir/open 的线程可能分离：thread-local 的 FUSE 请求头信号无法跨线程传递
+/// （2026-10-24 真机：系统服务开机创建 MIUI/Mirror 时 fuse_uid=-1）。读线程
+/// 捕获到系统 uid（<10000）的请求头时写入本槽，处理线程在归因落空时按时间
+/// 窗口取用。只对系统 uid 入槽：应用 uid 的请求已有 binder 与路径台账归因，
+/// 全局单槽在应用 IO 并发下会串味，收益不抵风险。
+///
+/// 取用资格按产品边界收窄：仅公共路径的写形态操作（经
+/// caller::update_caller_for_mutation 标记）允许取槽——MP 的高频读操作与
+/// 私有路径写会把待归因的公共路径写请求的槽内容提前消费掉（2026-10-24
+/// 真机：mkdir 槽内容被并发 stat 秒抢，监视记录全部 unknown）。
+struct SystemFuseRequestSlot {
+    uid: i32,
+    pid: i32,
+    at_ms: i64,
+}
+
+static SYSTEM_FUSE_REQUEST: std::sync::Mutex<SystemFuseRequestSlot> =
+    std::sync::Mutex::new(SystemFuseRequestSlot {
+        uid: -1,
+        pid: -1,
+        at_ms: -1,
+    });
+
+pub fn set_system_fuse_request(uid: i32, pid: i32) {
+    if uid < 0 || pid <= 0 {
+        return;
+    }
+    let mut slot = SYSTEM_FUSE_REQUEST
+        .lock()
+        .unwrap_or_else(|err| err.into_inner());
+    slot.uid = uid;
+    slot.pid = pid;
+    slot.at_ms = monotonic_ms();
+}
+
+/// 取窗口内的系统 uid FUSE 请求；取用即清，避免同一次请求被重复消费。
+pub fn take_recent_system_fuse_request(max_age_ms: i64) -> Option<(i32, i32)> {
+    let mut slot = SYSTEM_FUSE_REQUEST
+        .lock()
+        .unwrap_or_else(|err| err.into_inner());
+    if slot.uid < 0 || slot.pid <= 0 {
+        return None;
+    }
+    let now = monotonic_ms();
+    let age = now.saturating_sub(slot.at_ms);
+    let (uid, pid) = (slot.uid, slot.pid);
+    slot.uid = -1;
+    slot.pid = -1;
+    slot.at_ms = -1;
+    if age >= 0 && age <= max_age_ms {
+        return Some((uid, pid));
+    }
+    None
+}
+
 // 在 clearCallingIdentity 之前调用，保存真实调用方 UID
 pub fn set_binder_saved_caller_uid(uid: i32) {
     BINDER_SAVED_CALLER_UID.with(|cell| cell.set(uid));
@@ -420,6 +478,98 @@ pub fn provider_passthrough_virtual_query_dir(path: &str) -> Option<String> {
     } else {
         None
     }
+}
+
+// ── 进程级「映射请求路径 → 映射目标」短时登记 ─────────────────────────────
+//
+// 系统写者把 mkdir/create 落到映射目标之后，会用**原请求路径**回查 attr、做
+// realpath 校验；而请求路径在真实存储里并不存在（它只是应用视图里的 bind
+// 挂载点），这些回查一律 ENOENT，FUSE 最终把 ENOENT 回给调用方。2026-10-26
+// A17 场景 39 实证：DownloadProvider 的 mkdir 拿到 -1/ENOENT，映射目标里的
+// 目录却已由 MediaProvider 建好。
+//
+// 线程内的 PROVIDER_PASSTHROUGH_VIRTUAL_DIRS 覆盖不到这条链路：FuseDaemon 的
+// 写请求与后续回查落在不同线程上（binder 线程池 + FUSE 读线程）。这里登记到
+// 进程级并带 TTL，只用于回答查询，不改变落盘位置。
+const PROCESS_MAPPED_DIR_TTL_MS: i64 = 8000;
+// 单个下载/插入流程涉及的目录层级有限，设上限避免异常场景下无界增长
+const PROCESS_MAPPED_DIR_MAX: usize = 64;
+
+struct ProcessMappedDir {
+    request: String,
+    target: String,
+    at_ms: i64,
+}
+
+static PROCESS_MAPPED_DIRS: std::sync::Mutex<Vec<ProcessMappedDir>> =
+    std::sync::Mutex::new(Vec::new());
+
+/// 登记「本进程内刚把某请求侧目录重定向到了映射目标」。
+///
+/// 键统一折算到 /storage/emulated 路径空间，与查询侧 `virtual_dir_key` 一致。
+pub fn remember_process_mapped_dir(request_path: &str, target_path: &str) {
+    if request_path.is_empty() || target_path.is_empty() {
+        return;
+    }
+    let request = virtual_dir_key(request_path);
+    let target = crate::platform::paths::data_media_to_storage_path(target_path);
+    let now = monotonic_ms();
+    let mut dirs = PROCESS_MAPPED_DIRS
+        .lock()
+        .unwrap_or_else(|err| err.into_inner());
+    dirs.retain(|dir| now.saturating_sub(dir.at_ms) <= PROCESS_MAPPED_DIR_TTL_MS);
+    if let Some(existing) = dirs.iter_mut().find(|dir| dir.request == request) {
+        existing.target = target;
+        existing.at_ms = now;
+        return;
+    }
+    if dirs.len() >= PROCESS_MAPPED_DIR_MAX {
+        dirs.remove(0);
+    }
+    dirs.push(ProcessMappedDir {
+        request,
+        target,
+        at_ms: now,
+    });
+}
+
+/// 登记项对应的映射目标（含子路径派生），过期项在读取时就地清理。
+///
+/// 只做纯查询：命中不代表该路径在真实存储里存在，调用方仍须自行验证目标。
+pub fn process_mapped_dir_target(path: &str) -> Option<String> {
+    if path.is_empty() {
+        return None;
+    }
+    let key = virtual_dir_key(path);
+    let now = monotonic_ms();
+    let mut dirs = PROCESS_MAPPED_DIRS
+        .lock()
+        .unwrap_or_else(|err| err.into_inner());
+    dirs.retain(|dir| now.saturating_sub(dir.at_ms) <= PROCESS_MAPPED_DIR_TTL_MS);
+    let (request, target) = dirs
+        .iter()
+        .filter(|dir| key == dir.request || key.starts_with(&format!("{}/", dir.request)))
+        .max_by_key(|dir| dir.request.len())
+        .map(|dir| (dir.request.clone(), dir.target.clone()))?;
+    let suffix = key.strip_prefix(&request)?.trim_start_matches('/');
+    if suffix.is_empty() {
+        Some(target)
+    } else {
+        Some(format!("{target}/{suffix}"))
+    }
+}
+
+/// 当前有效登记条数（过期项就地清理）。
+///
+/// 只用于诊断：查询回退未命中时，`0` 说明「同进程内从没登记过这次映射」，非 `0`
+/// 则说明登记存在但路径形式对不上——这两种情况在修复动作上完全不同。
+pub fn process_mapped_dir_count() -> usize {
+    let now = monotonic_ms();
+    let mut dirs = PROCESS_MAPPED_DIRS
+        .lock()
+        .unwrap_or_else(|err| err.into_inner());
+    dirs.retain(|dir| now.saturating_sub(dir.at_ms) <= PROCESS_MAPPED_DIR_TTL_MS);
+    dirs.len()
 }
 
 pub fn set_binder_identity_cleared(cleared: bool) {

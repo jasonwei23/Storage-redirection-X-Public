@@ -48,6 +48,20 @@ class ScenarioScopeParseTest(unittest.TestCase):
         data = SCOPE.resolve_scope("", "29,34")
         self.assertEqual(data["scenarios"], "29,34")
 
+    def test_step_timeout_budget_follows_scenario_count(self) -> None:
+        # 步骤级超时预算按场景数自适应：窄跑要快速失败，全量留足余量。
+        # 1 个场景：15 分钟准备 + 2 分钟/场景 = 17；两个场景 = 19；全量固定 90。
+        self.assertEqual(SCOPE.resolve_scope("", "29")["test_flow_timeout_minutes"], 17)
+        self.assertEqual(
+            SCOPE.resolve_scope("", "29,34")["test_flow_timeout_minutes"], 19
+        )
+        self.assertEqual(SCOPE.resolve_scope("", "")["test_flow_timeout_minutes"], 90)
+        # 预算必须随场景数单调不减，避免场景多的窄跑比场景少的更早被误杀。
+        self.assertLess(
+            SCOPE.resolve_scope("", "29")["test_flow_timeout_minutes"],
+            SCOPE.resolve_scope("", "29,34,39")["test_flow_timeout_minutes"],
+        )
+
     def test_override_fullwidth_separator_normalized(self) -> None:
         data = SCOPE.resolve_scope("", "29，34")
         self.assertEqual(data["scenarios"], "29,34")
@@ -73,6 +87,24 @@ class ScenarioScopeParseTest(unittest.TestCase):
     def test_message_in_body(self) -> None:
         data = SCOPE.resolve_scope("修复：xxx\n\n单场景 17\n\n细节说明", "")
         self.assertEqual(data["scenarios"], "17")
+
+    def test_message_duration_suffix_is_not_scope(self) -> None:
+        # 正文里的耗时描述（数字紧跟单位）不是范围标记：按标记解析会因 990 超范围
+        # 直接 fail，把整轮 CI 卡在 prepare（run 40327967419 实证）。
+        for message in (
+            "看门狗预算 单场景 990s",
+            "预算（单场景 990s、6,38 1078s→1080s）",
+            "单场景 30秒",
+        ):
+            with self.subTest(message=message):
+                data = SCOPE.resolve_scope(message, "")
+                self.assertEqual(data["scenarios"], "all")
+                self.assertFalse(data["scenario_limited"])
+
+    def test_message_scope_followed_by_spaced_unit_still_parses(self) -> None:
+        # 单位前有空格时仍是范围标记：不能因为放宽上一条而吞掉真实窄跑意图。
+        data = SCOPE.resolve_scope("单场景 39,40 秒级验证", "")
+        self.assertEqual(data["scenarios"], "39,40")
 
     def test_override_takes_precedence_over_message(self) -> None:
         data = SCOPE.resolve_scope("单场景 29", "34")
@@ -110,7 +142,7 @@ class ScenarioScopeParseTest(unittest.TestCase):
 
     def test_above_max_out_of_range_raises(self) -> None:
         with self.assertRaises(SCOPE.ScenarioScopeError):
-            SCOPE.resolve_scope("", "38")
+            SCOPE.resolve_scope("", "41")
 
     def test_duplicate_number_raises(self) -> None:
         with self.assertRaises(SCOPE.ScenarioScopeError):
@@ -167,7 +199,7 @@ class ScenarioScopeParseTest(unittest.TestCase):
         )
         # 必须真正读取清单得到上限，而不是无脑返回 DEFAULT_MAX_SCENARIO。
         self.assertEqual(SCOPE.max_scenario_from_json(), expected)
-        self.assertEqual(expected, 37)
+        self.assertEqual(expected, 40)
 
     def test_max_scenario_missing_manifest_uses_default(self) -> None:
         self.assertEqual(
@@ -176,10 +208,10 @@ class ScenarioScopeParseTest(unittest.TestCase):
         )
 
     def test_max_scenario_corrupt_manifest_raises(self) -> None:
-        # 清单存在但结构异常时抛错，不能用 37 掩盖。
+        # 清单存在但结构异常时抛错，不能用默认上限掩盖。
         import tempfile
 
-        with tempfile.TemporaryDirectory() as tmp:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
             bad = Path(tmp) / "bad.json"
             bad.write_text('{"scenarios": "not-a-list"}', encoding="utf-8")
             with self.assertRaises(SCOPE.ScenarioScopeError):
@@ -199,12 +231,15 @@ class ScenarioScopeParseTest(unittest.TestCase):
                     "scenario_limited": True,
                     "validation_mode": "scope",
                     "publish_ci": False,
+                    "test_flow_timeout_minutes": 17,
                 },
                 "github",
             )
         lines = buf.getvalue().splitlines()
         self.assertIn("scenarios=29", lines)
         self.assertIn("publish_ci=false", lines)
+        # 步骤级超时预算由 test-flow 的 Run 步骤直接引用，必须进 CI 输出。
+        self.assertIn("test_flow_timeout_minutes=17", lines)
         # 未使用的 scenario_limited / validation_mode 不得进入 CI 输出。
         self.assertNotIn("scenario_limited", "\n".join(lines))
         self.assertNotIn("validation_mode", "\n".join(lines))

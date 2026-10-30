@@ -1,5 +1,6 @@
 mod caller;
 pub mod companion_api;
+pub(crate) mod config_watcher;
 mod context;
 mod diagnostic;
 mod entries;
@@ -25,9 +26,10 @@ pub(crate) use context::{
     enter_provider_passthrough, enter_provider_virtual_scope, exit_provider_passthrough,
     exit_provider_virtual_scope, get_binder_saved_caller_package,
     is_explicit_caller_decision_active, is_path_owner_inference_disabled,
-    is_provider_passthrough_active, is_provider_virtual_scope_active,
-    provider_passthrough_virtual_dir_target, provider_passthrough_virtual_query_dir,
-    provider_passthrough_virtual_query_target, remember_provider_passthrough_virtual_dir,
+    is_provider_passthrough_active, is_provider_virtual_scope_active, process_mapped_dir_count,
+    process_mapped_dir_target, provider_passthrough_virtual_dir_target,
+    provider_passthrough_virtual_query_dir, provider_passthrough_virtual_query_target,
+    remember_process_mapped_dir, remember_provider_passthrough_virtual_dir,
 };
 pub(crate) use jni_query::{
     is_redirect_enabled_for_caller_uid, resolve_download_media_placeholder_path_for_caller,
@@ -76,6 +78,16 @@ pub(crate) fn refresh_runtime_config_throttled() {
         return;
     }
     refresh_runtime_config_from_settings();
+}
+
+/// 共享节流阀的配置变更轮询，供 hook 决策路径内直接调用。
+///
+/// 不走 [`context::ReentryGuard`]：调用方本来就运行在 hook 决策内部（与
+/// `process_system_writer_redirect` 的磁盘变更检查一致），再入守卫会把每次
+/// 调用都判成重入而永远跳过轮询。返回 true 表示 SettingsHub 已重载，
+/// 调用方需要据此重建自己持有的规则视图（如 PathRouter）。
+pub(crate) fn poll_config_reload_throttled() -> bool {
+    reload::poll_or_check_throttled().did_reload()
 }
 
 fn refresh_runtime_config_from_native_reentrant() {

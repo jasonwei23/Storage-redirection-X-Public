@@ -75,6 +75,8 @@ class MountMetadataScopeTest(unittest.TestCase):
         cls.mount_core = read("src/mount/planner.rs")
         cls.fuse_mod = read("src/fuse_redirect/mod.rs")
         cls.fuse_config = read("src/fuse_redirect/config.rs")
+        cls.runtime = read("src/hook/runtime.rs")
+        cls.owner_migration = read("src/owner_migration.rs")
 
     def test_mapping_mode_only_apps_skip_private_owner_repair(self) -> None:
         # 私有外部存储由 MediaProvider 管理，监视侧不应再建立任何私有目录属主修复根。
@@ -84,6 +86,19 @@ class MountMetadataScopeTest(unittest.TestCase):
         )
         self.assertIn("MediaProvider", body)
         self.assertIn("Vec::new()", body)
+
+    def test_mapping_target_created_when_missing(self) -> None:
+        # 映射目标目录缺失时必须在挂载阶段补建：应用视图把它 bind 到请求路径，
+        # 源不存在会让应用写入报 ENOENT，系统代写者（下载提供器）对请求路径的
+        # mkdir 也会被 MediaProvider 判为拒绝，表现成 DownloadManager 的
+        # "Failed to create parent"（run 40277331532 五版本一致实证）。
+        body = function_body(
+            self.mount_core,
+            "pub(super) fn ensure_app_owned_mapping_target(&self, path: &str, owner_uid: i32) -> bool",
+        )
+        self.assertIn("fs::create_directory(&metadata_path, creation_uid)", body)
+        self.assertIn("mapping target mkdir failed", body)
+        self.assertNotIn("这里不做补建", body)
 
     def test_stuck_mount_circuit_is_scoped_to_one_package(self) -> None:
         # 熔断判据必须带上包名，否则单个应用的挂载超时会连坐整机其它应用。
@@ -191,6 +206,30 @@ class MountMetadataScopeTest(unittest.TestCase):
         self.assertNotIn("chown_android_private_path_if_needed", monitor)
         self.assertNotIn("repair_private_category_owner", monitor)
 
+    def test_system_writer_owner_fix_preserves_native_gid(self) -> None:
+        # 系统代写 hook 只负责把 owner 修回应用 UID；1078(ext_data_rw) 与
+        # 1023(media_rw) 都是设备上可能出现的原生私有目录组，不能固定覆盖。
+        body = function_body(self.runtime, "fn chown_private_path_if_needed(")
+        self.assertIn("st.st_uid == owner_uid as u32", body)
+        self.assertNotIn("st.st_uid == owner_uid as u32 && st.st_gid", body)
+        self.assertIn("owner_uid as u32, u32::MAX", body)
+
+    def test_owner_migration_restores_only_private_data_directory_gid(self) -> None:
+        # 一次性迁移只把 Android/data 下、owner 正确且无 other 权限位的目录从
+        # media_rw 组恢复到 AOSP 定义的 ext_data_rw；文件与共享媒体目录保留 1023。
+        self.assertIn("owner-migration-1023-v4.done", self.owner_migration)
+        self.assertIn("const EXT_DATA_RW_GID: u32 = 1078", self.owner_migration)
+        body = function_body(
+            self.owner_migration,
+            "fn should_restore_ext_data_gid(",
+        )
+        self.assertIn('metadata.is_dir()', body)
+        self.assertIn('metadata.uid() == target_uid || metadata.uid() == MEDIA_RW_UID', body)
+        self.assertIn('metadata.mode() & 0o007 != 0', body)
+        self.assertIn('path.rfind("/Android/data/")', body)
+        self.assertNotIn('"/Android/media/"', body)
+        self.assertNotIn('"/Android/obb/"', body)
+
     def test_storage_alias_binding_skips_source_self_bind(self) -> None:
         # 私有目录恢复会同时遍历 /storage、/mnt 和 /data/media 别名；源路径对应的
         # /data/media 别名必须跳过，避免 mount(source, source) 污染 FUSE/namespace 挂载栈。
@@ -201,13 +240,17 @@ class MountMetadataScopeTest(unittest.TestCase):
         self.assertIn("eq_ignore_case(source, &target)", overlay_body)
 
     def test_own_private_restore_prefers_system_fuse_anchor(self) -> None:
-        # 自有 Android/data|media|obb 不能从 /data/media 直绑到应用视图；直绑会绕过
+        # 自有 Android 私有目录不能从 /data/media 直绑到应用视图；直绑会绕过
         # MediaProvider FUSE 并带入 media_rw_data_file 上下文，应用仍会被 SELinux 拒绝。
+        # 2026-10-25 起（f84a29dd）源改为独立的系统视图锚点 ensure_system_view_anchor，
+        # 且只恢复 Android/media/<pkg>（data 是沙箱宿主、obb 无跨进程共享需求），
+        # 锚点缺失时以 "own private system view anchor unavailable" 留痕等待重试。
         apply = read("src/mount/apply.rs")
         body = function_body(apply, "fn restore_own_private_directories(")
-        self.assertIn("real_storage_anchor", body)
+        self.assertIn("ensure_system_view_anchor", body)
         self.assertIn("backend_source", body)
-        self.assertIn("FUSE anchor unavailable", body)
+        self.assertIn("own private system view anchor unavailable", body)
+        self.assertIn('format!("Android/media/{}", self.package_name)', body)
         self.assertNotIn("unwrap_or_else(|| backend_source.clone())", body)
         self.assertNotIn('relative.starts_with("Android/data/")', body)
 
