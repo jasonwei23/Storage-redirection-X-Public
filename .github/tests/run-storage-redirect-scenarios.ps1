@@ -149,6 +149,13 @@ $SrtDownloadUrl = if ($env:SRT_DOWNLOAD_URL) { $env:SRT_DOWNLOAD_URL } else { ""
 # 场景 40：系统 uid 的 FUSE 写入按发起服务归因夹具。
 $UidAttribRel = "Download/SrtUidAttrib"
 $UidAttribProbeRel = "Download/SrtUidAttrib/srt_uid_probe_dir"
+# 场景 40 第三段：系统 uid（shell 2000）自身配置沙盒、真实目标缺失、经 MediaProvider
+# 建目录，请求路径零穿透（与 .sh 同名夹具一致）。
+$ShellPackage = "com.android.shell"
+$ShellConfig = "/data/adb/modules/storage.redirect.x/config/apps/$ShellPackage.json"
+$ShellSandboxRel = "Download/SrtShellSandbox"
+$ShellSandboxRealDir = "$BackendRoot/$ShellSandboxRel"
+$ShellSandboxBackendDir = "$BackendRoot/Android/data/$ShellPackage/sdcard/$ShellSandboxRel"
 $RuleSiblingRoot = "$RealRoot/DCIM/SrtRuleSibling"
 $BackendRuleSiblingRoot = "$BackendRoot/DCIM/SrtRuleSibling"
 $PrivateRuleSiblingRoot = "$BackendPrivateRoot/DCIM/SrtRuleSibling"
@@ -1214,7 +1221,7 @@ function Assert-FixtureRootsEmpty {
     # 仅扫描原有 Download/Srt* 与 Download/Test 范围，不扩大枚举、不新增删除，避免误伤
     # 未知预置夹具。扫描失败（adb 中断、find 权限错误）必须传播，不能吞成成功；移除
     # -maxdepth 限制与 head 管道后，任何层级的残留与 find 错误都不再被掩盖。
-    $command = "for d in '$RealRoot/Download'/Srt* '$RealRoot/Download/Test'; do if [ -d `"`$d`" ]; then find `"`$d`" -type f || exit 1; fi; done"
+    $command = "for d in '$RealRoot/Download'/Srt* '$RealRoot/Download/Test'; do if [ -d `"`$d`" ]; then find `"`$d`" -type f -printf '%p size=%s owner=%u:%g mtime=%T@\n' || exit 1; fi; done"
     $lines = @(Invoke-Su $command)
     if ($LASTEXITCODE -ne 0) {
         Write-Host "fixture_scan_failed label=$Label"
@@ -1224,6 +1231,20 @@ function Assert-FixtureRootsEmpty {
     if ($residue.Count -gt 0) {
         Write-Host "fixture_residue label=$Label"
         $residue | ForEach-Object { Write-Host "  residue: $_" }
+        return $false
+    }
+    # 后端层同样断言：视图与后端必须同时干净。只清视图那一份时，后续场景会从后端读到
+    # 前序场景的残留（与 Clear-Targets 的双层删除口径一致）。
+    $backendCommand = "for d in '$BackendRoot/Download'/Srt* '$BackendRoot/Download/Test'; do if [ -d `"`$d`" ]; then find `"`$d`" -type f -printf '%p size=%s owner=%u:%g mtime=%T@\n' || exit 1; fi; done"
+    $backendLines = @(Invoke-Su $backendCommand)
+    if ($LASTEXITCODE -ne 0) {
+        Write-Host "fixture_scan_failed label=$Label layer=backend"
+        return $false
+    }
+    $backendResidue = @($backendLines | Where-Object { $_ -and $_.Trim() })
+    if ($backendResidue.Count -gt 0) {
+        Write-Host "fixture_residue label=$Label layer=backend"
+        $backendResidue | ForEach-Object { Write-Host "  residue: $_" }
         return $false
     }
     return $true
@@ -1968,6 +1989,8 @@ function Invoke-ConfigHotReloadScenario {
         # 两种形态对策完全不同：整块失效说明存储视图根在应用视野里落回了公共存储
         # （沙箱里才有的路径自然不存在）；只有映射失效则说明根仍指向沙箱、只是新加的
         # 映射挂载不可见。刻意不用 run-as：它不进入应用的挂载命名空间，量到的是 shell 视图。
+        # KernelSU 真机上 `su <uid>` 同理不可当应用 uid 探针：su 丢弃补充组（everybody）导致
+        # /storage 拒绝（非 SELinux），且不进入应用挂载命名空间；详见 docs/device-testing.md。
         $rootProbe = "$RealRoot/SrtHotRootProbe.txt"
         $rootProbePrivate = "$PrivateRoot/SrtHotRootProbe.txt"
         Invoke-Su "rm -f '$rootProbe' '$rootProbePrivate' 2>/dev/null || true" | Out-Null
@@ -2198,7 +2221,7 @@ function Get-ScenarioTitle {
         37 { "nested mapping chain applies parent result to child rule" }
         38 { "download provider own sandboxed_paths native write into sandbox" }
         39 { "download provider delegated write lands on requester mapping target" }
-        40 { "system uid fuse write attributed to originating service" }
+        40 { "system uid fuse write attributed to originating service; app-initiated mediaprovider creation attributed to source app; system uid sandbox missing target has zero leak" }
     }
 }
 
@@ -3356,7 +3379,7 @@ function Assert-FixtureRootsEmpty {
     # 仅扫描原有 Download/Srt* 与 Download/Test 范围，不扩大枚举、不新增删除，避免误伤
     # 未知预置夹具。扫描失败（adb 中断、find 权限错误）必须传播，不能吞成成功；移除
     # -maxdepth 限制与 head 管道后，任何层级的残留与 find 错误都不再被掩盖。
-    $command = "for d in '$RealRoot/Download'/Srt* '$RealRoot/Download/Test'; do if [ -d `"`$d`" ]; then find `"`$d`" -type f || exit 1; fi; done"
+    $command = "for d in '$RealRoot/Download'/Srt* '$RealRoot/Download/Test'; do if [ -d `"`$d`" ]; then find `"`$d`" -type f -printf '%p size=%s owner=%u:%g mtime=%T@\n' || exit 1; fi; done"
     $lines = @(Invoke-Su $command)
     if ($LASTEXITCODE -ne 0) {
         Write-Host "fixture_scan_failed label=$Label"
@@ -3366,6 +3389,20 @@ function Assert-FixtureRootsEmpty {
     if ($residue.Count -gt 0) {
         Write-Host "fixture_residue label=$Label"
         $residue | ForEach-Object { Write-Host "  residue: $_" }
+        return $false
+    }
+    # 后端层同样断言：视图与后端必须同时干净。只清视图那一份时，后续场景会从后端读到
+    # 前序场景的残留（与 Clear-Targets 的双层删除口径一致）。
+    $backendCommand = "for d in '$BackendRoot/Download'/Srt* '$BackendRoot/Download/Test'; do if [ -d `"`$d`" ]; then find `"`$d`" -type f -printf '%p size=%s owner=%u:%g mtime=%T@\n' || exit 1; fi; done"
+    $backendLines = @(Invoke-Su $backendCommand)
+    if ($LASTEXITCODE -ne 0) {
+        Write-Host "fixture_scan_failed label=$Label layer=backend"
+        return $false
+    }
+    $backendResidue = @($backendLines | Where-Object { $_ -and $_.Trim() })
+    if ($backendResidue.Count -gt 0) {
+        Write-Host "fixture_residue label=$Label layer=backend"
+        $backendResidue | ForEach-Object { Write-Host "  residue: $_" }
         return $false
     }
     return $true
@@ -4110,6 +4147,8 @@ function Invoke-ConfigHotReloadScenario {
         # 两种形态对策完全不同：整块失效说明存储视图根在应用视野里落回了公共存储
         # （沙箱里才有的路径自然不存在）；只有映射失效则说明根仍指向沙箱、只是新加的
         # 映射挂载不可见。刻意不用 run-as：它不进入应用的挂载命名空间，量到的是 shell 视图。
+        # KernelSU 真机上 `su <uid>` 同理不可当应用 uid 探针：su 丢弃补充组（everybody）导致
+        # /storage 拒绝（非 SELinux），且不进入应用挂载命名空间；详见 docs/device-testing.md。
         $rootProbe = "$RealRoot/SrtHotRootProbe.txt"
         $rootProbePrivate = "$PrivateRoot/SrtHotRootProbe.txt"
         Invoke-Su "rm -f '$rootProbe' '$rootProbePrivate' 2>/dev/null || true" | Out-Null
@@ -4340,7 +4379,7 @@ function Get-ScenarioTitle {
         37 { "nested mapping chain applies parent result to child rule" }
         38 { "download provider own sandboxed_paths native write into sandbox" }
         39 { "download provider delegated write lands on requester mapping target" }
-        40 { "system uid fuse write attributed to originating service" }
+        40 { "system uid fuse write attributed to originating service; app-initiated mediaprovider creation attributed to source app; system uid sandbox missing target has zero leak" }
     }
 }
 
@@ -5245,6 +5284,51 @@ function Invoke-SystemUidAttributionScenario {
     $true
 }
 
+function Invoke-SystemUidSandboxMissingTargetScenario {
+    # 与 .sh 的 run_system_uid_sandbox_missing_target_scenario 一致：shell（uid 2000）
+    # 配置沙盒、真实与沙盒目标都预先删除，以 immediate / aged 两档交错写入，每轮都要求
+    # 真实目录零穿透、沙盒目录建出。mkdir 返回码不作判据（AOSP pf_mkdir 的 lstat 可能 ENOENT）。
+    param([int]$Scenario)
+    $shellConfigBackup = Invoke-Su "test -f '$ShellConfig' && base64 '$ShellConfig' 2>/dev/null | tr -d '[:space:]'" | Select-Object -Last 1
+    $json = "{`"users`":{`"0`":{`"enabled`":true,`"mapping_mode_only`":true,`"sandboxed_paths`":[`"$ShellSandboxRel`"]}}}"
+    $encoded = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($json))
+    Invoke-Su "printf '%s' '$encoded' | base64 -d > '$ShellConfig.tmp.$PID'; mv -f '$ShellConfig.tmp.$PID' '$ShellConfig'; chmod 644 '$ShellConfig'" | Out-Null
+    Start-Sleep -Seconds 3
+    $ok = $true
+    $round = 0
+    foreach ($delay in @(4, 0, 4, 0)) {
+        $round++
+        Invoke-Su "rm -rf '$ShellSandboxRealDir' '$ShellSandboxBackendDir'" | Out-Null
+        Start-Sleep -Seconds 1
+        if ($delay -gt 0) {
+            & adb shell "sleep $delay; exec mkdir '/storage/emulated/0/$ShellSandboxRel'" 2>&1 | Out-Null
+        } else {
+            & adb shell "exec mkdir '/storage/emulated/0/$ShellSandboxRel'" 2>&1 | Out-Null
+        }
+        Start-Sleep -Seconds 2
+        $real = (Invoke-Su "test -d '$ShellSandboxRealDir'; echo exit=`$?" | Select-Object -Last 1) -eq "exit=0"
+        $sandbox = (Invoke-Su "test -d '$ShellSandboxBackendDir'; echo exit=`$?" | Select-Object -Last 1) -eq "exit=0"
+        Write-Host "  - scenario-$Scenario/system-uid-sandbox: round=$round delay=${delay}s real=$real sandbox=$sandbox"
+        if ($real -or -not $sandbox) {
+            if ($real) {
+                Write-Host "  - scenario-$Scenario/system-uid-sandbox: request path leaked to real storage"
+            } else {
+                Write-Host "  - scenario-$Scenario/system-uid-sandbox: sandbox directory not created"
+            }
+            Invoke-Su "grep -aE 'SrtShellSandbox' '$LogPath' 2>/dev/null | grep -av 'realpath mapped' | tail -6" | Write-Host
+            $ok = $false
+            break
+        }
+    }
+    Invoke-Su "rm -rf '$ShellSandboxRealDir' '$ShellSandboxBackendDir'" | Out-Null
+    if ($shellConfigBackup -and $shellConfigBackup -notmatch '^exit=') {
+        Invoke-Su "printf '%s' '$shellConfigBackup' | base64 -d > '$ShellConfig.tmp.$PID'; mv -f '$ShellConfig.tmp.$PID' '$ShellConfig'; chmod 644 '$ShellConfig'" | Out-Null
+    } else {
+        Invoke-Su "rm -f '$ShellConfig'" | Out-Null
+    }
+    $ok
+}
+
 function Invoke-FuseDaemonAllowWildcardScenario {
     param([int]$Scenario)
     $plainPath = "$FusePlainRoot/$TestFile"
@@ -5502,7 +5586,7 @@ function Invoke-Scenario {
         37 { Invoke-NestedMappingChainScenario $Scenario }
         38 { Invoke-ProviderSandboxScenario $Scenario }
         39 { Invoke-DownloadOwnerAttributionScenario $Scenario }
-        40 { Invoke-SystemUidAttributionScenario $Scenario }
+        40 { (Invoke-SystemUidAttributionScenario $Scenario) -and (Invoke-SystemUidSandboxMissingTargetScenario $Scenario) }
         default { Invoke-StandardScenario $Scenario }
     }
     $ok = [bool]$scenarioOk -and $ok

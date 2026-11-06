@@ -4,19 +4,21 @@ mod callbacks;
 pub(crate) mod config;
 mod helpers;
 mod inode;
+mod media_view;
 mod metadata;
 mod perf;
 mod policy;
 mod rules;
 pub(crate) mod scoped_mount;
+pub(crate) mod slow_probe;
 pub(super) use rules::normalize_rule_list;
 
 pub(crate) use policy::SharedPolicyTable;
 
 // 公开这些配置类型供 daemon/测试流复用；部分构建目标只使用其中的函数。
 pub use config::{
-    FuseRedirectConfig, MountRequestFields, fuse_config_from_request, mount_blocking_with_ready,
-    request_policy_fingerprint, scoped_fuse_mount_roots_for_request,
+    FuseRedirectConfig, MountRequestFields, request_policy_fingerprint,
+    scoped_fuse_mount_roots_for_request,
 };
 pub use scoped_mount::{
     ScopedMountAttempt, ScopedMountReport, conclude_scoped_mount, log_scoped_mount_roots,
@@ -28,7 +30,10 @@ use fuser::{
     Errno, FileAttr, FileType, FopenFlags, Generation, INodeNo, ReplyEmpty, ReplyEntry, Request,
 };
 use inode::{remove_inode_path, remove_unreferenced_inode};
-use metadata::{cstring_path, errno_from_code, errno_from_io, fix_path_metadata, last_errno};
+use metadata::{
+    apply_create_metadata, create_metadata, cstring_path, errno_from_code, errno_from_io,
+    last_errno,
+};
 use perf::FusePerfStats;
 use policy::{
     ANDROID_APP_UID_START, BackendPath, OperationKind, PolicyRegistry, RedirectPolicy,
@@ -38,7 +43,7 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 use std::ffi::OsStr;
 use std::fs::File;
-use std::os::fd::FromRawFd;
+use std::os::fd::{AsRawFd, FromRawFd};
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -67,7 +72,16 @@ const SYSTEM_REQUESTER_CACHE_CAP: usize = 256;
 type SystemRequesterCacheEntry = (i64, Option<RequesterIdentity>);
 static SYSTEM_REQUESTER_CACHE: Lazy<Mutex<HashMap<i32, SystemRequesterCacheEntry>>> =
     Lazy::new(|| Mutex::new(HashMap::new()));
-const DIR_CANDIDATE_CACHE_TTL: Duration = Duration::from_millis(250);
+/// 目录候选缓存的存活时间。
+///
+/// 命中前会逐源校验目录 mtime（`DirectorySourceSignature`），文件增删都会改变父目录
+/// mtime 从而立即失效，因此这里的 TTL 只是兜底上限，不承担新鲜度判定。此前取 250ms
+/// 时，相册类应用逐个相册目录 opendir 的间隔远大于有效期，几乎每次都重新枚举：
+/// 真机实测（A16，1 万张照片 / 20 个相册目录）模块视图的树枚举 198–229ms，原生
+/// 36–70ms；单目录 500 条枚举模块 32ms、原生 1ms，会话侧 `avg_dir_scan_us≈26000`。
+/// 按目录数线性放大后（上百个相册目录）正好是用户反馈的秒级加载。放宽到 2s 后
+/// 同一目录的重复 opendir 走缓存，新增/删除仍由 mtime 校验即时失效。
+const DIR_CANDIDATE_CACHE_TTL: Duration = Duration::from_secs(2);
 static INODE_POLICY_FALLBACKS: AtomicU64 = AtomicU64::new(0);
 /// 会话级 ENOENT 诊断限流：前 4 条带策略指纹落日志，用于定位「未登记 uid / 旧映射残留」。
 static OPEN_ENOENT_DIAG_COUNT: AtomicU64 = AtomicU64::new(0);
@@ -76,8 +90,9 @@ static CREATE_ENOENT_DIAG_COUNT: AtomicU64 = AtomicU64::new(0);
 const INITIAL_DIR_CANDIDATE_CACHE_ENTRIES: usize = 64;
 const MEDIA_RW_UID: u32 = 1023;
 pub(super) const MEDIA_RW_GID: u32 = 1023;
-pub(super) const MAPPED_DIR_MODE: libc::mode_t = 0o2773;
-const SHARED_PUBLIC_DIR_MODE: u32 = 0o2770;
+// 目录模式只在 `platform::fs` 定义一次，避免多处副本各自漂移。
+pub(super) use crate::platform::fs::MAPPED_DIR_MODE;
+const SHARED_PUBLIC_DIR_MODE: u32 = crate::platform::fs::SHARED_PUBLIC_DIR_MODE;
 /// 一级压缩（去重、剔除被父根覆盖的子路径）后的软目标根数。
 ///
 /// 优先保持"只在通配规则命中的最小具体父目录上挂 FUSE"的设计前提，能不收敛就不收敛。
@@ -113,12 +128,22 @@ struct FuseRedirectFs {
 struct FuseState {
     next_ino: u64,
     next_fh: u64,
+    /// 路径 → inode。键是 [`FuseState::inode_key`] 规整后的形式：后端存储根开启
+    /// casefold 时按 ASCII 小写折叠，与后端「大小写不同即同一文件」的语义一致。
     inodes: HashMap<String, u64>,
+    /// 后端是否按大小写不敏感解析路径（会话建立时探测一次存储根）。
+    casefold: bool,
     paths_by_inode: HashMap<u64, String>,
     /// 最近一次按应用策略解析每个 FUSE 路径，用于 root 子进程跨 namespace 接续访问。
     path_policy_uids: HashMap<String, u32>,
     inode_policy_uids: HashMap<u64, u32>,
     inode_path_versions: HashMap<u64, u64>,
+    /// inode 级已解析后端（对齐原生 FuseDaemon 的 `node->GetIoPath()` 模型）：
+    /// lookup 解析过一次的条目把后端留在 inode 上，随后的 getattr/readlink/xattr
+    /// 直接复用，不再整条重跑策略路由。键是 inode 本身，生命周期与 inode 表一致
+    /// （rename 改写 `paths_by_inode` 后 rel 比对必然 miss，重新解析即可），因此
+    /// 不引入"路径缓存"那类陈旧语义。
+    inode_backends: HashMap<u64, InodeBackendCacheEntry>,
     lookup_counts: HashMap<u64, u64>,
     dir_entry_refs: HashMap<u64, u64>,
     files: HashMap<u64, OpenFile>,
@@ -129,6 +154,23 @@ struct FuseState {
     dir_candidate_cache_capacity: usize,
     dir_candidate_cache_max_capacity: usize,
 }
+
+/// inode 后端缓存条目：属主 uid + 解析结果。
+///
+/// 复用条件是**请求策略与登记时的属主一致**：跨进程 fd fstat（GETATTR 以他人
+/// 身份到达）的视图差异必须保留原语义，不能拿属主的后端顶替。
+#[derive(Clone)]
+struct InodeBackendCacheEntry {
+    owner_uid: u32,
+    backend: Arc<BackendPath>,
+}
+
+/// 条目上限：`ls -lR` 一万条目的遍历会把 inode 全部带进来，每条目两段路径字符串
+/// 约 300B，8192 上限即 2MB 量级；超限整体清空（与系统 uid 身份缓存同一兜底模式）。
+const INODE_BACKEND_CACHE_CAP: usize = 8192;
+/// 按路径属主表上限：每条为一段相对路径加 u32，16384 条约 2MB 量级。
+const PATH_POLICY_UID_CAP: usize = 16384;
+static INODE_BACKEND_CACHE_HITS: AtomicU64 = AtomicU64::new(0);
 
 impl FuseState {
     fn next_handle(&mut self) -> u64 {
@@ -141,6 +183,37 @@ impl FuseState {
         self.dir_candidate_cache.clear();
         self.dir_candidate_cache_bytes = 0;
     }
+
+    /// inode 表的路径键。
+    ///
+    /// Android 的 /data/media 默认开启 casefold：`Tencent/x` 与 `tencent/x` 在后端是
+    /// 同一个文件。若按原样字符串分配 inode，两种拼写会得到两个 nodeid，各自有独立的
+    /// 页缓存与 i_size——writeback 下一侧写入后另一侧 fstat 的大小永远不变、read 立即
+    /// 返回 EOF，轮询日志增长的线程就会空转（真机：微信命名空间内 `Download/` 写 201
+    /// 字节，`download/` 读方停在 1 字节）。后端未开 casefold 时保持精确匹配，避免把
+    /// 两个真实不同的文件合并成一个 inode。
+    fn inode_key(&self, rel: &str) -> String {
+        if self.casefold {
+            rel.to_ascii_lowercase()
+        } else {
+            rel.to_string()
+        }
+    }
+}
+
+/// 探测后端根目录是否开启 casefold（ext4/f2fs 的 `FS_CASEFOLD_FL`）。
+///
+/// 只看存储根：Android 在建立 /data/media 时整棵树一次性设置，子目录继承。探测失败
+/// 时按不折叠处理，等价于改造前的精确匹配语义。
+fn backend_root_is_casefold(root: &Path) -> bool {
+    const FS_CASEFOLD_FL: libc::c_long = 0x4000_0000;
+    let Ok(dir) = File::open(root) else {
+        return false;
+    };
+    let mut flags: libc::c_long = 0;
+    // SAFETY: dir 是刚打开的有效目录 fd；FS_IOC_GETFLAGS 只向 flags 写入一个 long。
+    let ret = unsafe { libc::ioctl(dir.as_raw_fd(), libc::FS_IOC_GETFLAGS, &mut flags) };
+    ret == 0 && flags & FS_CASEFOLD_FL != 0
 }
 
 fn dir_candidate_cache_capacity_limits() -> (usize, usize, usize) {
@@ -153,12 +226,16 @@ fn dir_candidate_cache_capacity_limits() -> (usize, usize, usize) {
             })
         })
         .unwrap_or(4 * 1024 * 1024);
+    // 字节预算按设备内存分档：单个相册目录动辄上千条，原先 1MiB 预算下大目录
+    // 直接判超限（真机会话快照 `dir_cache_oversize=3`、命中率 2%），缓存等于没装。
+    // 宿主会话每设备只有一个，几 MB 的目录候选缓存换掉每目录 26ms 的重复枚举是
+    // 划算的；上限仍按条目数（256）与字节预算双重约束，不会无界增长。
     let (max_capacity, byte_budget) = if total_kib < 4 * 1024 * 1024 {
-        (64, 256 * 1024)
+        (64, 2 * 1024 * 1024)
     } else if total_kib < 8 * 1024 * 1024 {
-        (128, 512 * 1024)
+        (128, 4 * 1024 * 1024)
     } else {
-        (256, 1024 * 1024)
+        (256, 8 * 1024 * 1024)
     };
     (
         INITIAL_DIR_CANDIDATE_CACHE_ENTRIES.min(max_capacity),
@@ -201,6 +278,7 @@ pub(super) struct DirectorySourceSignature {
 
 impl DirectorySourceSignature {
     fn capture(path: &Path) -> Self {
+        let _slow = slow_probe::SlowFsGuard::start("readdir_source_capture", path);
         let metadata = std::fs::metadata(path).ok();
         Self {
             path: path.to_path_buf(),
@@ -210,6 +288,7 @@ impl DirectorySourceSignature {
     }
 
     fn state(&self) -> DirectorySourceState {
+        let _slow = slow_probe::SlowFsGuard::start("readdir_source_state", &self.path);
         let Some(metadata) = std::fs::metadata(&self.path).ok() else {
             return if self.modified.is_none() && self.is_dir.is_none() {
                 DirectorySourceState::Current
@@ -369,6 +448,13 @@ impl FuseRedirectFs {
         let policy = PolicyRegistry::new(RedirectPolicy::new(config)?, deny_unregistered);
         let (dir_cache_capacity, dir_cache_max_capacity, dir_cache_byte_budget) =
             dir_candidate_cache_capacity_limits();
+        let casefold = backend_root_is_casefold(&policy.session().real_root);
+        log::info!(
+            "fuse inode keying pkg={} casefold={} real_root={}",
+            package_name,
+            casefold,
+            policy.session().real_root.display()
+        );
         let mut inodes = HashMap::new();
         let mut paths_by_inode = HashMap::new();
         inodes.insert(String::new(), ROOT_INO);
@@ -388,10 +474,12 @@ impl FuseRedirectFs {
                 next_ino: ROOT_INO + 1,
                 next_fh: 1,
                 inodes,
+                casefold,
                 paths_by_inode,
                 path_policy_uids: HashMap::new(),
                 inode_policy_uids: HashMap::new(),
                 inode_path_versions: HashMap::from([(ROOT_INO, 0)]),
+                inode_backends: HashMap::new(),
                 lookup_counts: HashMap::new(),
                 dir_entry_refs: HashMap::new(),
                 files: HashMap::new(),
@@ -552,20 +640,49 @@ impl FuseRedirectFs {
         {
             return;
         }
+        if state.path_policy_uids.len() >= PATH_POLICY_UID_CAP
+            && !state.path_policy_uids.contains_key(rel)
+        {
+            // 按路径的属主表只在 inode 已被 forget 后兜底 root 接续访问；宿主会话常驻，
+            // 不设上限会随访问过的路径数无界增长。超限整体清空，与 inode 后端缓存同一模式，
+            // 仍存活的 inode 由 inode_policy_uids 继续承接。
+            state.path_policy_uids.clear();
+        }
         state.path_policy_uids.insert(rel.to_string(), uid);
         state.inode_policy_uids.insert(ino.0, uid);
     }
 
     fn ino_for_path_locked(state: &mut FuseState, rel: &str) -> INodeNo {
-        if let Some(ino) = state.inodes.get(rel).copied() {
+        let key = state.inode_key(rel);
+        if let Some(ino) = state.inodes.get(&key).copied() {
             return INodeNo(ino);
         }
         let ino = state.next_ino;
         state.next_ino = state.next_ino.saturating_add(1).max(ROOT_INO + 1);
-        state.inodes.insert(rel.to_string(), ino);
+        state.inodes.insert(key, ino);
         state.paths_by_inode.insert(ino, rel.to_string());
         state.inode_path_versions.insert(ino, 0);
         INodeNo(ino)
+    }
+
+    /// 登记本 inode 最近一次解析出的后端（`reply_entry_for_rel` 在 lookup 锁内调用）。
+    fn remember_backend_for_inode_locked(
+        state: &mut FuseState,
+        ino: INodeNo,
+        policy: &RedirectPolicy,
+        backend: Arc<BackendPath>,
+    ) {
+        if ino.0 == ROOT_INO || state.inode_backends.len() >= INODE_BACKEND_CACHE_CAP {
+            // 超限整体清空：条目只是加速件，清空后下一轮 lookup 自然重建。
+            state.inode_backends.clear();
+        }
+        state.inode_backends.insert(
+            ino.0,
+            InodeBackendCacheEntry {
+                owner_uid: policy.uid as u32,
+                backend,
+            },
+        );
     }
 
     fn add_lookup_locked(state: &mut FuseState, ino: INodeNo) {
@@ -590,10 +707,40 @@ impl FuseRedirectFs {
         state.paths_by_inode.get(&ino.0).cloned()
     }
 
-    fn backend_for_ino(&self, policy: &RedirectPolicy, ino: INodeNo) -> Result<BackendPath, Errno> {
+    /// 按已解析后端回答 inode 元数据类请求。命中条件：登记属主与请求策略一致
+    /// 且 `paths_by_inode` 的 rel 未变（rename/unlink 会改写或移除该表，命中前
+    /// 必然先比对），否则退回完整路由并更新缓存。rel 比对让陈旧条目只会造成
+    /// 重复解析，永远不会给出错误后端。
+    fn backend_for_ino(
+        &self,
+        policy: &RedirectPolicy,
+        ino: INodeNo,
+    ) -> Result<Arc<BackendPath>, Errno> {
         let rel = self.path_for_ino(ino).ok_or(Errno::ENOENT)?;
+        {
+            let state = self.state.read().unwrap_or_else(|err| err.into_inner());
+            if let Some(entry) = state.inode_backends.get(&ino.0)
+                && entry.owner_uid == policy.uid as u32
+                && entry.backend.rel == rel
+            {
+                let count = INODE_BACKEND_CACHE_HITS.fetch_add(1, Ordering::Relaxed) + 1;
+                if count == 1 || count.is_multiple_of(8192) {
+                    // 会话侧 info 不进 running.log（宿主只转发 warn 以上），命中率
+                    // 取证用 warn 限频落盘。
+                    log::warn!(
+                        "fuse inode backend cache hit uid={} ino={} rel={} count={}",
+                        policy.uid,
+                        ino.0,
+                        rel,
+                        count
+                    );
+                }
+                return Ok(Arc::clone(&entry.backend));
+            }
+        }
         policy
             .backend_for_relative(&rel, OperationKind::Read)
+            .map(Arc::new)
             .ok_or(Errno::ENOENT)
     }
 
@@ -683,6 +830,7 @@ impl FuseRedirectFs {
         ino: INodeNo,
         backend: &BackendPath,
     ) -> Result<FileAttr, Errno> {
+        let _slow = slow_probe::SlowFsGuard::start("attr_for_backend", &backend.path);
         let metadata = std::fs::symlink_metadata(&backend.path).map_err(errno_from_io)?;
         let mut attr = file_attr_from_metadata(ino, metadata);
         if backend.is_shared_public_backend {
@@ -728,10 +876,12 @@ impl FuseRedirectFs {
             return;
         };
         let policy = &policy;
+        let backend = Arc::new(backend);
         let ino = {
             let mut state = self.state.write().unwrap_or_else(|err| err.into_inner());
             let ino = Self::ino_for_path_locked(&mut state, rel);
             Self::remember_policy_for_inode_locked(&mut state, ino, rel, policy);
+            Self::remember_backend_for_inode_locked(&mut state, ino, policy, Arc::clone(&backend));
             Self::add_lookup_locked(&mut state, ino);
             ino
         };
@@ -770,20 +920,23 @@ impl FuseRedirectFs {
         if existed || fs::create_directory(&parent, owner_uid) {
             // 覆盖挂载目标（如 HyperOS apk-tmp 下载目录）由系统按下载方身份自管
             // 属主与权限，既有层级不得改写；仅本会话新建的层级按调用方身份修复。
-            // 注意：已存在的父目录必须整体跳过——fix_path_metadata 会把 group 恒写
-            // media_rw（1023），对 Android/data 私有树的原生 ext_data_rw（1078）
-            // 语义是一次性破坏（真机 2026-10-27 实证：微信每次启动写入都会把既有
-            // MicroMsg 目录 chown 成 uid=应用 gid=1023，uid 修回后仅剩 gid=1023 漂移）。
+            // 已存在的父目录必须整体跳过：既有目录由系统原生语义和独立迁移流程负责，
+            // 不在 FUSE 新建入口重复改写其 owner/group/mode。此前这里把 Android/data
+            // 私有树的 ext_data_rw（1078）覆盖成 media_rw（1023），造成 MicroMsg
+            // 每次启动后 gid 漂移。
             // 私有树既有层级的属主归位由 owner_migration 与 runtime 代写 hook 负责，
             // 这里只修「本会话刚创建」的层级。
             if !existed {
-                fix_path_metadata(
-                    parent_path,
-                    policy.uid,
+                let metadata = create_metadata(
+                    policy.uid as u32,
+                    MEDIA_RW_GID,
+                    policy.uid as u32,
                     MAPPED_DIR_MODE,
                     backend.is_shared_public_backend,
+                    backend.is_app_private_backend,
                     true,
                 );
+                apply_create_metadata(parent_path, metadata)?;
             }
             Ok(())
         } else {
@@ -907,6 +1060,7 @@ impl FuseRedirectFs {
     }
 
     fn open_backend_file(path: &Path, flags: i32, mode: u32) -> Result<File, Errno> {
+        let _slow = slow_probe::SlowFsGuard::start("open_backend_file", path);
         // FUSE writeback 回写模式下的部分页写，内核要先读原页（read-modify-write），
         // 该读仍由本 daemon 应答。backend 若照搬应用的 O_WRONLY 打开，pread 会返回
         // EBADF，内核 write_begin 失败后在应用侧呈现为诡异的 pwrite 短写（夸克下载
@@ -917,6 +1071,13 @@ impl FuseRedirectFs {
         if backend_flags & libc::O_PATH == 0 && backend_flags & libc::O_ACCMODE != libc::O_RDONLY {
             backend_flags = (backend_flags & !libc::O_ACCMODE) | libc::O_RDWR;
         }
+        // 后端绝不能带 O_APPEND：FUSE WRITE 请求携带的是内核算好的绝对偏移（writeback
+        // 回写时更是按页重写已有区段），daemon 以 pwrite(offset) 落盘；而 Linux 在
+        // O_APPEND fd 上的 pwrite 忽略 offset、一律追加到末尾。于是每次回写都把同一段
+        // 数据重复接到后端尾部（真机：视图 500 字节、后端 12750 字节，微信 xlog 视图与
+        // 后端尺寸分叉）。追加语义由内核在 FUSE 层维护（O_APPEND 打开时内核按 i_size
+        // 计算写偏移），后端只需按偏移写。
+        backend_flags &= !libc::O_APPEND;
         let c_path = cstring_path(path)?;
         // SAFETY: c_path 是合法的 NUL 结尾字符串，backend_flags/mode 为整数参数，
         // open 只在失败时返回 -1，成功返回的 fd 由 File 接管所有权。

@@ -162,36 +162,76 @@ fn await_policy_ack(fd: libc::c_int, uid: i32, budget_ms: i64) -> bool {
 /// 返回 `true` 表示**宿主会话已确认建好该 uid 的策略**（收到应答），而不是"数据已发出"：
 /// 接入会让应用的存储根直接由宿主会话承载，策略没登记上去就是整片 ENOENT，因此这里必须
 /// 拿应答而不是拿 `send` 的返回值。返回 `false` 时调用方保持 scoped 路径不变。
-pub fn register_app_policy(
+/// 通知宿主子进程摘除传播副本（attach 成功、传播已发生之后调用）。
+///
+/// fire-and-forget：副本摘除只是挂载表卫生（数据面已由 f2fs 直连锚点解耦），
+/// 通知失败不影响接入流程；宿主收到后在 control 线程内同步执行摘除。
+// quality-allow(lint-suppression): 调用方在 bin 侧 daemon_mount（接入完成时通知宿主），lib 视角无调用者；与控制协议 'U' 消息配对不拆分。
+#[allow(dead_code)]
+pub(crate) fn notify_host_unpropagate() {
+    let fd = HOST_CONTROL_FD.load(Ordering::Relaxed);
+    if fd < 0 {
+        return;
+    }
+    // SAFETY: fd 是本模块保存的控制端 socket，字面量在调用期间保持存活。
+    let sent = unsafe {
+        libc::send(
+            fd,
+            b"U
+"
+            .as_ptr() as *const libc::c_void,
+            2,
+            0,
+        )
+    };
+    if sent != 2 {
+        log::warn!("fuse host unpropagate notify failed sent={sent}");
+    }
+}
+
+/// 把详细日志开关同步给宿主会话子进程。
+///
+/// 会话子进程在 fork 时继承当时的 `DEBUG_LOGGING_ENABLED`，运行期再改全局配置不会
+/// 传到它：用户在设置页打开「详细日志」后复现问题，会话侧的目录扫描/缓存指标与
+/// `perf_snapshot` 仍然一条不落，日志包里看不到媒体读取链路的任何耗时证据。
+/// 这里用与 'U' 相同的一次性控制消息（`V0`/`V1`）在开关变化时同步过去。
+///
+/// fire-and-forget：日志开关不参与挂载或策略判定，通知失败只影响取证粒度。
+pub(crate) fn notify_host_verbose(enabled: bool) {
+    let fd = HOST_CONTROL_FD.load(Ordering::Relaxed);
+    if fd < 0 {
+        return;
+    }
+    let payload: [u8; 2] = [b'V', if enabled { b'1' } else { b'0' }];
+    // SAFETY: fd 是本模块保存的控制端 socket，payload 在调用期间保持存活。
+    let sent = unsafe {
+        libc::send(
+            fd,
+            payload.as_ptr() as *const libc::c_void,
+            payload.len(),
+            0,
+        )
+    };
+    if sent != payload.len() as isize {
+        log::warn!("fuse host verbose notify failed sent={sent}");
+    }
+}
+
+/// 构造策略消息、发给宿主会话并等待应答。
+///
+/// 返回 `true` 表示宿主会话已按该消息建好策略（收到应答），而不是"数据已发出"。
+fn send_policy_config(
     config: &crate::fuse_redirect::FuseRedirectConfig,
-    policy_fingerprint: u64,
     ack_budget_ms: i64,
 ) -> bool {
     let fd = HOST_CONTROL_FD.load(Ordering::Relaxed);
     if fd < 0 {
         return false;
     }
-    // 策略构造会探测宿主命名空间里的 MediaProvider FUSE 视图（自有 Android/media/<pkg>
-    // 下 sqlite 三件套统一缓存层的前置条件），因此绑定必须先于登记完成。失败不阻断：
-    // 策略探测不到视图会自动回退直连后端的既有行为。绑定平时亚秒完成，等待上限取
-    // 登记预算的一半：剩余留给后续应答等待与 scoped 回退，避免调用方（挂载子进程）
-    // 被 media 视图绑定拖过父进程 deadline 后遭到 SIGKILL。
-    let user_id = crate::platform::user_id_from_uid(config.uid);
-    let view_timeout_sec =
-        (ack_budget_ms / 2000).clamp(1, crate::fuse_host::HOST_ATTACH_TIMEOUT_SEC);
-    let view_start_ms = crate::platform::paths::monotonic_ms();
-    if !crate::fuse_host::ensure_host_media_fuse_view(user_id, view_timeout_sec) {
-        log::debug!(
-            "fuse host media view unavailable uid={} pkg={}",
-            config.uid,
-            config.package_name
-        );
-    }
-    // media 视图绑定与应答等待共享同一份预算：绑定实际消耗掉的时间必须从应答
-    // 预算里扣除，否则两段相加会把调用方（挂载子进程）拖过父进程 deadline，
-    // 子进程守卫会把它 SIGKILL，本轮挂载作废（真机 2026-10-16 开机期实测）。
-    let ack_remaining_ms = ack_budget_ms
-        .saturating_sub(crate::platform::paths::monotonic_ms().saturating_sub(view_start_ms));
+    // 登记本身只发一条控制消息并等应答，不再在调用方进程内做任何挂载/绑定的准备工作：
+    // 策略构造只读配置与账本，MediaProvider 视图按「用到时临时克隆」在自愈现场建立
+    // （见 `fuse_redirect::media_view`），因此这里不存在「绑定耗时吃掉应答预算」的问题，
+    // 预算全额留给应答等待。
     let Ok(payload) = serde_json::to_vec(config) else {
         log::warn!("fuse host policy encode failed pkg={}", config.package_name);
         return false;
@@ -226,14 +266,44 @@ pub fn register_app_policy(
         );
         return false;
     }
-    if await_policy_ack(fd, config.uid, ack_remaining_ms) {
-        // 登记结果必须同步进快照：companion 据此判断"我的 uid 已登记"才敢接入，
-        // 否则未登记 uid 的请求会被宿主 fail-closed 拒绝（整片 ENOENT）。
-        record_registered_policy(config.uid as u32, policy_fingerprint);
-        true
-    } else {
-        false
+    await_policy_ack(fd, config.uid, ack_budget_ms)
+}
+
+pub fn register_app_policy(
+    config: &crate::fuse_redirect::FuseRedirectConfig,
+    policy_fingerprint: u64,
+    ack_budget_ms: i64,
+) -> bool {
+    if !send_policy_config(config, ack_budget_ms) {
+        return false;
     }
+    // 登记结果必须同步进快照：companion 据此判断"我的 uid 已登记"才敢接入，
+    // 否则未登记 uid 的请求会被宿主 fail-closed 拒绝（整片 ENOENT）。
+    record_registered_policy(config.uid as u32, policy_fingerprint);
+    true
+}
+
+/// 只登记应用 mount namespace 维度的策略，不写按 uid 表。
+///
+/// 命名空间策略按**进程实例**绑定（namespace dev+ino），而按 uid 的幂等指纹刻意不含
+/// 应用 pid：应用重启后 namespace 是一个新 inode，旧条目对新进程无效，但按 uid 的
+/// 指纹仍然命中，于是「已登记」的结论把这个变化盖住了。此后该 namespace 里的 root
+/// 调用方（挂载子进程、MediaProvider 的 root 线程）请求会落进 namespace miss +
+/// deny_all 回退，表现为整片 ENOENT——自有私有目录恢复窗口的失败正是这个形态。
+/// 因此调用方在按 uid 的幂等判断**之前**先用这里补登一次 namespace。
+///
+/// 不更新宿主快照：本次只写了 namespace 表，按 uid 的就绪状态未变；若据此标记
+/// 已登记，companion 会在 uid 表仍为空时接入（整片 ENOENT）。
+// quality-allow(lint-suppression): 调用方在 bin 侧 daemon_mount（预登记前补登 namespace），
+// lib 视角无调用者；与 `register_app_policy` 共用同一条策略消息，不拆分。
+#[allow(dead_code)]
+pub fn register_app_namespace_only(
+    config: &crate::fuse_redirect::FuseRedirectConfig,
+    ack_budget_ms: i64,
+) -> bool {
+    let mut config = config.clone();
+    config.namespace_policy_only = true;
+    send_policy_config(&config, ack_budget_ms)
 }
 
 /// 把 daemon 自身的 mount namespace 登记为共享宿主的直通策略（仅 namespace 维度）。
@@ -282,46 +352,8 @@ pub fn register_daemon_namespace_passthrough() -> bool {
         is_passthrough_host: true,
         namespace_policy_only: true,
     };
-    let Ok(payload) = serde_json::to_vec(&config) else {
-        log::warn!("daemon namespace passthrough encode failed");
-        return false;
-    };
-    if payload.len() > HOST_CONTROL_PAYLOAD_LIMIT {
-        log::warn!(
-            "daemon namespace passthrough payload too large bytes={} limit={}",
-            payload.len(),
-            HOST_CONTROL_PAYLOAD_LIMIT
-        );
-        return false;
-    }
-    // SAFETY: fd 是本模块保存的控制端 socket，payload 在调用期间保持存活。
-    let sent = unsafe {
-        libc::send(
-            fd,
-            payload.as_ptr() as *const libc::c_void,
-            payload.len(),
-            0,
-        )
-    };
-    if sent != payload.len() as isize {
-        let errno = crate::platform::errno::last();
-        log::warn!(
-            "daemon namespace passthrough send failed sent={} bytes={} errno={} {}",
-            sent,
-            payload.len(),
-            errno,
-            crate::platform::errno::text(errno)
-        );
-        return false;
-    }
     // daemon 常驻路径，不在挂载 worker 的父进程等待预算内，用最坏值即可。
-    let registered = await_policy_ack(fd, 0, HOST_POLICY_ACK_BUDGET_MAX_MS);
-    if registered {
-        log::info!("daemon namespace passthrough registered pid={}", daemon_pid);
-    } else {
-        log::warn!("daemon namespace passthrough rejected pid={}", daemon_pid);
-    }
-    registered
+    send_policy_config(&config, HOST_POLICY_ACK_BUDGET_MAX_MS)
 }
 
 /// 在宿主会话内启动按 uid 策略控制通道的读取循环。
@@ -351,6 +383,22 @@ pub(crate) fn spawn_host_control_loop(
                     break;
                 }
                 let payload = &buffer[..read as usize];
+                // 'U' 前缀是 daemon 的传播副本摘除指令（attach 成功后触发，fire-
+                // and-forget）；'{' 开头是既有的策略登记 JSON。宿主与 daemon 同包
+                // 部署，无跨版本兼容负担。
+                if payload.first() == Some(&b'U') {
+                    crate::fuse_host::unpropagate_media_realm();
+                    continue;
+                }
+                // 'V' 前缀是详细日志开关同步（见 notify_host_verbose）：会话子进程
+                // 继承的是 fork 时刻的取值，运行期只靠这条消息才能跟上设置页的开关。
+                if payload.first() == Some(&b'V') {
+                    let enabled = payload.get(1) == Some(&b'1');
+                    crate::logging::set_debug_logging_enabled(enabled);
+                    // 用 warn 记录：关闭后 info/debug 会被丢弃，这条是开关确实生效的唯一凭据。
+                    log::warn!("fuse host verbose updated enabled={}", enabled);
+                    continue;
+                }
                 match serde_json::from_slice::<crate::fuse_redirect::FuseRedirectConfig>(payload) {
                     Ok(config) => {
                         let uid = config.uid;

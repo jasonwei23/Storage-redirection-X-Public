@@ -3,7 +3,7 @@ use super::{caller, context, diagnostic, monitor, path as path_utils};
 use crate::config::SettingsHub;
 use crate::platform::{self, fs, paths};
 use crate::redirect::{policy, process_redirect_path, record_redirect_hit, writer};
-use libc::{AT_FDCWD, c_char, c_void, mode_t};
+use libc::{AT_FDCWD, c_char, c_int, c_void, mode_t};
 use std::ffi::CString;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -34,7 +34,6 @@ fn redirect_mkdir_mode_for(path: &str, base: mode_t) -> mode_t {
     base
 }
 const PRIVATE_CHILD_DIR_REQUIRED_MODE: mode_t = 0o2751;
-const PRIVATE_CHILD_FILE_REQUIRED_MODE: mode_t = 0o664;
 
 struct RedirectDirOwner {
     uid: i32,
@@ -57,7 +56,7 @@ fn log_call_prev_fallback(site: &str) {
 
 #[inline]
 fn should_bypass_hook_in_fork_child(hub: &InterceptHub) -> bool {
-    if !srx_hook::is_forked_child() {
+    if !srx_hook::is_forked_child() || srx_hook::fork_safe() {
         return false;
     }
 
@@ -286,8 +285,13 @@ fn fix_system_writer_mapping_target_access(path: &str) {
         return;
     }
     let mode = (st.st_mode as mode_t) & 0o7777;
-    // MediaProvider 创建的目标文件通常为 0660/0664；QQ 等调用方随后仍需
-    // 通过系统代写链路继续写入同一文件，因此映射目标必须具备其它用户读写位。
+    // 映射目标常由 MediaProvider 以 `media_rw:media_rw 0660/0664` 创建，属主不是
+    // 应用。namespace bind 形态下没有 MP 代做 I/O，后续访问的 DAC 检查落在调用方
+    // 自己身上：映射属主应用经系统代写链路续写同一文件（2026-11-01 场景 5/6 实证：
+    // 0600 会让应用读不到自己刚写的文件），以及另一个映射到同一公共目标的应用经
+    // 自己的别名写入——两者都既非属主、也不在 media_rw 组，只能靠 **other 读写位**。
+    // 这里补的是 `0o006`（组写 + 其它读写），不是创建口径、不能按原生 0664 收敛成
+    // 其它只读：那会把跨应用共享映射目标的写入直接打成 EACCES。
     let required = mode | 0o006;
     // SAFETY: c_path 仍在本地作用域内有效，required 仅包含文件权限位。
     if required != mode && unsafe { libc::chmod(c_path.as_ptr(), required) } == 0 {
@@ -382,7 +386,9 @@ fn create_storage_parent_dirs_recursive(
     }
 
     if !fs::is_directory(&base) {
-        log::warn!(
+        // 该进程的命名空间里看不到数据媒体顶层目录（例如系统写入进程只映射了视图），
+        // 是每次写入都会复现的正常形态，不能按告警每访问一次的节奏刷屏。
+        log::debug!(
             "skip auto mkdir missing storage top dir base={} path={}",
             base,
             path
@@ -672,14 +678,19 @@ fn chmod_private_node_if_needed(
         return;
     }
     let file_type = st.st_mode & libc::S_IFMT as mode_t;
+    let current_mode = st.st_mode & 0o7777;
+    // 目录沿用既有的「最小可穿越 + 组可读写」口径；文件**不再写死 0664**，只把属主
+    // 已有的权限位镜像到组位：原生视图给的就是「属主能做的，服务方（media_rw/
+    // ext_data_rw 组）也能做」，不给 other 任何位，也不替属主决定更宽的权限。
+    // 此前固定 `| 0o664` 会把属主只想要的 0600 抬成 0664（多出 other 读），
+    // 属于模块自己发明的放宽。
     let required_mode = match file_type {
         mode if mode == libc::S_IFDIR as mode_t => private_dir_required_mode(path),
-        mode if mode == libc::S_IFREG as mode_t => PRIVATE_CHILD_FILE_REQUIRED_MODE,
+        mode if mode == libc::S_IFREG as mode_t => (current_mode & 0o700) >> 3,
         _ => return,
     };
-    let current_mode = st.st_mode & 0o7777;
 
-    if current_mode & required_mode == required_mode {
+    if required_mode == 0 || current_mode & required_mode == required_mode {
         return;
     }
 
@@ -905,6 +916,7 @@ fn package_matches_owner(package_name: &str, owner: &RedirectDirOwner) -> bool {
 pub fn with_redirected_path<F, R>(
     hub: &InterceptHub,
     op_name: &str,
+    dirfd: c_int,
     pathname: *const c_char,
     call_original: F,
 ) -> R
@@ -924,30 +936,38 @@ where
         return call_original(pathname);
     }
 
-    if !path_utils::is_relevant_storage_path(hub, &path_text) {
-        diagnostic::record_fast_bypass(op_name, &path_text);
+    // 相对路径必须先按 dirfd/cwd 解析成绝对形态；绝对路径也要先折叠
+    // `.`/`..` 与重复斜杠，再做存储前缀判断，否则 //storage 或
+    // /storage/../storage 写法会绕过整条决策链。
+    let decision_path = if path_text.starts_with('/') {
+        path_utils::normalize_decision_path(&path_text)
+    } else {
+        path_utils::resolve_path_for_dirfd(dirfd, &path_text)
+    };
+    if decision_path.is_empty() || !path_utils::is_relevant_storage_path(hub, &decision_path) {
+        diagnostic::record_fast_bypass(op_name, &decision_path);
         return call_original(pathname);
     }
 
-    diagnostic::log_diag_path_event(hub, op_name, "input", &path_text, -1);
+    diagnostic::log_diag_path_event(hub, op_name, "input", &decision_path, -1);
 
-    let redirect_result = process_redirect_path_for_runtime(hub, &path_text);
-    diagnostic::log_diag_redirect_decision(hub, op_name, &path_text, &redirect_result);
+    let redirect_result = process_redirect_path_for_runtime(hub, &decision_path);
+    diagnostic::log_diag_redirect_decision(hub, op_name, &decision_path, &redirect_result);
     // MediaStore 提交阶段对 .pending- 文件的存在性检查决定了改名能否找到源文件，
     // 而常规决策日志按操作类型采样输出，stat 这类高频操作几乎不会命中。这里对
     // pending 形态单独无条件记录一次：该形态仅在 MediaStore 提交时出现，频率极低。
-    if paths::media_store_pending_display_path(&path_text).is_some() {
+    if paths::media_store_pending_display_path(&decision_path).is_some() {
         log::info!(
             "pending probe op={} path={} action={:?} new={}",
             op_name,
-            path_text,
+            decision_path,
             redirect_result.action,
             redirect_result.new_path
         );
     }
 
     if redirect_result.is_redirect() {
-        record_redirect_hit(hub, op_name, &path_text, &redirect_result.new_path);
+        record_redirect_hit(hub, op_name, &decision_path, &redirect_result.new_path);
         if let Ok(c_path) = CString::new(redirect_result.new_path) {
             return call_original(c_path.as_ptr());
         }
@@ -1017,6 +1037,12 @@ fn create_parent_dirs_recursive_until(
     let mut st = std::mem::MaybeUninit::<libc::stat>::uninit();
     let ret = unsafe { libc::fstatat(AT_FDCWD, c_parent.as_ptr(), st.as_mut_ptr(), 0) };
     if ret == 0 {
+        // 父目录存在即意味着整条祖先链都在（目录不可能凭空挂在缺失的父级下），
+        // 唯一还需要往上走的原因是把祖先的元数据也归一。元数据修复关闭时这是纯开销：
+        // 原生写路径只创建缺失目录，不会回头治理已存在的父级。
+        if !crate::metadata_repair::enabled() {
+            return;
+        }
         create_parent_dirs_recursive_until(&parent, stop_dir, mode, owner);
         normalize_redirect_dir_metadata(&parent, mode, owner);
         return;

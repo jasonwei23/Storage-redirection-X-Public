@@ -22,6 +22,7 @@ SYSTEM_WRITER_UIDS_FILE="$CONFIG_DIR/system_writer_uids.list"
 APPS_CONFIG_DIR="$CONFIG_DIR/apps"
 BOOT_PENDING_FILE="$MODDIR/.boot_pending"
 BOOT_OK_FILE="$MODDIR/.boot_ok"
+BOOT_FAIL_COUNT_FILE="$MODDIR/.boot_fail_count"
 RUNTIME_DISABLE_FILE="$MODDIR/.runtime_disabled"
 MEDIA_HOOK_DEFERRED_FILE="$LOGS_DIR/.media_hook_deferred"
 
@@ -83,48 +84,12 @@ daemon_process_matches() {
   # 按 comm 而不是 exe 判定：daemon 的宿主会话（srx_fuse_host）与 scoped FUSE
   # 子进程（srx_fuse）都由 daemon fork 而来、exe 同样是 srx_daemon，只有 comm
   # 被 prctl 改过。若按 exe 判断，daemon 主进程崩溃后这些孤儿子进程会让存活检测
-  # 误判为「还在运行」，watchdog 永不重启，reconcile 停摆、新应用只能走 scoped。
+  # 误判为「还在运行」，pid 文件修复失效，新应用只能走 scoped。
   [ "$(cat "/proc/$pid/comm" 2>/dev/null)" = "srx_daemon" ]
 }
 
-# 清理 daemon 的遗留子进程：它们继承了 daemon 的实例锁 fd（flock），daemon 主进程
-# 崩溃后若不先杀掉，新 daemon 启动时 flock 冲突会 already_running 静默退出。
-kill_daemon_children() {
-  for child in srx_fuse_host srx_fuse; do
-    for pid in $(pidof "$child" 2>/dev/null); do
-      kill -9 "$pid" 2>/dev/null || true
-    done
-  done
-}
-
-daemon_watchdog() {
-  while true; do
-    if [ -f "$RUNTIME_DISABLE_FILE" ]; then
-      exit 0
-    fi
-    daemon_alive=0
-    if [ -r "$daemon_pid_file" ] && daemon_process_matches "$(cat "$daemon_pid_file" 2>/dev/null)"; then
-      daemon_alive=1
-    else
-      for pid in $(pidof srx_daemon 2>/dev/null); do
-        if daemon_process_matches "$pid"; then
-          daemon_alive=1
-          break
-        fi
-      done
-    fi
-    if [ "$daemon_alive" -eq 0 ]; then
-      log -p w -t Boot "srx daemon watchdog: not running, cleanup and restart"
-      kill_daemon_children
-      sleep 1
-      start_srx_daemon
-      # 重启后的第一次检查保持短间隔，尽快发现启动失败。
-      sleep 5
-      continue
-    fi
-    sleep "${DAEMON_WATCHDOG_INTERVAL_SECONDS:-20}"
-  done
-}
+# daemon 的崩溃自动重启由 daemon 自守护看门狗承担（pidfd 事件驱动，空闲零唤醒、
+# 退出即时感知），见 src/daemon_watchdog.rs；本脚本不再运行周期性 pidof 轮询。
 
 
 # 配置 WebUI
@@ -145,10 +110,8 @@ SERVICE_DIR="$MODDIR/service.d"
 RUNNING_LOG_FILE="$LOGS_DIR/running.log"
 MEDIA_STATE_LOG_FILE="$LOGS_DIR/media_provider_state.log"
 APP_STATUS_LOG_FILE="$LOGS_DIR/app_status.log"
-MAX_RUNNING_LOG_BYTES=2097152
 MAX_MEDIA_STATE_LOG_BYTES=10485760
 MAX_APP_STATUS_LOG_BYTES=10485760
-DIAGNOSTIC_SNAPSHOT_INTERVAL_SECONDS=120
 RUNNING_COLLECTOR_PID_FILE="$LOGS_DIR/.running_collector.pid"
 MEDIA_STATE_COLLECTOR_PID_FILE="$LOGS_DIR/.media_state_collector.pid"
 APP_STATUS_COLLECTOR_PID_FILE="$LOGS_DIR/.app_status_collector.pid"
@@ -158,7 +121,6 @@ APP_ERROR_RING_PID_FILE="$LOGS_DIR/.app_error_ring.pid"
 APP_ERROR_RING_LOG_FILE="$LOGS_DIR/app-errors.log"
 COLLECTOR_STATUS_LOG_FILE="$LOGS_DIR/collector_status.log"
 DEBUG_COLLECTORS_STATE_FILE="$LOGS_DIR/.debug_collectors_state"
-SYNC_WATCHDOG_PID_FILE="$LOGS_DIR/.sync_watchdog.pid"
 MEDIA_STATE_LAST_PID_FILE="$LOGS_DIR/.media_state_last_pid"
 MEDIA_STATE_DETAIL_TS_FILE="$LOGS_DIR/.media_state_detail_ts"
 SERVICE_PARTS="common.sh log_collectors.sh config_events.sh media_state.sh app_status.sh debug_collectors.sh boot.sh"
@@ -173,4 +135,3 @@ for service_name in $SERVICE_PARTS; do
 done
 
 boot_guard_wait &
-daemon_watchdog &

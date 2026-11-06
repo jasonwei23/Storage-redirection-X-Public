@@ -22,8 +22,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 pub(super) const MEDIA_RW_UID: u32 = 1023;
 pub(super) const MEDIA_RW_GID: u32 = 1023;
-pub(super) const MAPPED_DIR_MODE: libc::mode_t = 0o2773;
-pub(super) const REAL_PUBLIC_DIR_MODE: libc::mode_t = 0o2771;
+// 目录模式只在 `platform::fs` 定义一次，避免多处副本各自漂移（曾出现 0o2773 与
+// 0o2771 两套公共目录口径并存）。
+pub(super) use crate::platform::fs::{MAPPED_DIR_MODE, REAL_PUBLIC_DIR_MODE};
 pub(super) const ALLOWED_REAL_DIR_MODE: libc::mode_t = MAPPED_DIR_MODE;
 pub(super) const ALLOWED_REAL_TREE_METADATA_LIMIT: usize = 256;
 pub(super) const READ_ONLY_TREE_METADATA_LIMIT: usize = 512;
@@ -797,6 +798,9 @@ impl MountPlanner {
         };
         if ret != 0 {
             let errno = last_errno();
+            // bind 失败的真实 errno 必须可回查：自有私有恢复等调用方在失败日志里
+            // 报的是 create_directory 的陈旧 errno（真机上表现为误导性的 errno=0）。
+            crate::mount::own_private_pending::note_bind_errno(errno);
             if errno == libc::ENOTCONN && self.repair_disconnected_storage_parent(target) {
                 ret = unsafe {
                     mount(
@@ -1084,37 +1088,6 @@ impl MountPlanner {
         false
     }
 
-    /// 卸载本次已记录的全部挂载点并清空记录。
-    ///
-    /// 批量 FUSE 启动失败后需要退回到纯 mount namespace 方案，若不先卸载已装好的
-    /// bind/overlay 挂载，降级路径会在同一目标上再叠一层挂载，导致挂载栈重复、
-    /// 卸载顺序错乱。按记录的倒序卸载可以先摘掉后装的覆盖层。
-    pub(crate) fn unmount_recorded_targets(&self) -> usize {
-        let targets = std::mem::take(&mut *self.mounted_targets.borrow_mut());
-        let mut detached = 0usize;
-        for target in targets.iter().rev() {
-            let Ok(c_target) = CString::new(target.as_str()) else {
-                continue;
-            };
-            // SAFETY: c_target 是以 NUL 结尾的合法 C 字符串，且在本次调用期间保持存活。
-            if unsafe { umount2(c_target.as_ptr(), MNT_DETACH) } == 0 {
-                detached += 1;
-                continue;
-            }
-            let error_no = last_errno();
-            log::debug!(
-                "rollback umount failed dst={} errno={} {}",
-                target,
-                error_no,
-                errno_text(error_no)
-            );
-        }
-        if detached > 0 {
-            log::info!("rollback umount done count={}/{}", detached, targets.len());
-        }
-        detached
-    }
-
     fn record_mounted_target(&self, target: &str) {
         if target.is_empty() {
             return;
@@ -1232,10 +1205,6 @@ impl MountPlanner {
 
     fn is_real_storage_anchor_path(&self, path: &str) -> bool {
         paths::is_same_or_child(path, &self.real_storage_anchor_root())
-    }
-
-    pub(crate) fn real_storage_anchor(&self) -> Option<String> {
-        self.real_storage_anchor.clone()
     }
 
     fn real_storage_anchor_root(&self) -> String {

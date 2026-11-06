@@ -11,10 +11,11 @@ use crate::daemon_mount_reclaim::{
 use crate::domain::PathMapping;
 use crate::fuse_redirect::{
     FuseRedirectConfig, ScopedMountAttempt, ScopedMountReport, conclude_scoped_mount,
-    log_scoped_mount_roots, mount_blocking_with_ready,
+    log_scoped_mount_roots,
 };
 use crate::fuse_session::{
-    FuseMountState, recv_result, rollback_scoped_fuse_services, send_mount_result, set_recv_timeout,
+    FuseMountState, HostSessionSkip, recv_result, rollback_scoped_fuse_services, send_mount_result,
+    set_recv_timeout,
 };
 use crate::fuse_supervisor::{self, EndpointHealth, RecoveryAction};
 use crate::mount::MountPlanner;
@@ -38,6 +39,9 @@ const PARENT_RECV_GRACE_TIMEOUT_SEC: i64 = 1;
 const FUSE_READY_TIMEOUT_SEC: i64 = 4;
 const DAEMON_MOUNT_SLOW_MS: i64 = 20;
 const MAX_UNMOUNT_PASSES_PER_TARGET: usize = 32;
+/// 摘除预算的硬上限：越过软上限（32）后继续摘本模块可归属的层，达到该值才放弃。
+/// 深栈来自失败轮次的累积，软上限继续 fail-closed 会把残留钉到应用退出。
+const MAX_UNMOUNT_PASSES_HARD_LIMIT: usize = MAX_UNMOUNT_PASSES_PER_TARGET * 4;
 static ACTIVE_MOUNT_PIDS: Lazy<Mutex<HashSet<i32>>> = Lazy::new(|| Mutex::new(HashSet::new()));
 static LAST_SUCCESS_BY_PID: Lazy<Mutex<HashMap<i32, (u64, u64)>>> =
     Lazy::new(|| Mutex::new(HashMap::new()));
@@ -458,7 +462,24 @@ pub fn supervise_mount_request(
 
     if actions.is_empty() {
         // 账本还没有挂载明细（首次挂载后登记失败）：只能按命名空间身份判定。
-        let verdict = if target_is_current && current_namespace == Some(ledger.namespace) {
+        // 无策略规则的请求（未配置应用/无规则系统链路）不得判 Detached 触发
+        // 重放注入：否则未配置应用的空账本会被 reconcile 当成"挂载丢失"重新
+        // 接入宿主视图，绕过 preattach 闸门（2026-10-30 issue #2 报告者
+        // test14 实测）。无规则且账本为空 → 按过期账清理，不注入。
+        //
+        // 规则判定必须锚定"当前该 uid 是否仍应被宿主接管"（配置生效且启用），
+        // 而不是账本快照里的规则：旧版接管时代的账本残留即使配置早已删除/停用
+        // 仍带着规则字段，supervise 据此判 Detached 反复重放，把宿主 FUSE 一层层
+        // 叠挂进应用命名空间（2026-10-31 真机复现：MT 管理器的 ns 叠了 6 层
+        // srx_fuse_redirect、写 /storage/emulated/0 全部 EACCES，且 mount_state
+        // 因短路跳过而缺失，间歇性"有时能写"正是叠挂前后窗口的差异）。
+        let has_policy_rules =
+            crate::fuse_redirect::config::mount_request_has_policy_rules(request)
+                && crate::config::SettingsHub::instance()
+                    .has_effective_enabled_redirect_apps_for_user(request.uid);
+        let verdict = if !has_policy_rules {
+            MountVerdict::StaleNamespace
+        } else if target_is_current && current_namespace == Some(ledger.namespace) {
             MountVerdict::Detached
         } else {
             MountVerdict::StaleNamespace
@@ -963,8 +984,46 @@ fn handle_child_process(request: &MountRequest, plan: &MountForkPlan, sock: c_in
     // 并发登记时应答可能被别的 worker 取走，本方只能继续等，最坏会阻塞到预算耗尽。因此
     // 给它一个「剩余时间减去 scoped 回退所需」的上限，宁可提前放弃走 scoped，也不要挂在
     // 等应答上被父进程 SIGKILL。
+    // 这里是**唯一**的宿主接入点。规划阶段不再为 FUSE 预留覆盖（一律 bind），因此挂载
+    // 之后不再有第二次接入尝试——那会在已 bind 的目标上再叠一层 FUSE，清理时按路径只能
+    // 摘掉栈顶，底层 bind 残留成永久叠挂。
     let preattached_host = preattach_shared_host(request, scoped_fuse_roots, deadline_ms);
-    let ok = if preattached_host.is_some() {
+    // 无规则短路标记贯穿成功分支：短路跳过 planner 完整路径后，state 落账
+    // 也必须跳过（无挂载产物却留下 state=mounted 残留账，supervise/恢复流程
+    // 会据此误判"已在场"——与 companion 侧 no_rules_short_circuit 同因）。
+    let no_rules_short_circuit = preattached_host.is_err()
+        && !crate::fuse_redirect::config::mount_request_has_policy_rules(request);
+    if no_rules_short_circuit {
+        // 无规则请求没有挂载需求。旧 state/ledger 已在 clear_previous_mounts
+        // 中按 mount-id/source 归属验证清理；确认完成后还需确认账本记录目标上
+        // 不再有 srx FUSE 层，才删除旧 ledger 并返回。不能继续进入普通成功分支，
+        // 否则 scoped FUSE、私有目录恢复或 identity 落账会让无规则应用重新被接管。
+        let ledger_mounts_cleared = mount_identity::load(&request.package_name, request.pid)
+            .is_none_or(|ledger| {
+                ledger.mounts.iter().all(|mount| {
+                    crate::mount_ledger::live_mounts_at(request.pid, &mount.mount_point)
+                        .iter()
+                        .all(|live| !live.source.starts_with("srx_fuse"))
+                })
+            });
+        if !cleanup.is_cleared() || !ledger_mounts_cleared {
+            log::warn!(
+                "daemon no-rules request refused: previous mounts not cleared pid={} pkg={}",
+                request.pid,
+                request.package_name
+            );
+            let _ = send_mount_result(sock, -1);
+            // SAFETY: sock 来自本进程已连接的 socketpair，且此处是唯一关闭路径。
+            unsafe { close(sock) };
+            return false;
+        }
+        let _ = mount_identity::remove(&request.package_name, request.pid);
+        let _ = send_mount_result(sock, 0);
+        // SAFETY: sock 来自本进程已连接的 socketpair，且此处是唯一关闭路径。
+        unsafe { close(sock) };
+        return true;
+    }
+    let ok = if preattached_host.is_ok() {
         true
     } else if request.is_monitor_only {
         planner.ensure_mount_namespace_prepared()
@@ -973,7 +1032,11 @@ fn handle_child_process(request: &MountRequest, plan: &MountForkPlan, sock: c_in
             &request.path_mappings,
             &request.sandboxed_paths,
             &request.read_only_paths,
-            scoped_fuse_roots,
+            // 第四个参数是「由 FUSE 覆盖、规划阶段跳过 bind」的根。scoped 会话已退役，
+            // 现在只有共享宿主能提供 FUSE；宿主接入成功时根本不会走到这里（`ok = true`），
+            // 走到这里就说明本轮只有 namespace bind。因此一律传空：所有路径都由 bind 表达，
+            // 不再存在「等一个永远不会来的 FUSE 会话」的悬空根。
+            &[],
         )
     } else {
         planner.apply_sdcard_redirect(
@@ -981,7 +1044,7 @@ fn handle_child_process(request: &MountRequest, plan: &MountForkPlan, sock: c_in
             &request.excluded_real_paths,
             &request.read_only_paths,
             &request.path_mappings,
-            scoped_fuse_roots,
+            &[],
         )
     };
     if ok {
@@ -998,47 +1061,48 @@ fn handle_child_process(request: &MountRequest, plan: &MountForkPlan, sock: c_in
             &request.package_name,
             request.storage_backend_mode,
         );
-        let (fuse_children, attempt) = if let Some(state) = preattached_host {
-            (vec![state], ScopedMountAttempt::Ready)
-        } else if !fuse_roots.is_empty() {
-            match start_scoped_fuse_services(
-                request,
-                fuse_roots,
-                planner.real_storage_anchor(),
-                deadline_ms,
-            ) {
-                Some(children) => (children, ScopedMountAttempt::Ready),
-                None => (Vec::new(), ScopedMountAttempt::Failed),
-            }
-        } else if gate_allowed {
-            (Vec::new(), ScopedMountAttempt::NoRootsNeeded)
-        } else {
-            (Vec::new(), ScopedMountAttempt::GateBlocked)
+        // 宿主真的把存储视图根盖住时（本轮新建或既有层已在服务），`Android/data|media|obb`
+        // 由 FUSE 数据面自理，不能再叠一层系统视图 bind；纯 bind 轮次则相反，必须恢复
+        // 私有目录。这个判据此前取自「规划根」，规划根在 bind 路径下非空会误判成已覆盖。
+        let host_covers_view = preattached_host.is_ok();
+        let view_root_for_private = {
+            let user_id = crate::platform::user_id_from_uid(request.uid);
+            crate::platform::paths::storage_user_root_for_user(user_id)
         };
-        let outcome = conclude_scoped_mount(ScopedMountReport {
-            package_name: &request.package_name,
-            pid: request.pid,
-            requested_mode: request.storage_backend_mode,
-            log_prefix: "daemon hybrid fuse",
-            roots_planned: fuse_roots.len(),
-            sessions: fuse_children.len(),
-            attempt,
-            ready_reason: "scoped_mount_ready",
-            failed_reason: "scoped_mount_failed",
-        });
-        if outcome.needs_namespace_fallback {
-            log::warn!(
-                "daemon hybrid fuse no scoped service mounted, fallback to mount namespace pid={} pkg={}",
-                request.pid,
-                request.package_name
-            );
-            if !crate::fuse_session::apply_mount_namespace_fallback(&mut planner, request) {
-                log::warn!(
-                    "daemon hybrid fuse namespace fallback failed pid={} pkg={}",
-                    request.pid,
-                    request.package_name
-                );
+        let (fuse_children, attempt, host_skip) = match preattached_host {
+            Ok(state) => (vec![state], ScopedMountAttempt::Ready, None),
+            Err(reason) => {
+                if !fuse_roots.is_empty() && reason.counts_as_attempt_failure() {
+                    // 这条规则本该有 FUSE 视图，而且这次是真的尝试过并失败：计入预算。
+                    (Vec::new(), ScopedMountAttempt::Failed, Some(reason))
+                } else if !fuse_roots.is_empty() {
+                    // 根不满足接入条件 / 宿主尚未就绪：属「没试」，不计失败预算。开机
+                    // 风暴期这类判定可能连发十余次，计进预算会让该应用整轮开机都不再
+                    // 尝试 FUSE——真机 2026-11-05 的 sau 沙盒正是这样被锁死的。
+                    (Vec::new(), ScopedMountAttempt::GateBlocked, Some(reason))
+                } else if gate_allowed {
+                    (Vec::new(), ScopedMountAttempt::NoRootsNeeded, None)
+                } else {
+                    (Vec::new(), ScopedMountAttempt::GateBlocked, None)
+                }
             }
+        };
+        if let Some(reason) = host_skip {
+            // 现场可判定的一条结论：这个应用的规则本该走 FUSE，但 FUSE 视图没建起来。
+            // 附带设备节点、宿主与会话能力三段事实，便于把「设备不支持」「配置没规则」
+            // 「策略没登记」与「接入失败」区分开——issue 里只要贴这一行就能定位方向。
+            log::warn!(
+                "daemon fuse view unavailable reason={} fallback=namespace_bind pid={} pkg={} planned_roots={} fuse_device={} capability={} host_session={}",
+                reason.as_str(),
+                request.pid,
+                request.package_name,
+                fuse_roots.len(),
+                crate::fuse_redirect::config::fuse_device_present(),
+                crate::fuse_redirect::config::fuse_capability_as_str(
+                    crate::fuse_redirect::config::fuse_capability()
+                ),
+                crate::fuse_host::read_host_session_view().is_some()
+            );
         }
         let mut mounted_targets = planner.take_mounted_targets();
         // 仍在应用命名空间内，就地核对本轮目标的可见性，给热重载类问题留下应用视角证据。
@@ -1060,13 +1124,36 @@ fn handle_child_process(request: &MountRequest, plan: &MountForkPlan, sock: c_in
             mounted_targets = planner.take_mounted_targets();
         }
         if !write_mount_state(request, plan, &mounted_targets, &fuse_children) {
-            log::warn!("daemon mount state save failed pid={}", request.pid);
+            // 状态写失败必须回滚本轮全部挂载：state 与账本都没有记录时，这些层没有
+            // 任何归属判据，后续清理流程不知道它们存在，配置变更也无法把它们替换掉，
+            // 只能留到应用退出。先按挂载记录反序摘 bind 层，再回滚 FUSE 目标（宿主
+            // 会话跨应用共享，回滚只卸载目标、不终止宿主进程）。
+            let detached = crate::fuse_session::detach_round_mount_targets(&mounted_targets);
+            log::warn!(
+                "daemon mount state save failed pid={} pkg={} rollback_mounts={} rollback_targets={}",
+                request.pid,
+                request.package_name,
+                fuse_children.len(),
+                detached
+            );
+            rollback_scoped_fuse_services(&fuse_children);
+            let _ = send_mount_result(sock, -1);
+            // SAFETY: sock 是本次挂载请求自有的控制连接，本分支直接结束不再使用。
+            unsafe { close(sock) };
+            return false;
         }
         // 自有私有目录恢复放在所有存储根挂载动作之后（与 companion 路径同顺序）：
         // 提前到 apply 阶段做会被随后的视图根 FUSE 挂载整体遮蔽。scoped 根透传给
         // data/obb 的覆盖跳过判据，语义与失败留痕见
         // `MountPlanner::restore_own_private_system_view`。
-        let restored_own_private = planner.restore_own_private_system_view(scoped_fuse_roots);
+        // 走到这里时存储根要么已由宿主覆盖（不会执行到本行），要么就是纯 namespace bind，
+        // 没有任何 FUSE 层压着 `Android/data|media|obb`，私有目录恢复应按「无覆盖」处理。
+        let private_skip_roots: Vec<String> = if host_covers_view {
+            vec![view_root_for_private]
+        } else {
+            Vec::new()
+        };
+        let restored_own_private = planner.restore_own_private_system_view(&private_skip_roots);
         log::info!(
             "own private system view restored count={} pkg={} pid={}",
             restored_own_private,
@@ -1074,6 +1161,22 @@ fn handle_child_process(request: &MountRequest, plan: &MountForkPlan, sock: c_in
             request.pid
         );
         record_mount_identity(request, &mounted_targets, &fuse_children);
+        // 挂载结论（能力快照与 backend_effective 选择日志）紧挨成功回包产生，不提前登记。
+        // 写状态失败会把本轮挂载整轮摘除，结论提前写下去等于宣称一个已经不存在的 backend：
+        // 现场按 `backend_effective ... effective=fuse` 判断「FUSE 已生效」就会被误导，
+        // 能力快照也会把这次失败计入成功。回滚轮次因此不产生结论行，只留回滚告警。
+        conclude_scoped_mount(ScopedMountReport {
+            package_name: &request.package_name,
+            pid: request.pid,
+            requested_mode: request.storage_backend_mode,
+            log_prefix: "daemon hybrid fuse",
+            roots_planned: fuse_roots.len(),
+            sessions: fuse_children.len(),
+            attempt,
+            ready_reason: "scoped_mount_ready",
+            failed_reason: "scoped_mount_failed",
+            unavailable_reason: host_skip.map(|reason| reason.as_str()),
+        });
         let _ = send_mount_result(sock, 0);
         unsafe { close(sock) };
         return true;
@@ -1100,9 +1203,9 @@ fn preattach_shared_host(
     request: &MountRequest,
     scoped_fuse_roots: &[String],
     deadline_ms: i64,
-) -> Option<FuseMountState> {
+) -> Result<FuseMountState, HostSessionSkip> {
     if !shared_host_preattach_candidate(request, scoped_fuse_roots) {
-        return None;
+        return Err(preattach_skip_reason(request));
     }
     // 剩下的时间连"回一个失败结果"都不够时，直接放弃预接入。
     let remaining_ms = deadline_ms.saturating_sub(crate::platform::paths::monotonic_ms());
@@ -1113,25 +1216,32 @@ fn preattach_shared_host(
             request.package_name,
             remaining_ms
         );
-        return None;
+        return Err(HostSessionSkip::AttachFailed);
     }
     let user_id = crate::platform::user_id_from_uid(request.uid);
     let storage_root = crate::platform::paths::storage_user_root_for_user(user_id);
 
-    let host = crate::fuse_host::get_fuse_host()?;
+    let Some(host) = crate::fuse_host::get_fuse_host() else {
+        return Err(HostSessionSkip::NoSharedHost);
+    };
     let policy_config = fuse_config_from_request(request, None, None);
     // 登记应答预算：给 scoped 回退留出一个 FUSE_READY 周期。
     let ack_budget_ms = deadline_ms
         .saturating_sub(crate::platform::paths::monotonic_ms())
         .saturating_sub(FUSE_READY_TIMEOUT_SEC.saturating_mul(1000))
         .clamp(0, crate::fuse_host_control::HOST_POLICY_ACK_BUDGET_MAX_MS);
-    if !crate::fuse_host::register_app_policy(
+    // 登记先执行（宿主会话按 uid 持有策略，是接入的前置），再判闸门与登记结果：
+    // 两个失败原因必须分开上报，否则现场无法区分「这个根不允许接入」与「策略没进会话」。
+    let registered = crate::fuse_host::register_app_policy(
         &policy_config,
         request.policy_fingerprint,
         ack_budget_ms,
-    ) || !crate::fuse_host::can_attach_app(request.uid, &storage_root)
-    {
-        return None;
+    );
+    if !crate::fuse_host::can_attach_app(request.uid, &storage_root) {
+        return Err(HostSessionSkip::AttachGateClosed);
+    }
+    if !registered {
+        return Err(HostSessionSkip::PolicyRegistrationFailed);
     }
     // 接入预算：登记之后再按剩余时间收敛。接入失败还要回退 scoped，而 scoped 自己要等
     // 一个 FUSE_READY 周期，再加结果回包与状态落盘，因此两部分都要从剩余时间里扣掉；
@@ -1145,17 +1255,61 @@ fn preattach_shared_host(
         )
         .saturating_div(1000)
         .clamp(1, crate::fuse_host::HOST_ATTACH_TIMEOUT_SEC);
-    let state = try_bind_to_fuse_host(&host, request, &storage_root, attach_timeout_sec)?;
+    // 视图根已被**当前**宿主会话服务（daemon reconcile 抢先挂好或上一轮保留）：本轮不再
+    // 叠层，但仍要按宿主挂载记账——否则状态文件里没有这条目标，下一轮清理会漏摘，
+    // 挂载层没有任何归属判据。判据必须是「当前会话」：旧代际的层已经失效，仍需重新挂。
+    let view = crate::fuse_host::HostSessionView::from(host.as_ref());
+    if crate::fuse_session::storage_view_top_source(&storage_root).as_deref()
+        == Some(view.mount_source.as_str())
+    {
+        log::info!(
+            "daemon shared host preattach skipped, current host layer already serving pid={} pkg={} target={}",
+            request.pid,
+            request.package_name,
+            storage_root
+        );
+        return Ok(FuseMountState {
+            target: storage_root,
+            child: 0,
+            child_start_time_ticks: 0,
+            host_session: Some((view.child_pid, view.child_start_time_ticks)),
+        });
+    }
+    let Some(state) = try_bind_to_fuse_host(&host, request, &storage_root, attach_timeout_sec)
+    else {
+        return Err(HostSessionSkip::AttachFailed);
+    };
     log::info!(
         "daemon shared host preattached pid={} pkg={} target={}",
         request.pid,
         request.package_name,
         storage_root
     );
-    Some(state)
+    Ok(state)
 }
 
+/// 预接入闸门未放行时的原因归类（只用于日志与能力快照，不参与任何行为分支）。
+fn preattach_skip_reason(request: &MountRequest) -> HostSessionSkip {
+    if !crate::fuse_redirect::config::mount_request_has_policy_rules(request) {
+        return HostSessionSkip::NoPolicyRules;
+    }
+    // 有规则却没成为候选：模式不是 auto/monitor、规划根不是整棵存储视图根，或含
+    // 必须靠 namespace bind 才能表达的 fs 侧映射。
+    HostSessionSkip::AttachGateClosed
+}
+
+/// 请求是否携带任何策略规则（放行/排除/映射/沙箱/只读任一非空）。
+///
+/// 宿主接入由策略规则驱动：无规则的请求接入宿主只会得到 deny_all（未配置
 fn shared_host_preattach_candidate(request: &MountRequest, scoped_fuse_roots: &[String]) -> bool {
+    // 无任何策略规则的请求不预接宿主视图（2026-10-29 issue #2 test13 实测）：
+    // 未配置应用/无规则系统链路的策略登记为空，宿主对无规则 uid 一律拒绝，
+    // 接入后应用视图变空目录、文档选择器加载失败、跨路径写入全被拒。
+    // 监视能力由进程外 inotify 承担，不依赖宿主视图；规则非空的 monitor-only
+    // 请求（DownloadProvider 等已配置代写链路）仍按原设计预接。
+    if !crate::fuse_redirect::config::mount_request_has_policy_rules(request) {
+        return false;
+    }
     let is_auto = matches!(
         request.storage_backend_mode,
         crate::config::StorageBackendMode::Auto
@@ -1177,32 +1331,6 @@ fn shared_host_preattach_candidate(request: &MountRequest, scoped_fuse_roots: &[
     scoped_fuse_roots.len() == 1
         && crate::platform::paths::normalize_syntax(&scoped_fuse_roots[0])
             == crate::platform::paths::normalize_syntax(&storage_root)
-}
-
-/// 按根启动 scoped FUSE 服务；单根失败只丢弃该根。
-///
-/// 此前任一根启动失败都会调用 [`rollback_scoped_fuse_services`] 卸载所有已成功的会话
-/// 并返回 `None`，一次偶发的单根失败就让整个应用失去 FUSE 覆盖；调用方还会把这次失败
-/// 计入全局能力预算，累计到上限后把所有应用一起打回 mount namespace。改为按根隔离后，
-/// 失败根对应路径回落到 mount namespace 的 bind 分支，其余根继续由 FUSE 覆盖，影响面
-/// 收敛到单条规则。
-///
-/// 只有全部根都失败时才返回 `None`，保持原有的"FUSE 整体不可用"记账语义，
-/// 避免真正不可用的设备仍被反复重试。
-fn start_scoped_fuse_services(
-    request: &MountRequest,
-    roots: &[String],
-    real_root_override: Option<String>,
-    deadline_ms: i64,
-) -> Option<Vec<FuseMountState>> {
-    crate::fuse_session::start_scoped_fuse_services(
-        request,
-        roots,
-        real_root_override,
-        |root, real_root_override| {
-            start_fuse_service_for_root(request, root, real_root_override, deadline_ms)
-        },
-    )
 }
 
 fn scoped_fuse_mount_roots(request: &MountRequest) -> Vec<String> {
@@ -1264,159 +1392,6 @@ fn scoped_fuse_mount_roots(request: &MountRequest) -> Vec<String> {
     vec![view_root]
 }
 
-fn start_fuse_service_for_root(
-    request: &MountRequest,
-    mount_root: &str,
-    real_root_override: Option<String>,
-    deadline_ms: i64,
-) -> Option<FuseMountState> {
-    // B2-b：优先尝试共享宿主会话接入。
-    if let Some(host) = crate::fuse_host::get_fuse_host() {
-        // 先把该应用的策略按 uid 登记进共享宿主会话：这是应用接入的前置条件，提前登记也让
-        // 接入启用后第一帧请求就带上正确策略。虚拟根取整个存储根（mount_root=None），因为
-        // 宿主会话服务的是完整存储视图，而不是某个 scoped 子根。
-        //
-        // `real_root_override` 必须丢弃（传 None）：它是**应用命名空间专属**的锚点别名
-        // （`tmp/real_storage/<user>` 上的绑定只存在于应用 namespace，供 scoped 子进程读取）。
-        // 宿主子进程活在自己的私有命名空间里，同一个路径是空目录，照搬覆盖会让策略把真实根
-        // 读成空——真机实测表现为仅映射模式的应用整个公共存储视图消失，只剩被沙盒化的那几条
-        // 路径。宿主命名空间里 `/data/media/<user>` 就是未经覆盖的真实存储，本就无需别名。
-        let policy_config = fuse_config_from_request(request, None, None);
-        // 登记与接入共享父进程预算（与 preattach_shared_host 同一套公式）：给 scoped
-        // 回退留出一个 FUSE_READY 周期，登记内部再在登记与 media 视图绑定间分摊。
-        // 固定超时（旧实现 MAX 16s + 接入 10s）在开机风暴期会远超父进程预算，
-        // 子进程被守卫 SIGKILL，本轮挂载作废。
-        let ack_budget_ms = deadline_ms
-            .saturating_sub(crate::platform::paths::monotonic_ms())
-            .saturating_sub(FUSE_READY_TIMEOUT_SEC.saturating_mul(1000))
-            .clamp(0, crate::fuse_host_control::HOST_POLICY_ACK_BUDGET_MAX_MS);
-        let registered = crate::fuse_host::register_app_policy(
-            &policy_config,
-            request.policy_fingerprint,
-            ack_budget_ms,
-        );
-        if !crate::fuse_host::can_attach_app(request.uid, mount_root) {
-            // 宿主会话的虚拟根只能是整个存储视图根，且默认不接管应用挂载；两种情况都保持
-            // 既有 scoped 路径，不能因为"宿主会话可用"就顺手接上。
-            log::debug!(
-                "daemon fuse host attach skipped pid={} pkg={} target={} registered={} reason=attach_gate_closed",
-                request.pid,
-                request.package_name,
-                mount_root,
-                registered
-            );
-        } else if !registered {
-            // 策略没进宿主会话时接入会让应用拿到"未登记即拒绝"的空视图；宁可继续 scoped。
-            log::warn!(
-                "daemon fuse host attach skipped pid={} pkg={} target={} request_fingerprint={:016x} reason=policy_registration_failed",
-                request.pid,
-                request.package_name,
-                mount_root,
-                request.policy_fingerprint
-            );
-        } else {
-            let attach_timeout_sec = deadline_ms
-                .saturating_sub(crate::platform::paths::monotonic_ms())
-                .saturating_sub(
-                    FUSE_READY_TIMEOUT_SEC
-                        .saturating_add(1)
-                        .saturating_mul(1000),
-                )
-                .saturating_div(1000)
-                .clamp(1, crate::fuse_host::HOST_ATTACH_TIMEOUT_SEC);
-            if let Some(state) =
-                try_bind_to_fuse_host(&host, request, mount_root, attach_timeout_sec)
-            {
-                return Some(state);
-            }
-            log::warn!(
-                "daemon bind to fuse host failed, falling back to scoped fork pid={} pkg={}",
-                request.pid,
-                request.package_name
-            );
-        }
-    }
-
-    // 回退：fork 独立 scoped 会话（B2-a 前的既有路径）。
-    let mut ready_sockets = [0; 2];
-    // SAFETY: socketpair 系统调用，传入有效的栈数组指针。
-    if unsafe { socketpair(AF_UNIX, SOCK_DGRAM, 0, ready_sockets.as_mut_ptr()) } != 0 {
-        log_errno("daemon fuse ready socketpair failed");
-        return None;
-    }
-
-    // 先在父进程走完私有日志通道初始化，避免子进程继承处于初始化中的 OnceLock 而永久阻塞。
-    crate::logging::prepare_for_fork();
-    // SAFETY: fork 系统调用，已经通过 prepare_for_fork 避免日志通道竞态。
-    let service_child = unsafe { libc::fork() };
-    if service_child < 0 {
-        log_errno("daemon fuse fork failed");
-        // SAFETY: ready_sockets 是有效 fd，fork 失败后父进程负责清理。
-        unsafe {
-            close(ready_sockets[0]);
-            close(ready_sockets[1]);
-        }
-        return None;
-    }
-
-    if service_child == 0 {
-        // SAFETY: 子进程关闭继承的 fd；prctl 设置进程名，传入 null 结尾的字节串。
-        unsafe {
-            close(ready_sockets[0]);
-            let name = b"srx_fuse\0";
-            libc::prctl(libc::PR_SET_NAME, name.as_ptr() as libc::c_ulong, 0, 0, 0);
-        }
-        let ok = mount_blocking_with_ready(
-            fuse_config_from_request(request, Some(mount_root.to_string()), real_root_override),
-            Some(ready_sockets[1]),
-        );
-        // SAFETY: 子进程直接退出，不执行析构函数（避免 fork 后的资源清理问题）。
-        unsafe { libc::_exit(if ok { 0 } else { 1 }) };
-    }
-
-    // SAFETY: 父进程关闭写端 fd。
-    unsafe { close(ready_sockets[1]) };
-    set_recv_timeout(ready_sockets[0], service_child, FUSE_READY_TIMEOUT_SEC);
-    let mut ready_result: i32 = -1;
-    let expected = std::mem::size_of::<i32>() as isize;
-    let n = recv_result(ready_sockets[0], &mut ready_result);
-    // SAFETY: 父进程关闭读端 fd。
-    unsafe { close(ready_sockets[0]) };
-    if n != expected || ready_result != 0 {
-        log::warn!(
-            "daemon fuse service not ready child={} recv={} ret={} pid={} pkg={}",
-            service_child,
-            n,
-            ready_result,
-            request.pid,
-            request.package_name
-        );
-        crate::fuse_terminate::terminate_fuse_process(service_child, None);
-        // 子进程可能在 mount(2) 已完成后才被判失败：终止后若目标顶层残留本模块 scoped
-        // 死层，就地摘除，避免常驻应用的命名空间留下无人清理的 ENOTCONN 死挂载。
-        crate::fuse_session::detach_dead_scoped_layer_after_terminate(mount_root);
-        return None;
-    }
-
-    let Some(child_start_time_ticks) = crate::platform::process_start_time_ticks(service_child)
-    else {
-        // SAFETY: rollback 内部会 kill + waitpid，传入有效的 pid。
-        rollback_scoped_fuse_services(&[FuseMountState {
-            target: mount_root.to_string(),
-            child: service_child,
-            child_start_time_ticks: 0,
-            host_session: None,
-        }]);
-        return None;
-    };
-    Some(FuseMountState {
-        target: mount_root.to_string(),
-        child: service_child,
-        child_start_time_ticks,
-        host_session: None,
-    })
-}
-
 /// B2-b：把应用接入共享宿主 FUSE 会话。
 ///
 /// 跨命名空间的取句柄与 bind 都收敛在 [`crate::fuse_host::attach_app_to_host`]：daemon 与
@@ -1443,6 +1418,9 @@ fn try_bind_to_fuse_host(
         attached.target,
         attached.host_pid
     );
+    // move_mount 完成即传播已发生：事件通知宿主摘除 /data/media/0 副本（挂载表
+    // 卫生；数据面已由 f2fs 直连锚点解耦）。fire-and-forget，不阻塞接入。
+    crate::fuse_host_control::notify_host_unpropagate();
     maybe_probe_passthrough(request, attached.host_pid, mount_root);
     Some(FuseMountState {
         target: attached.target,
@@ -1671,6 +1649,13 @@ fn clear_previous_mounts(request: &MountRequest, plan: &MountForkPlan) -> ClearO
     let state_path = plan.state_path.as_str();
     let fuse_children = read_fuse_children(state_path);
     let mut targets = read_mount_targets(state_path);
+    // 短路场景可能没有 state 文件，但历史版本已经写过 mount_identity；
+    // 仅依赖 state 会让这些挂载层永久漏清理，之后每轮 supervise 都可能继续叠挂。
+    // 先把账本登记的目标加入候选，实际摘除仍由 mount_id/source 归属校验保护。
+    let ledger = mount_identity::load(&request.package_name, request.pid);
+    if let Some(ledger) = ledger.as_ref() {
+        targets.extend(ledger.mounts.iter().map(|mount| mount.mount_point.clone()));
+    }
     targets.extend(plan.overlay_targets.iter().cloned());
     // path_mappings 热重载必须显式覆盖全部存储别名根：旧状态文件可能来自 companion
     // 或上一轮部分失败，只记录了子映射目标；若漏掉视图根，旧沙箱层会继续压在新映射层上。
@@ -1686,14 +1671,55 @@ fn clear_previous_mounts(request: &MountRequest, plan: &MountForkPlan) -> ClearO
     }
     let targets = module_paths::normalize_mount_targets(&targets);
     if targets.is_empty() && fuse_children.is_empty() {
-        return if std::fs::remove_file(state_path).is_ok() || std::fs::metadata(state_path).is_err()
+        // 两个账本都为空不代表命名空间干净：写状态失败、账本被外部清理或旧版本
+        // 残留都可能在目标上留下本模块的层，而这些层没有记录，后续清理不会再被
+        // 加入候选。这里按模块挂载来源做一次兜底识别与摘除，只处理判定为本应用
+        // 重定向的层；仍有无法摘除的层时保守返回 Unverified，不进入挂载。
+        let leftovers =
+            crate::module_mount_source::app_redirect_mounts_in(0, &request.package_name);
+        let mut leftover_cleared = true;
+        for mount in leftovers.iter().rev() {
+            let Ok(c_target) = CString::new(mount.mount_point.as_str()) else {
+                leftover_cleared = false;
+                continue;
+            };
+            // SAFETY: c_target 是以 NUL 结尾的合法路径且在本次调用期间保持存活；
+            // MNT_DETACH 只影响当前命名空间的挂载视图，不触碰其它命名空间。
+            if unsafe { umount2(c_target.as_ptr(), MNT_DETACH) } == 0 {
+                log::info!(
+                    "daemon unmount unrecorded layer target={} source={} mount_id={}",
+                    mount.mount_point,
+                    mount.source,
+                    mount.mount_id
+                );
+                continue;
+            }
+            let errno = last_errno();
+            if errno != libc::EINVAL && errno != libc::ENOENT {
+                log::warn!(
+                    "daemon unmount unrecorded layer failed target={} mount_id={} errno={} {}",
+                    mount.mount_point,
+                    mount.mount_id,
+                    errno,
+                    errno_text(errno)
+                );
+                leftover_cleared = false;
+            }
+        }
+        let state_removed =
+            std::fs::remove_file(state_path).is_ok() || std::fs::metadata(state_path).is_err();
+        if state_removed
+            && let Some(ledger) = ledger.as_ref()
+            && ledger.mounts.is_empty()
         {
+            let _ = mount_identity::remove(&request.package_name, request.pid);
+        }
+        return if state_removed && leftover_cleared {
             ClearOutcome::Cleared
         } else {
             ClearOutcome::Unverified
         };
     }
-    let ledger = mount_identity::load(&request.package_name, request.pid);
     let mut outcome = ClearOutcome::Cleared;
     // 目标已经按深度降序排列；先摘子挂载，避免父层摘除后查询到另一个视图。
     for target in &targets {
@@ -1729,15 +1755,17 @@ fn clear_previous_mounts(request: &MountRequest, plan: &MountForkPlan) -> ClearO
             outcome = ClearOutcome::Unverified;
         }
     }
-    if outcome.is_cleared()
-        && std::fs::remove_file(state_path).is_err()
-        && std::fs::metadata(state_path).is_ok()
-    {
-        log::warn!(
-            "daemon mount state file removal failed path={} errno={}",
-            state_path,
-            last_errno()
-        );
+    if outcome.is_cleared() {
+        if std::fs::remove_file(state_path).is_err() && std::fs::metadata(state_path).is_ok() {
+            log::warn!(
+                "daemon mount state file removal failed path={} errno={}",
+                state_path,
+                last_errno()
+            );
+            outcome = ClearOutcome::Unverified;
+        } else {
+            let _ = mount_identity::remove(&request.package_name, request.pid);
+        }
     }
     outcome
 }
@@ -2023,13 +2051,24 @@ fn clear_mount_target_stack_verified(target: &str, ledger: Option<&MountLedger>)
                 return false;
             }
         }
-        if passes >= MAX_UNMOUNT_PASSES_PER_TARGET {
+        if passes >= MAX_UNMOUNT_PASSES_HARD_LIMIT {
             log::warn!(
-                "daemon unmount stack exceeded target={} mount_id={}",
+                "daemon unmount stack exceeded hard limit target={} mount_id={} passes={}",
                 target,
-                live.mount_id
+                live.mount_id,
+                passes
             );
             return false;
+        }
+        if passes == MAX_UNMOUNT_PASSES_PER_TARGET {
+            // 软上限只告警、不放弃：深栈来自上一轮失败累积，此时 fail-closed 会把
+            // 残留钉到应用退出。硬上限继续兜底，防止异常层让清理无限循环。
+            log::warn!(
+                "daemon unmount stack exceeded soft limit target={} mount_id={} passes={}",
+                target,
+                live.mount_id,
+                passes
+            );
         }
 
         let Ok(c_target) = CString::new(target) else {
@@ -2211,7 +2250,7 @@ fn fuse_config_from_request(
     mount_root: Option<String>,
     real_root_override: Option<String>,
 ) -> FuseRedirectConfig {
-    crate::fuse_redirect::fuse_config_from_request(request, mount_root, real_root_override)
+    crate::fuse_redirect::config::fuse_config_from_request(request, mount_root, real_root_override)
 }
 
 /// 预登记指纹：宿主子进程 pid、宿主 start_ticks、该 UID 的策略指纹。
@@ -2221,21 +2260,37 @@ type PreRegisterFingerprint = (i32, u64, u64);
 ///
 /// reconcile 常驻循环每轮都会对运行中的配置应用调用 [`pre_register_host_policy`]，
 /// 而策略内容只随该 UID 的策略与宿主会话代际变化。稳态下逐轮全量重登记纯属浪费：每次
-/// 登记都要在 daemon 侧为 media 视图探测 fork 一个子进程，并在宿主子进程内做一次
-/// 完整的 `RedirectPolicy::new`（沙盒目录准备、规则归一化），还会把注册日志刷到
-/// 秒级轮转。指纹任一分量变化都会自然失效重登记：宿主换代（pid/start_ticks）、
-/// 策略变更（policy_fingerprint）、MediaProvider 重启（由 reconcile 显式清空本表）。
+/// 登记都会在宿主子进程内做一次完整的 `RedirectPolicy::new`（沙盒目录准备、规则
+/// 归一化）并把注册日志刷到秒级轮转。指纹任一分量变化都会自然失效重登记：宿主换代
+/// （pid/start_ticks）、策略变更（policy_fingerprint）、MediaProvider 重启（由
+/// reconcile 显式清空本表）。
 static PRE_REGISTERED_HOST_POLICIES: Lazy<Mutex<HashMap<u32, PreRegisterFingerprint>>> =
+    Lazy::new(|| Mutex::new(HashMap::new()));
+
+/// 已为哪个**应用进程实例**登记过 mount namespace 策略：uid -> (app_pid, start_ticks)。
+///
+/// 按 uid 的策略指纹只覆盖策略内容与宿主代际，刻意不含应用 pid；而 namespace 策略按
+/// ns inode 绑定，两者生命周期不同步：应用重启后 namespace 是新 inode，旧条目对新进程
+/// 无效，但按 uid 的指纹仍然命中，于是「已登记」的结论把这个变化盖住了。此后该
+/// namespace 里的 root 调用方（挂载子进程、MediaProvider 的 root 线程）请求会落进
+/// namespace miss + deny_all 回退，表现为整片 ENOENT。这张表专门用来发现这种不同步。
+static REGISTERED_APP_NAMESPACES: Lazy<Mutex<HashMap<u32, (i32, u64)>>> =
     Lazy::new(|| Mutex::new(HashMap::new()));
 
 /// MediaProvider 进程集合变化时清空预登记指纹表。
 ///
-/// media 视图绑定指向 MediaProvider 的 FUSE 连接，其进程重启后旧连接死亡，已登记
-/// 策略里的视图根随之失效；清空指纹表让本轮预登记全量重跑，触发
-/// `ensure_host_media_fuse_view` 重新探测并重绑新连接，保留原有的自愈语义。
+/// 毒化 `-shm` 自愈需要经 MediaProvider 视图删除文件（`fuse_redirect::media_view`），
+/// 而视图按「用到时临时克隆」建立，MP 重启后下一次自愈自然克隆到新一代连接，不依赖
+/// 策略里缓存的任何视图状态；这里清空指纹表仍保留：MP 重启意味着宿主会话里该 uid 的
+/// 策略需要按最新配置重放一遍（例如新的 caller 归因与路径规则）。
 pub(crate) fn invalidate_pre_registered_host_policies() {
     if let Ok(mut registered) = PRE_REGISTERED_HOST_POLICIES.lock() {
         registered.clear();
+    }
+    // 宿主换代/MediaProvider 重启会丢掉会话内整张策略表，namespace 表同样为空：
+    // 本地记录必须一起清空，否则下一轮会把「该实例已登记」当成事实而跳过补登。
+    if let Ok(mut namespaces) = REGISTERED_APP_NAMESPACES.lock() {
+        namespaces.clear();
     }
 }
 
@@ -2256,6 +2311,42 @@ pub(crate) enum PreRegisterOutcome {
 /// companion 与 daemon 并行处理同一应用的挂载请求；如果等 companion 进入后才登记，
 /// companion 只能看到没有该 uid 的快照并回退 scoped。预登记只写策略，不创建挂载，且
 /// 必须丢弃应用 namespace 专属的 real_root_override，保证宿主看到真实存储根。
+/// 按当前应用进程实例补登 mount namespace 策略（仅 namespace 维度），在按 uid 的幂等
+/// 判断之前调用：namespace 按 ns inode 绑定，而按 uid 的指纹不含应用 pid，应用重启后
+/// 两者会脱同步。同一实例只发一次控制消息，稳态零开销。
+fn register_app_namespace_ahead(request: &MountRequest) {
+    let Ok(uid) = u32::try_from(request.uid) else {
+        return;
+    };
+    let Some(start_ticks) = crate::platform::process_start_time_ticks(request.pid) else {
+        // 进程尚未启动或已退出：namespace 取不到，登记由后续请求（同一 pid 出现时）完成。
+        return;
+    };
+    let instance = (request.pid, start_ticks);
+    let already_registered = REGISTERED_APP_NAMESPACES
+        .lock()
+        .map(|table| table.get(&uid) == Some(&instance))
+        .unwrap_or(false);
+    if already_registered {
+        return;
+    }
+    let config = fuse_config_from_request(request, None, None);
+    if crate::fuse_host_control::register_app_namespace_only(
+        &config,
+        crate::fuse_host_control::HOST_POLICY_ACK_BUDGET_MAX_MS,
+    ) {
+        if let Ok(mut table) = REGISTERED_APP_NAMESPACES.lock() {
+            table.insert(uid, instance);
+        }
+        log::info!(
+            "fuse host namespace registered ahead uid={} pid={} pkg={}",
+            uid,
+            request.pid,
+            request.package_name
+        );
+    }
+}
+
 pub(crate) fn pre_register_host_policy(request: &MountRequest) -> PreRegisterOutcome {
     let wants_shared_host = matches!(
         request.storage_backend_mode,
@@ -2267,6 +2358,10 @@ pub(crate) fn pre_register_host_policy(request: &MountRequest) -> PreRegisterOut
     {
         return PreRegisterOutcome::NotApplicable;
     }
+    // 命名空间补登必须早于按 uid 的幂等判断：应用重启后 namespace 换代而按 uid 指纹不变，
+    // 跳过路径会让新 namespace 一直缺席，root 请求只能靠上层重试兜住（自有私有目录恢复
+    // 窗口的 ENOENT 就是这个形态）。这里先按当前进程实例补一次 ns-only 登记。
+    register_app_namespace_ahead(request);
     // 幂等跳过以快照为准：快照自身校验了 boot 归属与宿主进程存活，指纹比对覆盖
     // 宿主换代与配置变更。跳过路径不做任何 fork、不构造策略、不发送控制消息；
     // 指纹不匹配（配置变更或宿主换代）时重登记，并在登记获宿主确认后才更新指纹，
@@ -2354,14 +2449,15 @@ fn state_file_path(request: &MountRequest) -> String {
 
 /// 登记本次挂载的账本。
 ///
-/// 登记纪律（何时写、何时清空、读不到归属时怎么办）由 [`crate::mount_ledger::record_mount_identity`]
-/// 统一实现，两条挂载路径共用；这里只负责把 daemon 侧的目标集合拼齐——除了规划出的挂载目标，
-/// 还要带上每个 scoped FUSE 会话自己的挂载点，否则这些会话在恢复流程里没有归属判据。
+/// 登记纪律（何时写、何时清空、读不到归属时怎么办、失败如何留痕）由
+/// [`crate::mount_ledger::record_mount_identity`] 统一实现，两条挂载路径共用；这里只负责把
+/// daemon 侧的目标集合拼齐——除了规划出的挂载目标，还要带上每个 scoped FUSE 会话自己的
+/// 挂载点，否则这些会话在恢复流程里没有归属判据。
 fn record_mount_identity(
     request: &MountRequest,
     targets: &[String],
     fuse_children: &[FuseMountState],
-) -> bool {
+) {
     let mut all_targets = targets.to_vec();
     all_targets.extend(fuse_children.iter().map(|state| state.target.clone()));
     crate::mount_ledger::record_mount_identity(
@@ -2369,7 +2465,7 @@ fn record_mount_identity(
         &request.package_name,
         request.pid,
         &all_targets,
-    )
+    );
 }
 
 fn read_mount_targets(path: &str) -> Vec<String> {

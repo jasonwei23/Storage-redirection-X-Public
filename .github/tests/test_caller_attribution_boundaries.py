@@ -91,6 +91,43 @@ class CallerAttributionBoundariesTest(unittest.TestCase):
         ):
             self.assertNotIn(forbidden, attribution_sources)
 
+    def test_attribution_intermediate_packages_keep_picker_ui_as_source(self) -> None:
+        """归因用「中间层」判定不得把文件/照片选择器当成中间层丢弃。
+
+        回归背景（2026-11-04 HyperOS A16 实测）：一份日志里 941 条记录全部落成未知，
+        路径都是 `Pictures/.thumbnails/thumb*.tmp`，caller_uid 明确指向
+        `com.android.photopicker`（单包、uid 唯一）。根因是 specialize 用来决定
+        「不要给这些进程装 hook」的那份 UI 包名单被复用进了归因链：命中即当作中间层
+        丢弃，于是真实发起方被抹掉。选择器自己写缩略图，它就是发起方。
+
+        这里锁定两条边界：归因判定不含 UI 名单；而「要不要装 hook」「能不能访问别人
+        私有目录」这类决策仍按原名单处理。
+        """
+        policy = read("src/redirect/policy.rs")
+        attribution_fn = extract_fn(policy, "is_attribution_intermediate_package")
+        self.assertIn("is_media_provider_candidate", attribution_fn)
+        self.assertIn("is_file_monitor_bridge_package", attribution_fn)
+        self.assertNotIn("is_file_monitor_ui_package", attribution_fn)
+
+        hook_install_fn = extract_fn(policy, "is_media_intermediate_package")
+        self.assertIn("is_file_monitor_ui_package", hook_install_fn)
+
+    def test_attribution_sites_use_attribution_variant(self) -> None:
+        """归因站点必须用归因专用判定，FUSE 访问决策仍用含 UI 名单的原判定。"""
+        for path in (
+            "src/monitor.rs",
+            "src/monitor/source_hint.rs",
+            "src/hook/monitor.rs",
+            "src/daemon_monitor/events.rs",
+        ):
+            source = read(path)
+            self.assertNotIn("policy::is_media_intermediate_package", source, path)
+            self.assertIn("policy::is_attribution_intermediate_package", source, path)
+
+        fuse_access = read("src/hook/media_fuse.rs")
+        self.assertIn("policy::is_media_intermediate_package", fuse_access)
+        self.assertNotIn("policy::is_attribution_intermediate_package", fuse_access)
+
     def test_ownership_bearing_caller_hints_remain_available(self) -> None:
         merge = read("src/config/merge.rs")
         caller = read("src/redirect/engine/caller.rs")
@@ -619,6 +656,132 @@ class CallerAttributionBoundariesTest(unittest.TestCase):
         ]
         self.assertIn("return true", guard_block)
 
+
+    def test_cross_thread_caller_evidence_is_record_only(self) -> None:
+        """跨线程 binder 证据只能用于记录归因，不得进入归因线索或决策路径。
+
+        背景（2026-11-05 HyperOS A16 实测）：MediaProvider 的 `Transport#insert` 在
+        binder 线程上建目录，而同一次写入的 FUSE 请求由 FuseDaemon 处理，两者不是同一个
+        线程 —— Java 侧捕获的调用方 uid/pid 在 thread_local 里，记录因读不到而退回
+        MP 自己的 uid（`caller_uid=10217`），用户问"这个目录是谁建的"答不上来。
+        补法是进程级证据，但必须只影响记录：决策与归因线索仍只看 thread_local。
+        """
+        context = read("src/hook/context.rs")
+        record_fn = extract_fn(context, "record_caller_uid")
+        self.assertIn("if direct != self_uid", record_fn)
+        self.assertIn("cross_thread_caller_in_window", record_fn)
+        # 归因线索/决策用的原函数不得引用跨线程证据。
+        monitor_fn = extract_fn(context, "get_effective_caller_uid_for_monitor")
+        self.assertNotIn("cross_thread", monitor_fn)
+
+    def test_cross_thread_records_mark_evidence_and_daemon_never_guesses_uid(self) -> None:
+        """记录必须带证据来源标记，且 daemon 对多包 uid 一律放弃而不是猜一个。"""
+        monitor = read("src/hook/monitor.rs")
+        self.assertIn("caller_evidence=cross_thread", monitor)
+
+        daemon = read("src/log_daemon.rs")
+        enrich_fn = extract_fn(daemon, "enrich_monitor_record_identity")
+        self.assertIn("caller_evidence=cross_thread", enrich_fn)
+        self.assertIn("system_uid_package", enrich_fn)
+
+        uid_fn = extract_fn(daemon, "system_uid_package")
+        # 同一 uid 对应多个包时登记 None（不可用），绝不按排序挑一个。
+        self.assertIn("map.insert(package_uid, None)", uid_fn)
+
+    def test_budget_separates_not_attempted_from_real_failure(self) -> None:
+        """「没试」不得计进失败预算，且预算耗尽后必须留探测窗口。
+
+        attach_gate_closed 的含义是「这条规则本轮不是宿主接入候选」，与挂载是否可行
+        无关；把它记成一次失败，会让开机风暴期的十余次判定把该应用整轮开机的重试
+        机会烧光（2026-11-05 真机：com.oplus.sau 的沙盒因此永久退回 namespace bind，
+        而 bind 无法表达一个并不存在的请求路径）。
+        """
+        session = read("src/fuse_session.rs")
+        gate_fn = extract_fn(session, "counts_as_attempt_failure")
+        self.assertIn("Self::AttachFailed", gate_fn)
+        self.assertIn("Self::PolicyRegistrationFailed", gate_fn)
+        self.assertNotIn("AttachGateClosed", gate_fn)
+
+        for path in ("src/daemon_mount.rs", "src/lifecycle/companion_mount.rs"):
+            source = read(path)
+            self.assertIn(
+                "reason.counts_as_attempt_failure()",
+                source,
+                f"{path} 必须按「是否真的尝试过」决定是否计入失败预算",
+            )
+
+        # 预算耗尽后窗口到期要放行探测，不能把整轮开机锁成终态。
+        config = read("src/fuse_redirect/config.rs")
+        budget_fn = extract_fn(config, "scope_budget_exhausted")
+        self.assertIn("SCOPE_RETRY_WINDOW_MS", budget_fn)
+        self.assertIn("scope_last_failure_ms", budget_fn)
+
+    def test_decision_identity_uses_same_evidence_as_record(self) -> None:
+        """决策期的源头身份必须与记录侧同源：内核请求头 pid，由 root 反查 /proc。
+
+        不能按「哪个包的规则匹配这条路径」反推源头——那样一旦猜错，用户会照着错误
+        的源头去配规则。这里锁定的是：快照未命中时同步问 daemon，且 daemon 侧只用
+        /proc 与 packages.list 的客观事实（多包 uid 一律不猜）。
+        """
+        caller = read("src/hook/caller.rs")
+        resolve_fn = extract_fn(caller, "resolve_system_fuse_identity")
+        self.assertIn("daemon_identity_query::query_process_identity", resolve_fn)
+
+        query = read("src/daemon_identity_query.rs")
+        self.assertIn("read_proc_identity", query)
+        # 回包必须校验 pid 与 uid 双向一致，否则 pid 复用后的答案会被误采信。
+        parse_fn = extract_fn(query, "parse_reply")
+        self.assertIn("reply_pid != pid", parse_fn)
+        self.assertIn("reply_uid != uid", parse_fn)
+        # 同一 uid 对应多个包时不许挑一个。
+        unique_fn = extract_fn(query, "unique_package_for_uid")
+        self.assertIn("return None", unique_fn)
+
+        # 回包方向的 SELinux 权限与询问方向同样必要，否则询问永远等不到答案。
+        policy = read("assets/zygisk_module/sepolicy.rule")
+        self.assertIn("allow magisk mediaprovider unix_dgram_socket sendto", policy)
+
+    def test_process_group_lineage_is_strict(self) -> None:
+        """native 子进程按内核进程组追溯发起应用，且只采信严格条件。
+
+        应用 exec 出来的 helper 继承 `uid_<uid>/pid_<发起应用>` 进程组（父进程退出、被
+        init 收养也不变），所以组首就是发起应用——多包 uid（1000 有 53 个包）也能精准
+        归因，issue #2 的 sau 即属此类。守卫锁定三条：uid 段必须与进程 uid 相同；组首
+        必须是本 uid 下真实存在的安装包；决策（daemon 回包）、pid 表与记录三处共用。
+        """
+        identity = read("src/platform/proc_identity.rs")
+        parse_fn = extract_fn(identity, "parse_process_group_leader")
+        self.assertIn("group_uid != uid", parse_fn)
+        lineage_fn = extract_fn(identity, "resolve_launching_app_by_process_group")
+        self.assertIn("leader == pid", lineage_fn)
+        self.assertIn("leader_uid != uid", lineage_fn)
+        self.assertIn("get_uid_for_package(&leader_name) != uid", lineage_fn)
+        for path in ("src/daemon_identity_query.rs", "src/daemon.rs", "src/log_daemon.rs"):
+            self.assertIn(
+                "resolve_launching_app_by_process_group",
+                read(path),
+                f"{path} 必须共用进程组追溯，否则决策、pid 表与记录会各说一套",
+            )
+
+    def test_pid_table_native_name_is_not_used_as_package(self) -> None:
+        """pid 表命中 native 名时必须换算，不能直接当包名用。
+
+        pid 表记录的是 /proc 命令行身份：native 进程（`sh`、`mkdir`、下载器 helper）
+        只有 basename。直接拿它查规则必然落空，写入就被当成「未配置应用」放行到真实
+        存储——2026-11-06 真机：进程刚起就写被重定向，存活超过一个扫描周期再写却泄漏，
+        差别正是「是否已进 pid 表」。两个读表站点都必须先判包名形态。
+        """
+        caller = read("src/hook/caller.rs")
+        for fn_name in ("resolve_system_fuse_identity", "resolve_java_caller_package"):
+            body = extract_fn(caller, fn_name)
+            table_at = body.index("lookup_system_pid_table(")
+            tail = body[table_at:]
+            self.assertIn(".contains('.')", tail, f"{fn_name} 读表后必须判包名形态")
+            self.assertIn(
+                "daemon_identity_query::query_process_identity",
+                tail,
+                f"{fn_name} 表内 native 名必须交给 daemon 按 uid 唯一归属换算",
+            )
 
 if __name__ == "__main__":
     unittest.main()

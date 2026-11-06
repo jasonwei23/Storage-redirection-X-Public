@@ -1,4 +1,9 @@
 pub const MODULE_DIR: &str = "/data/adb/modules/storage.redirect.x";
+/// daemon 二进制与 pid 文件：companion 在软重启后自拉起 daemon 时使用，
+/// 路径口径与 service.sh 的 start_srx_daemon 保持一致。
+pub const DAEMON_BIN_FILE: &str = "/data/adb/modules/storage.redirect.x/bin/srx_daemon";
+/// Companion 软重启自恢复的并发互斥锁，与 daemon 长持有的实例锁分开。
+pub const DAEMON_RESPAWN_LOCK_FILE: &str = "/data/adb/storage.redirect.x/.srx_daemon_respawn.lock";
 pub const MOUNT_STATE_DIR: &str = "/data/adb/modules/storage.redirect.x/tmp/mount_state";
 pub const MOUNT_INTENT_DIR: &str = "/data/adb/modules/storage.redirect.x/tmp/mount_intent";
 pub const REAL_STORAGE_TMP_DIR: &str = "/data/adb/modules/storage.redirect.x/tmp/real_storage";
@@ -10,21 +15,27 @@ pub const REAL_STORAGE_TMP_DIR: &str = "/data/adb/modules/storage.redirect.x/tmp
 /// （`<anchor>/Android/...`），而整根 bind 之后还要多一层 `<user>`
 /// （`<anchor>/<user>/Android/...`），两者混用会拼出错误路径。
 pub const SYSTEM_VIEW_TMP_DIR: &str = "/data/adb/modules/storage.redirect.x/tmp/system_view";
-/// 宿主子进程命名空间内 MediaProvider FUSE 挂载的绑定视图（按用户子树挂在
-/// `tmp/fuse_host_media/<user>`）。宿主对自有 `Android/media/<pkg>` 下 sqlite 三件套的
-/// 读写经该视图进行，与其它调用方（未重定向应用、MediaProvider 自身）共享同一份内核
-/// inode 缓存，避免两层缓存各自持有不同代际导致 `SQLITE_CORRUPT`。
+/// MediaProvider FUSE 视图的**临时**挂载点目录。
+///
+/// 毒化 `-shm` 自愈需要经 MediaProvider 自己的视图删一遍文件（见
+/// `fuse_redirect::media_view`）。该视图不长期存在：每次用到时由一个一次性子进程在自己的
+/// 私有 mount namespace 里克隆当前一代的 MP 挂载到这里、删除、随即随进程消失，因此
+/// 目录本身只是一块空地，磁盘上不会留下任何跨调用的挂载状态。
 pub const FUSE_HOST_MEDIA_VIEW_DIR: &str =
     "/data/adb/modules/storage.redirect.x/tmp/fuse_host_media";
-/// 媒体视图绑定失败的退避标记：记录上次失败的 monotonic 毫秒。视图在某些环境
-/// （如 x86_64 模拟器镜像）持续不可用，没有退避会让每次应用注册都阻塞整个超时周期。
-pub const MEDIA_VIEW_BACKOFF_FILE: &str =
-    "/data/adb/modules/storage.redirect.x/logs/.media_view_backoff";
 // quality-allow(lint-suppression): 该常量保留给外部挂载状态检查与兼容脚本使用。
 #[allow(dead_code)]
 pub const REAL_STORAGE_TMP_PREFIX: &str = "/data/adb/modules/storage.redirect.x/tmp/real_storage/";
 pub const CONFIG_DIR: &str = "/data/adb/modules/storage.redirect.x/config";
 pub const RUNTIME_DISABLE_FILE: &str = "/data/adb/modules/storage.redirect.x/.runtime_disabled";
+/// 存在即整体关闭共享宿主 FUSE 会话（等价于把 `SRT_FUSE_HOST_ATTACH` 设成 `0`）。
+///
+/// 环境变量只有 daemon 及其 fork 的 worker 读得到，而设备上 daemon 由 `service.sh`
+/// 直接拉起、没有注入环境变量的地方，因此现场排障实际需要一条落盘开关：创建本文件
+/// 并重启 daemon 即可让模块彻底不建立宿主会话（应用全部回到 namespace bind），
+/// 用来做「宿主是不是故障来源」的 A/B 归因。
+pub const HOST_ATTACH_DISABLE_FILE: &str =
+    "/data/adb/modules/storage.redirect.x/.disable_fuse_host";
 pub const FUSE_PROBE_FILE: &str = "/data/adb/modules/storage.redirect.x/.fuse_probe";
 /// 存在即禁用内核 FUSE passthrough（所有会话回退纯用户态读写）。
 /// 用途：OEM 内核 passthrough 实现缺陷的 A/B 定位与逃生口——实测某 ColorOS 设备
@@ -54,6 +65,8 @@ pub const MEDIA_HOOK_INSTALL_STATE_FILE: &str =
 /// MediaProvider 进程内热重载请求与确认文件。
 pub const MEDIA_PROVIDER_HOT_RELOAD_REQUEST_FILE: &str =
     "/data/adb/modules/storage.redirect.x/logs/.media_provider_hot_reload.request";
+// quality-allow(lint-suppression): ack 由 daemon（bin 目标）代 MP 落盘，lib 目标仅共享编译该模块。
+#[allow(dead_code)]
 pub const MEDIA_PROVIDER_HOT_RELOAD_ACK_FILE: &str =
     "/data/adb/modules/storage.redirect.x/logs/.media_provider_hot_reload.ack";
 pub const RECENT_SOURCE_HINT_FILE: &str =
@@ -67,6 +80,9 @@ pub const LOG_DIR: &str = "/data/adb/modules/storage.redirect.x/logs";
 // quality-allow(lint-suppression): 该路径由 daemon 二进制通过跨 crate 模块引用使用。
 #[allow(dead_code)]
 pub const DAEMON_INSTANCE_LOCK_FILE: &str = "/data/adb/storage.redirect.x/.srx_daemon.lock";
+/// daemon pid 文件：由 daemon 在取得实例锁后自写（watchdog 拉起的新实例同样生效），
+/// service.sh/WebUI 的写入仅覆盖 daemon 启动前的窗口。
+pub const DAEMON_PID_FILE: &str = "/data/adb/modules/storage.redirect.x/logs/.srx_daemon.pid";
 
 pub const GLOBAL_CONFIG_FILE: &str = "/data/adb/modules/storage.redirect.x/config/global.json";
 pub const APPS_CONFIG_DIR: &str = "/data/adb/modules/storage.redirect.x/config/apps";
@@ -80,6 +96,22 @@ pub const FUSE_HOST_MOUNT_DIR: &str = "/data/adb/modules/storage.redirect.x/tmp/
 // quality-allow(lint-suppression): 引用方在宿主 spawn 路径，lib 目标仅共享编译该模块。
 #[allow(dead_code)]
 pub const FUSE_HOST_STAGE_FILE: &str = "/data/adb/modules/storage.redirect.x/tmp/fuse_host.stage";
+/// 宿主会话心跳文件：宿主进程每 2 秒原子覆写一行（waiting/最后完成时刻等），
+/// daemon 侧外部 abort 兜底监控据此判定宿主内看门狗是否已失效。
+// quality-allow(lint-suppression): 引用方在宿主 spawn 路径与 daemon 兜底监控，lib 目标仅共享编译。
+#[allow(dead_code)]
+pub const FUSE_HOST_HEARTBEAT_FILE: &str =
+    "/data/adb/modules/storage.redirect.x/tmp/fuse_host.beat";
+
+/// 停摆取证独立文件：不参与 running.log 轮转，冻结现场双写落此，超过 2 MiB 就地截断。
+///
+/// 挂载风暴期 running.log 每秒可产生数千行（gen4 冻结现场 3 秒 19684 行），会话
+/// 启动期记录（含锚点建立结果）数分钟内即被轮出——归因被迫依赖推断。独立文件
+/// 保证停摆取证与锚点状态变迁永远可回溯。
+// quality-allow(lint-suppression): 引用方在宿主与 daemon 停摆取证路径，lib 目标仅共享编译。
+#[allow(dead_code)]
+pub const STALL_FORENSICS_LOG: &str =
+    "/data/adb/modules/storage.redirect.x/logs/stall-forensics.log";
 
 // quality-allow(lint-suppression): 引用方 log_daemon 仅由 daemon 二进制编译。
 #[allow(dead_code)]

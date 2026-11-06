@@ -7,12 +7,11 @@ use super::companion_request::CompanionMountRequest;
 use super::mount_timing;
 use crate::config::SettingsHub;
 use crate::fuse_redirect::{
-    FuseRedirectConfig, ScopedMountAttempt, ScopedMountReport, conclude_scoped_mount,
-    log_scoped_mount_roots, mount_blocking_with_ready,
+    ScopedMountAttempt, ScopedMountReport, conclude_scoped_mount, log_scoped_mount_roots,
 };
 use crate::fuse_session::{
-    FuseMountState, decode_wait_status, recv_result, rollback_scoped_fuse_services,
-    send_mount_result, set_recv_timeout,
+    FuseMountState, HostSessionSkip, decode_wait_status, recv_result,
+    rollback_scoped_fuse_services, send_mount_result, set_recv_timeout,
 };
 use crate::mount::MountPlanner;
 use crate::platform::unique_fd::UniqueFd;
@@ -20,8 +19,8 @@ use crate::platform::{self, paths::monotonic_ms};
 use diagnostics::log_child_diagnostics;
 use libc::{
     AF_UNIX, CLONE_NEWNS, MS_NODEV, MS_NOSUID, MS_PRIVATE, MS_RDONLY, MS_REC, O_CLOEXEC, O_RDONLY,
-    SIGKILL, SIGTERM, SOCK_DGRAM, WNOHANG, c_int, c_ulong, c_void, close, kill, mount, open, read,
-    readlink, setns, socketpair, waitpid,
+    SIGKILL, SIGTERM, SOCK_DGRAM, c_int, c_ulong, c_void, close, kill, mount, open, read, readlink,
+    setns, socketpair, waitpid,
 };
 use stats::update_redirect_stats;
 use std::ffi::{CStr, CString};
@@ -320,40 +319,33 @@ fn mount_one_storage_view_barrier(
             libc::_exit(0);
         }
     }
-    let mut status: c_int = 0;
-    // SAFETY: status 是有效的栈上整型指针，waitpid 阻塞等待本次 fork 的子进程。
-    let waited = unsafe { waitpid(child, &mut status, 0) };
-    waited == child && libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0
-}
-
-// 该应用命名空间的存储视图根是否已被任意 srx FUSE 层覆盖（宿主或 scoped）。
-// companion 的宿主接入失败回退 scoped 之前先查一次：daemon reconcile 可能已经
-// 抢先完成 attach，此时再叠一层 scoped 会造成双重挂载与视图基准混乱。
-fn app_storage_view_already_served(mount_root: &str) -> bool {
-    let Ok(mounts) = std::fs::read_to_string("/proc/self/mounts") else {
-        return false;
-    };
-    let root = mount_root.trim_end_matches('/');
-    // 栈顶判定：同一挂载点在 /proc/self/mounts 里的**最后一条**条目决定当前可见层。
-    // 旧实现用 rev().any()——被残留只读 tmpfs 屏障盖住的 FUSE 也会命中，把「屏障
-    // 裸奔」误判成会话存活，应用写入 ENOENT/EROFS 而链路自认为健康。
-    let last = mounts.lines().rev().find(|line| {
-        let mut fields = line.split_whitespace();
-        fields.next().unwrap_or("");
-        let mount_point = fields
-            .next()
-            .unwrap_or("")
-            .replace("\\040", " ")
-            .trim_end_matches('/')
-            .to_string();
-        mount_point == root
-    });
-    match last {
-        Some(line) => {
-            let source = line.split_whitespace().next().unwrap_or("");
-            source.starts_with("srx_fuse")
+    // 屏障子进程正常在毫秒级完成；阻塞等待会把应用线程永久挂在一个卡死（D 态）的
+    // 子进程上。改为有界等待：超时后 SIGKILL 并记录，后续挂载会重新评估屏障；子进程
+    // 若处于 D 态无法被杀，也留下可检索的记录而不是让调用线程无限挂起。
+    const BARRIER_WAIT_TIMEOUT_MS: i64 = 2_000;
+    use crate::platform::child_wait::{self, ChildExit};
+    match child_wait::wait_child_exit(child, BARRIER_WAIT_TIMEOUT_MS) {
+        ChildExit::Exited(code) => code == 0,
+        ChildExit::Signaled(_) => false,
+        ChildExit::Failed(errno) => {
+            log::warn!(
+                "storage view barrier wait failed child={} errno={} {}",
+                child,
+                errno,
+                errno_text(errno)
+            );
+            false
         }
-        None => false,
+        ChildExit::TimedOut => {
+            // SAFETY: child 是本次 fork 的子进程，SIGKILL 只作用于它。
+            let _ = unsafe { kill(child, SIGKILL) };
+            log::warn!(
+                "storage view barrier wait timeout child={} timeout_ms={}",
+                child,
+                BARRIER_WAIT_TIMEOUT_MS
+            );
+            false
+        }
     }
 }
 
@@ -953,41 +945,51 @@ fn handle_parent_process(child: i32, sock: c_int, primary_timeout_sec: i64) -> b
 }
 
 fn reap_child(child: i32, nonblocking: bool) {
-    let mut status: c_int = 0;
-    let options = if nonblocking { WNOHANG } else { 0 };
-    let attempts = if nonblocking { 20 } else { 1 };
-    for attempt in 0..attempts {
-        let wait_ret = unsafe { waitpid(child, &mut status as *mut _, options) };
-        if wait_ret < 0 {
-            let errno = last_errno();
-            log::warn!(
-                "waitpid failed child={} errno={} {}",
-                child,
-                errno,
-                errno_text(errno)
-            );
-            return;
+    use crate::platform::child_wait::{self, ChildExit};
+    if nonblocking {
+        // 有界等待约 200ms（与改造前 20×10ms 复查同预算），由 pidfd 退出事件唤醒。
+        match child_wait::wait_child_exit(child, 200) {
+            ChildExit::Exited(code) => {
+                log::info!("child reaped child={} status=exit={}", child, code);
+            }
+            ChildExit::Signaled(signal) => {
+                log::info!("child reaped child={} status=sig={}", child, signal);
+            }
+            ChildExit::Failed(errno) => {
+                log::warn!(
+                    "waitpid failed child={} errno={} {}",
+                    child,
+                    errno,
+                    errno_text(errno)
+                );
+            }
+            ChildExit::TimedOut => {
+                log::warn!(
+                    "child not reaped child={} status=still_running reason=nonblocking_timeout",
+                    child
+                );
+            }
         }
-        if wait_ret > 0 {
-            log::info!(
-                "child reaped child={} status={} raw={}",
-                child,
-                decode_wait_status(status),
-                status
-            );
-            return;
-        }
-        if !nonblocking {
-            break;
-        }
-        if attempt + 1 < attempts {
-            unsafe { libc::usleep(10 * 1000) };
-        }
+        return;
     }
-
-    log::warn!(
-        "child not reaped child={} status=still_running reason=nonblocking_timeout",
-        child
+    let mut status: c_int = 0;
+    // SAFETY: status 是栈上有效整型；child 是本次 fork 的子进程，阻塞等待它退出。
+    let wait_ret = unsafe { waitpid(child, &mut status as *mut _, 0) };
+    if wait_ret < 0 {
+        let errno = last_errno();
+        log::warn!(
+            "waitpid failed child={} errno={} {}",
+            child,
+            errno,
+            errno_text(errno)
+        );
+        return;
+    }
+    log::info!(
+        "child reaped child={} status={} raw={}",
+        child,
+        decode_wait_status(status),
+        status
     );
 }
 
@@ -1119,8 +1121,77 @@ fn handle_child_process(
         };
     // 共享宿主必须先于 namespace 重定向接管存储根，避免 SQLite 在接管前打开
     // 重定向沙盒中的旧副本。
+    // 这里是**唯一**的宿主接入点：规划阶段一律 bind，事后再接会在已 bind 的目标上叠一层
+    // FUSE，清理时按路径只能摘栈顶，底层 bind 会残留成永久叠挂。
     let preattached_host = preattach_shared_host(request, scoped_fuse_roots);
-    let is_success = if preattached_host.is_some() {
+    // 无规则短路标记必须贯穿整个成功分支：短路只挡住了 planner 完整路径，
+    // 若成功分支照常执行，非空的规划根（monitor_only 请求的存储视图根）
+    // 仍会驱动宿主接入尝试（2026-10-30 issue #2 报告者
+    // test15 实测：监视开启时 90 个未配置应用被接管、MT 写 sdcard 失败——
+    // 正是短路要阻止的行为）。
+    let no_rules_short_circuit = preattached_host.is_err()
+        && !crate::fuse_redirect::config::mount_request_has_policy_rules(request);
+    if no_rules_short_circuit {
+        // 无规则请求没有挂载需求：前面的旧 state 清理已执行，之后必须直接返回，
+        // 不进入 namespace fallback、私有目录恢复或 state/ledger 落账。若 state 缺失
+        // 但 ledger 仍登记挂载，当前 companion 清理路径无法按 mount-id/source 安全
+        // 摘层。允许从 ledger 恢复清理的前提是当前 namespace 中每个 mount point
+        // 的栈顶仍精确匹配 ledger 的 mount_id+source；否则保留账本并 fail-closed。
+        if let Some(ledger) = crate::mount_ledger::load(&request.package_name, request.pid) {
+            for recorded in &ledger.mounts {
+                let Some(top) =
+                    crate::mount_ledger::topmost_live_mount(request.pid, &recorded.mount_point)
+                else {
+                    continue;
+                };
+                if top.mount_id != recorded.mount_id || top.source != recorded.source {
+                    log::warn!(
+                        "companion no-rules cleanup refused: ledger mount not topmost-owned pid={} pkg={} target={} recorded_id={} live_id={}",
+                        request.pid,
+                        request.package_name,
+                        recorded.mount_point,
+                        recorded.mount_id,
+                        top.mount_id
+                    );
+                    return false;
+                }
+                let Ok(c_target) = CString::new(recorded.mount_point.as_str()) else {
+                    return false;
+                };
+                // SAFETY: c_target 是当前 setns 命名空间内已校验过的挂载路径。
+                if unsafe { libc::umount2(c_target.as_ptr(), libc::MNT_DETACH) } != 0 {
+                    log::warn!(
+                        "companion no-rules cleanup detach failed pid={} pkg={} target={} errno={}",
+                        request.pid,
+                        request.package_name,
+                        recorded.mount_point,
+                        last_errno()
+                    );
+                    return false;
+                }
+            }
+            let still_live = ledger.mounts.iter().any(|recorded| {
+                crate::mount_ledger::live_mounts_at(request.pid, &recorded.mount_point)
+                    .iter()
+                    .any(|live| {
+                        live.mount_id == recorded.mount_id && live.source == recorded.source
+                    })
+            });
+            if still_live {
+                return false;
+            }
+            if !crate::mount_ledger::remove(&request.package_name, request.pid) {
+                return false;
+            }
+        }
+        log::debug!(
+            "companion no-rules request skipped mount pid={} pkg={}",
+            request.pid,
+            request.package_name
+        );
+        return true;
+    }
+    let is_success = if preattached_host.is_ok() {
         true
     } else if request.is_monitor_only {
         mount_mgr.ensure_mount_namespace_prepared()
@@ -1130,7 +1201,10 @@ fn handle_child_process(
             &request.path_mappings,
             &request.sandboxed_paths,
             &request.read_only_paths,
-            scoped_fuse_roots,
+            // 第四个参数是「由 FUSE 覆盖、规划阶段跳过 bind」的根。scoped 会话已退役，
+            // 只剩共享宿主能提供 FUSE；接入成功时不会走到这里，走到这里就是纯 bind，
+            // 因此一律传空，不留任何悬空根。
+            &[],
         )
     } else {
         mount_mgr.apply_sdcard_redirect(
@@ -1138,14 +1212,14 @@ fn handle_child_process(
             &request.excluded_real_paths,
             &request.read_only_paths,
             &request.path_mappings,
-            scoped_fuse_roots,
+            &[],
         )
     };
 
-    // 注意：屏障裸奔检测不能放在这里——非 preattach 路径的 FUSE 会话在
-    // start_scoped_fuse_services（成功分支内）才启动，此处屏障必然裸奔，
-    // 在此判定会把每次正常挂载误判为失败并跳过 FUSE 启动。检测位于成功
-    // 分支尾部（conclude_scoped_mount 之后、send_mount_result 之前）。
+    // 注意：屏障裸奔检测不能放在这里——非 preattach 路径的 FUSE 会话在成功分支内
+    // 才接入，此处屏障必然裸奔，在此判定会把每次正常挂载误判为失败。检测位于成功
+    // 分支尾部（conclude_scoped_mount 之前、send_mount_result 之前），且只对真的
+    // 建立了 FUSE 会话的轮次生效：纯 bind 轮次没有「等 FUSE 压上来」这个前提。
     let result = if is_success { 0 } else { -1 };
     if !is_success {
         log::warn!(
@@ -1168,47 +1242,47 @@ fn handle_child_process(
             &request.package_name,
             request.storage_backend_mode,
         );
-        let (fuse_children, attempt) = if let Some(state) = preattached_host {
-            (vec![state], ScopedMountAttempt::Ready)
-        } else if !fuse_roots.is_empty() {
-            match start_scoped_fuse_services(request, fuse_roots, mount_mgr.real_storage_anchor()) {
-                Some(children) => (children, ScopedMountAttempt::Ready),
-                None => (Vec::new(), ScopedMountAttempt::Failed),
-            }
-        } else if gate_allowed {
-            (Vec::new(), ScopedMountAttempt::NoRootsNeeded)
-        } else {
-            (Vec::new(), ScopedMountAttempt::GateBlocked)
+        // 宿主真的把存储视图根盖住时（本轮新建或既有层已在服务），`Android/data|media|obb`
+        // 由 FUSE 数据面自理，不能再叠一层系统视图 bind；纯 bind 轮次则相反，必须恢复
+        // 私有目录。
+        let host_covers_view = preattached_host.is_ok();
+        let view_root_for_private = {
+            let user_id = platform::user_id_from_uid(request.uid);
+            platform::paths::storage_user_root_for_user(user_id)
         };
-        let outcome = conclude_scoped_mount(ScopedMountReport {
-            package_name: &request.package_name,
-            pid: request.pid,
-            requested_mode: request.storage_backend_mode,
-            log_prefix: "hybrid fuse",
-            roots_planned: fuse_roots.len(),
-            sessions: fuse_children.len(),
-            attempt,
-            ready_reason: "companion_scoped_mount_ready",
-            failed_reason: "companion_scoped_mount_failed",
-        });
-        let mut namespace_fallback_ok = false;
-        if outcome.needs_namespace_fallback {
-            log::warn!(
-                "hybrid fuse no scoped service mounted, fallback to mount namespace pid={} pkg={}",
-                request.pid,
-                request.package_name
-            );
-            if crate::fuse_session::apply_mount_namespace_fallback(&mut mount_mgr, request) {
-                // fallback 用 bind 覆盖根（无 FUSE 会话）：屏障裸奔检测只对
-                // FUSE 路径有意义，fallback 成功时跳过，否则必误报。
-                namespace_fallback_ok = true;
-            } else {
-                log::warn!(
-                    "hybrid fuse namespace fallback failed pid={} pkg={}",
-                    request.pid,
-                    request.package_name
-                );
+        let (fuse_children, attempt, host_skip) = match preattached_host {
+            Ok(state) => (vec![state], ScopedMountAttempt::Ready, None),
+            Err(reason) => {
+                if !fuse_roots.is_empty() && reason.counts_as_attempt_failure() {
+                    // 规则本该有 FUSE 视图，而且这次是真的尝试过并失败：计入预算。
+                    (Vec::new(), ScopedMountAttempt::Failed, Some(reason))
+                } else if !fuse_roots.is_empty() {
+                    // 根不满足接入条件 / 宿主尚未就绪：属「没试」，不计失败预算，
+                    // 否则一次开机风暴就能把该应用的后续尝试全部锁死。
+                    (Vec::new(), ScopedMountAttempt::GateBlocked, Some(reason))
+                } else if gate_allowed {
+                    (Vec::new(), ScopedMountAttempt::NoRootsNeeded, None)
+                } else {
+                    (Vec::new(), ScopedMountAttempt::GateBlocked, None)
+                }
             }
+        };
+        if let Some(reason) = host_skip {
+            // 与 daemon 侧同一行口径：规则本该走 FUSE，但视图没建起来。附带设备节点、
+            // 会话与宿主三段事实，现场一眼区分「设备不支持 / 配置无规则 / 策略没登记 /
+            // 接入失败」。
+            log::warn!(
+                "companion fuse view unavailable reason={} fallback=namespace_bind pid={} pkg={} planned_roots={} fuse_device={} capability={} host_session={}",
+                reason.as_str(),
+                request.pid,
+                request.package_name,
+                fuse_roots.len(),
+                crate::fuse_redirect::config::fuse_device_present(),
+                crate::fuse_redirect::config::fuse_capability_as_str(
+                    crate::fuse_redirect::config::fuse_capability()
+                ),
+                crate::fuse_host::read_host_session_view().is_some()
+            );
         }
         // 与 daemon 侧同源、同顺序：挂载完成后按平台需要摘掉系统 MediaProvider 的 app data
         // isolation FUSE 视图，再补回被 MNT_DETACH 级联摘掉的映射子路径 bind。摘除逻辑此前只
@@ -1236,7 +1310,7 @@ fn handle_child_process(
             );
         }
         // 自有媒体目录恢复必须放在**所有存储根挂载动作之后**。此前它写在
-        // `apply_sdcard_redirect` 内部（早于 `start_scoped_fuse_services`），随后 srx FUSE
+        // `apply_sdcard_redirect` 内部（早于宿主接入），随后 srx FUSE
         // 覆盖存储根会把子 bind 整体遮蔽——同一构建时而生效时而丢失（真机 2026-10-25：
         // 支付宝连续几次挂载里只有 preattach 那次留下 bind）。放在这里对
         // preattach / scoped / namespace fallback 三种形态统一生效。
@@ -1246,7 +1320,14 @@ fn handle_child_process(
         // 访问同一物理文件时属于另一层内核缓存，SQLite 的 `-shm` mmap 与页内锁跨不过去，
         // WAL 被判无效后回滚到上一次 checkpoint 的主库（真机 XRadiant 主库落到 4096B 空页）。
         // scoped 根透传给 data/obb 的覆盖跳过判据（FUSE 数据面自理自有私有路径）。
-        let restored_own_private = mount_mgr.restore_own_private_system_view(scoped_fuse_roots);
+        // 走到这里时存储根要么已由宿主覆盖（不会执行到本行），要么就是纯 namespace bind，
+        // 没有任何 FUSE 层压着 `Android/data|media|obb`，私有目录恢复按「无覆盖」处理。
+        let private_skip_roots: Vec<String> = if host_covers_view {
+            vec![view_root_for_private]
+        } else {
+            Vec::new()
+        };
+        let restored_own_private = mount_mgr.restore_own_private_system_view(&private_skip_roots);
         log::info!(
             "own private system view restored count={} pkg={} pid={}",
             restored_own_private,
@@ -1262,45 +1343,49 @@ fn handle_child_process(
         // 一样在应答前修复——真机 2026-10-18 实测 mapping_mode_only 应用的挂载
         // 普遍走本路径，只挂 daemon fork 会完全漏修。只对「无 mount identity
         if !mount_state::write_mount_state(request, plan, &mounted_targets, &fuse_children) {
+            // 状态写失败必须按失败返回：没有账本的层没有任何归属判据，成功回包还会让
+            // 应用误判已重定向。先摘本轮 bind 层，再回滚 FUSE 目标（宿主会话跨应用
+            // 共享，回滚只卸载目标、不终止宿主进程），最后回包 -1 并结束本次挂载。
+            let detached = crate::fuse_session::detach_round_mount_targets(&mounted_targets);
             log::warn!(
-                "mount state save failed pid={} pkg={}",
+                "mount state save failed pid={} pkg={} rollback_mounts={} rollback_targets={}",
                 request.pid,
-                request.package_name
+                request.package_name,
+                fuse_children.len(),
+                detached
             );
+            rollback_scoped_fuse_services(&fuse_children);
+            let _ = send_mount_result(sock, -1);
+            // SAFETY: sock 是本 fork 子进程持有的已连接控制端 fd，失败回包已发送完毕，
+            // 此处关闭后立即返回，无其它线程并发使用该 fd。
+            unsafe { close(sock) };
+            return false;
         }
         // 账本与状态文件职责不同：状态文件回答"要摘哪些路径"，账本回答"那些挂载归谁"。
         // 这条路径此前只写状态文件、不写账本，于是走 companion 的应用在恢复流程与 doctor 里
         // 没有任何归属判据，只能退化成"按挂载源判定"这个较弱的判据。两条挂载路径必须都登记，
         // 否则同一件事在两条路径上的结果不一致——这正是本项目反复踩的坑。
+        // 落盘失败的告警由 `record_mount_identity` 自己按 `path=companion` 输出，调用点不再
+        // 各自拼一份，避免两条路径的失败口径再次分叉。
         let mut identity_targets = mounted_targets.clone();
         identity_targets.extend(fuse_children.iter().map(|state| state.target.clone()));
-        if !crate::mount_ledger::record_mount_identity(
+        crate::mount_ledger::record_mount_identity(
             "companion",
             &request.package_name,
             request.pid,
             &identity_targets,
-        ) {
-            log::warn!(
-                "mount identity save failed pid={} pkg={}",
-                request.pid,
-                request.package_name
-            );
-        }
+        );
         // 坍缩形态的屏障处置：按遍历感知判定——被视图根 FUSE 遮蔽的兄弟屏障不可达
         // 且无害（Inert），只有压在同挂载点 srx FUSE 之上的残留屏障才真正回收。
-        if !namespace_fallback_ok && !fuse_children.is_empty() {
-            dispose_barriers_after_view_mount(
-                &plan.barrier_roots,
-                &request.package_name,
-                request.pid,
-            );
-        }
-        // 屏障裸奔检测：scoped_fuse_roots 非空时，成功判定必须包含「每个屏障根的
-        // 栈顶已被 srx FUSE 覆盖」。存在过的失败形态：会话建立失败但 bind 链判
-        // ok=true，屏障（只读空 tmpfs）裸奔在栈顶——应用写入 ENOENT/EROFS，且
-        // 应用重启无效（同 namespace），直到下一次完整挂载清掉为止。这里判失败：
-        // fail-closed 屏障保留（不给应用裸视图），重试时规则已正确即可压上 FUSE。
-        if !namespace_fallback_ok {
+        // 屏障处置无条件执行（不再以「是否存在 FUSE 会话」为前提）：纯 bind 轮次的存储根
+        // bind 同样会把屏障压到栈顶之下（Inert），没被压住的残留屏障必须摘除——留着它
+        // 应用看到的就是只读空目录。处置本身按 mountinfo 遍历判定，不会误摘活层。
+        dispose_barriers_after_view_mount(&plan.barrier_roots, &request.package_name, request.pid);
+        // 屏障裸奔检测：只有本轮真的建立了 FUSE 会话时才做。判据是「每个屏障根的栈顶
+        // 已被 srx FUSE 覆盖」——会话建立后又被判失败的形态里，屏障（只读空 tmpfs）会
+        // 裸奔在栈顶，应用写入 ENOENT/EROFS 且重启无效（同 namespace）。纯 bind 轮次
+        // 没有「等 FUSE 压上来」这个前提，套同一判据必然把每次正常挂载判成失败。
+        if !fuse_children.is_empty() {
             // 覆盖判定按屏障根逐个做祖先回退（坍缩后屏障根自身在 mounts 里没有
             // 条目，只按挂载点精确匹配会漏掉子路径上的暴露屏障）。
             let exposed_check_roots: &[String] = if plan.barrier_roots.is_empty() {
@@ -1338,6 +1423,21 @@ fn handle_child_process(
                 }
             }
         }
+        // 与 daemon 侧同源、同位置：挂载结论（能力快照与 backend_effective 选择日志）紧挨
+        // 成功回包产生，不提前登记。写状态失败会把本轮挂载整轮摘除，结论提前写下去等于宣称
+        // 一个已经不存在的 backend，现场与能力快照都会被误导；回滚轮次只留回滚告警。
+        conclude_scoped_mount(ScopedMountReport {
+            package_name: &request.package_name,
+            pid: request.pid,
+            requested_mode: request.storage_backend_mode,
+            log_prefix: "hybrid fuse",
+            roots_planned: fuse_roots.len(),
+            sessions: fuse_children.len(),
+            attempt,
+            ready_reason: "companion_scoped_mount_ready",
+            failed_reason: "companion_scoped_mount_failed",
+            unavailable_reason: host_skip.map(|reason| reason.as_str()),
+        });
         if !send_mount_result(sock, 0) {
             log::warn!(
                 "child send result failed pid={} pkg={}",
@@ -1371,90 +1471,70 @@ fn handle_child_process(
 fn preattach_shared_host(
     request: &CompanionMountRequest,
     scoped_fuse_roots: &[String],
-) -> Option<FuseMountState> {
+) -> Result<FuseMountState, HostSessionSkip> {
     if !shared_host_preattach_candidate(request, scoped_fuse_roots) {
-        return None;
+        if !crate::fuse_redirect::config::mount_request_has_policy_rules(request) {
+            return Err(HostSessionSkip::NoPolicyRules);
+        }
+        return Err(HostSessionSkip::AttachGateClosed);
     }
     let user_id = platform::user_id_from_uid(request.uid);
     let storage_root = platform::paths::storage_user_root_for_user(user_id);
 
-    let view = crate::fuse_host::read_host_session_view()?;
-    if view.policy_fingerprints.get(&(request.uid as u32)) != Some(&request.policy_fingerprint)
-        || !crate::fuse_host::can_attach_app(request.uid, &storage_root)
-    {
-        return None;
+    let Some(view) = crate::fuse_host::read_host_session_view() else {
+        return Err(HostSessionSkip::NoSharedHost);
+    };
+    if !crate::fuse_host::can_attach_app(request.uid, &storage_root) {
+        return Err(HostSessionSkip::AttachGateClosed);
     }
-    let state = try_bind_to_fuse_host(&view, request, &storage_root)?;
+    if view.policy_fingerprints.get(&(request.uid as u32)) != Some(&request.policy_fingerprint) {
+        return Err(HostSessionSkip::PolicyRegistrationFailed);
+    }
+    // 视图根已被**当前**宿主会话服务（daemon reconcile 抢先挂好或上一轮保留）：本轮不再
+    // 叠层，但仍按宿主挂载记账，否则状态文件里没有这条目标、下一轮清理会漏摘。
+    if crate::fuse_session::storage_view_top_source(&storage_root).as_deref()
+        == Some(view.mount_source.as_str())
+    {
+        log::info!(
+            "shared host preattach skipped, current host layer already serving pid={} pkg={} target={}",
+            request.pid,
+            request.package_name,
+            storage_root
+        );
+        return Ok(FuseMountState {
+            target: storage_root,
+            child: 0,
+            child_start_time_ticks: 0,
+            host_session: Some((view.child_pid, view.child_start_time_ticks)),
+        });
+    }
+    let Some(state) = try_bind_to_fuse_host(&view, request, &storage_root) else {
+        return Err(HostSessionSkip::AttachFailed);
+    };
     log::info!(
         "companion shared host preattached pid={} pkg={} target={}",
         request.pid,
         request.package_name,
         storage_root
     );
-    Some(state)
-}
-
-fn shared_host_preattach_candidate(
-    request: &CompanionMountRequest,
-    scoped_fuse_roots: &[String],
-) -> bool {
-    let is_auto = matches!(
-        request.storage_backend_mode,
-        crate::config::StorageBackendMode::Auto
-    );
-    let is_monitor_only = request.is_monitor_only && request.is_file_monitor_enabled;
-    if !is_auto && !is_monitor_only {
-        return false;
-    }
-    // 与 daemon 侧同源（crate::daemon_mount::shared_host_preattach_candidate）：存在
-    // 私有 fs 侧映射时 preattach 成功会短路 planner，私有映射的命名空间 bind 挂载
-    // 会被整体丢弃（真机实证：scenario 35 映射矩阵全失效）。命中时必须回落
-    // planner 流程，由 planner 一边宿主接入一边物化私有映射。
-    if crate::domain::mappings_need_namespace_mount(
-        request.uid,
-        &request.app_data_dir,
-        &request.redirect_target,
-        &request.path_mappings,
-    ) {
-        return false;
-    }
-    let user_id = platform::user_id_from_uid(request.uid);
-    let storage_root = platform::paths::storage_user_root_for_user(user_id);
-    scoped_fuse_roots.len() == 1
-        && platform::paths::normalize_syntax(&scoped_fuse_roots[0])
-            == platform::paths::normalize_syntax(&storage_root)
-}
-
-/// 按根启动 scoped FUSE 服务；单根失败只丢弃该根。
-///
-/// daemon 侧 [`crate::daemon_mount`] 有一份平行实现，两处必须保持一致：它们写入的是
-/// 同一份 FUSE 能力快照，任一侧整组回滚都会把失败计入全局预算，累计到上限后把所有
-/// 应用的 scoped 会话一起打回 mount namespace。
-fn start_scoped_fuse_services(
-    request: &CompanionMountRequest,
-    roots: &[String],
-    real_root_override: Option<String>,
-) -> Option<Vec<FuseMountState>> {
-    crate::fuse_session::start_scoped_fuse_services(
-        request,
-        roots,
-        real_root_override,
-        |root, real_root_override| start_fuse_service_for_root(request, root, real_root_override),
-    )
+    Ok(state)
 }
 
 fn scoped_fuse_mount_roots(request: &CompanionMountRequest) -> Vec<String> {
     let roots = crate::fuse_redirect::scoped_fuse_mount_roots_for_request(request);
-    // Auto 模式的目标形态是共享宿主会话，与 daemon 侧规划同一语义：把按目录 scoped 根
-    // 收敛成存储视图根。区别只在发现方式——companion 与 daemon 无共享内存，靠快照文件
-    // 等待"宿主在位 + 本 uid 已被 daemon 预登记"；等待发生在挂载应答返回之前，应用进程
-    // 尚未恢复运行，一次挂载到位，没有"先 scoped 后迁移"的 fail-open 中间态。快照缺失、
-    // 等待超时或处于失败冷却期时保持旧规划，scoped 数据面照常服务。
+    // 规划根只用于「这次本来需要 FUSE 覆盖的路径有哪些」这一诊断结论，以及宿主接入
+    // 候选判定（候选要求规划根恰好是整棵存储视图根）。真正承载数据面的是共享宿主会话，
+    // 不再是 per-app scoped 会话。
+    //
+    // Auto 模式下把按目录根收敛成存储视图根：宿主会话按 uid 持有同一份规则，一个整根
+    // 会话即可表达相同语义。区别只在发现方式——companion 与 daemon 无共享内存，靠快照
+    // 等待「宿主在位 + 本 uid 已被 daemon 预登记」，等待发生在挂载应答返回之前，一次挂载
+    // 到位；快照缺失或处于失败冷却期时保持按目录规划，此时不会接入，最终按 bind 表达。
     //
     // 存在私有 fs 侧映射时保持按目录规划（与 daemon 侧同源判定）：宿主策略层只覆盖
     // 存储视图，target 在视图外的映射会被宿主忽略，写入穿透到默认重定向根（真机实证：
     // scenario 35 的 Download/X → /data/user/0/<pkg>/no_backup 在收敛路径下落到
-    // sdcard 沙盒）。按目录 scoped 会话与命名空间 bind 才能完整表达这类映射。
+    // sdcard 沙盒）。这类映射只能靠 namespace bind 完整表达。
     if crate::domain::mappings_need_namespace_mount(
         request.uid,
         &request.app_data_dir,
@@ -1500,168 +1580,53 @@ fn scoped_fuse_mount_roots(request: &CompanionMountRequest) -> Vec<String> {
     vec![view_root]
 }
 
-fn start_fuse_service_for_root(
+fn shared_host_preattach_candidate(
     request: &CompanionMountRequest,
-    mount_root: &str,
-    real_root_override: Option<String>,
-) -> Option<FuseMountState> {
-    // B2-b：优先尝试共享宿主会话接入（跨进程发现）。
-    //
-    // companion 是 Zygisk companion 进程，与 daemon 没有共享内存：`get_fuse_host()` 在本
-    // 进程恒为 `None`，宿主会话只能通过 daemon 发布的快照文件发现。策略登记同样由 daemon
-    // 预先完成（companion 没有控制通道），接入前用快照里的 uid 集合确认，未登记 uid 的
-    // 请求会被宿主 fail-closed 拒绝成 ENOENT。
-    //
-    // `real_root_override` 必须丢弃（传 None）：它是应用命名空间专属的锚点别名，只存在于
-    // 应用 namespace；宿主子进程在自己的私有命名空间里看到的是空目录，照搬覆盖会把真实根
-    // 读成空，仅映射模式的应用会整个丢失公共存储视图。companion 不做登记（daemon 预登记），
-    // 因此这里不构造策略配置。
-    let view = crate::fuse_host::read_host_session_view();
-    let registered = view.as_ref().is_some_and(|view| {
-        view.policy_fingerprints.get(&(request.uid as u32)) == Some(&request.policy_fingerprint)
-    });
-    if !crate::fuse_host::can_attach_app(request.uid, mount_root) {
-        // 宿主会话的虚拟根只能是整个存储视图根，且默认不接管应用挂载；两种情况都保持
-        // 既有 scoped 路径，不能因为"宿主会话可用"就顺手接上。
-        log::debug!(
-            "fuse host attach skipped pid={} pkg={} target={} registered={} reason=attach_gate_closed",
-            request.pid,
-            request.package_name,
-            mount_root,
-            registered
-        );
-    } else if !registered {
-        // 策略没进宿主会话时接入会让应用拿到"未登记即拒绝"的空视图；宁可继续 scoped。
-        log::warn!(
-            "fuse host attach skipped pid={} pkg={} target={} request_fingerprint={:016x} snapshot_fingerprint={:?} reason=policy_registration_failed",
-            request.pid,
-            request.package_name,
-            mount_root,
-            request.policy_fingerprint,
-            view.as_ref()
-                .and_then(|view| view.policy_fingerprints.get(&(request.uid as u32)))
-                .copied()
-        );
-    } else if let Some(host_view) = view.as_ref() {
-        if let Some(state) = try_bind_to_fuse_host(host_view, request, mount_root) {
-            return Some(state);
-        }
-        log::warn!(
-            "bind to fuse host failed, falling back to scoped fork pid={} pkg={}",
-            request.pid,
-            request.package_name
-        );
-    } else {
-        log::warn!(
-            "fuse host view disappeared before attach, falling back to scoped fork pid={} pkg={}",
-            request.pid,
-            request.package_name
-        );
+    scoped_fuse_roots: &[String],
+) -> bool {
+    // 无任何策略规则的请求不预接宿主视图：与 daemon 侧
+    // （daemon_mount::shared_host_preattach_candidate）同源的闸门。未配置应用/
+    // 无规则系统链路接入后宿主策略 deny_all，应用视图变空目录、写入全被拒
+    // （2026-10-30 issue #2 报告者 test14 实测：未配置任何应用仍有 5 个进程
+    // 被覆盖，MT 管理器写 sdcard 失败）。监视由进程外 inotify 承担。
+    let has_policy_rules = !request.allowed_real_paths.is_empty()
+        || !request.excluded_real_paths.is_empty()
+        || !request.path_mappings.is_empty()
+        || !request.sandboxed_paths.is_empty()
+        || !request.read_only_paths.is_empty();
+    if !has_policy_rules {
+        return false;
     }
-    // 宿主接入失败时，daemon reconcile 可能已经为该应用挂上了共享宿主层；此时
-    // 再叠 scoped 会话只会造成双重挂载。检测到已有 srx 层就直接放弃本根。
-    if app_storage_view_already_served(mount_root) {
-        log::info!(
-            "scoped fork skipped, srx mount already present pid={} pkg={} target={}",
-            request.pid,
-            request.package_name,
-            mount_root
-        );
-        return None;
+    // 与 daemon 侧同源的策略规则闸门：无规则的请求不预接宿主视图（接入后
+    // 宿主对无规则 uid deny_all，未配置应用空目录/写入全拒）。
+    if !crate::fuse_redirect::config::mount_request_has_policy_rules(request) {
+        return false;
     }
-    // 回退：fork 独立 scoped 会话（B2-a 前的既有路径）。
-    let mut ready_sockets = [0; 2];
-    // SAFETY: socketpair 系统调用，传入有效的栈数组指针。
-    if unsafe { socketpair(AF_UNIX, SOCK_DGRAM, 0, ready_sockets.as_mut_ptr()) } != 0 {
-        let errno = last_errno();
-        log::warn!(
-            "fuse ready socketpair failed pid={} pkg={} errno={} {}",
-            request.pid,
-            request.package_name,
-            errno,
-            errno_text(errno)
-        );
-        return None;
-    }
-
-    // 先在父进程走完私有日志通道初始化，避免子进程继承处于初始化中的 OnceLock 而永久阻塞。
-    crate::logging::prepare_for_fork();
-    // SAFETY: fork 系统调用，已经通过 prepare_for_fork 避免日志通道竞态。
-    let service_child = unsafe { libc::fork() };
-    if service_child < 0 {
-        let errno = last_errno();
-        log::warn!(
-            "fuse fork failed pid={} pkg={} errno={} {}",
-            request.pid,
-            request.package_name,
-            errno,
-            errno_text(errno)
-        );
-        // SAFETY: ready_sockets 是有效 fd，fork 失败后父进程负责清理。
-        unsafe {
-            close(ready_sockets[0]);
-            close(ready_sockets[1]);
-        }
-        return None;
-    }
-
-    if service_child == 0 {
-        // SAFETY: 子进程关闭继承的 fd。
-        unsafe {
-            close(ready_sockets[0]);
-        }
-        let ok = mount_blocking_with_ready(
-            fuse_config_from_request(request, Some(mount_root.to_string()), real_root_override),
-            Some(ready_sockets[1]),
-        );
-        // SAFETY: 子进程直接退出，不执行析构函数（避免 fork 后的资源清理问题）。
-        unsafe { libc::_exit(if ok { 0 } else { 1 }) };
-    }
-
-    // SAFETY: 父进程关闭写端 fd。
-    unsafe { close(ready_sockets[1]) };
-    set_recv_timeout(
-        ready_sockets[0],
-        service_child,
-        mount_timing::FUSE_READY_TIMEOUT_SEC,
+    let is_auto = matches!(
+        request.storage_backend_mode,
+        crate::config::StorageBackendMode::Auto
     );
-    let mut ready_result: i32 = -1;
-    let expected = std::mem::size_of::<i32>() as isize;
-    let n = recv_result(ready_sockets[0], &mut ready_result);
-    // SAFETY: 父进程关闭读端 fd。
-    unsafe { close(ready_sockets[0]) };
-    if n != expected || ready_result != 0 {
-        log::warn!(
-            "fuse service not ready child={} recv={} ret={} pid={} pkg={}",
-            service_child,
-            n,
-            ready_result,
-            request.pid,
-            request.package_name
-        );
-        crate::fuse_terminate::terminate_fuse_process(service_child, None);
-        // 与 daemon 侧同口径：子进程可能在 mount(2) 已完成后才被判失败，终止后若目标
-        // 顶层残留本模块 scoped 死层，就地摘除，避免常驻应用命名空间留下 ENOTCONN 死挂载。
-        crate::fuse_session::detach_dead_scoped_layer_after_terminate(mount_root);
-        return None;
+    let is_monitor_only = request.is_monitor_only && request.is_file_monitor_enabled;
+    if !is_auto && !is_monitor_only {
+        return false;
     }
-
-    let Some(child_start_time_ticks) = crate::platform::process_start_time_ticks(service_child)
-    else {
-        rollback_scoped_fuse_services(&[FuseMountState {
-            target: mount_root.to_string(),
-            child: service_child,
-            child_start_time_ticks: 0,
-            host_session: None,
-        }]);
-        return None;
-    };
-    Some(FuseMountState {
-        target: mount_root.to_string(),
-        child: service_child,
-        child_start_time_ticks,
-        host_session: None,
-    })
+    // 与 daemon 侧同源（crate::daemon_mount::shared_host_preattach_candidate）：存在
+    // 私有 fs 侧映射时 preattach 成功会短路 planner，私有映射的命名空间 bind 挂载
+    // 会被整体丢弃（真机实证：scenario 35 映射矩阵全失效）。命中时必须回落
+    // planner 流程，由 planner 一边宿主接入一边物化私有映射。
+    if crate::domain::mappings_need_namespace_mount(
+        request.uid,
+        &request.app_data_dir,
+        &request.redirect_target,
+        &request.path_mappings,
+    ) {
+        return false;
+    }
+    let user_id = platform::user_id_from_uid(request.uid);
+    let storage_root = platform::paths::storage_user_root_for_user(user_id);
+    scoped_fuse_roots.len() == 1
+        && platform::paths::normalize_syntax(&scoped_fuse_roots[0])
+            == platform::paths::normalize_syntax(&storage_root)
 }
 
 /// B2-b：把应用接入共享宿主 FUSE 会话（companion 路径）。
@@ -1699,14 +1664,6 @@ fn try_bind_to_fuse_host(
         child_start_time_ticks: 0,
         host_session: Some((attached.host_pid, attached.host_start_time_ticks)),
     })
-}
-
-fn fuse_config_from_request(
-    request: &CompanionMountRequest,
-    mount_root: Option<String>,
-    real_root_override: Option<String>,
-) -> FuseRedirectConfig {
-    crate::fuse_redirect::fuse_config_from_request(request, mount_root, real_root_override)
 }
 
 /// fork 之前在父进程算好的挂载计划。

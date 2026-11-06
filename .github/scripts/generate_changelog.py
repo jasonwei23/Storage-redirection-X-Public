@@ -28,6 +28,25 @@ MACHINE_TRAILER_PATTERN = re.compile(
     flags=re.I,
 )
 BODY_FIELD_PATTERN = re.compile(r"^(变更|用户影响|范围|限制|验证)[：:]\s*(.*)$")
+# 致谢类字段：提交正文里记录外部思路来源与贡献者，必须同样出现在 CI 与发布日志里。
+# 它们不是普通正文，不能并进上一个字段（否则会被「验证」吞掉，日志里永远看不到）。
+CREDIT_FIELD_PATTERN = re.compile(r"^(致谢|思路来源|贡献者|上游来源|上游作者)[：:]\s*(.*)$")
+CREDIT_PEOPLE_LABELS = ("贡献者", "上游作者")
+CREDIT_SOURCE_LABELS = ("思路来源", "上游来源")
+# 致谢里的链接必须显式写成 Markdown 链接：GitHub 的自动链接会把紧跟在 URL 之后的
+# 中文标点（尤其全角括号）并进链接，`感谢 People-11（https://github.com/People-11），来源：上游`
+# 点开就成了 `…/People-11），来源：上游` 这样的错误地址（2.2.1 更新日志实测）。
+CREDIT_URL_PATTERN = re.compile(r"https?://[^\s，、；：（）()\[\]<>。]+")
+CREDIT_LINKED_NAME_PATTERN = re.compile(
+    r"([^\s，、；：（）()\[\]<>]+)\s*[（(]\s*(https?://[^\s，、；：（）()\[\]<>。]+)\s*[）)]"
+)
+# 依赖锁定常写成 `仓库.git@<sha>`：这种地址本身点不开（GitHub 上 404），
+# 改写成提交页地址才能落实「链接可用」的要求。
+CREDIT_GIT_PIN_PATTERN = re.compile(r"^(https?://[^/\s]+/[^/\s]+/[^/\s]+?)(?:\.git)?@([0-9a-f]{7,40})$")
+CREDITS_HEADING = "### 致谢"
+MAX_CREDITS = 10
+# CI 构建面向测试用户，致谢只保留最近的几条，避免把日志尾部拉长。
+MAX_CI_CREDITS = 5
 
 
 @dataclass(frozen=True)
@@ -122,6 +141,12 @@ def parse_body_fields(body: str) -> dict[str, str]:
     for raw_line in body.splitlines():
         line = raw_line.strip()
         if not line or MACHINE_TRAILER_PATTERN.match(line):
+            continue
+        match = CREDIT_FIELD_PATTERN.match(line)
+        if match:
+            fields.setdefault(match.group(1), []).append(match.group(2).strip())
+            # 致谢字段是独立条目：随后的正文行不能再续到上一个字段里。
+            current_field = ""
             continue
         match = BODY_FIELD_PATTERN.match(line)
         if match:
@@ -302,6 +327,98 @@ def summary_key(text: str) -> str:
     return re.sub(r"\s+", "", text).strip("。；;，,")
 
 
+def credit_url_target(url: str) -> str:
+    """返回致谢链接真正应该指向的地址，`仓库.git@<sha>` 转成可点击的提交页。"""
+    match = CREDIT_GIT_PIN_PATTERN.match(url)
+    return f"{match.group(1)}/commit/{match.group(2)}" if match else url
+
+
+def markdown_credit_links(text: str) -> str:
+    """把致谢文本里的链接统一改写成 Markdown 链接。
+
+    `名称（URL）` 与裸 URL 在 GitHub 上依赖自动链接，紧随其后的中文标点会被当成
+    URL 的一部分，读者点开就跳到错误地址。改写成 `[名称](URL)` 后链接边界由括号
+    确定，后面的中文标点留在链接外。已经是 Markdown 链接的片段原样保留。
+    """
+
+    def linked(match: re.Match[str]) -> str:
+        url = match.group(2)
+        return f"[{match.group(1)}]({credit_url_target(url)})"
+
+    text = CREDIT_LINKED_NAME_PATTERN.sub(linked, text)
+
+    def wrap_bare(match: re.Match[str]) -> str:
+        url = match.group(0)
+        if match.start() >= 2 and text[match.start() - 2 : match.start()] == "](":
+            return url
+        return f"[{url}]({credit_url_target(url)})"
+
+    return CREDIT_URL_PATTERN.sub(wrap_bare, text)
+
+
+def credit_line(commit: CommitInfo) -> str:
+    """把一笔提交里的贡献者与来源拼成一行致谢文本，没有贡献信息时返回空串。"""
+    people = [commit.fields[label] for label in CREDIT_PEOPLE_LABELS if commit.fields.get(label)]
+    sources = [commit.fields[label] for label in CREDIT_SOURCE_LABELS if commit.fields.get(label)]
+    notes = [commit.fields["致谢"]] if commit.fields.get("致谢") else []
+    if not people and not sources and not notes:
+        return ""
+    if not people:
+        # 没有具体贡献者时把裸链接（常见写法）补上"来源："，否则日志里只剩一串 URL。
+        parts = [f"来源：{source}" for source in sources]
+        parts.extend(note if not note.lower().startswith(("http", "git@")) else f"来源：{note}" for note in notes)
+        return markdown_credit_links("；".join(parts))
+    text = "感谢 " + "、".join(people)
+    if sources:
+        text += "，来源：" + "；".join(sources)
+    if notes:
+        text += "，" + "；".join(notes)
+    return markdown_credit_links(text)
+
+
+def credit_range_start(current: str) -> str:
+    """正式 Release 的致谢跨整个发布周期累积。
+
+    致谢可能写进任意一笔提交，而正式发布的对比基准可能只覆盖最后一程——只按对比
+    范围取会让早期贡献在发布日志里凭空消失。这里以最近的 `v*` 正式发布 tag 为下界，
+    正式发布后自然清零。CI 构建日志不走本函数：CI 是对比区间的差异记录，致谢只认
+    对比范围内的提交（见 write_changelog）。仓库是浅克隆或尚未打过 tag 时返回空串，
+    退回对比范围。
+    """
+    tag = run_git(["describe", "--tags", "--abbrev=0", "--match", "v*", current], allow_fail=True)
+    if not tag:
+        return ""
+    # 正式发布流程先建草稿（tag 指向当前提交）再生成正文，此时最近 tag 就是本版本
+    # 自身，按它取下界会得到空范围、致谢整段消失。这种情况退到再上一个 tag。
+    head = run_git(["rev-parse", f"{current}^{{commit}}"], allow_fail=True)
+    tagged = run_git(["rev-parse", f"{tag}^{{commit}}"], allow_fail=True)
+    if head and head == tagged:
+        return run_git(["describe", "--tags", "--abbrev=0", "--match", "v*", f"{tag}^"], allow_fail=True)
+    return tag
+
+
+def collect_credits(commits: list[CommitInfo], mode: str = "release") -> list[str]:
+    """按时间倒序收集去重后的致谢行。"""
+    limit = MAX_CI_CREDITS if mode == "ci" else MAX_CREDITS
+    lines: list[str] = []
+    seen: set[str] = set()
+    for commit in commits:
+        text = credit_line(commit).strip(" 。；;，,")
+        # 历史提交正文里把外部建议写成「私下建议」，公开日志里建议就是建议，
+        # 输出端统一归一措辞，不追溯改写提交原文。
+        text = text.replace("私下建议", "建议")
+        if not text:
+            continue
+        key = summary_key(text)
+        if key in seen:
+            continue
+        seen.add(key)
+        lines.append(text)
+        if len(lines) >= limit:
+            break
+    return lines
+
+
 def limit_analysis(analysis: dict[str, dict[str, list[dict[str, object]]]], mode: str = "release") -> None:
     per_section = MAX_CI_SECTION_ITEMS if mode == "ci" else MAX_SECTION_ITEMS
     for sections in analysis.values():
@@ -328,7 +445,14 @@ def limit_analysis(analysis: dict[str, dict[str, list[dict[str, object]]]], mode
             remaining -= len(analysis[component][section])
 
 
-def render_analysis(mode: str, version: str, previous: str, current: str, analysis: dict[str, dict[str, list[dict[str, object]]]]) -> str:
+def render_analysis(
+    mode: str,
+    version: str,
+    previous: str,
+    current: str,
+    analysis: dict[str, dict[str, list[dict[str, object]]]],
+    credits: list[str] | None = None,
+) -> str:
     if mode == "release":
         lines = [f"# Storage Redirect X v{version}"]
     else:
@@ -358,6 +482,10 @@ def render_analysis(mode: str, version: str, previous: str, current: str, analys
                 continue
             lines.extend(["", headings[section]])
             lines.extend(f"- {item['text']}。" for item in items)
+    if credits:
+        # 致谢独立成段放在全局末尾：它不属于任何组件，也不该被组件分区上限截断。
+        lines.extend(["", CREDITS_HEADING, ""])
+        lines.extend(f"- {text}。" for text in credits)
     if mode == "ci":
         # 不再罗列提交列表：使用者关心的是结论，逐笔提交交给对比链接。
         repo = os.environ.get("GITHUB_REPOSITORY", "")
@@ -375,15 +503,52 @@ def write_changelog(mode: str, version: str, current: str, output: Path) -> None
     commits = commit_infos(previous, current)
     analysis = collect_analysis(mode, files, commits)
     limit_analysis(analysis, mode)
-    output.write_text(render_analysis(mode, version, previous, current, analysis), encoding="utf-8")
+    # 致谢取数范围按模式区分：CI 构建日志是对比区间的差异记录，致谢也只认对比
+    # 范围内的提交——按整个发布周期累积会让上一版 CI 已展示过的旧条目在后续
+    # 每版 CI 里重复出现（ci.11 曾因此带出 ci.9/ci.10 已发布的致谢）。
+    # 正式 Release 是版本周期汇总，保持周期累积不变。
+    if mode == "ci":
+        credits = collect_credits(commits, mode)
+    else:
+        credit_base = credit_range_start(current)
+        earlier = commit_infos(credit_base, current) if credit_base and credit_base != previous else []
+        credits = collect_credits([*commits, *earlier], mode)
+    output.write_text(render_analysis(mode, version, previous, current, analysis, credits), encoding="utf-8")
+
+
+def ensure_credits(path: Path, mode: str = "release") -> None:
+    """给人写的发布说明补齐致谢段。
+
+    正式 Release 允许用 `docs/release-notes/v<版本>.md` 覆盖自动生成的正文，覆盖之后
+    生成器算出的致谢就丢了。这里在覆盖之后兜住：正文已有 `### 致谢` 就不动（尊重人工
+    措辞），没有则按发布周期内的提交汇总追加，保证外部思路来源始终出现在更新日志里。
+    """
+    markdown = path.read_text(encoding="utf-8")
+    if CREDITS_HEADING in markdown:
+        return
+    current = current_ref()
+    base = credit_range_start(current)
+    credits = collect_credits(commit_infos(base, current), mode)
+    if not credits:
+        return
+    lines = markdown.rstrip("\n").splitlines()
+    lines.extend(["", CREDITS_HEADING, ""])
+    lines.extend(f"- {text}。" for text in credits)
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--mode", choices=["ci", "release"], required=True)
     parser.add_argument("--version", default="")
-    parser.add_argument("--output", required=True)
+    parser.add_argument("--output", default="")
+    parser.add_argument("--ensure-credits", default="")
     args = parser.parse_args()
+    if args.ensure_credits:
+        ensure_credits(Path(args.ensure_credits), args.mode)
+        return
+    if not args.output:
+        raise SystemExit("必须提供 --output，或使用 --ensure-credits 补充致谢")
     write_changelog(args.mode, args.version, current_ref(), Path(args.output))
 
 

@@ -204,6 +204,34 @@ where
         return call_original(pathname);
     }
 
+    // 入口留痕：只在诊断进程（MediaProvider / 代写者等系统链路）上开，用来回答
+    // 「这次 mkdir 到底有没有进到本模块」。没有这一层，hook 未被调用与 hook 判成
+    // 放行在日志上完全同形——真机 2026-11-05 排查 sau 沙盒时正是卡在这里。
+    let is_diagnostic_caller = {
+        let pkg = hub.get_package_name();
+        crate::redirect::policy::is_media_provider_package(&pkg)
+            || crate::redirect::policy::is_system_writer_package(&pkg)
+    };
+    if is_diagnostic_caller {
+        // SAFETY: pathname 已判空；c_str_to_string 按 NUL 结尾读取，指针有效期由
+        // hook 调用方保证。
+        let raw_path = unsafe { crate::hook::util::c_str_to_string(pathname) };
+        // SAFETY: getuid 无参数、无副作用，只读取当前进程的实际 uid。
+        let self_uid = unsafe { libc::getuid() };
+        log::debug!(
+            "{} entry pkg={} dirfd={} self_uid={} path={}",
+            op_name,
+            hub.get_package_name(),
+            dirfd,
+            self_uid,
+            if raw_path.is_empty() {
+                "-"
+            } else {
+                raw_path.as_str()
+            }
+        );
+    }
+
     // SAFETY: pathname 已在上方判空，prepare_relevant_path 会按 NUL 结尾读取该 C 字符串并解析路径，指针有效性由 hook 调用方保证。
     let PreparedPath::Ready {
         path_for_decision, ..
@@ -243,6 +271,23 @@ where
         path_for_decision.as_ref(),
         &redirect_result,
     );
+    if is_diagnostic_caller {
+        // 决策结果无条件留痕：入口有日志、决策没有，就说明这次直接走了「放行到真实
+        // 存储」。两者必须成对出现才能判定是「没进 hook」还是「进了但判成放行」。
+        log::debug!(
+            "{} decision pkg={} redirect={} denied={} mapping={} to={}",
+            op_name,
+            hub.get_package_name(),
+            redirect_result.is_redirect(),
+            redirect_result.is_denied(),
+            redirect_result.is_mapping,
+            if redirect_result.new_path.is_empty() {
+                "-"
+            } else {
+                redirect_result.new_path.as_str()
+            }
+        );
+    }
     if redirect_result.is_denied() {
         return deny_read_only_mkdir(
             hub,
@@ -444,6 +489,10 @@ where
     let saved_errno = runtime::current_errno();
     let request_backend = storage_backend_dir(source_path);
 
+    // 请求路径在真实存储里**绝不创建**：它是映射视图里的挂载点，用户配置映射正是为了
+    // 不让它出现在公共目录。这里只落映射目标，调用方随后的 isDirectory/realpath 由
+    // 进程内登记的「请求路径→映射目标」短时表承接（见 `remember_process_mapped_dir`
+    // 与 `hooked_realpath`），因此不再需要真实请求目录来喂内核 FUSE entry。
     let (mut result, mut error_no) = if request_backend.is_empty() {
         // 非 storage 形态（相对路径、其它挂载）保持原来的改写语义。
         let target_c = CString::new(redirect.new_path.as_str()).ok();
@@ -454,15 +503,12 @@ where
         let call_errno = runtime::errno_for_result(call_result);
         (call_result, call_errno)
     } else {
-        let (request_result, request_errno) = create_backend_dir(&request_backend);
         log::debug!(
-            "mkdir mapping request dir: result={} errno={} path={} backend={}",
-            request_result,
-            request_errno,
+            "mkdir mapping request dir skipped (request path must not be created) path={} backend={}",
             source_path,
             request_backend
         );
-        (request_result, request_errno)
+        (0, 0)
     };
 
     runtime::ensure_redirect_parent_dirs(&redirect.new_path, 0o2773);
@@ -476,6 +522,12 @@ where
             redirect.new_path,
             target_backend
         );
+        // 请求路径不再落盘，映射目标就是这次 mkdir 唯一的真实产物：它建不出来时
+        // 必须把失败原样交回调用方，不能因为「请求侧跳过」就报成功。
+        if !request_backend.is_empty() {
+            result = target_result;
+            error_no = target_errno;
+        }
         runtime::normalize_redirect_directory(&redirect.new_path);
     }
 
@@ -484,11 +536,7 @@ where
     crate::hook::remember_process_mapped_dir(source_path, &redirect.new_path);
     runtime::set_errno(saved_errno);
 
-    if result == 0
-        || error_no == libc::EEXIST
-        || error_no == libc::ENOTDIR
-        || (!request_backend.is_empty() && crate::platform::fs::is_directory(&request_backend))
-    {
+    if result == 0 || error_no == libc::EEXIST || error_no == libc::ENOTDIR {
         log::debug!(
             "mkdir mapping resolved: returning 0 errno={} path={} redirect={}",
             error_no,

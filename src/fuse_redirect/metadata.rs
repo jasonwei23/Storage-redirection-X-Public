@@ -11,30 +11,100 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use std::time::UNIX_EPOCH;
 
+/// 应用私有树（Android/data|media|obb）新建条目使用的扩展数据组。
+const EXT_DATA_RW_GID: u32 = 1078;
+
 pub(super) fn cstring_path(path: &Path) -> Result<CString, Errno> {
     CString::new(path.as_os_str().as_bytes()).map_err(|_| Errno::EINVAL)
 }
 
-pub(super) fn fix_path_metadata(
-    path: &Path,
-    owner_uid: i32,
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct CreateMetadata {
+    pub uid: u32,
+    pub gid: u32,
+    pub mode: u32,
+    pub rewrite_owner: bool,
+    pub rewrite_mode: bool,
+}
+
+pub(super) fn create_metadata(
+    request_uid: u32,
+    request_gid: u32,
+    owner_uid: u32,
     mode: u32,
     is_shared_public_backend: bool,
+    is_app_private_backend: bool,
     is_dir: bool,
-) {
+) -> CreateMetadata {
     if !crate::metadata_repair::enabled() {
-        return;
+        return CreateMetadata {
+            uid: request_uid,
+            gid: request_gid,
+            mode: mode & 0o7777,
+            rewrite_owner: false,
+            rewrite_mode: false,
+        };
     }
-    let mode = adjust_metadata_mode(mode, is_shared_public_backend, is_dir);
-    let effective_uid = if is_shared_public_backend {
-        MEDIA_RW_UID
-    } else {
-        owner_uid as u32
-    };
-    if let Ok(c_path) = cstring_path(path) {
-        let _ = unsafe { libc::chown(c_path.as_ptr(), effective_uid, MEDIA_RW_GID) };
+    if is_shared_public_backend {
+        return CreateMetadata {
+            uid: MEDIA_RW_UID,
+            gid: MEDIA_RW_GID,
+            // 公共后端的属主被改写成 media_rw，mode 必须同步派生（owner 位镜像到
+            // group、清 others）：保留调用方原始 0600 会让应用连自己刚写的文件都读
+            // 不到（真机 2026-11-01 duchamp：场景 5 写入后 1023:1023 0600，场景 6
+            // 同路径 stat 得 EACCES、createNewFile 报 EEXIST）。目录固定 02770。
+            mode: adjust_metadata_mode(mode, true, false, is_dir),
+            rewrite_owner: true,
+            rewrite_mode: true,
+        };
     }
-    let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode));
+    if is_app_private_backend {
+        return CreateMetadata {
+            uid: owner_uid,
+            gid: EXT_DATA_RW_GID,
+            mode: adjust_metadata_mode(mode, false, true, is_dir),
+            rewrite_owner: true,
+            rewrite_mode: true,
+        };
+    }
+    CreateMetadata {
+        uid: request_uid,
+        gid: request_gid,
+        mode: mode & 0o7777,
+        rewrite_owner: false,
+        rewrite_mode: false,
+    }
+}
+
+pub(super) fn apply_create_metadata(path: &Path, metadata: CreateMetadata) -> Result<(), Errno> {
+    let mut failed = None;
+    if metadata.rewrite_owner {
+        let c_path = cstring_path(path)?;
+        // SAFETY: c_path 是 NUL 结尾的合法路径；uid/gid 来自当前 FUSE 策略
+        // （共享媒体常量或 app-private 的属主），不来自不可信输入。
+        if unsafe { libc::chown(c_path.as_ptr(), metadata.uid, metadata.gid) } != 0 {
+            failed = Some(errno_from_code(last_errno()));
+        }
+    }
+    // 符号链接绝不能走 `set_permissions`：`std::fs::set_permissions` 跟随链接，
+    // 会把 mode 打到**目标文件**上（例如链接到公共照片时就地改掉别人文件的权限），
+    // 而 Linux 没有 lchmod，`fchmodat(AT_SYMLINK_NOFOLLOW)` 恒 ENOTSUP。链接自身
+    // 没有可用的 mode 语义，跳过即可。
+    if metadata.rewrite_mode
+        && !is_symlink(path)
+        && let Err(error) =
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(metadata.mode))
+    {
+        failed.get_or_insert_with(|| errno_from_io(error));
+    }
+    failed.map_or(Ok(()), Err)
+}
+
+/// 路径本身是否为符号链接（不跟随）。
+fn is_symlink(path: &Path) -> bool {
+    std::fs::symlink_metadata(path)
+        .map(|metadata| metadata.file_type().is_symlink())
+        .unwrap_or(false)
 }
 
 pub(super) fn fix_existing_path_metadata(
@@ -49,25 +119,55 @@ pub(super) fn fix_existing_path_metadata(
         return;
     };
     let mode = metadata.permissions().mode() & 0o7777;
-    fix_path_metadata(
-        path,
-        owner_uid,
+    let metadata = create_metadata(
+        MEDIA_RW_UID,
+        MEDIA_RW_GID,
+        owner_uid as u32,
         mode,
         is_shared_public_backend,
+        false,
         metadata.is_dir(),
     );
+    let _ = apply_create_metadata(path, metadata);
 }
 
-pub(super) fn adjust_metadata_mode(mode: u32, is_shared_public_backend: bool, is_dir: bool) -> u32 {
+pub(super) fn adjust_metadata_mode(
+    mode: u32,
+    is_shared_public_backend: bool,
+    is_app_private_backend: bool,
+    is_dir: bool,
+) -> u32 {
     let mode = mode & 0o7777;
     if is_shared_public_backend && is_dir {
         return SHARED_PUBLIC_DIR_MODE;
     }
-    // 私有树与公共文件统一做 owner→group 位镜像并清 others：原生 MP FUSE 对
-    // 应用新建条目不透传调用方请求 mode，而是按 media_rw 可管理的语义派生
-    // （真机 2026-10-20 实证：同一 app 显式 0600 创建录制文件，原生结果
-    // 0660/目录 02770）。宿主此前对私有树透传 0600，media_rw 组位归零导致
-    // MP 侧后续读取被 DAC 拒——QQ 相机录制收尾即因此误报「录制异常」。
+    if is_app_private_backend {
+        // 复刻**系统视图自己的创建口径**，不发明规则：MediaProvider 的 FuseDaemon 在
+        // `pf_create`/`pf_mknod` 里把 mode 归一成 `(mode & ~0777) | 0664`，在
+        // `pf_mkdir` 里归一成 `(mode & ~0777) | 0775`——它不透传调用方 umask，因为
+        // 这三类目录在原生形态下本来就由 MP 服务，权限口径属于平台约定而非应用选择。
+        //
+        // 模块在这条路径上扮演的就是「系统视图」，所以必须产出同一口径：否则会话里
+        // 由模块建出来的 `-wal`/`-shm` 会是应用 umask 077 的 0600，等目录改由 MP
+        // 服务时 MP 用自身身份（附加组 media_rw/ext_data_rw、`CapEff: 0`）打不开，
+        // 应用侧就是 SQLITE_CANTOPEN（真机 2026-11-04 duchamp：XRadiant 打不开自己的
+        // -wal，主库被 WAL 回滚成 4096B）。
+        //
+        // 注意这里只在**新建**时决定落盘权限，不回头修改任何已存在文件；历史遗留的
+        // owner-only 入口只做诊断上报（见 `mount::apply::report_unserviceable_private_entries`）。
+        return if is_dir {
+            (mode & 0o7000) | 0o775
+        } else {
+            (mode & 0o7000) | 0o664
+        };
+    }
+    // 公共后端的文件统一做 owner→group 位镜像并清 others：新建时属主被改写为
+    // media_rw(1023)，若保留调用方原始 mode（应用常见 0600），应用自己就再也读不到
+    // 自己刚写的文件——真机 2026-11-01 duchamp 实证：场景 5 放行路径写入后文件为
+    // `1023:1023 0600`，紧接着场景 6 写同名时 `stat` 得 EACCES、`createNewFile`
+    // 报 EEXIST（内核认为条目存在但打不开）。原生 MP FUSE 同样不透传请求 mode，
+    // 而是按 media_rw 可管理的语义派生（同一 app 显式 0600 创建录制文件，原生结果
+    // 是 0660/目录 02770），这里与之对齐。
     let owner_bits_for_group = (mode & 0o700) >> 3;
     (mode | owner_bits_for_group) & !0o007
 }

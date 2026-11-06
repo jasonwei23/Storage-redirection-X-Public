@@ -503,40 +503,6 @@ function diagnosticArchiveWorkerScript() {
   ].join("\n");
 }
 
-function parseDiagnosticProgress(line) {
-  const parts = String(line || "")
-    .trim()
-    .split("|");
-  if (parts.length < 3) return null;
-  const percent = Math.max(0, Math.min(100, Number.parseInt(parts[0], 10)));
-  if (!Number.isFinite(percent)) return null;
-  return {
-    percent,
-    phase: String(parts[1] || "").slice(0, 32),
-    message: parts.slice(2).join("|").slice(0, 80) || "正在导出日志",
-  };
-}
-
-function parseDiagnosticArchivePoll(stdout) {
-  let progressLine = "";
-  let doneCode = null;
-  String(stdout || "")
-    .split(/\r?\n/)
-    .forEach((line) => {
-      if (line.startsWith("__SRX_DONE__=")) {
-        const value = line.slice("__SRX_DONE__=".length).trim();
-        if (value !== "") doneCode = Number.parseInt(value, 10);
-      } else if (line.includes("|")) {
-        progressLine = line.trim();
-      }
-    });
-  return {
-    progress: parseDiagnosticProgress(progressLine),
-    progressLine,
-    doneCode: Number.isFinite(doneCode) ? doneCode : null,
-  };
-}
-
 function isSafePackageName(packageName) {
   return /^[A-Za-z0-9_.-]+$/.test(packageName || "");
 }
@@ -545,20 +511,78 @@ function isSafeUserId(userId) {
   return /^[0-9]+$/.test(String(userId || ""));
 }
 
+/**
+ * dex 输出中标志「该用户视角下的系统应用」的行前缀。
+ * 由 tools/list_apps/Main.java 生成，以 `#` 开头，旧读取端会整行跳过。
+ */
+const COMPAT_APP_LIST_SYSTEM_MARKER = "#system=";
+
 function parseCompatAppList(content) {
   const apps = [];
+  const systemPackages = new Set();
   String(content || "")
     .split("\n")
     .forEach((line) => {
       const text = line.trim();
-      if (!text || text.startsWith("#")) return;
+      if (!text) return;
+      if (text.startsWith(COMPAT_APP_LIST_SYSTEM_MARKER)) {
+        text
+          .slice(COMPAT_APP_LIST_SYSTEM_MARKER.length)
+          .split(/\s+/)
+          .forEach((name) => {
+            if (isSafePackageName(name)) systemPackages.add(name);
+          });
+        return;
+      }
+      if (text.startsWith("#")) return;
       const splitAt = text.indexOf("=");
       const packageName = splitAt >= 0 ? text.slice(0, splitAt).trim() : text.split(/\s+/)[0];
       const appLabel = splitAt >= 0 ? text.slice(splitAt + 1).trim() : packageName;
       if (isSafePackageName(packageName))
-        apps.push({ packageName, appLabel: appLabel || packageName, isSystem: false });
+        apps.push({ packageName, appLabel: appLabel || packageName });
     });
+  // 系统应用只在 dex 给出了标记时按用户结果覆盖；旧版 dex 没有该标记，
+  // 此时保持 isSystem 未定义，让调用方继续沿用包名前缀兜底判断。
+  if (systemPackages.size) {
+    apps.forEach((app) => {
+      app.isSystem = systemPackages.has(app.packageName);
+    });
+  }
   return apps;
+}
+
+/**
+ * 解析 `pm list packages -f -U --user <id>` 与 `pm list packages -s --user <id>` 两段输出。
+ *
+ * 判据与 Kotlin 侧 `parseUserPackageList` 一致：`-f` 段给出成员与 APK 路径，`-s` 段给出
+ * 该用户视角的系统应用；分段靠调用方显式 echo 的标记行，不靠包名前缀猜。
+ */
+function parseUserPackageListing(content, systemMarker) {
+  const packageSet = new Set();
+  const system = new Set();
+  let inSystemSection = false;
+  String(content || "")
+    .split("\n")
+    .forEach((line) => {
+      const text = line.trim();
+      if (!text) return;
+      if (text === systemMarker) {
+        inSystemSection = true;
+        return;
+      }
+      if (!text.startsWith("package:")) return;
+      const body = text.slice("package:".length);
+      if (inSystemSection) {
+        const name = body.split(/\s+/)[0].trim();
+        if (isSafePackageName(name)) system.add(name);
+        return;
+      }
+      // APK 路径里可能出现 `==`（如 /data/app/~~xxxx==/base.apk），包名只在最后一个 `=` 之后。
+      const split = body.lastIndexOf("=");
+      const name = (split >= 0 ? body.slice(split + 1) : body).split(/\s+/)[0].trim();
+      if (isSafePackageName(name)) packageSet.add(name);
+    });
+  return { packages: Array.from(packageSet), system };
 }
 
 function normalizePackageResult(raw) {
@@ -1480,6 +1504,26 @@ const Api = {
           return target;
         }
       }
+      // Download 不可写（存储挂载异常时的典型现场）：降级把日志包留在模块目录
+      // （root 直连路径，不经 FUSE 视图），用户用 root 文件管理器或 adb 手动拷贝。
+      const fallbackTarget = MODULE_DIR + "/" + safeName;
+      const fallbackCopy = await this.exec(
+        "cp " + shellQuote(tmpArchive) + " " + shellQuote(fallbackTarget) + " && echo ok",
+        { timeoutMs: 30000 },
+      ).catch(() => "");
+      if (
+        String(fallbackCopy || "")
+          .trim()
+          .split(/\s+/)
+          .pop() === "ok"
+      ) {
+        options?.onProgress?.({
+          percent: 100,
+          phase: "done",
+          message: "Download 不可写，日志包已保存到模块目录",
+        });
+        return fallbackTarget;
+      }
       throw new Error("日志包写入 Download 失败");
     } finally {
       try {
@@ -1813,17 +1857,15 @@ const Api = {
     }
     try {
       const marker = "__SRX_APP_CONFIG__";
+      // 单个 awk 进程一次读完所有配置。早先逐文件 `cat` 的有 56 次 fork，
+      // 实测 1.9s 以上（输出只有 18KB），改成一条命令后降到 0.1~0.2s。
       const out = await this.exec(
-        "mkdir -p " +
-          shellQuote(APPS_DIR) +
-          "; " +
-          "for f in " +
-          shellQuote(APPS_DIR) +
-          "/*.json; do " +
-          '[ -f "$f" ] || continue; b="${f##*/}"; p="${b%.json}"; ' +
-          'printf "\\n' +
+        'awk \'FILENAME != prev { prev = FILENAME; n = FILENAME; sub(/.*\\//, "", n); ' +
+          'sub(/\\.json$/, "", n); printf "\\n' +
           marker +
-          '%s\\n" "$p"; cat "$f"; printf "\\n"; done 2>/dev/null',
+          "%s\\n\", n } { print }' " +
+          shellQuote(APPS_DIR) +
+          "/*.json 2>/dev/null",
       );
       const items = [];
       const lines = String(out || "").split("\n");
@@ -1885,7 +1927,9 @@ const Api = {
   /** 获取已安装应用列表（用户应用与系统应用） */
   async getInstalledApps(userId) {
     const safeUser = isSafeUserId(userId) ? String(userId) : "";
-    const fromKsu = this.getInstalledAppsFromKsu();
+    // KSU 的包列表接口没有用户维度，只反映当前进程视角，因此仅对主用户可用；
+    // 其它用户必须走可按用户查询的 dex/pm 通道，否则切换用户后列表不会变化。
+    const fromKsu = !safeUser || safeUser === "0" ? this.getInstalledAppsFromKsu() : [];
     if (fromKsu.length) return fromKsu;
     const fromDex = await this.getInstalledAppsFromDex(safeUser);
     if (fromDex.length) return fromDex;
@@ -1895,15 +1939,39 @@ const Api = {
   async getInstalledAppsFromPackageManager(userId) {
     const safeUser = isSafeUserId(userId) ? String(userId) : "";
     const userArg = safeUser ? " --user " + safeUser : "";
+    // 标记必须加引号：裸写 `#srx-system` 会被 sh 当成注释，连带吃掉后面的 `-s` 查询，
+    // 系统应用集合就会静默变成空集，界面只能退化成按包名前缀猜。
+    const marker = 'echo "srx-system-section"';
     const commands = [
-      "pm list packages -f" + userArg + " 2>/dev/null",
-      "cmd package list packages -f" + userArg + " 2>/dev/null",
+      "pm list packages -f -U" +
+        userArg +
+        " 2>/dev/null; " +
+        marker +
+        "; pm list packages -s" +
+        userArg +
+        " 2>/dev/null",
+      "cmd package list packages -f -U" +
+        userArg +
+        " 2>/dev/null; " +
+        marker +
+        "; cmd package list packages -s" +
+        userArg +
+        " 2>/dev/null",
     ];
     for (const command of commands) {
       try {
-        const out = await this.exec(command + ' | sed "s/package://" | awk -F= "{print \$2}"');
-        const packages = out.split("\n").filter(Boolean).filter(isSafePackageName);
-        if (packages.length) return packages;
+        const listing = parseUserPackageListing(await this.exec(command), "srx-system-section");
+        if (!listing.packages.length) continue;
+        // 把系统标记写进包信息缓存：列表分桶直接用该用户视角的真实结果。
+        listing.packages.forEach((pkg) => {
+          const prev = this._packageInfo.get(pkg) || {};
+          this._packageInfo.set(pkg, {
+            ...prev,
+            packageName: pkg,
+            isSystem: listing.system.has(pkg),
+          });
+        });
+        return listing.packages;
       } catch {}
     }
     return [];

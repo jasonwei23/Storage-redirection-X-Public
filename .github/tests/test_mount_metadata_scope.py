@@ -141,20 +141,38 @@ class MountMetadataScopeTest(unittest.TestCase):
         # 属主已正确时必须在 chown/chmod 之前直接返回，跳过整段元数据修正。
         self.assertIn("return true", body[keep_index:chmod_index])
 
-    def test_scoped_fuse_start_isolates_single_root_failure(self) -> None:
-        # 单根启动失败后以存储根会话恢复规则覆盖；daemon 与 companion 行为保持一致。
-        # 根会话重试同样失败时才交给 namespace 回退与能力失败记账。
-        # 启动编排已下沉到 fuse_session 共享模块（按根启动函数经闭包注入），
-        # 因此隔离不变量锚定共享实现，两侧只断言走共享入口。
-        body = function_body(read("src/fuse_session.rs"), "fn start_scoped_fuse_services(")
-        self.assertIn("failed_roots", body)
-        self.assertIn("storage_root", body)
-        self.assertIn("collapsed to storage root", body)
-        # 全部根都失败时仍要返回 None，保住"FUSE 整体不可用"的降级记账语义。
-        self.assertIn("states.is_empty()", body)
+    def test_scoped_fuse_sessions_are_retired(self) -> None:
+        # per-app scoped FUSE 会话已退役：它是应用命名空间的自持引用，应用退出后仍在
+        # 服务自己的挂载、永远等不到退出条件（issue #4：单机累积 1198 个常驻会话）。
+        # 契约改为「只接共享宿主」：任一根本地 fork 出常驻会话都算回归。
+        session = read("src/fuse_session.rs")
+        self.assertNotIn("fn start_scoped_fuse_services(", session)
+        self.assertNotIn("libc::fork()", session)
+        # 不可用原因集中定义在共享模块，供两侧与日志共用同一套取值。
+        for reason in (
+            "NoSharedHost",
+            "AttachGateClosed",
+            "PolicyRegistrationFailed",
+            "NoPolicyRules",
+            "AttachFailed",
+        ):
+            self.assertIn(reason, session)
         for path in ("src/daemon_mount.rs", "src/lifecycle/companion_mount.rs"):
-            wrapper = function_body(read(path), "fn start_scoped_fuse_services(")
-            self.assertIn("crate::fuse_session::start_scoped_fuse_services(", wrapper, path)
+            source = read(path)
+            # 只允许一个接入点：接入在挂载前完成，规划阶段一律 bind。事后再接会在已 bind
+            # 的目标上叠一层 FUSE，清理时按路径只能摘栈顶，底层 bind 残留成永久叠挂。
+            self.assertEqual(
+                source.count("fn preattach_shared_host("),
+                1,
+                f"{path} 只能有一个宿主接入点",
+            )
+            self.assertNotIn("attach_shared_host_sessions", source, path)
+            # 已由当前宿主层服务的视图根也要按宿主挂载记账，否则状态文件缺这条目标、
+            # 下一轮清理会漏摘，挂载层失去归属判据。
+            self.assertIn("crate::fuse_session::storage_view_top_source(", source, path)
+            self.assertIn("host_session: Some((view.child_pid, view.child_start_time_ticks))", source, path)
+            # 两条挂载路径都不得再 fork per-app 会话。
+            self.assertNotIn("srx_fuse\\0", source, path)
 
     def test_scoped_fuse_budget_preserves_dynamic_rules(self) -> None:
         # 多会话预算只控制进程/内存开销，预算超限必须折叠为单个存储根 FUSE 会话，

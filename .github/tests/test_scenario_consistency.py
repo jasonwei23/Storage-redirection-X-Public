@@ -186,7 +186,7 @@ class ScenarioConsistencyTest(unittest.TestCase):
         backend = section(
             policy,
             "fn real_backend_root_for_storage_rel(",
-            "/// MediaProvider FUSE 视图根",
+            "/// 自有 media sqlite `-shm` 是否必须走宿主用户态通道",
         )
         # 自有 Android 私有目录必须从首次创建起固定使用真实存储根，不能按数据库族
         # 是否存在或 MediaProvider 视图状态在真实根与其它后端之间切换。
@@ -197,8 +197,83 @@ class ScenarioConsistencyTest(unittest.TestCase):
 
         decision = section(policy, "fn backend_decision(", "fn matches_any(")
         # 用户显式映射仍由路径映射分支优先处理，自有目录的默认行为才是 Real。
-        self.assertIn("self.resolve_mapping(storage_path).is_some()", decision)
+        # 映射解析在函数入口只做一次（路由热路径去重），其命中结果以 mapping_hit
+        # 参与 Real 分支判定，语义与逐处内联 resolve_mapping(...).is_some() 等价。
+        self.assertIn("let own_mapping_target = self.resolve_mapping(storage_path);", decision)
+        self.assertIn("own_mapping_target.is_some()", decision)
+        self.assertIn("|| mapping_hit", decision)
         self.assertIn("self.is_own_private_storage_path(storage_path)", decision)
+
+    def test_media_view_never_outlives_the_deletion(self) -> None:
+        # 宿主对 MediaProvider 视图的唯一用途是「毒化 -shm 自愈时经 MP 删一遍文件」。
+        # 历史实现把它做成宿主命名空间里的长期绑定，由此生出两个根问题：①MP 重启 /
+        # `vold volume abort_fuse` 后宿主命名空间（建会话时已 MS_REC|MS_PRIVATE）收不到
+        # 新挂载，克隆永远停在旧连接上；②旧连接是「挂载记录还在、无人应答」形态，任何经
+        # 它的 syscall 会无限期挂在 FUSE 队列里——而这条路径在 FUSE LOOKUP 回调中，
+        # 挂住一个就是永久失去一个 worker。所以视图必须是**一次性**的：每次自愈现克隆、
+        # 用完随子进程命名空间一起消失；并且调用方必须有界等待。
+        media_view = read("src/fuse_redirect/media_view.rs")
+        self.assertIn("pub(crate) fn unlink_relative(", media_view)
+        # 一次性：进 init 命名空间（唯一保证是当前一代）→ 私有副本 → 克隆 → 删除。
+        self.assertIn('c"/proc/1/ns/mnt"', media_view)
+        self.assertIn("libc::unshare(libc::CLONE_NEWNS)", media_view)
+        self.assertIn("libc::SYS_open_tree", media_view)
+        self.assertIn("libc::SYS_move_mount", media_view)
+        # 有界：等内核事件（pidfd + poll，缺失时 SIGCHLD + sigtimedwait），不是定时轮询；
+        # 超时必须 SIGKILL。等待机制是可替换的实现细节，不能变成「没有 pidfd 就停用视图」
+        # 这类功能开关——视图删除是毒化 -shm 自愈唯一无副作用的路径。
+        self.assertIn("libc::SYS_pidfd_open", media_view)
+        self.assertIn("libc::poll(", media_view)
+        self.assertIn("libc::sigtimedwait(", media_view)
+        self.assertIn("libc::SIGKILL", media_view)
+        # 不得退化成定时轮询子进程状态：`sleep` 循环既缩短不了等待，又会在连接停摆时把
+        # 宿主线程拖成轮询机。（`WNOHANG` 允许出现，但只作为一次非阻塞状态复查。）
+        self.assertNotIn("thread::sleep", media_view)
+        self.assertNotIn("std::time::Duration", media_view)
+        self.assertIn("fn pidfd_available()", media_view)
+        # 不得再出现「整会话失效标记」这类长生命周期状态：视图按次重建即是自愈，
+        # 一旦留下会话级毒化标记，MP 恢复后本代宿主再也用不上视图。
+        self.assertNotIn("VIEW_UNUSABLE", media_view)
+        self.assertNotIn("is_usable", media_view)
+
+        # 子进程泄漏面必须被结构钉死：宿主的直接子进程只能是「监督进程」（不接触任何
+        # FUSE，必在有限时间内退出），worker 由它收尸、放弃时被 init 收养——僵尸不会
+        # 跨父进程存活，也就不会在宿主名下按失败次数累积。
+        self.assertIn("fn supervise_worker(", media_view)
+        self.assertIn("fn child_view_unlink(", media_view)
+        supervisor = section(media_view, "fn supervise_worker(", "/// 读回监督进程的结论")
+        self.assertIn("libc::fork()", supervisor)
+        self.assertNotIn("SYS_open_tree", supervisor)
+        self.assertNotIn("libc::setns", supervisor)
+        # 残留进程台账：没离开进程表之前不再起新的 worker，泄漏上界钉成 1。
+        self.assertIn("PENDING_CHILD_PID", media_view)
+        self.assertIn("INFLIGHT", media_view)
+        pending = section(media_view, "fn pending_child_alive(", "/// 经 MediaProvider 视图删除")
+        self.assertIn("PENDING_CHILD_PID.load", pending)
+        self.assertIn("/proc/{pid}", pending)
+        # 任何失败都要进冷却（含起不了子进程），否则毒化反复命中会打成 fork 风暴。
+        self.assertIn("enter_fail_cooldown();", section(media_view, "ChildOutcome::Failed => {", "}\n    }\n}"))
+
+        # 长生命周期绑定必须整条移除：策略里不再缓存视图根，宿主模块不再有绑定函数，
+        # 登记路径也不再做绑定准备（否则又会在调用方进程内阻塞）。
+        policy = read("src/fuse_redirect/policy.rs")
+        self.assertNotIn("media_sqlite_real_root", policy)
+        self.assertNotIn("media_sqlite_view_root", policy)
+        host = read_fuse_host_module()
+        self.assertNotIn("ensure_host_media_fuse_view", host)
+        self.assertNotIn("FUSE_HOST_MEDIA_VIEW_DIR.join", policy)
+
+        callbacks = read("src/fuse_redirect/callbacks.rs")
+        self.assertIn("super::media_view::unlink_relative(user_id, rel)", callbacks)
+        heal = section(
+            callbacks,
+            "fn heal_poisoned_sqlite_shm_backend(",
+            "fn sqlite_sidecar_wal_path(",
+        )
+        # 视图侧删除不得在回调里直接 unlinkat（那条路径等不起停摆的连接）；f2fs 直删
+        # 兜底保留，它是毒化数据消失的最终保证。
+        self.assertNotIn("c_view", heal)
+        self.assertIn("libc::SYS_unlinkat", heal)
 
     def test_monitor_only_heals_cross_owner_sqlite_sidecars(self) -> None:
         policy = read("src/fuse_redirect/policy.rs")
@@ -258,7 +333,12 @@ class ScenarioConsistencyTest(unittest.TestCase):
                 source.index("apply_sdcard_redirect(", source.index("preattach_shared_host(")),
                 f"{label} 必须先接入共享宿主再执行 namespace 重定向",
             )
-            self.assertIn("preattached_host.is_some()", source)
+            # 接入点唯一且返回 Result：Ok(Some(挂载)) 表示本次新建、Ok(None) 表示视图根
+            # 已由既有层服务、Err(原因) 表示本轮按 bind 继续。
+            self.assertIn("match preattached_host {", source)
+            self.assertIn("Ok(state) => (vec![state], ScopedMountAttempt::Ready", source)
+            # 已服务判定必须只认**当前**宿主会话：旧代际的层已经失效，仍需重新挂。
+            self.assertIn("Some(view.mount_source.as_str())", source)
             monitor_only = source.index("else if request.is_monitor_only")
             redirect = source.index("apply_sdcard_redirect(", source.index("preattach_shared_host("))
             self.assertLess(monitor_only, redirect, label)
@@ -852,8 +932,10 @@ class ScenarioConsistencyTest(unittest.TestCase):
         self.assertIn('"srx_fuse_host"', config)
         self.assertIn("if !crate::fuse_host::ensure_global()", daemon)
         self.assertIn("crate::fuse_host::ensure_global()", daemon)
-        self.assertIn("scoped path remains active", daemon)
-        # B2-a 不能改变现有应用 scoped 挂载路径；host 只是新增基础设施。
+        # 宿主不可用时应用照常拿到 namespace bind 视图（scoped 会话已退役）。
+        self.assertIn("namespace bind remains active", daemon)
+        # scoped 会话退役后，`srx_fuse_redirect` 前缀仍必须保留：它用于识别并清理旧版本
+        # 遗留的 scoped 挂载层，删掉会让历史死层失去归属判据。
         self.assertIn('"srx_fuse_redirect"', config)
 
     def test_shared_fuse_host_registers_app_policy_before_attach(self) -> None:
@@ -864,7 +946,12 @@ class ScenarioConsistencyTest(unittest.TestCase):
         # 3) 闸门本身仍然存在——打开接入必须是一次有意的改动（默认由环境变量关闭）。
         for path in ("src/daemon_mount.rs", "src/lifecycle/companion_mount.rs"):
             source = read(path)
-            body = section(source, "fn start_fuse_service_for_root", "let mut ready_sockets")
+            end_marker = (
+                "fn preattach_skip_reason("
+                if path.endswith("daemon_mount.rs")
+                else "fn shared_host_preattach_candidate("
+            )
+            body = section(source, "fn preattach_shared_host(", end_marker)
             compact = "".join(body.split())
             if path.endswith("daemon_mount.rs"):
                 register_at = body.index("crate::fuse_host::register_app_policy(")
@@ -917,6 +1004,125 @@ class ScenarioConsistencyTest(unittest.TestCase):
             config,
         )
 
+    def test_cursor_row_action_is_single_entry_and_plan_gated(self) -> None:
+        # 行循环此前每行跨 JNI 三到六次（改写 + 隐藏 + 两次存在性），并在每行跑一遍
+        # 完整策略路由；原生 MediaProvider 的行循环不做任何判定。这里钉死「整行判定
+        # 收敛为一次调用」，且「整库同判」只在没有任何规则与映射时才允许成立：
+        # 1) Java 行循环只调 cursorRowAction，原生侧同签名注册（名字/签名错会整批失败）；
+        # 2) 计划的准入条件必须同时包含「无路径规则」与「无映射」；
+        # 3) 私有根与点开头的名字不得走同判（它们有独立视图/例外分支）；
+        # 4) 详细日志下保留差分校验，用旧序列证明新入口等价。
+        java = read("java_src/org/srx/hook/Hooker.java")
+        self.assertIn(
+            "private static native String cursorRowAction(",
+            java,
+        )
+        self.assertIn("cursorRowAction(path, callerUid, allowMissingMappedTarget)", java)
+        self.assertIn("verifyCursorRowAction(", java)
+        self.assertIn("cursor row action mismatch path=", java)
+        native = read("src/java_hook/hooker_class.rs")
+        self.assertIn(
+            'b"cursorRowAction' + chr(92) + '0"',
+            native,
+        )
+        self.assertIn("(Ljava/lang/String;IZ)Ljava/lang/String;", native)
+        self.assertIn("crate::hook::cursor_row_action(&original, caller_uid, allow_missing)", native)
+        rewrite = read("src/hook/jni_query/rewrite.rs")
+        self.assertIn("pub(crate) fn cursor_row_action(", rewrite)
+        self.assertIn("writer::caller_has_no_path_rules(caller_package, caller_uid)", rewrite)
+        self.assertIn("writer::get_caller_mappings(caller_package, caller_uid).is_empty()", rewrite)
+        self.assertIn('path_text.contains("/Android/data/")', rewrite)
+        self.assertIn("name.starts_with('.')", rewrite)
+        # 退回完整判定时必须仍走原序列（改写 → 隐藏 → 原始存在性 → 改写目标存在性）。
+        legacy = section(rewrite, "fn legacy_row_action(", "fn storage_path_exists_for_caller(")
+        self.assertIn("rewrite_cursor_storage_path_for_caller(original_text", legacy)
+        self.assertIn("should_hide_cursor_storage_path_for_caller(original_text", legacy)
+        self.assertIn("storage_path_exists_for_caller(path_text", legacy)
+        self.assertIn("is_mapping_view_rewrite(path_text", legacy)
+        writer = read("src/redirect/writer.rs")
+        self.assertIn("pub fn caller_has_no_path_rules(", writer)
+        for field in (
+            "allowed_real_paths",
+            "excluded_real_paths",
+            "sandboxed_paths",
+            "read_only_paths",
+            "read_only_excluded_paths",
+        ):
+            self.assertIn(field + ".is_empty()", writer)
+
+    def test_cursor_row_existence_folds_by_directory(self) -> None:
+        # MediaStore 行循环的存在性判定必须按父目录折叠枚举：逐行 faccessat 的 FUSE
+        # 往返是 issue #7 冷启动相册首屏的主成本（实测单次约 250µs）。这里钉死三件事，
+        # 任一条丢失都会让优化悄悄退回逐行系统调用：
+        # 1) Java 行循环用的是行级入口，不是逐条 syscall 入口；
+        # 2) 原生侧该入口存在且已注册（名字/签名错会在 RegisterNatives 时整批失败）；
+        # 3) 折叠只按「父目录 + 名字」，目录不可枚举时必须退回逐条判定。
+        java = read("java_src/org/srx/hook/Hooker.java")
+        self.assertIn("private static native boolean pathExistsForCursorRow(String path);", java)
+        self.assertIn("if (pathExistsForCursorRow(path)) return true;", java)
+        native = read("src/java_hook/hooker_class.rs")
+        self.assertIn('b"pathExistsForCursorRow' + chr(92) + '0"', native)
+        self.assertIn("(Ljava/lang/String;)Z", native)
+        self.assertIn("crate::hook::path_exists_for_cursor_row(&path_text)", native)
+        snapshot = read("src/hook/jni_query/dir_snapshot.rs")
+        self.assertIn("libc::SYS_getdents64", snapshot)
+        self.assertIn("libc::X_OK", snapshot)
+        # 不可枚举必须退回逐条判定，不能把失败态当成「不存在」。
+        self.assertIn("DirState::Unlisted => return path_exists_by_syscall", snapshot)
+        self.assertIn("names.contains(name)", snapshot)
+        # 按代价切换：小分页逐条查、整库查询才枚举，避免枚举大目录反噬小分页。
+        self.assertIn("DIR_ENUMERATE_AFTER_ROWS", snapshot)
+        self.assertIn("Observation::Enumerate", snapshot)
+        rewrite = read("src/hook/jni_query/rewrite.rs")
+        compact = "".join(rewrite.split())
+        self.assertIn("use super::dir_snapshot::path_exists_for_cursor_row as row_path_exists;", rewrite)
+        self.assertIn("row_path_exists(&fallback_path)", compact)
+        self.assertIn("row_path_exists(path_text)", compact)
+
+    def test_host_namespace_policy_registered_ahead_of_uid_idempotency(self) -> None:
+        # namespace 策略按 ns inode 绑定，而按 uid 的幂等指纹刻意不含应用 pid：应用重启后
+        # namespace 换代但指纹仍然命中，跳过路径会让新 namespace 永久缺席，该 namespace
+        # 里的 root 调用方（挂载子进程、MediaProvider 的 root 线程）请求随之落进
+        # deny_all，表现为整片 ENOENT——自有私有目录恢复窗口的失败正是这个形态。
+        # 这里钉死「补登早于按 uid 的幂等判断」，并锁定它只写 namespace 表。
+        daemon_src = read_daemon_mount_module()
+        pre_register = section(
+            daemon_src, "pub(crate) fn pre_register_host_policy(", "fn write_mount_state("
+        )
+        compact = "".join(pre_register.split())
+        self.assertIn("register_app_namespace_ahead(request);", compact)
+        self.assertLess(
+            compact.index("register_app_namespace_ahead(request);"),
+            compact.index("PreRegisterOutcome::AlreadyRegistered"),
+            "命名空间补登必须先于按 uid 的幂等跳过",
+        )
+        self.assertIn("register_app_namespace_only(", daemon_src)
+        self.assertIn("REGISTERED_APP_NAMESPACES", daemon_src)
+        control = read("src/fuse_host_control.rs")
+        self.assertIn("pub fn register_app_namespace_only(", control)
+        self.assertIn("config.namespace_policy_only = true;", control)
+        # 只写 namespace 表时不得更新宿主快照：否则 companion 会在 uid 表仍为空时接入。
+        namespace_only = section(
+            control,
+            "pub fn register_app_namespace_only(",
+            "/// 把 daemon 自身的 mount namespace",
+        )
+        self.assertNotIn("record_registered_policy(", namespace_only)
+
+
+    def test_write_parent_walk_stops_when_repair_disabled(self) -> None:
+        # 写打开的父链治理此前对每一级都 fstatat + 可能的 chmod/chown，即使父目录已存在；
+        # 原生写路径只创建缺失目录，不回头治理已存在的父级。元数据修复关闭时上溯是纯开销，
+        # 这里钉死「父目录存在且修复关闭 → 立即返回」，避免以后又被改成逐级治理。
+        runtime = read("src/hook/runtime.rs")
+        body = section(runtime, "fn create_parent_dirs_recursive_until(", "fn process_redirect_path_for_runtime(")
+        self.assertIn("if !crate::metadata_repair::enabled() {", body)
+        self.assertLess(
+            body.index("if !crate::metadata_repair::enabled() {"),
+            body.index("normalize_redirect_dir_metadata(&parent, mode, owner)"),
+            "修复关闭时必须先返回，不能继续逐级归一",
+        )
+
     def test_shared_fuse_host_attach_contract(self) -> None:
         # 应用接入共享宿主会话的四条硬约束，任一条被放宽都会让应用静默失去重定向或让
         # 清理流程误伤其它应用：
@@ -942,9 +1148,21 @@ class ScenarioConsistencyTest(unittest.TestCase):
         self.assertIn("if!host_attach_enabled(){", gate)
         # 开关方向必须与目标形态一致：只有显式写成关闭取值才关闭，未设置即接入。
         switch = section(host, "fn host_attach_enabled() -> bool", "/// 共享宿主会话当前")
-        self.assertIn('"0"|"false"|"no"|"off"', "".join(switch.split()))
-        self.assertIn("!disabled", switch)
-        self.assertNotIn('"1"|"true"|"yes"', "".join(switch.split()))
+        compact_switch = "".join(switch.split())
+        self.assertIn('"0"|"false"|"no"|"off"', compact_switch)
+        self.assertIn("!disabled", compact_switch)
+        self.assertNotIn('"1"|"true"|"yes"', compact_switch)
+        # 开关必须覆盖宿主的**全部**使用路径，而不只是应用接入：宿主会话建立与外部
+        # abort 兜底监控只要漏掉一处，「关闭接入」就变成假关闭——宿主照样建立、照样
+        # 换代，每次换代仍会给已附着命名空间留下死挂载层，设备侧用它做 A/B 归因时
+        # 看到的现象与开启时没有差别。
+        self.assertIn("HOST_ATTACH_DISABLE_FILE", compact_switch)
+        ensure = section(host, "pub fn ensure_global() -> bool", "/// 等待宿主会话就绪的预算")
+        self.assertIn("if!host_attach_enabled(){", "".join(ensure.split()))
+        monitor = section(
+            host, "pub fn spawn_external_abort_monitor()", "fn external_abort_monitor_main("
+        )
+        self.assertIn("if!host_attach_enabled(){", "".join(monitor.split()))
         self.assertIn(
             "paths::normalize_syntax(mount_root)==paths::normalize_syntax(&view_root)", gate
         )
@@ -975,9 +1193,10 @@ class ScenarioConsistencyTest(unittest.TestCase):
 
         # 登记必须有应答：只按 `send` 是否成功判断，会让应用在策略尚未进宿主会话时接入，
         # 结果是整片 ENOENT（未登记即拒绝）。应答带 uid，因为控制通道被所有挂载 worker 共用；
-        # 等待受 ack 预算约束（按父进程 deadline 派生的 ack_remaining_ms），不无界阻塞。
+        # 等待受 ack 预算约束（全额用于应答等待：登记不再做任何挂载/视图绑定准备，
+        # 因此没有需要先从预算里扣除的前置耗时），不无界阻塞。
         self.assertIn("fn await_policy_ack(", host)
-        self.assertIn("await_policy_ack(fd, config.uid, ack_remaining_ms)", host)
+        self.assertIn("await_policy_ack(fd, config.uid, ack_budget_ms)", host)
         ack = section(host, "fn await_policy_ack(", "/// 把某个应用的策略登记到共享宿主会话")
         self.assertIn("if ack_uid != uid {", ack)
 
@@ -1014,7 +1233,7 @@ class ScenarioConsistencyTest(unittest.TestCase):
         self.assertIn("request.policy_fingerprint", pre_register)
         self.assertIn("view.policy_fingerprints.get(&(request.uid as u32))", pre_register)
         collapse = section(
-            daemon_src, "fn scoped_fuse_mount_roots(", "fn start_fuse_service_for_root("
+            daemon_src, "fn scoped_fuse_mount_roots(", "fn try_bind_to_fuse_host("
         )
         self.assertIn("crate::fuse_host::wait_for_host_session()", collapse)
         self.assertIn("crate::config::StorageBackendMode::Auto", collapse)
@@ -1800,13 +2019,19 @@ class ScenarioConsistencyTest(unittest.TestCase):
         source = read("src/java_hook/hot_reload.rs")
         java_hook = read("src/java_hook.rs")
         specialize_post = read("src/lifecycle/specialize_post.rs")
+        module_paths = read("src/platform/module_paths.rs")
+        log_daemon = read("src/log_daemon.rs")
         srxctl = read("assets/zygisk_module/bin/srxctl")
         webui = read("assets/zygisk_module/webroot/js/api.js")
         self.assertIn("MEDIA_PROVIDER_HOT_RELOAD_REQUEST_FILE", source)
-        self.assertIn("MEDIA_PROVIDER_HOT_RELOAD_ACK_FILE", source)
-        self.assertIn("stage=hot_reload_ok", source)
+        # 回执文件由 daemon 代写：MP 域对模块目录无写权限，MP 侧只发 HotReload 标签。
+        self.assertIn("MEDIA_PROVIDER_HOT_RELOAD_ACK_FILE", module_paths)
+        self.assertIn("MEDIA_PROVIDER_HOT_RELOAD_ACK_FILE", log_daemon)
+        self.assertIn("stage=hot_reload_ok", log_daemon)
         self.assertIn("SIGUSR2", source)
-        self.assertIn("SIGNAL_PENDING", source)
+        # 唤醒走自管道：信号处理器只 write 一个字节，监视线程 poll 等待。
+        self.assertIn("SIGNAL_PIPE_WRITE_FD", source)
+        self.assertIn("drain_signal_pipe", source)
         self.assertIn("hot_reload_completed_count", srxctl)
         self.assertIn('boot_id=$boot_id"', srxctl)
         self.assertIn("stage=hot_reload_ok", srxctl)
@@ -2474,7 +2699,9 @@ class ScenarioConsistencyTest(unittest.TestCase):
         统一可检索标记而不是自由文本；自行预置夹具的场景必须显式豁免，否则断言会误报。
         """
         helper = section(self.bash, "assert_fixture_roots_empty() {", "\nclean_results() {")
-        self.assertIn("-type f || exit 1", helper)
+        # find 的失败必须传播（`|| exit 1`），并且输出字段供残留对照；不得用 -maxdepth 收窄。
+        self.assertIn("-type f -printf", helper)
+        self.assertIn("|| exit 1", helper)
         self.assertNotIn("-maxdepth 2", helper)
         self.assertIn("fixture_scan_failed", helper)
         self.assertIn("fixture_residue label=", helper)
@@ -2488,7 +2715,9 @@ class ScenarioConsistencyTest(unittest.TestCase):
 
         ps = section(self.powershell, "function Assert-FixtureRootsEmpty", "function Clear-Targets")
         self.assertIn("fixture_residue label=", ps)
-        self.assertIn("-type f || exit 1", ps)
+        # 与 SH 同口径：带输出字段的 find，且失败必须传播。
+        self.assertIn("-type f -printf", ps)
+        self.assertIn("|| exit 1", ps)
         self.assertNotIn("-maxdepth 2", ps)
         self.assertIn("fixture_scan_failed", ps)
         ps_runner = section(self.powershell, "function Invoke-Scenario {", "\n    $scenarioOk = switch")

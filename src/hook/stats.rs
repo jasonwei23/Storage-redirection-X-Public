@@ -59,6 +59,7 @@ pub struct InterceptHub {
     is_fuse_fix_only: AtomicBool,
     is_boot_lite: AtomicBool,
     is_app_write_only: AtomicBool,
+    is_redirect_via_hook: AtomicBool,
     is_monitor_only: AtomicBool,
     is_monitor_enabled: AtomicBool,
     is_app_redirect_owner: AtomicBool,
@@ -245,6 +246,16 @@ impl InterceptHub {
         self.is_app_write_only.load(Ordering::Relaxed)
     }
 
+    /// 本进程的重定向是否由进程内 hook 承担（系统代写 / app redirect hook）。
+    /// mount/FUSE 后端为 false；此时写类 hook 才需要改写目标路径。
+    pub fn set_redirect_via_hook(&self, enabled: bool) {
+        self.is_redirect_via_hook.store(enabled, Ordering::Relaxed);
+    }
+
+    pub fn is_redirect_via_hook(&self) -> bool {
+        self.is_redirect_via_hook.load(Ordering::Relaxed)
+    }
+
     pub fn refresh_monitor_runtime_config(&self) {
         let package_name = self.get_package_name();
         if package_name.is_empty() {
@@ -315,6 +326,22 @@ impl InterceptHub {
         context::get_current_caller_uid()
     }
 
+    /// 监视记录专用：CALLER_UID 未设置时回退当前 fsuid（见
+    /// `context::get_effective_caller_uid_for_monitor`）。禁止用于重定向判定。
+    pub fn get_effective_caller_uid_for_monitor(&self) -> i32 {
+        context::get_effective_caller_uid_for_monitor()
+    }
+
+    /// 记录用调用方 uid 与"是否来自跨线程证据"（见 `context::record_caller_uid`）。
+    /// 仅在写监视记录时使用；归因线索与重定向判定仍走上一行的原函数。
+    pub fn record_caller_uid(&self) -> (i32, bool) {
+        context::record_caller_uid()
+    }
+
+    pub fn record_caller_pid(&self, cross_thread: bool) -> i32 {
+        context::record_caller_pid(cross_thread)
+    }
+
     pub fn set_current_caller_from_mapping_request_owner(
         &self,
         caller_package: &str,
@@ -376,7 +403,10 @@ impl InterceptHub {
             }
         }
 
-        let is_system_writer = self.with_package_name(policy::is_system_writer_package);
+        let is_system_writer = self.with_package_name(|package_name| {
+            policy::is_system_writer_package(package_name)
+                || policy::is_legacy_writer_process_name(package_name)
+        });
         let (active_profiles, profile_name) = select_hook_profile(
             is_system_writer,
             self.is_monitor_only(),
@@ -737,6 +767,7 @@ static INTERCEPT_HUB: InterceptHub = InterceptHub {
     is_fuse_fix_only: AtomicBool::new(false),
     is_boot_lite: AtomicBool::new(false),
     is_app_write_only: AtomicBool::new(false),
+    is_redirect_via_hook: AtomicBool::new(false),
     is_monitor_only: AtomicBool::new(false),
     is_monitor_enabled: AtomicBool::new(false),
     is_app_redirect_owner: AtomicBool::new(false),

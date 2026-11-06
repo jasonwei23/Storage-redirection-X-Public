@@ -12,10 +12,8 @@ const LOGCAT_OP_TAG: &str = "FileMonitorOp";
 const ANDROID_APP_UID_START: i32 = 10000;
 const MEDIA_RW_UID: u32 = 1023;
 const MEDIA_RW_GID: u32 = 1023;
-const REAL_PUBLIC_DIR_MODE: mode_t = 0o2771;
-const REDIRECT_BACKEND_DIR_REQUIRED_MODE: mode_t = 0o2773;
-const PRIVATE_CHILD_DIR_REQUIRED_MODE: mode_t = 0o2751;
-const PRIVATE_CHILD_FILE_REQUIRED_MODE: mode_t = 0o664;
+// 目录模式只在 `platform::fs` 定义一次，避免与挂载侧副本各自漂移。
+use crate::platform::fs::REAL_PUBLIC_DIR_MODE;
 
 pub(super) struct MonitorIdentity {
     pub(super) package_name: String,
@@ -146,6 +144,16 @@ pub(super) fn emit_monitor_event(
     } else {
         "CREATE"
     };
+    // 短窗去重：同一物理写入会被多条 watch 链路（映射源 watch 与公共根 watch）
+    // 各上报一条观察记录，backend 相同、from 不同；窗口内只保留首条。
+    if crate::platform::paths::should_suppress_duplicate_monitor_record(
+        "observation",
+        event_kind,
+        &paths.backend_path,
+        identity.package_name.as_str(),
+    ) {
+        return;
+    }
     let mut line = format!(
         "{}|{}|{}|{}|{}|ret=0|errno=0|identify_method={}|identify_reliability={}|event_role=observation|op={}|source={}|mask=0x{:x}|backend={}",
         build_timestamp(),
@@ -244,7 +252,7 @@ fn resolve_recent_path_caller_identity(
             "provider_open" | "provider_mkdir" | "saf_provider"
         )
         || identity.package_name.is_empty()
-        || policy::is_media_intermediate_package(&identity.package_name)
+        || policy::is_attribution_intermediate_package(&identity.package_name)
         || policy::is_system_writer_package(&identity.package_name)
     {
         return None;
@@ -330,7 +338,7 @@ fn should_keep_system_intermediate_owner_identity(
     ) && identity.package_name != watch_package_name
         && matches!(identity.identify_method, "owner_uid" | "path_owner")
         && !policy::is_media_provider_package(&identity.package_name)
-        && policy::is_media_intermediate_package(&identity.package_name)
+        && policy::is_attribution_intermediate_package(&identity.package_name)
 }
 
 pub(super) fn should_prefer_watch_package_for_system_writer_owner(
@@ -339,7 +347,7 @@ pub(super) fn should_prefer_watch_package_for_system_writer_owner(
 ) -> bool {
     matches!(source, "path_mapping" | "sandbox_path" | "redirect_root")
         && (policy::is_system_writer_package(owner_package)
-            || policy::is_media_intermediate_package(owner_package))
+            || policy::is_attribution_intermediate_package(owner_package))
 }
 
 pub(super) fn repair_monitored_backend_owner(

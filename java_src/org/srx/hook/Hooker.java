@@ -806,12 +806,6 @@ public class Hooker {
     }
   }
 
-  private static String publicMediaStorePath(String path, int callerUid) {
-    if (path == null || path.length() == 0) return null;
-    if (path.startsWith("/storage/emulated/")) return path;
-    return mediaStoreDisplayPath(path, callerUid);
-  }
-
   private static String mediaStoreRelativePath(String path) {
     if (path == null || !path.startsWith("/storage/emulated/")) return null;
     int rootEnd = path.indexOf('/', "/storage/emulated/".length());
@@ -2003,6 +1997,12 @@ public class Hooker {
 
   private static native boolean storagePathExistsBySyscall(String path);
 
+  /** 游标行存在性判定：按父目录折叠枚举，逐行只查名字；只供行循环使用。 */
+  private static native boolean pathExistsForCursorRow(String path);
+
+  /** 整行判定：null 保留原路径，空串隐藏，其余为改写后的路径。 */
+  private static native String cursorRowAction(String path, int callerUid, boolean allowMissing);
+
   private static native boolean isProviderVirtualPathVisible(String path);
 
   private static native void rememberProviderRedirectSourceDirectory(
@@ -2252,10 +2252,6 @@ public class Hooker {
 
   private static int intArg(Object value, int fallback) {
     return value instanceof Integer ? ((Integer) value).intValue() : fallback;
-  }
-
-  private static boolean booleanArg(Object value, boolean fallback) {
-    return value instanceof Boolean ? ((Boolean) value).booleanValue() : fallback;
   }
 
   private static boolean shouldAllowFuseFileOpen(FuseFileOpenRequest request) {
@@ -2996,22 +2992,6 @@ public class Hooker {
     } catch (Throwable ignored) {
       return fieldValue(activityThread, "mInitialApplication");
     }
-  }
-
-  private static boolean isIntermediateAttributionPackage(String value) {
-    if (value == null || value.length() == 0) return true;
-    String name = value.toLowerCase(Locale.ROOT);
-    return name.equals("com.android.providers.media")
-        || name.equals("com.android.providers.media.module")
-        || name.equals("com.google.android.providers.media.module")
-        || name.equals("com.android.providers.downloads")
-        || name.equals("com.android.providers.downloads.ui")
-        || name.equals("com.android.externalstorage")
-        || name.contains(".documentsui")
-        || name.contains(".photopicker")
-        || name.contains(".filemanager")
-        || name.contains("fileexplorer")
-        || name.endsWith(".myfiles");
   }
 
   private static MutationPatchResult patchMediaStoreValues(
@@ -5626,6 +5606,9 @@ public class Hooker {
     return sb.toString();
   }
 
+  private static int WRAP_TIMING_LOG_COUNT = 0;
+  private static int WRAP_SLOW_TIMING_LOG_COUNT = 0;
+
   private static void logCursor(
       String stage, Cursor cursor, int pathColumn, int before, int after, int callerUid) {
     if (!shouldLog()) return;
@@ -5712,6 +5695,11 @@ public class Hooker {
       int count = safeCount(base);
       logCursor("wrap", base, pathColumn, count, count, callerUid);
       if (count <= 0) return base;
+      // issue #7：TIM 冷启动选图空屏 3-4 秒——需要把「一次 MediaStore 查询的逐行
+      // 过滤总耗时」直接记进日志，与 native 侧 filter_path 的单行均值互相印证。
+      // 慢查询（>200ms）必然落一条；快查询按 1/64 采样，避免热路径日志噪声。
+      long filterStartedMs = android.os.SystemClock.elapsedRealtime();
+      boolean slowQuery = false;
       if (pathColumn < 0 && relativePathColumn < 0 && idColumn < 0 && bucketIdColumn < 0) {
         return wrapOpaqueAggregateIfHidden(base, callerUid, count, visibleColumns);
       }
@@ -5734,33 +5722,18 @@ public class Hooker {
           long id = readId(base, idColumn);
           if (pathColumn >= 0) {
             String path = base.getString(pathColumn);
-            String rewritten = path == null ? null : filterPath(path, callerUid);
-            if (HIDDEN_ROW_SENTINEL.equals(rewritten)
-                || (rewritten != null && rewritten.length() == 0)) {
+            // 整行判定收敛到一次原生调用：改写、隐藏判定与两次存在性校验都在
+            // 同一次调用里完成，行循环不再逐行跨 JNI 多次。
+            String rewritten =
+                path == null ? null : cursorRowAction(path, callerUid, allowMissingMappedTarget);
+            if (rewritten != null && rewritten.length() == 0) {
               logFilter("filter", id, callerUid);
               continue;
             }
-            if ((rewritten == null || rewritten.equals(path))
-                && isHiddenByCallerVisibility(path, callerUid)) {
-              logFilter("filter_visibility", id, callerUid);
-              continue;
-            }
-            if (!allowMissingMappedTarget
-                && !isMediaStorePendingPath(path)
-                && !storagePathExistsForCaller(path, callerUid)) {
-              logFilter("filter_missing_plain", id, callerUid);
-              continue;
+            if (shouldLog() && path != null) {
+              verifyCursorRowAction(path, rewritten, callerUid, allowMissingMappedTarget);
             }
             if (rewritten != null && !rewritten.equals(path)) {
-              if (!allowMissingMappedTarget) {
-                boolean rewrittenExists = storagePathExistsForCaller(rewritten, callerUid);
-                boolean mappingViewRewrite = isMappingViewRewrite(path, rewritten, callerUid);
-                if (!rewrittenExists && (!mappingViewRewrite || !isMediaStorePendingPath(path))) {
-                  logFilter("filter_missing_rewrite", id, callerUid);
-                  continue;
-                }
-                if (!rewrittenExists) logFilter("keep_missing_mapping_view", id, callerUid);
-              }
               logFilter("rewrite", id, callerUid);
               logKeptRow("rewrite", id, callerUid, path, rewritten, base, bucketIdColumn);
               rewrites[row] = rewritten;
@@ -5833,6 +5806,30 @@ public class Hooker {
         try {
           base.moveToPosition(oldPosition);
         } catch (Throwable ignored) {
+        }
+        long filterCostMs = android.os.SystemClock.elapsedRealtime() - filterStartedMs;
+        slowQuery = filterCostMs > 200;
+        // 慢查询（>200ms）不受 verbose 开关约束，但每进程最多 32 条；常规耗时样本只在
+        // verbose 下记录前 64 条。此前慢查询会把常规计数清零，慢查询频繁时日志没有上限。
+        boolean logTiming;
+        if (slowQuery) {
+          logTiming = WRAP_SLOW_TIMING_LOG_COUNT < 32;
+          if (logTiming) WRAP_SLOW_TIMING_LOG_COUNT++;
+        } else {
+          logTiming = WRAP_TIMING_LOG_COUNT < 64 && shouldLog();
+          if (logTiming) WRAP_TIMING_LOG_COUNT++;
+        }
+        if (logTiming) {
+          android.util.Log.i(
+              "SRX",
+              "java cursor timing caller_uid="
+                  + callerUid
+                  + " rows="
+                  + count
+                  + " visible="
+                  + visibleRows.size()
+                  + " cost_ms="
+                  + filterCostMs);
         }
       }
 
@@ -6141,13 +6138,61 @@ public class Hooker {
     }
 
     private static boolean storagePathExistsForCaller(String path, int callerUid) {
-      if (storagePathExists(path)) return true;
+      if (pathExistsForCursorRow(path)) return true;
       try {
         String mappedPath = resolveOpenPath(path, callerUid);
         return mappedPath != null && mappedPath.length() > 0 && storagePathExists(mappedPath);
       } catch (Throwable ignored) {
         return false;
       }
+    }
+
+    /** 差分校验：详细日志时用旧序列复核，只记录不参与决策。 */
+    private static void verifyCursorRowAction(
+        String path, String action, int callerUid, boolean allowMissingMappedTarget) {
+      try {
+        String legacy = legacyCursorRowAction(path, callerUid, allowMissingMappedTarget);
+        boolean same = legacy == null ? action == null : legacy.equals(action);
+        if (!same) {
+          android.util.Log.w(
+              "SRX",
+              "cursor row action mismatch path="
+                  + path
+                  + " native="
+                  + action
+                  + " legacy="
+                  + legacy);
+        }
+      } catch (Throwable ignored) {
+      }
+    }
+
+    private static String legacyCursorRowAction(
+        String path, int callerUid, boolean allowMissingMappedTarget) {
+      String rewritten = filterPath(path, callerUid);
+      if (HIDDEN_ROW_SENTINEL.equals(rewritten) || (rewritten != null && rewritten.length() == 0)) {
+        return "";
+      }
+      if ((rewritten == null || rewritten.equals(path))
+          && isHiddenByCallerVisibility(path, callerUid)) {
+        return "";
+      }
+      if (!allowMissingMappedTarget
+          && !isMediaStorePendingPath(path)
+          && !storagePathExistsForCaller(path, callerUid)) {
+        return "";
+      }
+      if (rewritten != null && !rewritten.equals(path)) {
+        if (!allowMissingMappedTarget) {
+          boolean rewrittenExists = storagePathExistsForCaller(rewritten, callerUid);
+          boolean mappingViewRewrite = isMappingViewRewrite(path, rewritten, callerUid);
+          if (!rewrittenExists && (!mappingViewRewrite || !isMediaStorePendingPath(path))) {
+            return "";
+          }
+        }
+        return rewritten;
+      }
+      return null;
     }
 
     private static boolean isMappingViewRewrite(
