@@ -140,20 +140,26 @@ stop_collector_by_pid_file() {
 # 因此采集器启动时给自己的 logcat 打上 `SRX_COLLECTOR_TAG` 标记（`exec -a`），这里按该
 # 标记扫描 /proc 回收全部孤儿。标记同时也是幂等保证：不依赖 pid 文件是否被覆盖或丢失。
 SRX_COLLECTOR_TAG="srx-debug-collector"
+# 应用错误环形采集器使用独立标记：它不受 verbose 门禁、常驻运行，
+# 不能被 debug 采集器的例行重启（reap + 重启）误杀。
+SRX_APP_ERROR_COLLECTOR_TAG="srx-apperror-collector"
 
 reap_stale_logcat_collectors() {
   reaped=0
-  for proc_dir in /proc/[0-9]*; do
-    [ -r "$proc_dir/cmdline" ] || continue
-    cmdline=$(tr '\0' ' ' < "$proc_dir/cmdline" 2>/dev/null)
-    case "$cmdline" in
-      "$SRX_COLLECTOR_TAG"*)
-        kill "${proc_dir#/proc/}" 2>/dev/null && reaped=$((reaped + 1))
-        ;;
-    esac
+  for collector_tag in "$SRX_COLLECTOR_TAG" "$SRX_APP_ERROR_COLLECTOR_TAG"; do
+    for proc_dir in /proc/[0-9]*; do
+      [ -r "$proc_dir/cmdline" ] || continue
+      cmdline=$(tr '\0' ' ' < "$proc_dir/cmdline" 2>/dev/null)
+      case "$cmdline" in
+        "$collector_tag"*)
+          kill "${proc_dir#/proc/}" 2>/dev/null && reaped=$((reaped + 1))
+          ;;
+      esac
+    done
   done
   if [ "$reaped" -gt 0 ]; then
     log -p i -t Boot "reaped stale logcat collectors n=$reaped"
+    log_collector_status "reaped stale logcat collectors n=$reaped"
   fi
   return 0
 }
@@ -161,6 +167,17 @@ reap_stale_logcat_collectors() {
 is_process_alive() {
   pid="$1"
   [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null
+}
+
+# 采集器生命周期留痕：启动/停止/sync 决策/管道异常重启都落一行。
+# 反馈设备上 debug 采集器曾在 verbose=true 的 boot 里静默死亡，导致 [Jv] 转发与
+# FUSE 逐操作日志整体缺失却无从定位；有这份时间线才能从诊断包里直接读出死因。
+log_collector_status() {
+  status_message="$1"
+  [ -n "$COLLECTOR_STATUS_LOG_FILE" ] || return 0
+  printf '%s %s\n' "$(date '+%m-%d %H:%M:%S')" "$status_message" \
+    >> "$COLLECTOR_STATUS_LOG_FILE" 2>/dev/null || true
+  rotate_log_file_if_needed "$COLLECTOR_STATUS_LOG_FILE" 524288 2
 }
 
 is_pid_file_alive() {

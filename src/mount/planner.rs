@@ -22,8 +22,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 pub(super) const MEDIA_RW_UID: u32 = 1023;
 pub(super) const MEDIA_RW_GID: u32 = 1023;
-pub(super) const MAPPED_DIR_MODE: libc::mode_t = 0o2773;
-pub(super) const REAL_PUBLIC_DIR_MODE: libc::mode_t = 0o2771;
+// 目录模式只在 `platform::fs` 定义一次，避免多处副本各自漂移（曾出现 0o2773 与
+// 0o2771 两套公共目录口径并存）。
+pub(super) use crate::platform::fs::{MAPPED_DIR_MODE, REAL_PUBLIC_DIR_MODE};
 pub(super) const ALLOWED_REAL_DIR_MODE: libc::mode_t = MAPPED_DIR_MODE;
 pub(super) const ALLOWED_REAL_TREE_METADATA_LIMIT: usize = 256;
 pub(super) const READ_ONLY_TREE_METADATA_LIMIT: usize = 512;
@@ -238,6 +239,97 @@ impl MountPlanner {
             );
         }
 
+        true
+    }
+
+    /// 把映射目标目录归调用应用所有，并把模式收敛到 MAPPED_DIR_MODE。
+    ///
+    /// 以真实后端为访问路径的设备（锚点 /data/media 直绑等裸权限场景）由内核按真实
+    /// 属主与模式位裁决访问：media_rw 属主的目录对应用只剩 other 位，覆盖不了
+    /// 「应用创建文件 + 列目录 + 按名访问」的完整语义（真机实测：属主改为应用后
+    /// 全部可见）。FUSE 虚拟化设备的应用视图不经过真实属主与模式位，此修正无副作用。
+    /// 仅映射目标目录调用本方法；Download 等共享公共目录仍保持 media_rw 所有权。
+    /// 幂等：属主已是应用且模式已是 MAPPED_DIR_MODE 时不发任何元数据系统调用。
+    pub(super) fn ensure_app_owned_mapping_target(&self, path: &str, owner_uid: i32) -> bool {
+        if path.is_empty() || owner_uid < 0 {
+            return true;
+        }
+        let Some(metadata_path) = self.metadata_operations_path(path) else {
+            return true;
+        };
+        if !fs::is_directory(&metadata_path) {
+            // 映射目标目录缺失时必须在这里补建，不能留给后续调用方：应用视图是把
+            // 该目录 bind 到请求路径，源不存在时应用侧写入直接 ENOENT；系统代写者
+            // （下载提供器）对请求路径的 mkdir 也会因为映射目标不存在被 MediaProvider
+            // 判为拒绝，表现成 DownloadManager 的 "Failed to create parent
+            // .../Download/SrtDlOwner"（run 40277331532 五版本一致实证：目标目录由
+            // 重定向在访问判定之后才被动创建）。
+            let creation_uid = if crate::metadata_repair::enabled() {
+                owner_uid
+            } else {
+                -1
+            };
+            if !fs::create_directory(&metadata_path, creation_uid) {
+                log::warn!(
+                    "mount dir: mapping target mkdir failed errno={} path={} metadata_path={}",
+                    fs::last_create_directory_errno(),
+                    path,
+                    metadata_path
+                );
+                return true;
+            }
+            log::debug!(
+                "mount dir: mapping target created path={} metadata_path={} owner={}",
+                path,
+                metadata_path,
+                owner_uid
+            );
+        }
+        let Ok(c_path) = CString::new(metadata_path.as_str()) else {
+            return false;
+        };
+        let mut st = std::mem::MaybeUninit::<c_stat>::uninit();
+        // SAFETY: c_path 由 CString 保证以 NUL 结尾；st 是栈上有效存储，stat 只写入该结构。
+        if unsafe { c_stat(c_path.as_ptr(), st.as_mut_ptr()) } != 0 {
+            return true;
+        }
+        // SAFETY: 上一步返回 0 表示 st 已被完整初始化。
+        let st = unsafe { st.assume_init() };
+        let current_mode = st.st_mode & 0o7777;
+        if st.st_uid == owner_uid as u32 && current_mode == MAPPED_DIR_MODE {
+            return true;
+        }
+        // SAFETY: chown 只依赖 c_path 指向的有效 NUL 结尾字符串，无借用指针参数。
+        let chown_ret = unsafe { chown(c_path.as_ptr(), owner_uid as u32, MEDIA_RW_GID) };
+        if chown_ret != 0 {
+            let error_no = last_errno();
+            log::warn!(
+                "mount dir: mapping target chown failed errno={} {} path={} metadata_path={}",
+                error_no,
+                errno_text(error_no),
+                path,
+                metadata_path
+            );
+        }
+        // SAFETY: chmod 只依赖 c_path 指向的有效 NUL 结尾字符串，无借用指针参数。
+        let chmod_ret = unsafe { chmod(c_path.as_ptr(), MAPPED_DIR_MODE) };
+        if chmod_ret != 0 {
+            let error_no = last_errno();
+            log::warn!(
+                "mount dir: mapping target chmod failed errno={} {} path={} metadata_path={}",
+                error_no,
+                errno_text(error_no),
+                path,
+                metadata_path
+            );
+        }
+        log::debug!(
+            "mount dir: mapping target app ownership fixed path={} metadata_path={} uid={} mode={:o}",
+            path,
+            metadata_path,
+            owner_uid,
+            current_mode
+        );
         true
     }
 
@@ -706,6 +798,9 @@ impl MountPlanner {
         };
         if ret != 0 {
             let errno = last_errno();
+            // bind 失败的真实 errno 必须可回查：自有私有恢复等调用方在失败日志里
+            // 报的是 create_directory 的陈旧 errno（真机上表现为误导性的 errno=0）。
+            crate::mount::own_private_pending::note_bind_errno(errno);
             if errno == libc::ENOTCONN && self.repair_disconnected_storage_parent(target) {
                 ret = unsafe {
                     mount(
@@ -993,37 +1088,6 @@ impl MountPlanner {
         false
     }
 
-    /// 卸载本次已记录的全部挂载点并清空记录。
-    ///
-    /// 批量 FUSE 启动失败后需要退回到纯 mount namespace 方案，若不先卸载已装好的
-    /// bind/overlay 挂载，降级路径会在同一目标上再叠一层挂载，导致挂载栈重复、
-    /// 卸载顺序错乱。按记录的倒序卸载可以先摘掉后装的覆盖层。
-    pub(crate) fn unmount_recorded_targets(&self) -> usize {
-        let targets = std::mem::take(&mut *self.mounted_targets.borrow_mut());
-        let mut detached = 0usize;
-        for target in targets.iter().rev() {
-            let Ok(c_target) = CString::new(target.as_str()) else {
-                continue;
-            };
-            // SAFETY: c_target 是以 NUL 结尾的合法 C 字符串，且在本次调用期间保持存活。
-            if unsafe { umount2(c_target.as_ptr(), MNT_DETACH) } == 0 {
-                detached += 1;
-                continue;
-            }
-            let error_no = last_errno();
-            log::debug!(
-                "rollback umount failed dst={} errno={} {}",
-                target,
-                error_no,
-                errno_text(error_no)
-            );
-        }
-        if detached > 0 {
-            log::info!("rollback umount done count={}/{}", detached, targets.len());
-        }
-        detached
-    }
-
     fn record_mounted_target(&self, target: &str) {
         if target.is_empty() {
             return;
@@ -1088,7 +1152,9 @@ impl MountPlanner {
         }
     }
 
-    fn metadata_operations_path(&self, path: &str) -> Option<String> {
+    // 映射目标源以锚点路径形式返回时，map 侧也需要经此换算到真实后端再做元数据
+    // 判定，因此对同层模块可见。
+    pub(super) fn metadata_operations_path(&self, path: &str) -> Option<String> {
         if path.is_empty() {
             return None;
         }
@@ -1139,10 +1205,6 @@ impl MountPlanner {
 
     fn is_real_storage_anchor_path(&self, path: &str) -> bool {
         paths::is_same_or_child(path, &self.real_storage_anchor_root())
-    }
-
-    pub(crate) fn real_storage_anchor(&self) -> Option<String> {
-        self.real_storage_anchor.clone()
     }
 
     fn real_storage_anchor_root(&self) -> String {

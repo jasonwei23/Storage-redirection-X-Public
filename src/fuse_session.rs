@@ -5,7 +5,6 @@
 //! 各写一份已发生过行为分叉，因此这里收敛为单一实现，两侧只保留各自的请求建模
 //! 与宿主会话发现方式（daemon 进程内持有、companion 经快照发现）。
 
-use crate::fuse_redirect::MountRequestFields;
 use crate::platform::errno::{last as last_errno, text as errno_text};
 use crate::platform::fs;
 use crate::platform::module_paths;
@@ -64,6 +63,57 @@ pub(crate) fn rollback_scoped_fuse_services(states: &[FuseMountState]) {
     }
 }
 
+/// 失败回滚：摘除本轮在应用命名空间里新建的挂载层，返回成功摘除的数量。
+///
+/// daemon 与 companion 两条挂载路径共用：状态写不进去时账本也不会登记，这些层
+/// 没有归属判据，后续清理与配置替换都无从得知它们存在，只能留到应用退出。
+/// 按挂载记录反序摘除（后挂的先摘），`MNT_DETACH` 保证仍有引用的层延迟消失、
+/// 不阻塞回滚；路径已不在（EINVAL/ENOENT）视为已摘除，不重复报错。
+pub(crate) fn detach_round_mount_targets(targets: &[String]) -> usize {
+    let mut detached = 0usize;
+    for target in targets.iter().rev() {
+        let Ok(c_target) = std::ffi::CString::new(target.as_str()) else {
+            continue;
+        };
+        // SAFETY: c_target 是以 NUL 结尾的合法路径且在本次调用期间保持存活；MNT_DETACH
+        // 只影响当前命名空间的挂载视图，不触碰其它命名空间。
+        if unsafe { libc::umount2(c_target.as_ptr(), libc::MNT_DETACH) } == 0 {
+            detached += 1;
+            log::info!("mount rollback detached target={}", target);
+            continue;
+        }
+        let errno = last_errno();
+        if errno != libc::EINVAL && errno != libc::ENOENT {
+            log::warn!(
+                "mount rollback detach failed target={} errno={} {}",
+                target,
+                errno,
+                errno_text(errno)
+            );
+        }
+    }
+    detached
+}
+/// 该挂载点当前可见层的挂载源（`/proc/self/mounts` 里该点的**最后一条**条目）。
+///
+/// 栈顶才是应用当前看到的层：被残留只读屏障盖住的旧层不能算数（那会把「屏障裸奔」
+/// 误判成会话存活）。调用方据此判断是否已有本模块的层在服务该路径。
+pub(crate) fn storage_view_top_source(mount_root: &str) -> Option<String> {
+    let mounts = std::fs::read_to_string("/proc/self/mounts").ok()?;
+    let root = mount_root.trim_end_matches('/');
+    let last = mounts.lines().rev().find(|line| {
+        let mut fields = line.split_whitespace();
+        fields.next().unwrap_or("");
+        fields
+            .next()
+            .unwrap_or("")
+            .replace("\\040", " ")
+            .trim_end_matches('/')
+            == root
+    })?;
+    Some(last.split_whitespace().next().unwrap_or("").to_string())
+}
+
 /// 把本次挂载写入状态文件（原子写：临时文件 + fsync + rename）。
 ///
 /// 状态行契约：`version=` 与 `fingerprint=`（指纹跨进程可比、version 计数器两侧不同域）、
@@ -77,6 +127,7 @@ pub(crate) fn write_mount_state(
     uid: i32,
     package_name: &str,
     config_version: u64,
+    policy_fingerprint: u64,
     state_path: &str,
     temp_path: &str,
     targets: &[String],
@@ -102,6 +153,12 @@ pub(crate) fn write_mount_state(
         "fingerprint={}\n",
         crate::config::SettingsHub::instance().config_fingerprint()
     ));
+    // 包级策略指纹：只随本应用的规则与后端模式变化。幂等判定用它而不是全局目录指纹——
+    // 全局指纹覆盖整个配置目录，任何单个应用配置新增/变更都会让**所有**应用的状态失效，
+    // 触发全量重挂扫（真机实测：单个新应用被自动启用 → 59 应用全部重挂一轮，反复发生）。
+    // 该指纹由 request_policy_fingerprint 按请求内容算出，daemon 与 companion 对同一份
+    // 配置得到同一个值，跨进程可比性不变。
+    content.push_str(&format!("policy_fp={}\n", policy_fingerprint));
     content.push_str(&format!("package={}\n", package_name));
     content.push_str(&format!("uid={}\n", uid));
     if let Some(start_time_ticks) = crate::platform::process_start_time_ticks(pid) {
@@ -189,122 +246,45 @@ pub(crate) fn write_mount_state(
     ok
 }
 
-/// 批量启动 scoped FUSE 会话；单根失败只丢弃该根，全部根失败前先回滚再收敛成存储根。
+/// FUSE 视图没能建立起来的**具体原因**，用于现场诊断「为什么这个应用没有 FUSE」。
 ///
-/// 部分失败的恢复契约：先收回已启动的会话，再以单个存储根会话保留原始规则的动态
-/// 匹配，避免失败根变成无规则覆盖；存储根重试同样失败才交给调用方走 namespace 回退
-/// 与能力失败记账。`start_one` 由两侧传入各自的按根启动函数（宿主会话发现方式不同）。
-pub(crate) fn start_scoped_fuse_services(
-    request: &(impl MountRequestFields + ?Sized),
-    roots: &[String],
-    real_root_override: Option<String>,
-    start_one: impl Fn(&str, Option<String>) -> Option<FuseMountState>,
-) -> Option<Vec<FuseMountState>> {
-    if roots.is_empty() {
-        return Some(Vec::new());
-    }
-
-    let mut states = Vec::with_capacity(roots.len());
-    let mut failed_roots: Vec<&str> = Vec::new();
-    for root in roots {
-        match start_one(root, real_root_override.clone()) {
-            Some(state) => states.push(state),
-            None => failed_roots.push(root.as_str()),
-        }
-    }
-
-    if !failed_roots.is_empty() {
-        log::warn!(
-            "fuse partial scoped mount pkg={} pid={} mounted={} failed={} failed_roots={}",
-            request.package_name(),
-            request.pid(),
-            states.len(),
-            failed_roots.len(),
-            failed_roots.join(",")
-        );
-        // 规划阶段已跳过这些预期 FUSE 根对应的 bind；部分失败时先收回已启动会话，
-        // 再以单个存储根会话保留原始规则的动态匹配，避免失败根变成无规则覆盖。
-        let user_id = crate::platform::user_id_from_uid(request.uid());
-        let storage_root = crate::platform::paths::storage_user_root_for_user(user_id);
-        rollback_scoped_fuse_services(&states);
-        if let Some(state) = start_one(&storage_root, real_root_override) {
-            log::warn!(
-                "fuse partial roots collapsed to storage root pkg={} pid={} failed={}",
-                request.package_name(),
-                request.pid(),
-                failed_roots.len()
-            );
-            return Some(vec![state]);
-        }
-        log::warn!(
-            "fuse partial roots and storage-root retry failed pkg={} pid={}",
-            request.package_name(),
-            request.pid()
-        );
-        return None;
-    }
-
-    if states.is_empty() {
-        return None;
-    }
-    Some(states)
+/// 每条原因都对应一个可以独立验证的事实（会话不存在 / 闸门不许 / 策略没登记 /
+/// 无规则 / 接入失败），而不是一句笼统的 "unavailable"。用户设备上出现不支持时，
+/// 只凭日志就能判断是设备侧、配置侧还是模块侧的问题。
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum HostSessionSkip {
+    /// 共享宿主会话不存在或已消失（设备不支持 / 宿主启动失败 / 尚未建立）。
+    NoSharedHost,
+    /// 宿主会话只服务整个存储视图根，该根不满足接入条件。
+    AttachGateClosed,
+    /// 策略没有登记进宿主会话（daemon 侧登记失败或 fingerprint 不匹配）。
+    PolicyRegistrationFailed,
+    /// 请求没有任何策略规则，接入宿主只会得到 deny_all 空视图。
+    NoPolicyRules,
+    /// 登记与闸门都通过，但实际接入失败（超时、errno、后端不可读）。
+    AttachFailed,
 }
 
-/// scoped FUSE 不可用时的 namespace 回退降级。
-///
-/// 降级契约：主方案已装好的 bind/overlay 必须先卸载（降级路径会对同一批目标重新
-/// 执行挂载，保留旧挂载会叠加导致卸载顺序错乱）；只读路径优先保留文件监视能力，
-/// 让 MediaProvider/FUSE 仍可生成拒绝记录，锚点覆盖不了时才用强制只读绑定。
-/// 配置热重载触发的降级会走到这里，因此回滚一步不能省。
-pub(crate) fn apply_mount_namespace_fallback(
-    planner: &mut crate::mount::MountPlanner,
-    request: &(impl MountRequestFields + ?Sized),
-) -> bool {
-    let detached = planner.unmount_recorded_targets();
-    if detached > 0 {
-        log::info!(
-            "hybrid fuse namespace fallback rollback count={} pid={} pkg={}",
-            detached,
-            request.pid(),
-            request.package_name()
-        );
+impl HostSessionSkip {
+    /// 是否算一次「真的尝试过并失败」。
+    ///
+    /// 失败预算只该记录真尝试：闸门未放行（该根不满足接入条件）、宿主尚未就绪、
+    /// 请求无规则，都属「没试」——把它们计进预算会让开机风暴期的十余次判定把该
+    /// 应用整轮开机的重试机会一次烧光（真机 2026-11-05：sau 的沙盒因此永久退回
+    /// namespace bind，而 bind 无法表达一个并不存在的请求路径）。
+    pub(crate) fn counts_as_attempt_failure(self) -> bool {
+        matches!(self, Self::AttachFailed | Self::PolicyRegistrationFailed)
     }
-    let allowed_real_paths = crate::fuse_redirect::config::expand_namespace_fallback_rules(
-        request.uid(),
-        request.allowed_real_paths(),
-    );
-    let read_only_paths = crate::fuse_redirect::config::expand_namespace_fallback_rules(
-        request.uid(),
-        request.read_only_paths(),
-    );
-    let can_record_fallback = request.is_file_monitor_enabled()
-        && planner.can_record_read_only_mapping_denials(
-            request.path_mappings(),
-            &read_only_paths,
-            request.excluded_real_paths(),
-        );
-    planner.set_file_monitor_enabled(can_record_fallback);
-    log::info!(
-        "hybrid fuse namespace fallback file_monitor={} pid={} pkg={}",
-        can_record_fallback,
-        request.pid(),
-        request.package_name()
-    );
-    if request.is_mapping_mode_only() {
-        planner.apply_path_mappings_only(
-            request.path_mappings(),
-            request.sandboxed_paths(),
-            &read_only_paths,
-            &[],
-        )
-    } else {
-        planner.apply_sdcard_redirect(
-            &allowed_real_paths,
-            request.excluded_real_paths(),
-            &read_only_paths,
-            request.path_mappings(),
-            &[],
-        )
+
+    /// 稳定短名：写进日志与能力快照，供现场与 issue 直接检索。
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::NoSharedHost => "no_shared_host_session",
+            Self::AttachGateClosed => "attach_gate_closed",
+            Self::PolicyRegistrationFailed => "policy_registration_failed",
+            Self::NoPolicyRules => "no_policy_rules",
+            Self::AttachFailed => "host_attach_failed",
+        }
     }
 }
 

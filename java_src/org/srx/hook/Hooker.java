@@ -233,9 +233,22 @@ public class Hooker {
         // 未开启重定向的调用方必须保持 MediaProvider 原始 URI/FD 语义。
         // 这里若继续尝试映射文件，可能把未配置应用的原图读取带入其它调用方
         // 的路径提示或映射目标，导致缩略图可见但原图打开失败。
-        recordProviderOpenPath(this, args, actualArgs, callerUid);
-        Object result = callBackupPassthrough(args);
+        recordProviderOpenPath(this, args, actualArgs, callerUid, callerPid);
+        Object result;
+        try {
+          result = callBackupPassthrough(args);
+        } catch (Throwable passthroughFailure) {
+          // 与重定向分支同款的静默失败：未开启重定向的调用方（QQ/B 站图片走这里）
+          // open 被拒时应用侧只会看到空图，此前这里不留任何痕迹。
+          logOpenBackupFailure(callerUid, passthroughFailure);
+          throw passthroughFailure;
+        }
+        if (result == null) {
+          // MediaProvider 的 open 正常路径要么返回 fd 要么抛异常，null 属于异常信号。
+          logOpenBackupFailure(callerUid, null);
+        }
         if (result != null) recordProviderOpenSuccess(this, args, actualArgs, result, callerUid);
+        logOpenResult("passthrough", result);
         return result;
       }
       captureMediaSourceFileDescriptor(this, actualArgs, callerUid);
@@ -248,13 +261,13 @@ public class Hooker {
           closeQuietly(takeRecentMediaSourceFd(callerUid));
           throw readOnlyOpenException(readOnlyRequest.path);
         }
-        Object mappedResult = tryOpenMappedMediaFile(args, callerUid);
+        Object mappedResult = tryOpenMappedMediaFile(args, callerUid, callerPid);
         if (mappedResult != null) {
           recordProviderOpenSuccess(this, args, actualArgs, mappedResult, callerUid);
           logOpenResult("mapped", mappedResult);
           return mappedResult;
         }
-        recordProviderOpenPath(this, args, actualArgs, callerUid);
+        recordProviderOpenPath(this, args, actualArgs, callerUid, callerPid);
         Object result;
         try {
           result = callBackup(args);
@@ -420,7 +433,7 @@ public class Hooker {
       if (hintedUid >= ANDROID_APP_UID_START) callerUid = hintedUid;
     }
     String sourcePath = receiver.getPath();
-    recordProviderDirectoryPath(sourcePath, callerUid);
+    recordProviderDirectoryPath(sourcePath, callerUid, android.os.Binder.getCallingPid());
     String mappingPath = mediaStoreDisplayPath(sourcePath, callerUid);
     if (mappingPath == null) mappingPath = sourcePath;
     String directPath = resolveMediaStoreDirectPathForValues(mappingPath, callerUid);
@@ -467,7 +480,7 @@ public class Hooker {
       if (hintedUid >= ANDROID_APP_UID_START) callerUid = hintedUid;
     }
     String sourcePath = receiver.getPath();
-    recordProviderDirectoryPath(sourcePath, callerUid);
+    recordProviderDirectoryPath(sourcePath, callerUid, android.os.Binder.getCallingPid());
     String mappingPath = mediaStoreDisplayPath(sourcePath, callerUid);
     if (mappingPath == null) mappingPath = sourcePath;
     String directPath = resolveMediaStoreDirectPathForValues(mappingPath, callerUid);
@@ -606,6 +619,9 @@ public class Hooker {
     Object[] actualArgs = unwrapArgs(args);
     ContentValues values = findContentValues(actualArgs);
     if (values == null) return callBackup(args);
+    Integer scopedUid = MEDIA_PROVIDER_CALLER_UID.get();
+    int callerUid = scopedUid == null ? android.os.Binder.getCallingUid() : scopedUid.intValue();
+    if (callerUid < ANDROID_APP_UID_START) return callBackup(args);
     MediaFileBuildContext pendingContext = MEDIA_FILE_BUILD_CONTEXT.get();
     if ("update".equals(mutationMethod)
         && pendingContext != null
@@ -617,12 +633,11 @@ public class Hooker {
         values.put(MediaStore.MediaColumns.RELATIVE_PATH, pendingRelative);
         patchDirectoryColumns(values, pendingRelative);
         logInfo("media pending column path patched to=" + pendingContext.publicPath);
-        return callBackup(args);
+        Object result = callBackup(args);
+        restoreMediaStoreVolumePrefix(values, callerUid);
+        return result;
       }
     }
-    Integer scopedUid = MEDIA_PROVIDER_CALLER_UID.get();
-    int callerUid = scopedUid == null ? android.os.Binder.getCallingUid() : scopedUid.intValue();
-    if (callerUid < ANDROID_APP_UID_START) return callBackup(args);
     String relativePath = values.getAsString(MediaStore.MediaColumns.RELATIVE_PATH);
     if (relativePath == null || relativePath.length() == 0) {
       relativePath = relativePathFromDirectoryColumns(values);
@@ -669,6 +684,8 @@ public class Hooker {
       return callBackup(args);
     } finally {
       restoreMediaFileBuildValues(args);
+      // FileUtils 的上下文可能已被消费；ensureFileColumns 最后一次写入仍需修正卷前缀。
+      restoreMediaStoreVolumePrefix(values, callerUid);
       restoreContentValue(
           values, MediaStore.MediaColumns.RELATIVE_PATH, hadRelative, originalRelative);
       restoreContentValue(values, "primary_directory", hadPrimary, originalPrimary);
@@ -740,8 +757,17 @@ public class Hooker {
       if (actualArgs.length == 0 || !(actualArgs[0] instanceof ContentValues)) return;
       if (context.publicPath == null || context.publicPath.length() == 0) return;
       ContentValues values = (ContentValues) actualArgs[0];
-      values.put(MediaStore.MediaColumns.DATA, context.publicPath);
-      String relativePath = mediaStoreRelativePath(context.publicPath);
+      String publicPath = context.publicPath;
+      String builtPath = values.getAsString(MediaStore.MediaColumns.DATA);
+      // 保留系统生成的 pending、重名避让和文件名清洗结果，只恢复逻辑父目录。
+      if (builtPath != null && builtPath.lastIndexOf('/') >= 0) {
+        int parentEnd = publicPath.lastIndexOf('/');
+        publicPath =
+            publicPath.substring(0, parentEnd + 1)
+                + builtPath.substring(builtPath.lastIndexOf('/') + 1);
+      }
+      values.put(MediaStore.MediaColumns.DATA, publicPath);
+      String relativePath = mediaStoreRelativePath(publicPath);
       if (relativePath != null) values.put(MediaStore.MediaColumns.RELATIVE_PATH, relativePath);
     } finally {
       MEDIA_FILE_BUILD_CONTEXT.remove();
@@ -778,12 +804,6 @@ public class Hooker {
     if (display != null && !display.equals(data)) {
       values.put(MediaStore.MediaColumns.DATA, display);
     }
-  }
-
-  private static String publicMediaStorePath(String path, int callerUid) {
-    if (path == null || path.length() == 0) return null;
-    if (path.startsWith("/storage/emulated/")) return path;
-    return mediaStoreDisplayPath(path, callerUid);
   }
 
   private static String mediaStoreRelativePath(String path) {
@@ -1372,7 +1392,7 @@ public class Hooker {
         scopedUid == null ? recentMediaDirectoryCallerUid(source.getPath()) : scopedUid.intValue();
     if (callerUid < ANDROID_APP_UID_START) return source;
     String sourcePath = source.getPath();
-    recordProviderDirectoryPath(sourcePath, callerUid);
+    recordProviderDirectoryPath(sourcePath, callerUid, android.os.Binder.getCallingPid());
     String mappingPath = mediaStoreDisplayPath(sourcePath, callerUid);
     if (mappingPath == null) mappingPath = sourcePath;
     String directPath = resolveMediaStoreDirectPathForValues(mappingPath, callerUid);
@@ -1411,7 +1431,7 @@ public class Hooker {
     if (pathIndex < 0 || sourcePath == null) return callBackup(args);
     int callerUid =
         scopedUid == null ? recentMediaDirectoryCallerUid(sourcePath) : scopedUid.intValue();
-    recordProviderDirectoryPath(sourcePath, callerUid);
+    recordProviderDirectoryPath(sourcePath, callerUid, android.os.Binder.getCallingPid());
     if (callerUid < ANDROID_APP_UID_START) return callBackup(args);
     String mappingPath = mediaStoreDisplayPath(sourcePath, callerUid);
     if (mappingPath == null) mappingPath = sourcePath;
@@ -1977,6 +1997,12 @@ public class Hooker {
 
   private static native boolean storagePathExistsBySyscall(String path);
 
+  /** 游标行存在性判定：按父目录折叠枚举，逐行只查名字；只供行循环使用。 */
+  private static native boolean pathExistsForCursorRow(String path);
+
+  /** 整行判定：null 保留原路径，空串隐藏，其余为改写后的路径。 */
+  private static native String cursorRowAction(String path, int callerUid, boolean allowMissing);
+
   private static native boolean isProviderVirtualPathVisible(String path);
 
   private static native void rememberProviderRedirectSourceDirectory(
@@ -1994,10 +2020,10 @@ public class Hooker {
   private static native void recordQueryAccessPath(String path, int callerUid);
 
   private static native void recordProviderOpenPath(
-      String path, int callerUid, String callerPackage);
+      String path, int callerUid, int callerPid, String callerPackage);
 
   private static native void recordProviderDirectoryPath(
-      String path, int callerUid, String callerPackage);
+      String path, int callerUid, int callerPid, String callerPackage);
 
   private static native void recordProviderOpenSuccess(
       String path, int callerUid, String callerPackage, String opFilter, int resultFd);
@@ -2012,6 +2038,8 @@ public class Hooker {
       int flags);
 
   private static native boolean allowsPublicMappingTarget(String path, int callerUid);
+
+  private static native boolean allowsOwnAndroidPrivatePath(String path, int callerUid);
 
   private static native boolean isRedirectEnabledForCallerUid(int callerUid);
 
@@ -2226,17 +2254,27 @@ public class Hooker {
     return value instanceof Integer ? ((Integer) value).intValue() : fallback;
   }
 
-  private static boolean booleanArg(Object value, boolean fallback) {
-    return value instanceof Boolean ? ((Boolean) value).booleanValue() : fallback;
-  }
-
   private static boolean shouldAllowFuseFileOpen(FuseFileOpenRequest request) {
     if (request == null || request.callerUid < ANDROID_APP_UID_START) return false;
     // 映射目标由该应用的 path_mappings 明确产生。MediaProvider 在 FUSE 层仍按目标
     // 公共目录做权限校验时，写入请求也要沿用映射授权，否则 QQ 的分片临时文件会被
     // 误判为“无权写入公共目录”。
+    // 应用自身 Android/data、obb 私有目录的读写是 Android 语义本来就允许的操作，
+    // 但 MediaProvider 的身份判定在调用方解析高压失效时可能误拒，导致应用读不到
+    // 自己的媒体文件；放行口径与其自身 bypass 判定一致（路径属主包与调用 UID 匹配）。
     return allowsPublicMappingTargetSafe(request.path, request.callerUid)
-        || allowsPublicMappingTargetSafe(request.ioPath, request.callerUid);
+        || allowsPublicMappingTargetSafe(request.ioPath, request.callerUid)
+        || allowsOwnAndroidPrivatePathSafe(request.path, request.callerUid)
+        || allowsOwnAndroidPrivatePathSafe(request.ioPath, request.callerUid);
+  }
+
+  private static boolean allowsOwnAndroidPrivatePathSafe(String path, int callerUid) {
+    if (path == null || path.length() == 0) return false;
+    try {
+      return allowsOwnAndroidPrivatePath(path, callerUid);
+    } catch (Throwable ignored) {
+      return false;
+    }
   }
 
   private static boolean allowsPublicMappingTargetSafe(String path, int callerUid) {
@@ -2546,7 +2584,8 @@ public class Hooker {
     }
   }
 
-  private Object tryOpenMappedMediaFile(Object[] rawArgs, int callerUid) throws Throwable {
+  private Object tryOpenMappedMediaFile(Object[] rawArgs, int callerUid, int callerPid)
+      throws Throwable {
     String path = null;
     String mappedPath = null;
     OpenRequest request = null;
@@ -2575,7 +2614,7 @@ public class Hooker {
         logOpenDelegate("mapped_resolve_miss", path, mappedPath == null ? "" : mappedPath);
         return null;
       }
-      rememberProviderOpenPath(mappedPath, callerUid);
+      rememberProviderOpenPath(mappedPath, callerUid, callerPid, packageNameForUid(callerUid));
       if (!isWriteMode(request.mode) && shouldDenyMissingMappedRead(mappedPath)) {
         logOpenDelegate("mapped_read_missing_denied", path, mappedPath);
         throw new FileNotFoundException(mappedPath);
@@ -2747,7 +2786,7 @@ public class Hooker {
   }
 
   private static void recordProviderOpenPath(
-      Hooker hooker, Object[] rawArgs, Object[] actualArgs, int callerUid) {
+      Hooker hooker, Object[] rawArgs, Object[] actualArgs, int callerUid, int callerPid) {
     try {
       if (!(hooker != null && hooker.target instanceof Method)) return;
       Method method = (Method) hooker.target;
@@ -2759,14 +2798,14 @@ public class Hooker {
       android.content.ContentProvider receiver = providerReceiver(rawArgs);
       if (receiver == null) return;
       String path = queryDataPath(receiver, request.uri);
-      rememberProviderOpenPath(path, callerUid);
+      rememberProviderOpenPath(path, callerUid, callerPid, packageNameForUid(callerUid));
       String mappedPath = null;
       try {
         mappedPath = path == null ? null : resolveOpenPath(path, callerUid);
       } catch (Throwable ignored) {
       }
       if (mappedPath != null && mappedPath.length() > 0 && !mappedPath.equals(path)) {
-        rememberProviderOpenPath(mappedPath, callerUid);
+        rememberProviderOpenPath(mappedPath, callerUid, callerPid, packageNameForUid(callerUid));
       }
     } catch (Throwable ignored) {
     }
@@ -2812,26 +2851,31 @@ public class Hooker {
   }
 
   private static void rememberProviderOpenPath(String path, int callerUid) {
-    rememberProviderOpenPath(path, callerUid, packageNameForUid(callerUid));
+    rememberProviderOpenPath(path, callerUid, -1, packageNameForUid(callerUid));
   }
 
   /**
-   * 将 MediaProvider 实际尝试创建的目录原路径送入监视台账。
+   * 将 MediaProvider 即将尝试创建的目录原路径登记为监视归因 hint。
    *
-   * <p>这里记录的是 mkdir/mkdirs/native mkdir 回调当前看到的完整路径， 不是从子目录向父目录倒推，因此同一父目录存在多个应用子目录时不会串归属。
+   * <p>这里登记的是 mkdir/mkdirs/native mkdir 回调当前看到的完整路径，不代表目录已经创建成功；实际结果由 native/FUSE
+   * 请求路径记录。路径不是从子目录向父目录倒推，因此同一父目录存在多个应用子目录时不会串归属。
+   *
+   * <p>系统 uid（如 platform 1000 的 com.xiaomi.mirror）的调用方包名无法凭 uid 解析（共享组 成员过多），callerUid 区间门槛不再前置拦截，把
+   * binder caller pid 一并交给 native 侧按 进程身份归因；应用 uid 的行为保持原语义。
    */
-  private static void recordProviderDirectoryPath(String path, int callerUid) {
-    if (path == null || path.length() == 0 || callerUid < ANDROID_APP_UID_START) return;
+  private static void recordProviderDirectoryPath(String path, int callerUid, int callerPid) {
+    if (path == null || path.length() == 0 || callerUid < 0) return;
     try {
-      recordProviderDirectoryPath(path, callerUid, packageNameForUid(callerUid));
+      recordProviderDirectoryPath(path, callerUid, callerPid, packageNameForUid(callerUid));
     } catch (Throwable ignored) {
     }
   }
 
-  private static void rememberProviderOpenPath(String path, int callerUid, String callerPackage) {
-    if (path == null || path.length() == 0 || callerUid < ANDROID_APP_UID_START) return;
+  private static void rememberProviderOpenPath(
+      String path, int callerUid, int callerPid, String callerPackage) {
+    if (path == null || path.length() == 0 || callerUid < 0) return;
     try {
-      recordProviderOpenPath(path, callerUid, callerPackage);
+      recordProviderOpenPath(path, callerUid, callerPid, callerPackage);
     } catch (Throwable ignored) {
     }
   }
@@ -2840,7 +2884,7 @@ public class Hooker {
       String path, ContentValues values, int callerUid) {
     String hintPath = mediaStoreMutationHintPath(path, values, callerUid);
     if (hintPath == null || hintPath.length() == 0) return;
-    rememberProviderOpenPath(hintPath, callerUid);
+    rememberProviderOpenPath(hintPath, callerUid, -1, packageNameForUid(callerUid));
     // MediaProvider 可能异步创建相对路径目录，登记直接父目录以延续原始调用方归因。
     int userId = userIdFromUid(callerUid);
     String storageRoot = "/storage/emulated/" + userId;
@@ -2926,19 +2970,14 @@ public class Hooker {
       android.content.pm.PackageManager pm = ((android.content.Context) app).getPackageManager();
       if (pm == null) return "";
       String[] packages = pm.getPackagesForUid(uid);
-      if (packages != null) {
-        for (String candidate : packages) {
-          if (candidate != null
-              && candidate.length() > 0
-              && !isIntermediateAttributionPackage(candidate)) {
-            return candidate.trim();
-          }
-        }
-        if (packages.length > 0 && packages[0] != null) {
-          return packages[0].trim();
-        }
+      if (packages != null && packages.length == 1 && packages[0] != null) {
+        return packages[0].trim();
       }
-      return normalizePackageManagerUidName(pm.getNameForUid(uid));
+      // 共享 uid 组内有多个成员时无法凭 uid 区分发起进程；返回空串交给
+      // native 侧归因链（下载行数据反查、路径提示）确定真实发起者。按
+      // 顺序硬取组内某个成员会把引擎代写误归给无辜包（2026-10-24 真机：
+      // android.media 组的下载代写被误归 soundpicker 并污染路径台账）。
+      return "";
     } catch (Throwable ignored) {
       return "";
     }
@@ -2953,31 +2992,6 @@ public class Hooker {
     } catch (Throwable ignored) {
       return fieldValue(activityThread, "mInitialApplication");
     }
-  }
-
-  private static String normalizePackageManagerUidName(String name) {
-    if (name == null || name.length() == 0) return "";
-    int colon = name.indexOf(':');
-    if (colon >= 0) name = name.substring(0, colon);
-    int comma = name.indexOf(',');
-    if (comma >= 0) name = name.substring(0, comma);
-    return name.trim();
-  }
-
-  private static boolean isIntermediateAttributionPackage(String value) {
-    if (value == null || value.length() == 0) return true;
-    String name = value.toLowerCase(Locale.ROOT);
-    return name.equals("com.android.providers.media")
-        || name.equals("com.android.providers.media.module")
-        || name.equals("com.google.android.providers.media.module")
-        || name.equals("com.android.providers.downloads")
-        || name.equals("com.android.providers.downloads.ui")
-        || name.equals("com.android.externalstorage")
-        || name.contains(".documentsui")
-        || name.contains(".photopicker")
-        || name.contains(".filemanager")
-        || name.contains("fileexplorer")
-        || name.endsWith(".myfiles");
   }
 
   private static MutationPatchResult patchMediaStoreValues(
@@ -3106,6 +3120,8 @@ public class Hooker {
         patched = copyIfNeeded(patched, values);
         patched.put("relative_path", mappedRelative);
         patchDirectoryColumns(patched, mappedRelative);
+        relativeSource = patched;
+        relativePath = mappedRelative;
       }
     }
     // insert 且未提供 _data 时补一个公共形态的 _data。MediaProvider 的 ensureFileColumns
@@ -4412,6 +4428,9 @@ public class Hooker {
     else if (relative.startsWith("/" + absoluteRoot))
       relative = relative.substring(absoluteRoot.length() + 1);
     String name = displayName != null && displayName.length() > 0 ? displayName : ".srx_probe";
+    // DISPLAY_NAME 是文件名：系统把分隔符清洗为下划线，探测时也不能将其变成子目录。
+    // 保留原字段交由 MediaProvider 完成其余文件名清洗，只在探测路径中消除分隔符。
+    name = name.replace('/', '_').replace('\\', '_');
     return "/storage/emulated/" + userId + "/" + relative + "/" + name;
   }
 
@@ -4732,6 +4751,7 @@ public class Hooker {
               + source
               + " class="
               + (result == null ? "null" : result.getClass().getName())
+              + describeOpenResultDetail(result)
               + " n="
               + OPEN_RESULT_LOG_COUNT);
     } catch (Throwable ignored) {
@@ -4739,13 +4759,43 @@ public class Hooker {
   }
 
   /**
+   * 给出 open 结果的关键观测量：fd 号、声明长度与起始偏移。
+   *
+   * <p>排查图片加载失败时，只有 class 名无法区分「fd 从未产出」（open 阶段就失败） 与「fd 已产出但后续读取/解码失败」（open 正常，问题在数据面）。 长度异常（0
+   * 或远小于图片体积）还能暴露 fd 指向了错误文件或被截断的文件。
+   */
+  private static String describeOpenResultDetail(Object result) {
+    try {
+      if (result instanceof ParcelFileDescriptor) {
+        ParcelFileDescriptor pfd = (ParcelFileDescriptor) result;
+        return " fd=" + pfd.getFd() + " len=" + pfd.getStatSize();
+      }
+      if (result instanceof AssetFileDescriptor) {
+        AssetFileDescriptor afd = (AssetFileDescriptor) result;
+        ParcelFileDescriptor pfd = afd.getParcelFileDescriptor();
+        return " fd="
+            + (pfd == null ? -1 : pfd.getFd())
+            + " len="
+            + afd.getLength()
+            + " start="
+            + afd.getStartOffset();
+      }
+    } catch (Throwable ignored) {
+    }
+    return "";
+  }
+
+  /**
    * 记录「原始 open 没有产出结果」。`failure == null` 表示原始调用返回了 null 而不是抛异常。
    *
    * <p>这条日志刻意不受 OPEN_RESULT_LOG_COUNT 之类的上限约束：它只在失败路径上产生，量很小；而一旦被
    * 上限截断就再也看不到失败原因——真机上排查时正是如此，普通请求在场景早期就把上限用完了。
+   *
+   * <p>同样刻意不受 shouldLog()（verbose 调试开关）约束：开关是进程内 AtomicBool， boot 早期 specialize 的进程可能因配置不可读而永久停在
+   * false（实测反馈设备上 MediaProvider 进程整个生命周期静默，open 失败完全不可见）。失败日志是排查
+   * 「图片加载不了」类问题的唯一线索，量又小（仅失败路径），必须始终落盘。
    */
   private static void logOpenBackupFailure(int callerUid, Throwable failure) {
-    if (!shouldLog()) return;
     try {
       android.util.Log.w(
           "SRX",
@@ -5556,6 +5606,9 @@ public class Hooker {
     return sb.toString();
   }
 
+  private static int WRAP_TIMING_LOG_COUNT = 0;
+  private static int WRAP_SLOW_TIMING_LOG_COUNT = 0;
+
   private static void logCursor(
       String stage, Cursor cursor, int pathColumn, int before, int after, int callerUid) {
     if (!shouldLog()) return;
@@ -5642,6 +5695,11 @@ public class Hooker {
       int count = safeCount(base);
       logCursor("wrap", base, pathColumn, count, count, callerUid);
       if (count <= 0) return base;
+      // issue #7：TIM 冷启动选图空屏 3-4 秒——需要把「一次 MediaStore 查询的逐行
+      // 过滤总耗时」直接记进日志，与 native 侧 filter_path 的单行均值互相印证。
+      // 慢查询（>200ms）必然落一条；快查询按 1/64 采样，避免热路径日志噪声。
+      long filterStartedMs = android.os.SystemClock.elapsedRealtime();
+      boolean slowQuery = false;
       if (pathColumn < 0 && relativePathColumn < 0 && idColumn < 0 && bucketIdColumn < 0) {
         return wrapOpaqueAggregateIfHidden(base, callerUid, count, visibleColumns);
       }
@@ -5664,33 +5722,18 @@ public class Hooker {
           long id = readId(base, idColumn);
           if (pathColumn >= 0) {
             String path = base.getString(pathColumn);
-            String rewritten = path == null ? null : filterPath(path, callerUid);
-            if (HIDDEN_ROW_SENTINEL.equals(rewritten)
-                || (rewritten != null && rewritten.length() == 0)) {
+            // 整行判定收敛到一次原生调用：改写、隐藏判定与两次存在性校验都在
+            // 同一次调用里完成，行循环不再逐行跨 JNI 多次。
+            String rewritten =
+                path == null ? null : cursorRowAction(path, callerUid, allowMissingMappedTarget);
+            if (rewritten != null && rewritten.length() == 0) {
               logFilter("filter", id, callerUid);
               continue;
             }
-            if ((rewritten == null || rewritten.equals(path))
-                && isHiddenByCallerVisibility(path, callerUid)) {
-              logFilter("filter_visibility", id, callerUid);
-              continue;
-            }
-            if (!allowMissingMappedTarget
-                && !isMediaStorePendingPath(path)
-                && !storagePathExistsForCaller(path, callerUid)) {
-              logFilter("filter_missing_plain", id, callerUid);
-              continue;
+            if (shouldLog() && path != null) {
+              verifyCursorRowAction(path, rewritten, callerUid, allowMissingMappedTarget);
             }
             if (rewritten != null && !rewritten.equals(path)) {
-              if (!allowMissingMappedTarget) {
-                boolean rewrittenExists = storagePathExistsForCaller(rewritten, callerUid);
-                boolean mappingViewRewrite = isMappingViewRewrite(path, rewritten, callerUid);
-                if (!rewrittenExists && (!mappingViewRewrite || !isMediaStorePendingPath(path))) {
-                  logFilter("filter_missing_rewrite", id, callerUid);
-                  continue;
-                }
-                if (!rewrittenExists) logFilter("keep_missing_mapping_view", id, callerUid);
-              }
               logFilter("rewrite", id, callerUid);
               logKeptRow("rewrite", id, callerUid, path, rewritten, base, bucketIdColumn);
               rewrites[row] = rewritten;
@@ -5763,6 +5806,30 @@ public class Hooker {
         try {
           base.moveToPosition(oldPosition);
         } catch (Throwable ignored) {
+        }
+        long filterCostMs = android.os.SystemClock.elapsedRealtime() - filterStartedMs;
+        slowQuery = filterCostMs > 200;
+        // 慢查询（>200ms）不受 verbose 开关约束，但每进程最多 32 条；常规耗时样本只在
+        // verbose 下记录前 64 条。此前慢查询会把常规计数清零，慢查询频繁时日志没有上限。
+        boolean logTiming;
+        if (slowQuery) {
+          logTiming = WRAP_SLOW_TIMING_LOG_COUNT < 32;
+          if (logTiming) WRAP_SLOW_TIMING_LOG_COUNT++;
+        } else {
+          logTiming = WRAP_TIMING_LOG_COUNT < 64 && shouldLog();
+          if (logTiming) WRAP_TIMING_LOG_COUNT++;
+        }
+        if (logTiming) {
+          android.util.Log.i(
+              "SRX",
+              "java cursor timing caller_uid="
+                  + callerUid
+                  + " rows="
+                  + count
+                  + " visible="
+                  + visibleRows.size()
+                  + " cost_ms="
+                  + filterCostMs);
         }
       }
 
@@ -6071,13 +6138,61 @@ public class Hooker {
     }
 
     private static boolean storagePathExistsForCaller(String path, int callerUid) {
-      if (storagePathExists(path)) return true;
+      if (pathExistsForCursorRow(path)) return true;
       try {
         String mappedPath = resolveOpenPath(path, callerUid);
         return mappedPath != null && mappedPath.length() > 0 && storagePathExists(mappedPath);
       } catch (Throwable ignored) {
         return false;
       }
+    }
+
+    /** 差分校验：详细日志时用旧序列复核，只记录不参与决策。 */
+    private static void verifyCursorRowAction(
+        String path, String action, int callerUid, boolean allowMissingMappedTarget) {
+      try {
+        String legacy = legacyCursorRowAction(path, callerUid, allowMissingMappedTarget);
+        boolean same = legacy == null ? action == null : legacy.equals(action);
+        if (!same) {
+          android.util.Log.w(
+              "SRX",
+              "cursor row action mismatch path="
+                  + path
+                  + " native="
+                  + action
+                  + " legacy="
+                  + legacy);
+        }
+      } catch (Throwable ignored) {
+      }
+    }
+
+    private static String legacyCursorRowAction(
+        String path, int callerUid, boolean allowMissingMappedTarget) {
+      String rewritten = filterPath(path, callerUid);
+      if (HIDDEN_ROW_SENTINEL.equals(rewritten) || (rewritten != null && rewritten.length() == 0)) {
+        return "";
+      }
+      if ((rewritten == null || rewritten.equals(path))
+          && isHiddenByCallerVisibility(path, callerUid)) {
+        return "";
+      }
+      if (!allowMissingMappedTarget
+          && !isMediaStorePendingPath(path)
+          && !storagePathExistsForCaller(path, callerUid)) {
+        return "";
+      }
+      if (rewritten != null && !rewritten.equals(path)) {
+        if (!allowMissingMappedTarget) {
+          boolean rewrittenExists = storagePathExistsForCaller(rewritten, callerUid);
+          boolean mappingViewRewrite = isMappingViewRewrite(path, rewritten, callerUid);
+          if (!rewrittenExists && (!mappingViewRewrite || !isMediaStorePendingPath(path))) {
+            return "";
+          }
+        }
+        return rewritten;
+      }
+      return null;
     }
 
     private static boolean isMappingViewRewrite(

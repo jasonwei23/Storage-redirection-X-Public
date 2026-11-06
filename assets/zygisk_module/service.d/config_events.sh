@@ -765,6 +765,13 @@ handle_package_added_event() {
   changed_file="$LOGS_DIR/.new_app_config_packages.tmp"
   : > "$changed_file"
 
+  # 卸载流程会把配置置回 disabled 并留标记（文件保留以免丢用户自定义规则）。
+  # 重装时先恢复这类配置，否则 auto-enable 会因「profile 已存在」跳过写入，
+  # 开关永远停在关闭态——这正是「卸载重装后不自动开启」的根因。
+  if restore_uninstall_disabled_config "$package_name"; then
+    echo "$package_name" >> "$changed_file"
+  fi
+
   user_ids=$(resolve_package_event_user_ids "$event_user_id" "$package_name")
   if [ -z "$user_ids" ]; then
     log -p w -t Boot "skip package added event: no user resolved pkg=$package_name"
@@ -933,6 +940,33 @@ disable_package_config() {
     return 1
   }
   chmod 644 "$config_file" 2>/dev/null
+  # 卸载禁用标记：配置文件保留（用户自定义规则不丢），但重装时需要据此区分
+  # 「卸载流程关的」与「用户手工关的」——前者在 added 事件时恢复 enabled，
+  # 后者保持 disabled 不受打扰。只有卸载流程会产生这个标记（唯一调用点）。
+  : > "$config_file.uninstall_disabled"
+  return 0
+}
+
+restore_uninstall_disabled_config() {
+  package_name="$1"
+  config_file="$APPS_CONFIG_DIR/$package_name.json"
+  marker_file="$config_file.uninstall_disabled"
+  [ -f "$marker_file" ] || return 1
+  rm -f "$marker_file"
+  [ -f "$config_file" ] || return 1
+  grep -Eq '"enabled"[[:space:]]*:[[:space:]]*false' "$config_file" 2>/dev/null || return 0
+
+  tmp_file="$config_file.tmp"
+  sed 's/"enabled"[[:space:]]*:[[:space:]]*false/"enabled": true/g' "$config_file" > "$tmp_file" 2>/dev/null || {
+    rm -f "$tmp_file"
+    return 1
+  }
+  mv "$tmp_file" "$config_file" || {
+    rm -f "$tmp_file"
+    return 1
+  }
+  chmod 644 "$config_file" 2>/dev/null
+  log -p i -t Boot "restored config disabled by uninstall: pkg=$package_name"
   return 0
 }
 
@@ -1140,14 +1174,26 @@ wait_for_package_event_notification() {
     return 1
   fi
 
+  # 必须自己同时持有读写两端再启动监听进程。
+  # 若用裸输入重定向直接读，读端 open(O_RDONLY) 在对端缺失时会无限期阻塞
+  # （wait_for_partner），而 `read -t` 的超时只对读取生效、管不到 open。一旦
+  # inotifyd 未能在本上下文启动，收集器就永久卡在这里，包事件从此不再消费：
+  # 新装应用自动开启、卸载清理、基线更新与热重载全部静默失效。
+  # 用 fd 3 自持两端后 open 永不阻塞，配合 -t 与监听进程存活检查必定返回。
+  if ! exec 3<>"$notification_fifo" 2>/dev/null; then
+    rm -f "$notification_fifo"
+    sleep "$notification_timeout_seconds"
+    return 1
+  fi
+
   inotifyd - \
-    "$LOGS_DIR":wcmdn > "$notification_fifo" 2>/dev/null &
+    "$LOGS_DIR":wcmdn >&3 2>/dev/null &
   notification_pid="$!"
   notification_elapsed=0
   notification_status=1
   while [ "$notification_elapsed" -lt "$notification_timeout_seconds" ]; do
     event_line=""
-    IFS= read -t 1 -r event_line < "$notification_fifo"
+    IFS= read -t 1 -r event_line <&3
     read_status="$?"
     if [ "$read_status" -eq 0 ]; then
       # 目录内还有 running/media/debug 日志；只有包事件日志轮换/写入或 ready
@@ -1161,14 +1207,27 @@ wait_for_package_event_notification() {
       continue
     fi
     notification_elapsed=$((notification_elapsed + 1))
+    if ! kill -0 "$notification_pid" 2>/dev/null; then
+      # 监听进程已退出，继续空等没有意义；本次按未收到通知返回，调用方随后
+      # 会照常消费事件日志并按节奏重试，功能降级为低频轮询而不是整体停摆。
+      log -p w -t Boot "package event inotifyd exited; fallback to polling"
+      break
+    fi
   done
   kill "$notification_pid" 2>/dev/null || true
   wait "$notification_pid" 2>/dev/null || true
+  exec 3>&-
   rm -f "$notification_fifo"
   [ "$notification_status" -eq 0 ]
 }
 
 start_package_event_collector() {
+  # 上一次 boot 或异常退出可能留下失效 FIFO，文件名带 pid 不会自愈，
+  # 不清理会无限累积；这里只删管道类型，避免误删同名普通文件。
+  for stale_notify_fifo in "$MODDIR"/.package_event_notify.*; do
+    [ -p "$stale_notify_fifo" ] || continue
+    rm -f "$stale_notify_fifo"
+  done
   (
     mkdir -p "$APPS_CONFIG_DIR"
     ensure_log_file "$PACKAGE_EVENT_LOG_FILE"
@@ -1241,7 +1300,10 @@ start_config_event_collector() {
           sync_monitor_collector
         fi
         if command -v sync_debug_collectors >/dev/null 2>&1; then
-          sync_debug_collectors
+          # 收敛放在子 shell 里执行：采集器启动会碰 logcat/dumpsys 等外部命令，
+          # 任何异常退出都不能连带结束这个事件循环——它现在是采集器状态的唯一
+          # 驱动源（周期看门狗已按规范移除），循环一死配置事件就再无人处理。
+          ( sync_debug_collectors ) || log_collector_status "sync failed rc=$?"
         fi
 
         case "$event_line" in

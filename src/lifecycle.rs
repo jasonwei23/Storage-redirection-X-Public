@@ -41,6 +41,13 @@ pub struct RuntimeFlow {
     should_install_app_redirect_hook: bool,
     is_system_writer_boot_lite: bool,
     is_file_monitor_ui: bool,
+    /// 本进程是否属于「诊断上必须在无 verbose 时也留痕」的系统链路
+    /// （MediaProvider / 代写者 / 共享组 / 监视桥接 / 文件选择 UI）。
+    ///
+    /// 这类进程的 specialize 结论一旦丢失，事后就只能靠猜：真机实测
+    /// android.process.media 因为走 bypass 分支、且 info 会被 verbose 门禁挡掉，
+    /// 于是 running.log 与 logcat 里都完全看不到它。
+    is_diagnostic_process: bool,
     should_install_fuse_fix: bool,
     should_skip_post_work: bool,
     should_keep_module_loaded: bool,
@@ -71,6 +78,7 @@ impl RuntimeFlow {
             should_install_app_redirect_hook: false,
             is_system_writer_boot_lite: false,
             is_file_monitor_ui: false,
+            is_diagnostic_process: false,
             should_install_fuse_fix: false,
             should_skip_post_work: false,
             should_keep_module_loaded: false,
@@ -81,6 +89,9 @@ impl RuntimeFlow {
     pub fn on_load(&mut self, api: abi::Api, env: *mut jni_sys::JNIEnv) {
         Logger::init(Some("zygisk"));
         self.api = Some(api);
+        // 供 hook 运行期（MP 进程 open:create 应答前）连接 companion 代执行
+        // 特权操作；保存本身无成本，仅 MP 进程的 hook 会真正使用。
+        crate::hook::companion_api::save_companion_api(&api);
         self.env = env;
         self.module_dir_fd = -1;
         jni::init_java_vm(env);

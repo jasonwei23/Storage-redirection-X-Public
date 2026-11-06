@@ -24,9 +24,7 @@ pub unsafe extern "C" fn hooked_rename(oldpath: *const c_char, newpath: *const c
         || call_rename(oldpath, newpath),
         |hub| {
             hub.increment_rename_calls();
-            if runtime::should_resolve_caller_context(hub) {
-                caller::update_caller_package_for_current_thread(hub);
-            }
+            caller::update_caller_for_mutation(hub, newpath);
 
             handle_rename_like(
                 hub,
@@ -67,9 +65,7 @@ pub unsafe extern "C" fn hooked_renameat(
         || call_original(oldpath, newpath),
         |hub| {
             hub.increment_rename_calls();
-            if runtime::should_resolve_caller_context(hub) {
-                caller::update_caller_package_for_current_thread(hub);
-            }
+            caller::update_caller_for_mutation(hub, newpath);
 
             handle_rename_like(
                 hub,
@@ -125,9 +121,7 @@ pub unsafe extern "C" fn hooked_renameat2(
         || call_original(oldpath, newpath),
         |hub| {
             hub.increment_rename_calls();
-            if runtime::should_resolve_caller_context(hub) {
-                caller::update_caller_package_for_current_thread(hub);
-            }
+            caller::update_caller_for_mutation(hub, newpath);
 
             handle_rename_like(
                 hub,
@@ -153,6 +147,23 @@ struct RenameLikeRequest {
     flags: i32,
 }
 
+const RENAME_EXCHANGE_FLAG: u32 = 1 << 1;
+const RENAME_WHITEOUT_FLAG: u32 = 1 << 2;
+
+/// EXCHANGE/WHITEOUT 都需要两个目录项处在同一可写后端；只重定向一侧会把
+/// 沙盒和真实路径混在一起，按内核语义应直接 EXDEV。NOREPLACE 只是最终目标
+/// 存在性检查，交给重定向后的内核判断即可。
+fn rename_cross_boundary_needs_exdev(
+    flags: i32,
+    old_redirected: bool,
+    new_redirected: bool,
+) -> bool {
+    if flags < 0 || old_redirected == new_redirected {
+        return false;
+    }
+    let flags = flags as u32;
+    flags & (RENAME_EXCHANGE_FLAG | RENAME_WHITEOUT_FLAG) != 0
+}
 fn handle_rename_like<F>(
     hub: &super::super::stats::InterceptHub,
     op_name: &str,
@@ -189,8 +200,6 @@ where
         return call_original(request.oldpath, request.newpath);
     };
 
-    let is_old_relative = !old_text.starts_with('/');
-    let is_new_relative = !new_text.starts_with('/');
     let is_old_storage = path_utils::is_relevant_storage_path(hub, old_resolved.as_ref());
     let is_new_storage = path_utils::is_relevant_storage_path(hub, new_resolved.as_ref());
     if !is_old_storage && !is_new_storage {
@@ -260,6 +269,15 @@ where
         new_resolved.as_ref()
     };
 
+    if rename_cross_boundary_needs_exdev(
+        request.flags,
+        old_redirect.is_redirect(),
+        new_redirect.is_redirect(),
+    ) {
+        runtime::set_errno(libc::EXDEV);
+        return -1;
+    }
+
     diagnostic::log_diag_rename_decision(
         hub,
         old_resolved.as_ref(),
@@ -288,8 +306,10 @@ where
         O_WRONLY | O_CREAT,
     );
 
-    let should_rewrite_old = old_redirect.is_redirect() || is_old_relative;
-    let should_rewrite_new = new_redirect.is_redirect() || is_new_relative;
+    // 只有真的重定向时才改写路径；不重定向的相对路径必须保留原 dirfd 语义，
+    // 否则会把 renameat(dirfd, "a", dirfd, "b") 变成绝对路径调用，丢失 fd 身份。
+    let should_rewrite_old = old_redirect.is_redirect();
+    let should_rewrite_new = new_redirect.is_redirect();
     let c_old = if should_rewrite_old {
         match CString::new(final_old) {
             Ok(path) => Some(path),
@@ -351,7 +371,7 @@ fn resolve_rename_path<'a>(
     }
 
     if path_text.starts_with('/') {
-        return Some(Cow::Borrowed(path_text));
+        return Some(Cow::Owned(path_utils::normalize_decision_path(path_text)));
     }
 
     diagnostic::log_relative_path_bypass(
@@ -406,9 +426,44 @@ fn process_redirect_path_for_rename(
 }
 
 fn should_apply_rename_policy(hub: &crate::hook::stats::InterceptHub) -> bool {
-    should_apply_rename_policy_for_mode(hub.is_monitor_only(), &hub.get_package_name())
+    should_apply_rename_policy_for_mode(hub.effective_monitor_only(), &hub.get_package_name())
 }
 
 fn should_apply_rename_policy_for_mode(is_monitor_only: bool, package_name: &str) -> bool {
     !is_monitor_only || policy::is_system_writer_package(package_name)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn exchange_or_whiteout_across_boundary_is_exdev() {
+        assert!(rename_cross_boundary_needs_exdev(
+            RENAME_EXCHANGE_FLAG as i32,
+            true,
+            false
+        ));
+        assert!(rename_cross_boundary_needs_exdev(
+            RENAME_WHITEOUT_FLAG as i32,
+            false,
+            true
+        ));
+        assert!(!rename_cross_boundary_needs_exdev(
+            RENAME_EXCHANGE_FLAG as i32,
+            true,
+            true
+        ));
+        assert!(!rename_cross_boundary_needs_exdev(
+            (RENAME_EXCHANGE_FLAG | RENAME_WHITEOUT_FLAG) as i32,
+            false,
+            false
+        ));
+    }
+
+    #[test]
+    fn noreplace_is_left_to_kernel_target_check() {
+        assert!(!rename_cross_boundary_needs_exdev(1, true, false));
+        assert!(!rename_cross_boundary_needs_exdev(-1, true, false));
+    }
 }

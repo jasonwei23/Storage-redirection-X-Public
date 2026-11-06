@@ -4,7 +4,15 @@ set -euo pipefail
 export MSYS_NO_PATHCONV=1
 export MSYS2_ARG_CONV_EXCL="*"
 
-PREFLIGHT_DIAGNOSTICS="test-flow-preflight.txt"
+# 测试流产物统一落盘目录（AGENTS.md「临时文件管理」规范）：temp/test-flow/<启动时间戳>/。
+# 本脚本先建目录并注入 SRT_ARTIFACT_DIR，后续场景脚本与诊断脚本共用同一目录，
+# 同一天多轮测试互不覆盖；CI 的 artifact 上传按 temp/test-flow/ 整目录收集。
+repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+SRT_ARTIFACT_DIR="${SRT_ARTIFACT_DIR:-${repo_root}/temp/test-flow/$(date +%Y%m%d-%H%M%S)}"
+mkdir -p "$SRT_ARTIFACT_DIR"
+export SRT_ARTIFACT_DIR
+
+PREFLIGHT_DIAGNOSTICS="${SRT_ARTIFACT_DIR}/test-flow-preflight.txt"
 
 capture_preflight_diagnostics() {
   {
@@ -89,7 +97,7 @@ android17_disable_graphics_readback() {
   # android17-release IWindowManager.aidl：135 为 isTaskSnapshotSupported，137 为
   # setTaskSnapshotEnabled。模块重启后的 framework 可能在短窗口内再次重启，因此
   # 每轮都绑定 system_server PID，稳定观察后再复核全部状态；PID 变化即从头重放。
-  local state_file="test-flow-graphics-state.txt"
+  local state_file="${SRT_ARTIFACT_DIR}/test-flow-graphics-state.txt"
   if [ "$phase" = "初次启动后" ]; then
     : >"$state_file"
   fi
@@ -223,7 +231,7 @@ fi
   adb shell "su 0 sh -c 'pm list packages -f -U --user 0 2>/dev/null'" 2>&1 || true
   echo "=== package_service ==="
   adb shell "cmd package list packages -f -U --user 0 2>/dev/null" 2>&1 || true
-} > test-flow-app-list.txt
+} > "${SRT_ARTIFACT_DIR}/test-flow-app-list.txt"
 
 # 模块重启后 system_server/package 服务可能还在恢复，进入场景脚本前再次等待。
 if ! wait_for_adb_ready; then
@@ -248,7 +256,7 @@ export SRT_SCENARIO_TIMEOUT_SECONDS="${SRT_SCENARIO_TIMEOUT_SECONDS:-300}"
 # SRT_SCENARIOS 直接传入，本块仅在本地运行或未走 prepare 时生效——此时
 # 手动触发传入的场景编号优先，其次看提交信息里的「单场景 29」（可逗号列举）。
 #
-# 逐场景修复时整轮矩阵（5 个版本 × 37 场景）要等约 50 分钟才看到结果，
+# 逐场景修复时整轮矩阵（5 个版本 × 40 场景）要等约 50 分钟才看到结果，
 # 而验证单点修复只需要那一个场景；用这两个入口把反馈周期压到十几分钟，
 # 不必为了跑窄范围而临时改写 workflow（改 workflow 容易在收尾时漏改回全量）。
 # srx-scenario-scope:begin
@@ -261,13 +269,55 @@ if [ -z "$scenario_scope" ]; then
 fi
 if [ -n "$scenario_scope" ]; then
   export SRT_SCENARIOS="${scenario_scope//，/,}"
-  echo "scenario_scope=limited value=${SRT_SCENARIOS}"
+  # 全量时 CI 传的是 `all`，它不是「受限范围」；打 limited 会误导判据核对。
+  case "$SRT_SCENARIOS" in
+    all|ALL) echo "scenario_scope=full value=all" ;;
+    *) echo "scenario_scope=limited value=${SRT_SCENARIOS}" ;;
+  esac
 fi
 # srx-scenario-scope:end
 # 场景脚本的失败退出码直接透传给 job（此前 224 无任何标记），这里显式打印便于定位。
+# 全局看门狗（按场景数自适应）：模拟器在场景失败后可能进入异常状态，脚本内
+# 后续 adb 调用会无限阻塞（run 40269845250 窄跑卡死 32 分钟实证；terminate
+# 修复只覆盖脚本退出之后）。预算＝15 分钟基础 + 每场景 90 秒：单场景约
+# 16.5 分钟封顶，全量 40 场景 75 分钟；超时以 124 退出并显式标注，job 快速
+# 失败进入重跑，而不是无限占用 runner。
+#
+# 场景数必须按清单取，不能数 SRT_SCENARIOS 的字面 token：全量时该变量的值是
+# `all`（空值走脚本内默认清单），按 token 数只能算出 1，看门狗缩到 990s，
+# 全量 40 场景必被腰斩——run 40324023063 的 A14 跑到场景 29 就被 124 杀掉，
+# A17 只是刚好赶上，掩盖了这个预算错误。
+scenario_total="$(grep -c '\"id\"' "$(dirname "$0")/storage-redirect-scenarios.json" 2>/dev/null || echo 0)"
+[ "$scenario_total" -ge 1 ] 2>/dev/null || scenario_total=40
+case "${SRT_SCENARIOS:-}" in
+  ''|all|ALL) scenario_count="$scenario_total" ;;
+  *) scenario_count="$(awk -F',' 'BEGIN{n=1} END{print (NF>0)?NF:1}' <<<"${SRT_SCENARIOS}")" ;;
+esac
+[ "$scenario_count" -ge 1 ] 2>/dev/null || scenario_count="$scenario_total"
+scenario_watchdog=$((900 + scenario_count * 90))
 scenario_exit=0
-bash .github/tests/run-storage-redirect-scenarios.sh || scenario_exit=$?
+timeout "${scenario_watchdog}s" bash .github/tests/run-storage-redirect-scenarios.sh || scenario_exit=$?
+if [ "$scenario_exit" -eq 124 ]; then
+  echo "场景脚本执行超时（${scenario_watchdog}s 看门狗触发，场景范围=${SRT_SCENARIOS:-全量}），按失败处理以便快速重跑" >&2
+fi
+# 只在看门狗超时时主动终止模拟器：那时设备侧可能已无响应，action 收尾的
+# `adb emu kill` 会无限挂起（run 40257794067/40261786446 实证）。
+# 正常失败路径**不能**提前 kill：模拟器先死会让 action 收尾的 emu kill 拿到
+# Connection refused，收尾不干净（run 40286639350：07:45:48 结束 Terminate
+# Emulator 后静默到 17 分钟步骤超时）。正常失败交给 action 自己收尾即可，
+# 配合场景脚本里取数服务的 exec 修复，step 能在秒级结束。
+if [ "$scenario_exit" -eq 124 ]; then
+  timeout 60 adb emu kill >/dev/null 2>&1 || true
+fi
 if [ "$scenario_exit" -ne 0 ]; then
   echo "场景脚本退出码：${scenario_exit}" >&2
+  # 失败时快照宿主侧的残留进程：GitHub runner 只在 step 的所有 stdout 写端
+  # 关闭后才判定结束，任何继承管道又不退出的子进程都会让 job 静默挂到步骤
+  # 超时（run 40286639350 实证 11 分 44 秒零输出）。这段输出用于下一轮直接
+  # 判定「谁还活着」，不必再靠推测。
+  echo "---- 宿主残留进程快照（失败诊断） ----" >&2
+  ps -eo pid,ppid,stat,etime,cmd 2>/dev/null |
+    grep -aE "emulator|qemu|http\.server|adb " |
+    grep -av "grep -aE" | head -20 >&2 || true
   exit "$scenario_exit"
 fi

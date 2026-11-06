@@ -45,10 +45,25 @@ READ_ONLY_IMAGE_FILE=image.jpg
 READ_ONLY_MEDIA_ROOT=/unused
 PRIVATE_READ_ONLY_MEDIA_ROOT=/unused
 """
-        with tempfile.TemporaryDirectory() as directory:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as directory:
+            # run_scenario 的结果文件写 ${SRT_ARTIFACT_DIR}/scenario-N-result.txt；
+            # 该变量由脚本头部的仓库默认值或编排器（run-android-test-flow.sh）经
+            # 环境传入，函数体抽取后两者都不在。按编排器方式用环境变量传递，
+            # 不注入脚本文本（-c 内联脚本在 Windows/MSYS 下有命令行长度上限）。
+            env = dict(os.environ, SRT_ARTIFACT_DIR=directory)
+            # 脚本落临时文件再执行，不走 `-c` 内联：Windows/MSYS 的命令行上限约 8191
+            # 字符，run_scenario 函数体加桩后已逼近该上限，再加一个场景分支就会被截断成
+            # 「unexpected EOF」（2026-11-06 场景 40 第三段即撞上）。
+            script = Path(directory) / "run_scenario_case.sh"
+            script.write_text(
+                stubs + overrides + function + f"\nrun_scenario {scenario}\n",
+                encoding="utf-8",
+                newline="\n",
+            )
+            file_options = [option for option in options if option != "-c"]
             return subprocess.run(
-                [BASH, *options, "-c", stubs + overrides + function + f"\nrun_scenario {scenario}\n"],
-                cwd=directory, text=True, encoding="utf-8", capture_output=True, timeout=10,
+                [BASH, *file_options, str(script)],
+                cwd=directory, env=env, text=True, encoding="utf-8", capture_output=True, timeout=10,
             )
 
     def test_success_keeps_backend_diagnostics(self):

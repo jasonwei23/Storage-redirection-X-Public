@@ -1,6 +1,11 @@
 package org.srx.manager.ui.screen
 
 import androidx.compose.animation.AnimatedVisibility
+import androidx.compose.animation.core.tween
+import androidx.compose.animation.fadeIn
+import androidx.compose.animation.fadeOut
+import androidx.compose.animation.scaleIn
+import androidx.compose.animation.scaleOut
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.combinedClickable
@@ -17,13 +22,13 @@ import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
-import androidx.compose.material.icons.Icons
-import androidx.compose.material.icons.rounded.Check
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -35,13 +40,24 @@ import androidx.compose.ui.draw.drawBehind
 import androidx.compose.ui.draw.dropShadow
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.Shape
+import androidx.compose.ui.graphics.TransformOrigin
 import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.graphics.shadow.Shadow
+import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.Dp
+import androidx.compose.ui.unit.IntOffset
+import androidx.compose.ui.unit.IntRect
+import androidx.compose.ui.unit.IntSize
+import androidx.compose.ui.unit.LayoutDirection
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import androidx.compose.ui.window.Popup
+import androidx.compose.ui.window.PopupPositionProvider
+import androidx.compose.ui.window.PopupProperties
+import kotlinx.coroutines.delay
 import org.srx.manager.capsuleContainerColor
 import org.srx.manager.capsuleSelectedColor
 import org.srx.manager.data.AppFilter
@@ -56,6 +72,8 @@ import org.srx.manager.ui.component.liquidPressScale
 import org.srx.manager.ui.theme.isSrxDarkTheme
 import top.yukonga.miuix.kmp.basic.Icon
 import top.yukonga.miuix.kmp.basic.Text
+import top.yukonga.miuix.kmp.icon.MiuixIcons
+import top.yukonga.miuix.kmp.icon.extended.Ok
 import top.yukonga.miuix.kmp.theme.MiuixTheme
 
 // 应用列表的展示组件。
@@ -75,18 +93,20 @@ internal fun AppListControls(
     val stackUserSwitcher = users.size > 1 && maxWidth < 360.dp
     if (stackUserSwitcher) {
       Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
-        AppFilterGroup(filter = filter, onFilter = onFilter, modifier = Modifier.fillMaxWidth())
+        AppFilterGroup(filter = filter, onFilter = onFilter)
         Box(modifier = Modifier.fillMaxWidth(), contentAlignment = Alignment.CenterEnd) {
           AppUserSwitcher(users = users, selectedUser = selectedUser, onUser = onUser)
         }
       }
     } else {
+      // 筛选组按内容取宽（不再 weight 铺满），用户按钮靠右：用户列表异步到达、按钮出现时
+      // 三个标签不会跟着重排，避免「点了用户菜单，Tab 位置却变了」。
       Row(
           modifier = Modifier.fillMaxWidth(),
-          horizontalArrangement = Arrangement.spacedBy(10.dp),
+          horizontalArrangement = Arrangement.SpaceBetween,
           verticalAlignment = Alignment.Top,
       ) {
-        AppFilterGroup(filter = filter, onFilter = onFilter, modifier = Modifier.weight(1f))
+        AppFilterGroup(filter = filter, onFilter = onFilter)
         AppUserSwitcher(users = users, selectedUser = selectedUser, onUser = onUser)
       }
     }
@@ -111,11 +131,17 @@ internal fun AppFilterGroup(
               .padding(5.dp),
       horizontalArrangement = Arrangement.spacedBy(2.dp),
   ) {
-    FilterButton("用户", filter == AppFilter.User, Modifier.weight(1f)) { onFilter(AppFilter.User) }
-    FilterButton("系统", filter == AppFilter.System, Modifier.weight(1f)) {
+    FilterButton("用户", filter == AppFilter.User, Modifier.widthIn(min = FilterButtonMinWidth)) {
+      onFilter(AppFilter.User)
+    }
+    FilterButton("系统", filter == AppFilter.System, Modifier.widthIn(min = FilterButtonMinWidth)) {
       onFilter(AppFilter.System)
     }
-    FilterButton("已配置", filter == AppFilter.Configured, Modifier.weight(1f)) {
+    FilterButton(
+        "已配置",
+        filter == AppFilter.Configured,
+        Modifier.widthIn(min = FilterButtonMinWidth),
+    ) {
       onFilter(AppFilter.Configured)
     }
   }
@@ -170,8 +196,37 @@ internal fun AppUserSwitcher(
 ) {
   if (users.size <= 1) return
   var expanded by remember(users, selectedUser) { mutableStateOf(false) }
+  // 关闭时保留一小段存活时间，让退场动画播完再移除 Popup。
+  var menuAlive by remember { mutableStateOf(false) }
+  LaunchedEffect(expanded) {
+    if (expanded) {
+      menuAlive = true
+    } else if (menuAlive) {
+      delay(MenuExitAnimMs.toLong())
+      menuAlive = false
+    }
+  }
   val triggerInteraction = remember { MutableInteractionSource() }
-  Column(horizontalAlignment = Alignment.End) {
+  val menuGapPx = with(LocalDensity.current) { 8.dp.roundToPx() }
+  val menuTransformOrigin = TransformOrigin(1f, 0f)
+  val menuPositionProvider =
+      remember(menuGapPx) {
+        object : PopupPositionProvider {
+          override fun calculatePosition(
+              anchorBounds: IntRect,
+              windowSize: IntSize,
+              layoutDirection: LayoutDirection,
+              popupContentSize: IntSize,
+          ): IntOffset {
+            // 菜单右边缘与触发按钮右边缘对齐，避免右对齐的按钮下挂一个偏左的菜单。
+            val x = anchorBounds.right - popupContentSize.width
+            val maxY = (windowSize.height - popupContentSize.height).coerceAtLeast(0)
+            val y = (anchorBounds.bottom + menuGapPx).coerceIn(0, maxY)
+            return IntOffset(x.coerceAtLeast(0), y)
+          }
+        }
+      }
+  Box {
     Text(
         text = "U$selectedUser",
         modifier =
@@ -198,37 +253,65 @@ internal fun AppUserSwitcher(
         fontWeight = FontWeight.Black,
         fontSize = 12.sp,
     )
-    AnimatedVisibility(visible = expanded) {
-      Column(
-          modifier =
-              Modifier.padding(top = 8.dp)
-                  .liquidGlassControl(
-                      shape = RoundedCornerShape(20.dp),
-                      tint = glassSurfaceColor(0.88f),
-                      refractionHeight = 12.dp,
-                      refractionAmount = 14.dp,
-                  )
-                  .padding(6.dp),
-          verticalArrangement = Arrangement.spacedBy(4.dp),
+    if (menuAlive) {
+      // 用户菜单必须以浮层覆盖在列表之上：早先的内联展开会把下方应用列表整体推下去，
+      // 切换用户时布局还会再跳一次，看起来像列表被挤走。
+      Popup(
+          popupPositionProvider = menuPositionProvider,
+          onDismissRequest = { expanded = false },
+          properties = PopupProperties(focusable = true),
       ) {
-        users.forEach { user ->
-          val selected = user == selectedUser
-          Text(
-              text = "用户 $user",
+        AnimatedVisibility(
+            visible = expanded,
+            enter =
+                fadeIn(tween(MenuEnterAnimMs)) +
+                    scaleIn(
+                        animationSpec = tween(MenuEnterAnimMs),
+                        initialScale = 0.92f,
+                        transformOrigin = menuTransformOrigin,
+                    ),
+            exit =
+                fadeOut(tween(MenuExitAnimMs)) +
+                    scaleOut(
+                        animationSpec = tween(MenuExitAnimMs),
+                        targetScale = 0.94f,
+                        transformOrigin = menuTransformOrigin,
+                    ),
+        ) {
+          Column(
               modifier =
-                  Modifier.clip(RoundedCornerShape(15.dp))
-                      .background(if (selected) capsuleSelectedColor() else Color.Transparent)
-                      .clickable {
-                        expanded = false
-                        onUser(user)
-                      }
-                      .padding(horizontal = 12.dp, vertical = 10.dp),
-              color =
-                  if (selected) srxPrimaryColor()
-                  else MiuixTheme.colorScheme.onSurfaceVariantSummary,
-              fontWeight = FontWeight.Bold,
-              fontSize = 12.sp,
-          )
+                  Modifier.width(MenuMinWidth)
+                      .liquidGlassControl(
+                          shape = RoundedCornerShape(22.dp),
+                          tint = glassSurfaceColor(0.94f),
+                          refractionHeight = 14.dp,
+                          refractionAmount = 16.dp,
+                      )
+                      .padding(MenuPadding),
+              verticalArrangement = Arrangement.spacedBy(MenuItemGap),
+          ) {
+            users.forEach { user ->
+              val selected = user == selectedUser
+              Text(
+                  text = "用户 $user",
+                  modifier =
+                      Modifier.fillMaxWidth()
+                          .clip(RoundedCornerShape(16.dp))
+                          .background(if (selected) capsuleSelectedColor() else Color.Transparent)
+                          .clickable {
+                            expanded = false
+                            onUser(user)
+                          }
+                          .padding(horizontal = 16.dp, vertical = 13.dp),
+                  color =
+                      if (selected) srxPrimaryColor()
+                      else MiuixTheme.colorScheme.onSurfaceVariantSummary,
+                  fontWeight = FontWeight.Bold,
+                  fontSize = 13.sp,
+                  textAlign = TextAlign.End,
+              )
+            }
+          }
         }
       }
     }
@@ -401,7 +484,7 @@ internal fun SelectionMark(selected: Boolean) {
   ) {
     if (selected) {
       Icon(
-          Icons.Rounded.Check,
+          MiuixIcons.Ok,
           contentDescription = "已选择",
           tint = Color.White,
           modifier = Modifier.size(16.dp),
@@ -432,3 +515,13 @@ internal fun StatusPill(app: InstalledApp) {
       overflow = TextOverflow.Ellipsis,
   )
 }
+
+/** 三个筛选标签的最小宽度：按内容取宽，同时保证三个胶囊等宽、不被拉伸到整行。 */
+private val FilterButtonMinWidth = 64.dp
+
+/** 用户切换菜单：宽度与点击热区按单手操作留余量，但保持窄菜单不遮挡列表。 */
+private val MenuMinWidth = 132.dp
+private val MenuPadding = 6.dp
+private val MenuItemGap = 4.dp
+private const val MenuEnterAnimMs = 160
+private const val MenuExitAnimMs = 120

@@ -13,6 +13,7 @@ pub(super) fn write_mount_state(
         request.uid,
         &request.package_name,
         request.config_version,
+        request.policy_fingerprint,
         plan.state_path.as_str(),
         plan.temp_state_path.as_str(),
         targets,

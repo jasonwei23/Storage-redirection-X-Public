@@ -69,6 +69,7 @@ impl RuntimeFlow {
             should_redirect: self.should_redirect,
             should_monitor: self.should_monitor,
             is_system_writer,
+            is_diagnostic: self.is_diagnostic_process,
             is_hook_redirect: self.is_system_writer_hook_redirect,
             allow_count: stages.allow_count,
             excluded_count: stages.excluded_count,
@@ -110,6 +111,15 @@ impl RuntimeFlow {
         self.package_name = process.package_name.clone();
         self.app_uid = process.uid;
         self.app_pid = process.pid;
+
+        // 日志汇必须在任何"结论性"日志之前装上。
+        //
+        // 此前它在 configure_monitoring() 之后才 init，于是更早产生的结论全部写进了
+        // 虚空：真机实测（HyperOS 2026-11-05）`monitor init`、`module dir fd open`
+        // 各有 0 条记录，而同一次 specialize 里 `hook manager init` 有记录——差别
+        // 只在于后者发生在 init 之后。这类行恰好是"这个进程到底被判定成什么"的
+        // 唯一证据，缺了只能靠猜。ensure_log_adapter 是 Once，重复调用无副作用。
+        Logger::init(Some(&self.package_name));
 
         // MediaProvider 一进入 specialize 就登记，早于任何提前返回分支。
         //
@@ -219,19 +229,30 @@ impl RuntimeFlow {
     pub fn pre_app_specialize(&mut self, args: *mut abi::AppSpecializeArgs) {
         let mut perf_stages = SpecializePerfStages::new(monotonic_ms());
         let Some(process) = self.resolve_specialize_identity(args) else {
+            // 身份解析失败是该进程「完全没有下文」的唯一解释，必须留痕：它连
+            // package_name 都没有，后面的任何结论行都不会出现。
+            log::warn!("specialize identity unresolved");
             return;
         };
 
-        let is_system_writer = policy::is_system_writer_package(&self.package_name);
+        let is_system_writer = policy::is_system_writer_package(&self.package_name)
+            || policy::is_legacy_writer_process_name(&self.package_name);
         let is_shared_uid_writer = policy::is_shared_uid_process(self.app_uid);
         let is_monitor_bridge = policy::is_file_monitor_bridge_package(&self.package_name);
         self.is_file_monitor_ui =
             is_file_monitor_ui_process(&self.package_name, &process.nice_name);
+        // 系统链路进程的 specialize 结论必须无条件留痕（见字段注释）：info 会被
+        // verbose 门禁挡掉，而这类进程一旦走 bypass，事后连"它被判成了什么"都查不到。
+        self.is_diagnostic_process = is_system_writer
+            || is_shared_uid_writer
+            || is_monitor_bridge
+            || self.is_file_monitor_ui;
         if self.is_file_monitor_ui {
             self.should_skip_post_work = true;
             self.close_module_dir_fd();
             self.request_dlclose();
-            log::info!(
+            // 这条是"该进程为什么没被 hook"的唯一结论，诊断进程必须无条件可见。
+            log::warn!(
                 "file monitor UI daemon-only bypass pkg={} nice={} uid={} pid={}",
                 self.package_name,
                 process.nice_name,
@@ -254,11 +275,19 @@ impl RuntimeFlow {
             self.should_skip_post_work = true;
             self.close_module_dir_fd();
             self.request_dlclose();
-            log::debug!(
-                "app config inactive, fast bypass pkg={} uid={}",
-                self.package_name,
-                self.app_uid
-            );
+            if self.is_diagnostic_process {
+                log::warn!(
+                    "app config inactive, fast bypass pkg={} uid={}",
+                    self.package_name,
+                    self.app_uid
+                );
+            } else {
+                log::debug!(
+                    "app config inactive, fast bypass pkg={} uid={}",
+                    self.package_name,
+                    self.app_uid
+                );
+            }
             return;
         }
 
@@ -366,7 +395,6 @@ impl RuntimeFlow {
         }
 
         self.configure_monitoring();
-        Logger::init(Some(&self.package_name));
 
         // MediaProvider 的重定向 Java hook 仍在 pre 阶段安装；SAF 来源识别
         // 走 native 文件监视路径，避免在系统 provider 内加载 LSPlant。
@@ -577,13 +605,10 @@ impl RuntimeFlow {
             return;
         }
 
-        crate::mount_intent::mark_planned(
-            &self.package_name,
-            self.app_pid,
-            self.app_uid,
-            storage_backend_mode,
-            config.config_version(),
-        );
+        // 这里不再写 mount intent。应用进程（zygote 域、uid 10xxx）对模块目录没有写
+        // 权限，`mark_planned` 必然失败——真机一轮开机里它留下 71 条
+        // `mount intent write failed`，而意图状态本身并没有写进去。意图从 daemon /
+        // companion 收到请求时写 `applying` 开始记录，结束后写 mounted / failed。
 
         // 预挂载路径与兜底路径的发送动作完全一致，只有额外日志和退出原因不同
         let is_pre_mount_request = !is_system_writer && !is_shared_uid_writer && !is_monitor_bridge;
@@ -668,6 +693,18 @@ impl RuntimeFlow {
         let trail = AuditTrail::instance();
         if !self.should_monitor {
             trail.set_enabled(false);
+            // 「关掉监视」与「根本没走到这里」在事后完全无法区分，而系统链路的
+            // 进程恰恰最需要这个区分（真机实测 MP 从来没打过 monitor init，
+            // 到底是这里关掉了、还是更早的分支就返回了，只能靠猜）。
+            if self.is_diagnostic_process {
+                log::warn!(
+                    "monitor disabled pkg={} uid={} redirect={} hook_redirect={}",
+                    self.package_name,
+                    self.app_uid,
+                    self.should_redirect,
+                    self.is_system_writer_hook_redirect
+                );
+            }
             return;
         }
 
@@ -753,7 +790,43 @@ impl RuntimeFlow {
     }
 }
 
+/// 诊断开关：`.disable_mp_hooks` 存在时跳过 MediaProvider 进程内全部模块 hook
+/// （Java hook / PLT hook / fuse-fix），用于二分定位「hook 引发应用行为异常」类
+/// 问题；正常构建与用户环境不存在该文件，零影响。
+pub(crate) fn mp_hooks_disabled() -> bool {
+    std::path::Path::new(crate::platform::module_paths::MODULE_DIR)
+        .join(".disable_mp_hooks")
+        .exists()
+}
+
+/// 诊断开关：`.disable_fuse_fix` 只跳过 fuse-fix（对 MP 原生 FuseDaemon 的
+/// native 补丁），Java hook 与 PLT hook 保持安装。
+pub(crate) fn fuse_fix_disabled() -> bool {
+    std::path::Path::new(crate::platform::module_paths::MODULE_DIR)
+        .join(".disable_fuse_fix")
+        .exists()
+}
+
+/// 诊断开关：`.disable_plt_hook` 只跳过 MP 的 PLT/media-runtime hook。
+pub(crate) fn plt_hook_disabled() -> bool {
+    std::path::Path::new(crate::platform::module_paths::MODULE_DIR)
+        .join(".disable_plt_hook")
+        .exists()
+}
+
+/// 诊断开关：`.disable_java_hook` 只跳过 MP 的 Java hook（LSPlant）。
+pub(crate) fn java_hook_disabled() -> bool {
+    std::path::Path::new(crate::platform::module_paths::MODULE_DIR)
+        .join(".disable_java_hook")
+        .exists()
+}
+
 fn install_java_hook(env: *mut jni_sys::JNIEnv) {
+    if java_hook_disabled() {
+        log::info!("java hook skip: disabled by diagnostic marker");
+        record_media_hook_install_state("java_hook_disabled");
+        return;
+    }
     // MediaProvider 主进程的 Java hook 保持启用
     // 用于 Caller 识别，工作稳定
     if !java_hook::is_available() {
@@ -806,6 +879,7 @@ fn config_file_monitor_enabled() -> bool {
 
 fn should_open_writer_config_fd_before_uid_resolution(package_name: &str) -> bool {
     policy::is_system_writer_package(package_name)
+        || policy::is_legacy_writer_process_name(package_name)
         || policy::is_file_monitor_bridge_package(package_name)
 }
 

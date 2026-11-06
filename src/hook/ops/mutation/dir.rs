@@ -27,9 +27,7 @@ pub unsafe extern "C" fn hooked_mkdir(pathname: *const c_char, mode: mode_t) -> 
         },
         |hub| {
             hub.increment_mkdir_calls();
-            if runtime::should_resolve_caller_context(hub) {
-                crate::hook::caller::update_caller_package_for_current_thread(hub);
-            }
+            crate::hook::caller::update_caller_for_mutation(hub, pathname);
 
             handle_mkdir_like(hub, "mkdir", AT_FDCWD, pathname, mode, |call_path| {
                 runtime::call_prev(
@@ -66,9 +64,7 @@ pub unsafe extern "C" fn hooked_mkdirat(
         },
         |hub| {
             hub.increment_mkdir_calls();
-            if runtime::should_resolve_caller_context(hub) {
-                crate::hook::caller::update_caller_package_for_current_thread(hub);
-            }
+            crate::hook::caller::update_caller_for_mutation(hub, pathname);
 
             handle_mkdir_like(hub, "mkdirat", dirfd, pathname, mode, |call_path| {
                 runtime::call_prev(
@@ -100,9 +96,7 @@ pub unsafe extern "C" fn hooked_unlink(pathname: *const c_char) -> c_int {
         },
         |hub| {
             hub.increment_unlink_calls();
-            if runtime::should_resolve_caller_context(hub) {
-                crate::hook::caller::update_caller_package_for_current_thread(hub);
-            }
+            crate::hook::caller::update_caller_for_mutation(hub, pathname);
 
             handle_unlink_like(hub, "unlink", AT_FDCWD, pathname, -1, |call_path| {
                 runtime::call_prev(
@@ -144,9 +138,7 @@ pub unsafe extern "C" fn hooked_unlinkat(
         || call_original(pathname),
         |hub| {
             hub.increment_unlink_calls();
-            if runtime::should_resolve_caller_context(hub) {
-                crate::hook::caller::update_caller_package_for_current_thread(hub);
-            }
+            crate::hook::caller::update_caller_for_mutation(hub, pathname);
 
             handle_unlink_like(hub, "unlinkat", dirfd, pathname, flags, call_original)
         },
@@ -168,9 +160,7 @@ pub unsafe extern "C" fn hooked_rmdir(pathname: *const c_char) -> c_int {
         },
         |hub| {
             hub.increment_unlink_calls();
-            if runtime::should_resolve_caller_context(hub) {
-                crate::hook::caller::update_caller_package_for_current_thread(hub);
-            }
+            crate::hook::caller::update_caller_for_mutation(hub, pathname);
 
             handle_single_path_audit(
                 hub,
@@ -181,6 +171,7 @@ pub unsafe extern "C" fn hooked_rmdir(pathname: *const c_char) -> c_int {
                     pathname,
                     log_flags: 0,
                     extra_tail: None,
+                    redirect_mutation: true,
                 },
                 |call_path| {
                     runtime::call_prev(
@@ -213,6 +204,34 @@ where
         return call_original(pathname);
     }
 
+    // 入口留痕：只在诊断进程（MediaProvider / 代写者等系统链路）上开，用来回答
+    // 「这次 mkdir 到底有没有进到本模块」。没有这一层，hook 未被调用与 hook 判成
+    // 放行在日志上完全同形——真机 2026-11-05 排查 sau 沙盒时正是卡在这里。
+    let is_diagnostic_caller = {
+        let pkg = hub.get_package_name();
+        crate::redirect::policy::is_media_provider_package(&pkg)
+            || crate::redirect::policy::is_system_writer_package(&pkg)
+    };
+    if is_diagnostic_caller {
+        // SAFETY: pathname 已判空；c_str_to_string 按 NUL 结尾读取，指针有效期由
+        // hook 调用方保证。
+        let raw_path = unsafe { crate::hook::util::c_str_to_string(pathname) };
+        // SAFETY: getuid 无参数、无副作用，只读取当前进程的实际 uid。
+        let self_uid = unsafe { libc::getuid() };
+        log::debug!(
+            "{} entry pkg={} dirfd={} self_uid={} path={}",
+            op_name,
+            hub.get_package_name(),
+            dirfd,
+            self_uid,
+            if raw_path.is_empty() {
+                "-"
+            } else {
+                raw_path.as_str()
+            }
+        );
+    }
+
     // SAFETY: pathname 已在上方判空，prepare_relevant_path 会按 NUL 结尾读取该 C 字符串并解析路径，指针有效性由 hook 调用方保证。
     let PreparedPath::Ready {
         path_for_decision, ..
@@ -229,7 +248,7 @@ where
         mode as i32,
     );
 
-    if hub.is_monitor_only() && !should_enforce_monitor_only_writer_policy(hub) {
+    if hub.effective_monitor_only() && !should_enforce_monitor_only_writer_policy(hub) {
         let result = call_original(pathname);
         let error_no = runtime::errno_for_result(result);
         monitor::record_mkdir_result(hub, op_name, path_for_decision.as_ref(), result, error_no);
@@ -252,6 +271,23 @@ where
         path_for_decision.as_ref(),
         &redirect_result,
     );
+    if is_diagnostic_caller {
+        // 决策结果无条件留痕：入口有日志、决策没有，就说明这次直接走了「放行到真实
+        // 存储」。两者必须成对出现才能判定是「没进 hook」还是「进了但判成放行」。
+        log::debug!(
+            "{} decision pkg={} redirect={} denied={} mapping={} to={}",
+            op_name,
+            hub.get_package_name(),
+            redirect_result.is_redirect(),
+            redirect_result.is_denied(),
+            redirect_result.is_mapping,
+            if redirect_result.new_path.is_empty() {
+                "-"
+            } else {
+                redirect_result.new_path.as_str()
+            }
+        );
+    }
     if redirect_result.is_denied() {
         return deny_read_only_mkdir(
             hub,
@@ -291,6 +327,17 @@ where
         return 0;
     }
 
+    if redirect_result.is_mapping {
+        return handle_mapping_mkdir(
+            hub,
+            op_name,
+            path_for_decision.as_ref(),
+            pathname,
+            &redirect_result,
+            call_original,
+        );
+    }
+
     let result = if redirect_result.is_redirect() {
         let redirected_path = redirect_result.new_path.clone();
         record_redirect_hit(hub, op_name, path_for_decision.as_ref(), &redirected_path);
@@ -323,10 +370,20 @@ where
         } else {
             path_for_decision.as_ref()
         };
-        runtime::fix_system_writer_android_private_owner(owner_path, true);
+        runtime::fix_system_writer_android_private_owner(owner_path, true, -1);
     }
     if redirect_result.is_redirect() {
         if result == 0 || error_no == libc::EEXIST {
+            // 映射重定向成功后登记到进程级：系统写者落盘完会用**原请求路径**回查
+            // attr / realpath，而请求侧在真实存储里并不存在（只是应用视图的 bind
+            // 挂载点），没有这张表就一律 ENOENT，FUSE 会把 ENOENT 回给调用方。
+            // 线程级登记覆盖不到——回查发生在 MP 的 FUSE 读线程上。
+            if redirect_result.is_mapping {
+                crate::hook::remember_process_mapped_dir(
+                    path_for_decision.as_ref(),
+                    &redirect_result.new_path,
+                );
+            }
             cleanup_empty_redirect_source_dir_if_needed(
                 op_name,
                 path_for_decision.as_ref(),
@@ -340,13 +397,40 @@ where
             path_for_decision,
             redirect_result.new_path
         );
-        if result == 0 || error_no == libc::EEXIST || error_no == libc::ENOTDIR {
+        if result == 0
+            || error_no == libc::EEXIST
+            || error_no == libc::ENOTDIR
+            || error_no == libc::EACCES
+        {
             runtime::normalize_redirect_directory(&redirect_result.new_path);
             if error_no == libc::EEXIST || error_no == libc::ENOTDIR {
                 log::debug!(
                     "mkdir redirect exists/notdir: returning 0 errno={} path={}",
                     error_no,
                     path_for_decision
+                );
+                monitor::record_mkdir_result_from(
+                    hub,
+                    op_name,
+                    &redirect_result.new_path,
+                    path_for_decision.as_ref(),
+                    0,
+                    0,
+                );
+                return 0;
+            }
+            if error_no == libc::EACCES
+                && crate::platform::fs::is_directory(&redirect_result.new_path)
+            {
+                // 映射改写后的 storage 路径由系统 FUSE（MediaProvider）承接，代写者
+                // uid 对发起者映射目标的 mkdir 会被拒绝；目标目录通常已由发起者按
+                // 自己的视图预建，此时原路径 mkdir 的语义已经达成，透传 EACCES
+                // 会让引擎把「目录可用」误判为创建失败（2026-10-24 真机：XL 引擎
+                // 对已预建的映射目标仍报 Failed to create target dir）。
+                log::debug!(
+                    "mkdir redirect target exists as dir: returning 0 path={} redirect={}",
+                    path_for_decision,
+                    redirect_result.new_path
                 );
                 monitor::record_mkdir_result_from(
                     hub,
@@ -373,6 +457,143 @@ where
         monitor::record_mkdir_result(hub, op_name, path_for_decision.as_ref(), result, error_no);
     }
     result
+}
+
+/// 映射请求路径的 mkdir：目录必须落在**请求路径自身的后端**，不能只建映射目标。
+///
+/// 映射请求路径是应用视图里的别名 bind 挂载点，只有被登记的应用 namespace 能看见；
+/// 未登记的代写链路（`android.process.media` 里的下载提供器）走的是 MediaProvider
+/// 的 FUSE 视图。此时若沿用「把 mkdir 改写到映射目标」的老路，请求路径在后端始终
+/// 没有真实目录，内核拿不到可用的 FUSE entry：daemon 侧明明返回成功
+/// （`mkdir redirect exists/notdir: returning 0`），客户端 `File.mkdirs()` 仍然
+/// `isDirectory()==false && mkdirs()==false`，最终抛
+/// `Failed to create parent for <请求路径>`
+/// （2026-10-26 A17 场景 39 在本地模拟器与 CI 上双向复现，两侧 proc maps /
+/// mountinfo 完全同形，只有「请求路径后端目录是否存在」不同）。
+///
+/// 因此这里先在请求路径的后端落盘目录，再补齐映射目标，最后按调用方语义返回：
+/// 请求路径或映射目标任一成为目录即视为成功。
+fn handle_mapping_mkdir<F>(
+    hub: &InterceptHub,
+    op_name: &str,
+    source_path: &str,
+    pathname: *const c_char,
+    redirect: &RedirectDecision,
+    call_original: F,
+) -> c_int
+where
+    F: FnOnce(*const c_char) -> c_int,
+{
+    record_redirect_hit(hub, op_name, source_path, &redirect.new_path);
+
+    let saved_errno = runtime::current_errno();
+    let request_backend = storage_backend_dir(source_path);
+
+    // 请求路径在真实存储里**绝不创建**：它是映射视图里的挂载点，用户配置映射正是为了
+    // 不让它出现在公共目录。这里只落映射目标，调用方随后的 isDirectory/realpath 由
+    // 进程内登记的「请求路径→映射目标」短时表承接（见 `remember_process_mapped_dir`
+    // 与 `hooked_realpath`），因此不再需要真实请求目录来喂内核 FUSE entry。
+    let (mut result, mut error_no) = if request_backend.is_empty() {
+        // 非 storage 形态（相对路径、其它挂载）保持原来的改写语义。
+        let target_c = CString::new(redirect.new_path.as_str()).ok();
+        let call_ptr = target_c
+            .as_ref()
+            .map_or(pathname, |c_string| c_string.as_ptr());
+        let call_result = call_original(call_ptr);
+        let call_errno = runtime::errno_for_result(call_result);
+        (call_result, call_errno)
+    } else {
+        log::debug!(
+            "mkdir mapping request dir skipped (request path must not be created) path={} backend={}",
+            source_path,
+            request_backend
+        );
+        (0, 0)
+    };
+
+    runtime::ensure_redirect_parent_dirs(&redirect.new_path, 0o2773);
+    let target_backend = storage_backend_dir(&redirect.new_path);
+    if !target_backend.is_empty() {
+        let (target_result, target_errno) = create_backend_dir(&target_backend);
+        log::debug!(
+            "mkdir mapping target dir: result={} errno={} path={} backend={}",
+            target_result,
+            target_errno,
+            redirect.new_path,
+            target_backend
+        );
+        // 请求路径不再落盘，映射目标就是这次 mkdir 唯一的真实产物：它建不出来时
+        // 必须把失败原样交回调用方，不能因为「请求侧跳过」就报成功。
+        if !request_backend.is_empty() {
+            result = target_result;
+            error_no = target_errno;
+        }
+        runtime::normalize_redirect_directory(&redirect.new_path);
+    }
+
+    // 映射落盘后系统写者会用**原请求路径**回查 attr / realpath，请求侧在真实存储里
+    // 只是应用视图的 bind 挂载点，必须登记才能让回查报告「存在」。
+    crate::hook::remember_process_mapped_dir(source_path, &redirect.new_path);
+    runtime::set_errno(saved_errno);
+
+    if result == 0 || error_no == libc::EEXIST || error_no == libc::ENOTDIR {
+        log::debug!(
+            "mkdir mapping resolved: returning 0 errno={} path={} redirect={}",
+            error_no,
+            source_path,
+            redirect.new_path
+        );
+        result = 0;
+        error_no = 0;
+    }
+    monitor::record_mkdir_result_from(
+        hub,
+        op_name,
+        &redirect.new_path,
+        source_path,
+        result,
+        error_no,
+    );
+    result
+}
+
+/// 把 storage 视图路径换算成后端落盘路径；非 storage 形态返回空串。
+fn storage_backend_dir(path: &str) -> String {
+    if path.is_empty() {
+        return String::new();
+    }
+    let normalized = paths::normalize(path);
+    if normalized.starts_with("/storage/emulated/") {
+        return paths::storage_to_data_media_path(&normalized);
+    }
+    if normalized.starts_with("/data/media/") {
+        return normalized;
+    }
+    String::new()
+}
+
+/// 在后端路径上直接建目录（已存在视为成功）。
+///
+/// 调用点位于 hook 重入保护内，`libc::mkdir` 会落到原始实现，不再次进入重定向，
+/// 因此不会把这次的请求路径又改写到映射目标上。
+fn create_backend_dir(path: &str) -> (c_int, c_int) {
+    if path.is_empty() {
+        return (-1, libc::ENOENT);
+    }
+    if crate::platform::fs::is_directory(path) {
+        return (0, 0);
+    }
+    let Ok(c_path) = CString::new(path) else {
+        return (-1, libc::EINVAL);
+    };
+    // SAFETY: c_path 由上一行 CString::new 构造，保证以 NUL 结尾且在本次调用期间有效；
+    // mkdir 只读取该路径字符串，不保留指针。
+    let result = unsafe { libc::mkdir(c_path.as_ptr(), 0o2773) };
+    if result == 0 {
+        (0, 0)
+    } else {
+        (result, runtime::current_errno())
+    }
 }
 
 fn should_passthrough_provider_allowed_parent_mkdir(

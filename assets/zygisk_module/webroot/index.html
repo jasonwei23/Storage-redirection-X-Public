@@ -71,6 +71,16 @@
               <span class="status-card-value" id="statEnabledAppCount">--</span>
               <span class="status-card-label">生效次数</span>
             </div>
+            <div
+              class="module-status-metric"
+              id="hostStatusMetric"
+              role="button"
+              tabindex="0"
+              aria-label="查看宿主策略说明"
+            >
+              <span class="status-card-value" id="statHostStatus">--</span>
+              <span class="status-card-label">宿主策略</span>
+            </div>
           </div>
         </section>
       </div>
@@ -84,6 +94,9 @@
       <div class="page-header">
         <div class="page-header-text">
           <h1 class="page-title">应用管理</h1>
+        </div>
+        <div class="page-header-actions">
+          <button class="icon-btn icon-btn-refresh" id="appListRefresh" type="button" aria-label="刷新应用列表" title="刷新应用列表"><span class="icon icon-refresh" aria-hidden="true"></span></button>
         </div>
       </div>
       <div class="search-bar">
@@ -114,7 +127,7 @@
     </div>
 
     <div class="page" id="page-app-config">
-      <div class="page-header app-config-header miuix-blur">
+      <div class="page-header app-config-header">
         <button class="icon-btn icon-btn-back" id="appConfigBack" type="button" aria-label="返回" title="返回"><span class="icon icon-arrow-left" aria-hidden="true"></span></button>
         <div class="page-header-text">
           <h1 class="page-title" id="configAppName">应用配置</h1>
@@ -207,7 +220,7 @@
     </div>
   </div>
 
-  <nav class="bottom-nav miuix-floating-container miuix-blur" id="bottomNav" data-miuix-ui="floating-container" data-miuix-blur="realtime">
+  <nav class="bottom-nav" id="bottomNav">
     <button class="nav-item active" data-page="dashboard">
       <span class="nav-icon icon icon-nav-dashboard" aria-hidden="true"></span>
       <span class="nav-label">概览</span>

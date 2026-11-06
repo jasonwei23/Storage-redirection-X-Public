@@ -112,9 +112,11 @@ pub(super) fn send_companion_request_payload(api: Option<&abi::Api>, payload: &s
         return false;
     }
 
+    // 协议 v2：首字节 'M' 标识挂载请求，companion 按类型分发。
     let payload_len = payload.len() as u32;
-    let sent =
-        fs::write_all(fd, &payload_len.to_ne_bytes()) && fs::write_all(fd, payload.as_bytes());
+    let sent = fs::write_all(fd, b"M")
+        && fs::write_all(fd, &payload_len.to_ne_bytes())
+        && fs::write_all(fd, payload.as_bytes());
     unsafe { libc::close(fd) };
 
     if !sent {

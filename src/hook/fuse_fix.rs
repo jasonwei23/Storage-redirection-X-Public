@@ -7,7 +7,7 @@ use std::ffi::c_void;
 use std::mem::size_of;
 use std::sync::Mutex;
 use std::sync::RwLock;
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU32, Ordering};
 
 const LIB_FUSE_JNI: &str = "libfuse_jni.so";
 const EQUALS_IGNORE_CASE_NDK_SYMBOL: &str =
@@ -42,6 +42,11 @@ static TARGET_PACKAGE: RwLock<String> = RwLock::new(String::new());
 static COMPARE_PATCH_LOCK: Mutex<()> = Mutex::new(());
 static RETRY_COUNT: AtomicU32 = AtomicU32::new(0);
 const MAX_RETRY_COUNT: u32 = 16;
+// 重试预算耗尽后的长尾重试间隔：fuse_jni 由 FuseDaemonThread 按需 dlopen，
+// 加载时机不受 MP 流量控制（2026-10-30 A17 模拟器实测：首批 open 耗尽 16 次，
+// FuseDaemonThread 启动在其后），长尾重试保证零宽修复在 fuse_jni 映射后仍能
+// 装上。只影响零宽修复自身的安装可靠性，不涉及其它功能。
+const LONG_TAIL_RETRY_INTERVAL_MS: i64 = 10 * 60 * 1000;
 
 unsafe extern "C" {
     fn srx_fuse_fix_install(
@@ -168,11 +173,18 @@ fn install_target_if_enabled() {
         .filter(|probe| {
             matches!(
                 probe.as_str(),
-                "core" | "extended" | "all" | "all_compare" | "late"
+                "core"
+                    | "extended"
+                    | "all"
+                    | "all_compare"
+                    | "late"
+                    | "reply"
+                    | "passthrough"
+                    | "openwithfuse"
             )
         });
     if let Some(probe) = native_probe.as_deref() {
-        log::warn!(
+        log::debug!(
             "fuse fix diagnostic property={} api={}",
             probe,
             crate::platform::android_api_level()
@@ -186,6 +198,11 @@ fn install_target_if_enabled() {
                 "fuse fix native hooks skipped on Android 13/14 x86_64; Java media mutation remains active"
             );
         }
+        // 跳过的是 srx_hook 对 libfuse_jni 符号体系的 hook；归因所需的 FUSE 请求
+        // 头捕获走独立的 read patch 通道（read.rs 自带库候选、重试与限频），在此
+        // 形态（A13/A14 模拟器）请求读取方是 libappfuse.so——2026-10-25 本地
+        // 模拟器实证 libfuse_jni 不加载而 libappfuse 承载 FuseDaemon 读循环。
+        crate::hook::ops::read::ensure_fuse_engine_read_patch();
         return;
     }
     if native_probe.as_deref() == Some("late") && !crate::platform::is_boot_completed() {
@@ -200,11 +217,19 @@ fn install_target_if_enabled() {
             unsafe { srx_fuse_fix_is_installed() }
         );
     }
-    if native_probe.is_none() || native_probe.as_deref() == Some("all_compare") {
+    if native_probe.as_deref() == Some("all_compare") {
         register_compare_hooks_once();
     }
     if RETRY_COUNT.load(Ordering::Relaxed) >= MAX_RETRY_COUNT {
-        return;
+        // 预算耗尽后降频长尾重试：fuse_jni 映射完成后（FuseDaemon 启动）的
+        // 下一次触发即装上零宽修复；成功后由 installed 状态短路。
+        static LONG_TAIL_RETRY_MS: AtomicI64 = AtomicI64::new(i64::MIN / 2);
+        let now_ms = crate::platform::paths::monotonic_ms();
+        let last_ms = LONG_TAIL_RETRY_MS.load(Ordering::Relaxed);
+        if now_ms.saturating_sub(last_ms) < LONG_TAIL_RETRY_INTERVAL_MS {
+            return;
+        }
+        LONG_TAIL_RETRY_MS.store(now_ms, Ordering::Relaxed);
     }
     if INSTALL_ATTEMPTED.swap(true, Ordering::AcqRel) {
         return;
@@ -216,6 +241,11 @@ fn install_target_if_enabled() {
         RETRY_COUNT.fetch_add(1, Ordering::Relaxed);
         return;
     };
+
+    // libfuse_jni 已映射 = FuseDaemon 正在启动：此刻装上 FUSE 引擎读取补丁，
+    // 消除「引擎补丁等待自身触发源」的归因空窗（引擎读取方 libfuse.so 同样
+    // 刚映射完成，窗口内的系统 uid 请求此前无法归因）。
+    crate::hook::ops::read::ensure_fuse_engine_read_patch();
 
     let is_app_accessible_path = find_any(&elf, IS_APP_ACCESSIBLE_PATH_SYMBOLS);
     let is_package_owned_path = find_any(&elf, IS_PACKAGE_OWNED_PATH_SYMBOLS);
@@ -239,13 +269,21 @@ fn install_target_if_enabled() {
                 is_bpf_backing_path,
             )
         };
+    // 默认与 reply 档：core-3 + reply×2。真机 2026-10-20 A/B（QQ 相机录制）：
+    // should_open_with_fuse 与 passthrough×2 单独安装即可令录制「首次成功后续
+    // 全败」（签名核对无误，疑为 inline 跳板对这几个函数的扰动），reply×2 与
+    // core-3 无此问题；默认安装剔除三者，全量保留在 all/all_compare 调试档。
+    let extended_slots_disabled = !matches!(
+        native_probe.as_deref(),
+        Some("all") | Some("all_compare") | Some("late")
+    );
     let (
         should_open_with_fuse,
         reply_open_slot,
         reply_create_slot,
         passthrough_enable_slot,
         passthrough_open_slot,
-    ) = if native_probe.as_deref() == Some("core") {
+    ) = if extended_slots_disabled {
         (
             std::ptr::null_mut(),
             std::ptr::null_mut(),
@@ -261,6 +299,33 @@ fn install_target_if_enabled() {
             passthrough_enable_slot,
             passthrough_open_slot,
         )
+    };
+    // 细分档位：reply 只保留 reply×2；passthrough 只保留 passthrough×2；
+    // openwithfuse 只保留 should_open_with_fuse。其余五件套槽位保持 null。
+    let reply_open_slot = if matches!(native_probe.as_deref(), None | Some("reply")) {
+        find_first_plt_slot(&elf, "fuse_reply_open")
+    } else {
+        reply_open_slot
+    };
+    let reply_create_slot = if matches!(native_probe.as_deref(), None | Some("reply")) {
+        find_first_plt_slot(&elf, "fuse_reply_create")
+    } else {
+        reply_create_slot
+    };
+    let passthrough_enable_slot = if native_probe.as_deref() == Some("passthrough") {
+        find_first_plt_slot(&elf, "fuse_passthrough_enable")
+    } else {
+        passthrough_enable_slot
+    };
+    let passthrough_open_slot = if native_probe.as_deref() == Some("passthrough") {
+        find_first_plt_slot(&elf, "fuse_passthrough_open")
+    } else {
+        passthrough_open_slot
+    };
+    let should_open_with_fuse = if native_probe.as_deref() == Some("openwithfuse") {
+        find_any(&elf, SHOULD_OPEN_WITH_FUSE_SYMBOLS)
+    } else {
+        should_open_with_fuse
     };
     if native_probe.is_some() {
         log::warn!(
@@ -473,7 +538,11 @@ fn patch_compare_hooks_direct_once() {
     );
 }
 
-fn patch_plt_slots(elf: &ElfImg, symbol: &str, replacement: *mut c_void) -> usize {
+/// 改写目标库指定符号的全部 PLT 槽位，返回成功改写的槽位数。
+///
+/// 供晚加载库的定向补丁使用（如 libfuse_jni 的 read）：绕开 srx_hook 的
+/// hook 注册体系，由调用方提供独立包装函数直调原实现。
+pub(crate) fn patch_plt_slots(elf: &ElfImg, symbol: &str, replacement: *mut c_void) -> usize {
     let mut patched = 0usize;
     for slot in elf.find_plt_slots(symbol) {
         if patch_plt_slot(slot, replacement as usize) {

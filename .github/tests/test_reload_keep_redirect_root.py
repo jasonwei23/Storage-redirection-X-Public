@@ -96,7 +96,9 @@ class ReloadKeepRedirectRootTest(unittest.TestCase):
 
         harness_src = build_harness(template, paths_fns, all_fns)
 
-        with tempfile.TemporaryDirectory() as tmp:
+        # Windows 上 Defender 会短暂锁定刚退出的新编译 exe，清目录可能报
+        # WinError 32；断言已全部完成，清理失败不应误报为测试失败。
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
             harness_path = os.path.join(tmp, "harness.rs")
             Path(harness_path).write_text(harness_src, encoding="utf-8")
             bin_path = os.path.join(tmp, "reload_keep_redirect_root")

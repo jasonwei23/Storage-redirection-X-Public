@@ -59,8 +59,10 @@ pub struct InterceptHub {
     is_fuse_fix_only: AtomicBool,
     is_boot_lite: AtomicBool,
     is_app_write_only: AtomicBool,
+    is_redirect_via_hook: AtomicBool,
     is_monitor_only: AtomicBool,
     is_monitor_enabled: AtomicBool,
+    is_app_redirect_owner: AtomicBool,
     stats: AtomicStats,
     last_late_hook_refresh_ms: AtomicI64,
 }
@@ -218,12 +220,40 @@ impl InterceptHub {
         self.is_monitor_only.load(Ordering::Relaxed)
     }
 
+    /// 进程自身配置了重定向规则（非代写 hook 路径）。置位后已安装的监视 hook 会对
+    /// 命中规则的写操作执行重定向决策，作为挂载层（宿主/屏障）全部失效时的
+    /// fail-closed 兜底；仅系统桥接进程会置位，普通应用不安装 PLT hook、不受影响。
+    pub fn set_app_redirect_owner(&self, value: bool) {
+        self.is_app_redirect_owner.store(value, Ordering::Relaxed);
+    }
+
+    pub fn is_app_redirect_owner(&self) -> bool {
+        self.is_app_redirect_owner.load(Ordering::Relaxed)
+    }
+
+    /// 重定向判定使用的有效 monitor-only 语义：自身拥有重定向配置的进程不再视为
+    /// 纯监视（其 hook 决策链需要放行到 PathRouter），但 hook 符号集保持 Monitor
+    /// profile 不变，不扩大 hook 面。
+    pub fn effective_monitor_only(&self) -> bool {
+        self.is_monitor_only() && !self.is_app_redirect_owner()
+    }
+
     pub fn is_monitor_enabled(&self) -> bool {
         self.is_monitor_enabled.load(Ordering::Relaxed)
     }
 
     pub fn is_app_write_only(&self) -> bool {
         self.is_app_write_only.load(Ordering::Relaxed)
+    }
+
+    /// 本进程的重定向是否由进程内 hook 承担（系统代写 / app redirect hook）。
+    /// mount/FUSE 后端为 false；此时写类 hook 才需要改写目标路径。
+    pub fn set_redirect_via_hook(&self, enabled: bool) {
+        self.is_redirect_via_hook.store(enabled, Ordering::Relaxed);
+    }
+
+    pub fn is_redirect_via_hook(&self) -> bool {
+        self.is_redirect_via_hook.load(Ordering::Relaxed)
     }
 
     pub fn refresh_monitor_runtime_config(&self) {
@@ -296,6 +326,34 @@ impl InterceptHub {
         context::get_current_caller_uid()
     }
 
+    /// 监视记录专用：CALLER_UID 未设置时回退当前 fsuid（见
+    /// `context::get_effective_caller_uid_for_monitor`）。禁止用于重定向判定。
+    pub fn get_effective_caller_uid_for_monitor(&self) -> i32 {
+        context::get_effective_caller_uid_for_monitor()
+    }
+
+    /// 记录用调用方 uid 与"是否来自跨线程证据"（见 `context::record_caller_uid`）。
+    /// 仅在写监视记录时使用；归因线索与重定向判定仍走上一行的原函数。
+    pub fn record_caller_uid(&self) -> (i32, bool) {
+        context::record_caller_uid()
+    }
+
+    pub fn record_caller_pid(&self, cross_thread: bool) -> i32 {
+        context::record_caller_pid(cross_thread)
+    }
+
+    pub fn set_current_caller_from_mapping_request_owner(
+        &self,
+        caller_package: &str,
+        caller_uid: i32,
+    ) {
+        context::set_current_caller_from_mapping_request_owner(caller_package, caller_uid);
+    }
+
+    pub fn is_current_caller_from_mapping_request_owner(&self) -> bool {
+        context::is_current_caller_from_mapping_request_owner()
+    }
+
     pub fn clear_current_caller(&self) {
         context::clear_current_caller();
     }
@@ -345,7 +403,10 @@ impl InterceptHub {
             }
         }
 
-        let is_system_writer = self.with_package_name(policy::is_system_writer_package);
+        let is_system_writer = self.with_package_name(|package_name| {
+            policy::is_system_writer_package(package_name)
+                || policy::is_legacy_writer_process_name(package_name)
+        });
         let (active_profiles, profile_name) = select_hook_profile(
             is_system_writer,
             self.is_monitor_only(),
@@ -493,7 +554,8 @@ impl InterceptHub {
 
     pub fn refresh_hooks_after_late_load(&self, reason: &str) {
         if !self.is_hooks_installed()
-            || !self.is_app_write_only.load(Ordering::Relaxed)
+            || !(self.is_app_write_only.load(Ordering::Relaxed)
+                || self.is_fuse_fix_only.load(Ordering::Relaxed))
             || context::ReentryGuard::is_reentrant()
         {
             return;
@@ -602,6 +664,16 @@ fn is_ignorable_refresh_failure(
     {
         return true;
     }
+    // media-runtime（MediaProvider）：2026-10-25 本地 A14 模拟器实证，refresh 的
+    // 解析失败清单全部是 lazy stub/裁剪段表的系统小库（libdl、libnativeloader_lazy、
+    // libandroid_runtime_lazy 等），FUSE 归因链真正依赖的目标库（libfuse_jni/
+    // libappfuse/libfuse）解析成功；这些失败不清 hooks 时 mkdir 等写链路 hook 才
+    // 能在宿主形态上生效（此前 refresh 整体失败 → srx_hook::clear → 记录链断裂）。
+    if profile_name == "media-runtime"
+        && is_module_parse_refresh_failure(refresh_errno, refresh_errors)
+    {
+        return true;
+    }
     if refresh_errno != srx_hook::SrxHookErrno::Format {
         return false;
     }
@@ -695,8 +767,10 @@ static INTERCEPT_HUB: InterceptHub = InterceptHub {
     is_fuse_fix_only: AtomicBool::new(false),
     is_boot_lite: AtomicBool::new(false),
     is_app_write_only: AtomicBool::new(false),
+    is_redirect_via_hook: AtomicBool::new(false),
     is_monitor_only: AtomicBool::new(false),
     is_monitor_enabled: AtomicBool::new(false),
+    is_app_redirect_owner: AtomicBool::new(false),
     stats: AtomicStats::new(),
     last_late_hook_refresh_ms: AtomicI64::new(0),
 };

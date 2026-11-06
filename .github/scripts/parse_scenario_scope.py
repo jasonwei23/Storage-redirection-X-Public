@@ -10,14 +10,14 @@ CI 的 ``prepare`` job 输出，使 dispatch inputs 与提交标记成为唯一�
 
 - 非法范围（非数字、越界、重复、空元素、分隔符后缺数字、标记后无编号）必须显式
   抛错，绝不静默回退到全量。这是「非法范围不得静默跑全量」的硬保证：标记写错时
-  整条 CI 直接失败，而不是悄悄把 37 个场景全跑一遍。
+  整条 CI 直接失败，而不是悄悄把全部场景跑一遍。
 - 派发输入或提交标记写 ``all``（不区分大小写）按现有输入约定表示全量，不报错。
 - 没有标记也没有 dispatch 输入时，范围保持 ``all``、验证模式 ``full``、
   且仍走完整发布流程（publish_ci=true）。
 - 一旦范围受限，发布开关关闭（publish_ci=false），下游发布相关 job 必须跳过，
   既不发布 CI 资产，也不更新 update.json，也不会额外触发一次全量 CI。
 - 真实清单（``.github/tests/storage-redirect-scenarios.json``）存在但结构异常时
-  必须抛错，绝不用默认 37 掩盖解析失败；只在清单文件确实缺失时才回退默认上限。
+  必须抛错，绝不用默认上限掩盖解析失败；只在清单文件确实缺失时才回退默认上限。
 """
 
 from __future__ import annotations
@@ -28,7 +28,7 @@ import re
 import sys
 from pathlib import Path
 
-DEFAULT_MAX_SCENARIO = 37
+DEFAULT_MAX_SCENARIO = 40
 # 标记「单场景」只在后接空白/冒号/数字时才算范围标记，避免把正文里
 # 「单场景运行能力」这类 incidental 提及误判为范围标记。
 MARKER_KEYWORD = re.compile(r"单场景[：:]?(?=[\s0-9])")
@@ -49,7 +49,7 @@ def max_scenario_from_json(path: Path | None = None) -> int:
     """从场景清单读取合法上限。
 
     仅在清单文件确实缺失时回退默认上限；清单存在但无法解析或结构异常时抛错，
-    绝不静默用默认 37 掩盖解析失败。
+    绝不静默用默认上限掩盖解析失败。
     """
     if path is None:
         path = Path(__file__).resolve().parents[1] / "tests" / "storage-redirect-scenarios.json"
@@ -146,7 +146,30 @@ def _extract_scope_from_message(message: str) -> str | None:
             i += 1
         else:
             break
+    # 「单场景 990s」「单场景 30 秒」这类正文里的耗时描述不是范围标记：990 本就
+    # 超出合法范围，按标记处理会让整轮 CI 在 prepare 阶段直接 fail（run
+    # 40327967419 实证：提交正文写「单场景 990s、6,38 1078s」，prepare 报
+    # 「场景编号 990 超出合法范围 1-40」，五个版本的测试全部没跑）。只认紧跟数字
+    # 的单位字符，带空格的不算（「单场景 39,40 秒级验证」仍按范围解析）。
+    if i < len(message) and message[i] in ("s", "S", "秒"):
+        return None
     return "".join(scope_chars)
+
+
+def _test_flow_timeout_minutes(count: int) -> int:
+    """按场景数估算 test-flow 步骤的超时预算（分钟）。
+
+    步骤级超时是「runner 被拖住」的最终兜底：编排脚本的看门狗只覆盖场景脚本
+    本体，模拟器异常时它前面的设备健康检查与模块/APK 安装同样可能无限挂起
+    （run 40272962460 实证：五个版本全部停在 Run Android test-flow scenarios、
+    33 分钟无进展，取消请求也无法立即生效）。预算＝15 分钟准备 + 每场景 2 分钟，
+    单场景约 17 分钟封顶，被拖住时快速失败并释放 runner。
+    """
+    base_minutes = 15
+    per_scenario_minutes = 2
+    if count <= 0:
+        return 90
+    return min(90, base_minutes + count * per_scenario_minutes)
 
 
 def _full_result(source: str) -> dict:
@@ -155,6 +178,7 @@ def _full_result(source: str) -> dict:
         "scenario_limited": False,
         "validation_mode": "full",
         "publish_ci": True,
+        "test_flow_timeout_minutes": _test_flow_timeout_minutes(0),
         "source": source,
     }
 
@@ -165,6 +189,7 @@ def _limited_result(numbers: list[int], source: str) -> dict:
         "scenario_limited": True,
         "validation_mode": "scope",
         "publish_ci": False,
+        "test_flow_timeout_minutes": _test_flow_timeout_minutes(len(numbers)),
         "source": source,
     }
 
@@ -210,10 +235,11 @@ def resolve_scope(
 
 def _emit(data: dict, fmt: str) -> None:
     if fmt == "github":
-        # 只输出下游实际消费的两项，避免无用项（scenario_limited/validation_mode
-        # 未被任何 job 引用，不进入 CI 输出）。
         print(f"scenarios={data['scenarios']}")
         print(f"publish_ci={'true' if data['publish_ci'] else 'false'}")
+        # 步骤级超时预算：下游 test-flow 的「Run Android test-flow scenarios」
+        # 直接引用，避免固定值在窄跑时白等、在全量时误杀。
+        print(f"test_flow_timeout_minutes={data['test_flow_timeout_minutes']}")
     else:
         print(json.dumps(data, ensure_ascii=False, indent=2))
 

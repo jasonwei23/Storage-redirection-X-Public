@@ -43,6 +43,7 @@ import org.srx.manager.GlassTextButton
 import org.srx.manager.R
 import org.srx.manager.data.GlobalConfig
 import org.srx.manager.data.ModuleStatus
+import org.srx.manager.data.StorageBackendStatus
 import org.srx.manager.glassPanel
 import org.srx.manager.glassSurfaceColor
 import org.srx.manager.isSrxBackdropEffectEnabled
@@ -71,6 +72,14 @@ internal fun moduleStatusUi(status: ModuleStatus): StatusUi =
       ModuleStatus.Unknown -> StatusUi("状态未知", srxWarningColor())
     }
 
+/** 共享宿主已登记策略数的展示文本；与相邻数字统计口径一致，读取失败或未知时展示为 --。 */
+internal fun storageBackendStatusText(storageBackend: StorageBackendStatus?): String =
+    when {
+      storageBackend == null -> "--"
+      storageBackend.active -> storageBackend.policyCount?.toString() ?: "--"
+      else -> "0"
+    }
+
 @Composable
 @OptIn(ExperimentalLayoutApi::class)
 internal fun ModuleStatusCard(
@@ -78,9 +87,11 @@ internal fun ModuleStatusCard(
     globalConfig: GlobalConfig,
     enabledApps: Int,
     runtimeActivations: String,
+    storageBackend: StorageBackendStatus?,
     onToggleModule: (Boolean) -> Unit,
     onRuntimeActivationClick: () -> Unit,
     onRuntimeActivationLongClick: () -> Unit,
+    onHostPolicyClick: () -> Unit,
 ) {
   val colors = MiuixTheme.colorScheme
   val statusUi = moduleStatusUi(status)
@@ -158,6 +169,17 @@ internal fun ModuleStatusCard(
                     onClick = onRuntimeActivationClick,
                 ),
         )
+        Box(
+            Modifier.width(1.dp)
+                .height(52.dp)
+                .background(colors.onSurface.copy(alpha = if (isSrxDarkTheme()) 0.045f else 0.06f)),
+        )
+        MetricBox(
+            "宿主策略",
+            storageBackendStatusText(storageBackend),
+            Modifier.weight(1f),
+            onClick = onHostPolicyClick,
+        )
       }
     }
   }
@@ -200,9 +222,9 @@ internal fun ModuleToggleConfirmDialog(
 ) {
   val message =
       if (enable) {
-        "启动模块会恢复运行时并重启 MediaProvider，普通应用进程保持运行。媒体访问可能短暂不可用，是否继续？"
+        "启动模块会恢复运行时并请求 MediaProvider 在原进程内热重载，普通应用进程保持运行。媒体访问可能短暂抖动，是否继续？"
       } else {
-        "停止模块会停止运行时并重启 MediaProvider，普通应用进程保持运行。媒体访问可能短暂不可用，是否继续？"
+        "停止模块会停止运行时并请求 MediaProvider 在原进程内热重载，普通应用进程保持运行。媒体访问可能短暂抖动，是否继续？"
       }
   CenteredDialog(
       show = show,
@@ -297,6 +319,80 @@ internal fun RuntimeActivationDetailsDialog(exactValue: String, onDismiss: () ->
 }
 
 @Composable
+internal fun HostPolicyDetailsDialog(
+    storageBackend: StorageBackendStatus?,
+    onDismiss: () -> Unit,
+) {
+  val stateLine =
+      when {
+        storageBackend == null -> "暂时无法读取共享宿主状态。"
+        storageBackend.active ->
+            buildString {
+              append("共享宿主运行中")
+              storageBackend.pid?.let { append("，宿主进程 pid=$it") }
+              append("。")
+            }
+        else -> "共享宿主当前未运行。"
+      }
+  CenteredDialog(show = true, onDismiss = onDismiss) {
+    Column(
+        modifier = Modifier.fillMaxWidth(),
+        horizontalAlignment = Alignment.CenterHorizontally,
+        verticalArrangement = Arrangement.spacedBy(18.dp),
+    ) {
+      Text(
+          text = "宿主策略",
+          color = MiuixTheme.colorScheme.onSurface,
+          fontSize = 18.sp,
+          fontWeight = FontWeight.Bold,
+      )
+      Text(
+          text = storageBackendStatusText(storageBackend),
+          modifier = Modifier.fillMaxWidth(),
+          color = MiuixTheme.colorScheme.onSurface,
+          fontSize = 22.sp,
+          fontWeight = FontWeight.Bold,
+          textAlign = TextAlign.Center,
+          maxLines = 1,
+      )
+      Text(
+          text =
+              "共享宿主 FUSE 会话已登记的重定向策略数量，大致对应已启用重定向的应用会话数；应用实际发起存储访问后才计入。同一应用在不同用户下分别计一条，这里显示的是所有用户合计。共享宿主未运行时显示 0，读取失败或状态未知时显示 --。",
+          modifier = Modifier.fillMaxWidth(),
+          color = MiuixTheme.colorScheme.onSurfaceVariantSummary,
+          fontSize = 13.sp,
+          lineHeight = 19.sp,
+          fontWeight = FontWeight.Medium,
+          textAlign = TextAlign.Center,
+      )
+      if (storageBackend?.userPolicyCounts?.isNotEmpty() == true) {
+        Text(
+            text =
+                storageBackend.userPolicyCounts.entries
+                    .sortedBy { it.key }
+                    .joinToString(separator = "\n") { (user, count) -> "用户 $user：$count 个" },
+            modifier = Modifier.fillMaxWidth(),
+            color = MiuixTheme.colorScheme.onSurfaceVariantSummary,
+            fontSize = 12.sp,
+            lineHeight = 17.sp,
+            fontWeight = FontWeight.SemiBold,
+            textAlign = TextAlign.Center,
+        )
+      }
+      Text(
+          text = stateLine,
+          modifier = Modifier.fillMaxWidth(),
+          color = MiuixTheme.colorScheme.onSurfaceVariantSummary,
+          fontSize = 12.sp,
+          lineHeight = 17.sp,
+          textAlign = TextAlign.Center,
+      )
+      GlassTextButton("关闭", onDismiss, modifier = Modifier.fillMaxWidth(), primary = true)
+    }
+  }
+}
+
+@Composable
 internal fun ResetRuntimeStatsConfirmDialog(onDismiss: () -> Unit, onConfirm: () -> Unit) {
   CenteredDialog(show = true, onDismiss = onDismiss) {
     Column(
@@ -325,9 +421,15 @@ internal fun ResetRuntimeStatsConfirmDialog(onDismiss: () -> Unit, onConfirm: ()
 }
 
 @Composable
-internal fun MetricBox(label: String, value: String, modifier: Modifier) {
+internal fun MetricBox(
+    label: String,
+    value: String,
+    modifier: Modifier,
+    onClick: (() -> Unit)? = null,
+) {
+  val baseModifier = modifier.padding(vertical = 8.dp)
   Box(
-      modifier = modifier.padding(vertical = 8.dp),
+      modifier = if (onClick != null) baseModifier.clickable(onClick = onClick) else baseModifier,
       contentAlignment = Alignment.Center,
   ) {
     Column(horizontalAlignment = Alignment.CenterHorizontally) {
@@ -409,15 +511,4 @@ internal fun GlassIcon(icon: ImageVector, modifier: Modifier = Modifier) {
         modifier = Modifier.size(24.dp),
     )
   }
-}
-
-@Composable
-internal fun SectionTitle(text: String) {
-  Text(
-      text,
-      modifier = Modifier.padding(start = 2.dp, top = 2.dp, bottom = 4.dp),
-      color = MiuixTheme.colorScheme.onSurfaceVariantSummary,
-      fontSize = 13.sp,
-      fontWeight = FontWeight.Bold,
-  )
 }

@@ -20,9 +20,7 @@ pub unsafe extern "C" fn hooked_link(oldpath: *const c_char, newpath: *const c_c
         },
         |hub| {
             hub.increment_mkdir_calls();
-            if runtime::should_resolve_caller_context(hub) {
-                crate::hook::caller::update_caller_package_for_current_thread(hub);
-            }
+            crate::hook::caller::update_caller_for_mutation(hub, newpath);
 
             handle_link_audit(
                 hub,
@@ -77,9 +75,7 @@ pub unsafe extern "C" fn hooked_linkat(
         },
         |hub| {
             hub.increment_mkdir_calls();
-            if runtime::should_resolve_caller_context(hub) {
-                crate::hook::caller::update_caller_package_for_current_thread(hub);
-            }
+            crate::hook::caller::update_caller_for_mutation(hub, newpath);
 
             handle_link_audit(
                 hub,
@@ -128,9 +124,7 @@ pub unsafe extern "C" fn hooked_symlink(target: *const c_char, linkpath: *const 
         },
         |hub| {
             hub.increment_mkdir_calls();
-            if runtime::should_resolve_caller_context(hub) {
-                crate::hook::caller::update_caller_package_for_current_thread(hub);
-            }
+            crate::hook::caller::update_caller_for_mutation(hub, linkpath);
 
             // SAFETY: target 是 symlink 调用传入的原始 C 字符串指针，c_str_to_string 内部处理空指针并按 NUL 结尾读取，指针有效性由调用方保证。
             let target_text = unsafe { c_str_to_string(target) };
@@ -148,6 +142,7 @@ pub unsafe extern "C" fn hooked_symlink(target: *const c_char, linkpath: *const 
                     pathname: linkpath,
                     log_flags: 0,
                     extra_tail: extra,
+                    redirect_mutation: hub.is_redirect_via_hook(),
                 },
                 |call_path| {
                     runtime::call_prev(
@@ -185,9 +180,7 @@ pub unsafe extern "C" fn hooked_symlinkat(
         },
         |hub| {
             hub.increment_mkdir_calls();
-            if runtime::should_resolve_caller_context(hub) {
-                crate::hook::caller::update_caller_package_for_current_thread(hub);
-            }
+            crate::hook::caller::update_caller_for_mutation(hub, linkpath);
 
             // SAFETY: target 是 symlinkat 调用传入的原始 C 字符串指针，c_str_to_string 内部处理空指针并按 NUL 结尾读取，指针有效性由调用方保证。
             let target_text = unsafe { c_str_to_string(target) };
@@ -205,6 +198,7 @@ pub unsafe extern "C" fn hooked_symlinkat(
                     pathname: linkpath,
                     log_flags: 0,
                     extra_tail: extra,
+                    redirect_mutation: hub.is_redirect_via_hook(),
                 },
                 |call_path| {
                     runtime::call_prev(

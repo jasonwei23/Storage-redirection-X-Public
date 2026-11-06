@@ -1,10 +1,10 @@
 # 自动后端与 FUSE 挂载架构
 
-本文记录从早期“FUSE-first”设计到当前自动后端实现的演进。当前项目并不把 FUSE 视为所有设备上的唯一优先后端：配置面固定使用 `auto`，运行时根据平台能力、规则需求和挂载状态，在 scoped FUSE、共享 FUSE 宿主会话与 mount namespace 之间选择，并保留回退路径。
+本文记录从早期“FUSE-first”设计到当前自动后端实现的演进。配置面固定使用 `auto`，运行时在**共享 FUSE 宿主会话**与 mount namespace 之间选择；per-app scoped FUSE 会话已退役（它会让应用命名空间被自己的会话进程自持，见 [共享宿主架构](shared-fuse-daemon-architecture.md)）。
 
 ## 运行方式
 
-- `auto`：设备存在可用 `/dev/fuse` 且规则需要动态匹配时使用 scoped FUSE；其它路径继续使用 mount namespace，FUSE 服务异常时自动回退。
+- `auto`：设备存在可用 `/dev/fuse` 且规则需要动态匹配时经共享宿主会话提供 FUSE 视图；接入不了（无宿主、闸门未放行、策略未登记、接入失败）就用 mount namespace，原因写进 `fuse view unavailable reason=` 日志。
 
 配置位于 `config/global.json`：
 
@@ -20,7 +20,7 @@
 
 - 每个 scoped 会话使用唯一的挂载源（`MountOption::FSName`，形如 `srx_fuse_redirect[<pid>]`），挂载完成后记录该挂载的挂载 ID。收尾时先确认挂载点最顶层仍是本次会话的挂载源；同路径已被新会话替换或已被摘除时跳过卸载，不会摘掉接管者的挂载。
 - 挂载归属按挂载源前缀判断，不按文件系统类型判断：内核 `mount(2)` 直挂的 scoped 挂载类型是 `fuse`，只有经 fusermount 回退时才出现 `fuse.srx`。
-- scoped 挂载启动或会话收尾连续失败达到预算（连续 3 次）才把整机能力写成 `unavailable`，本轮开机内随后回退 mount namespace；任意一次成功都会清零，daemon 启动会重置。能力快照包含 `state`、`reason` 与 `fail_count`（`schema=2`），管理端、WebUI 与诊断归档仍只读取 `state` 与 `reason`。
+- scoped 挂载启动或会话收尾失败受按应用分桶的预算约束；设备级 `unavailable` 需要 ≥2 个不同应用的失败（`schema=3` 能力快照，含 `state`、`reason`、`device_fail_count`、`last_failed_scope` 等），单应用失败不会锁出整机。设备级锁出后按 `retry_at_ms` 退避自愈（30s 起倍增封顶 10 分钟，无需重启），任意成功都会清零回 FUSE；daemon 启动会重置快照。管理端、WebUI 与诊断归档只读取 `state` 与 `reason`。
 
 ## 优点
 
@@ -43,7 +43,6 @@
 
 当前实现的关键边界如下：
 
-- 有能力且规则需要时使用 scoped FUSE；共享宿主会话可通过 `srx_fuse_host[<pid>]` 为多个应用 namespace 提供共享数据面。
-- `mount namespace` 不是待删除的旧实现，而是 `auto` 后端的正式路径和 FUSE 不可用时的兼容回退。
-- `srx_fuse_redirect` 仍是 scoped FUSE 的兼容前缀；测试、账本和诊断必须同时识别 `srx_fuse_redirect` 与 `srx_fuse_host`。
-- 只有在新的共享宿主路径、真实设备兼容性和回退行为持续通过验证后，才可以进一步收窄旧 scoped FUSE 路径；当前不应删除该回退。
+- 共享宿主会话（`srx_fuse_host[<pid>]`）是**唯一**的 FUSE 数据面，为多个应用 namespace 提供共享视图，Auto 模式下应用会话默认收敛到该会话。
+- `mount namespace` 不是待删除的旧实现，而是 `auto` 后端在宿主接入不可用时的正式路径。
+- `srx_fuse_redirect` 前缀保留用于识别旧版本遗留的 scoped 层；测试、账本和诊断必须同时识别 `srx_fuse_redirect` 与 `srx_fuse_host`。

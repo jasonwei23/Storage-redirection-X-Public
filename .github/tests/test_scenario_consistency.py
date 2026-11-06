@@ -171,12 +171,22 @@ class ScenarioConsistencyTest(unittest.TestCase):
             self.android_wrapper,
         )
 
+    def test_watchdog_budget_counts_full_range_from_manifest(self) -> None:
+        # 看门狗预算按场景数算，而全量时 SRT_SCENARIOS 的字面值是 `all`：按逗号
+        # token 数只能得到 1，预算缩到 990s，40 场景的版本必被腰斩。run
+        # 40324023063 实证：A14 跑到场景 29 被 124 杀掉，A17 只是刚好赶上（40 场景
+        # 全过），差别只在一路快几秒。因此场景数必须回落到清单条目数。
+        self.assertIn("storage-redirect-scenarios.json", self.android_wrapper)
+        self.assertIn('scenario_total="$(grep -c', self.android_wrapper)
+        self.assertIn("''|all|ALL) scenario_count=\"$scenario_total\"", self.android_wrapper)
+        self.assertIn("scenario_watchdog=$((900 + scenario_count * 90))", self.android_wrapper)
+
     def test_own_private_backend_is_stable_for_new_files(self) -> None:
         policy = read("src/fuse_redirect/policy.rs")
         backend = section(
             policy,
             "fn real_backend_root_for_storage_rel(",
-            "/// MediaProvider FUSE 视图根",
+            "/// 自有 media sqlite `-shm` 是否必须走宿主用户态通道",
         )
         # 自有 Android 私有目录必须从首次创建起固定使用真实存储根，不能按数据库族
         # 是否存在或 MediaProvider 视图状态在真实根与其它后端之间切换。
@@ -187,8 +197,83 @@ class ScenarioConsistencyTest(unittest.TestCase):
 
         decision = section(policy, "fn backend_decision(", "fn matches_any(")
         # 用户显式映射仍由路径映射分支优先处理，自有目录的默认行为才是 Real。
-        self.assertIn("self.resolve_mapping(storage_path).is_some()", decision)
+        # 映射解析在函数入口只做一次（路由热路径去重），其命中结果以 mapping_hit
+        # 参与 Real 分支判定，语义与逐处内联 resolve_mapping(...).is_some() 等价。
+        self.assertIn("let own_mapping_target = self.resolve_mapping(storage_path);", decision)
+        self.assertIn("own_mapping_target.is_some()", decision)
+        self.assertIn("|| mapping_hit", decision)
         self.assertIn("self.is_own_private_storage_path(storage_path)", decision)
+
+    def test_media_view_never_outlives_the_deletion(self) -> None:
+        # 宿主对 MediaProvider 视图的唯一用途是「毒化 -shm 自愈时经 MP 删一遍文件」。
+        # 历史实现把它做成宿主命名空间里的长期绑定，由此生出两个根问题：①MP 重启 /
+        # `vold volume abort_fuse` 后宿主命名空间（建会话时已 MS_REC|MS_PRIVATE）收不到
+        # 新挂载，克隆永远停在旧连接上；②旧连接是「挂载记录还在、无人应答」形态，任何经
+        # 它的 syscall 会无限期挂在 FUSE 队列里——而这条路径在 FUSE LOOKUP 回调中，
+        # 挂住一个就是永久失去一个 worker。所以视图必须是**一次性**的：每次自愈现克隆、
+        # 用完随子进程命名空间一起消失；并且调用方必须有界等待。
+        media_view = read("src/fuse_redirect/media_view.rs")
+        self.assertIn("pub(crate) fn unlink_relative(", media_view)
+        # 一次性：进 init 命名空间（唯一保证是当前一代）→ 私有副本 → 克隆 → 删除。
+        self.assertIn('c"/proc/1/ns/mnt"', media_view)
+        self.assertIn("libc::unshare(libc::CLONE_NEWNS)", media_view)
+        self.assertIn("libc::SYS_open_tree", media_view)
+        self.assertIn("libc::SYS_move_mount", media_view)
+        # 有界：等内核事件（pidfd + poll，缺失时 SIGCHLD + sigtimedwait），不是定时轮询；
+        # 超时必须 SIGKILL。等待机制是可替换的实现细节，不能变成「没有 pidfd 就停用视图」
+        # 这类功能开关——视图删除是毒化 -shm 自愈唯一无副作用的路径。
+        self.assertIn("libc::SYS_pidfd_open", media_view)
+        self.assertIn("libc::poll(", media_view)
+        self.assertIn("libc::sigtimedwait(", media_view)
+        self.assertIn("libc::SIGKILL", media_view)
+        # 不得退化成定时轮询子进程状态：`sleep` 循环既缩短不了等待，又会在连接停摆时把
+        # 宿主线程拖成轮询机。（`WNOHANG` 允许出现，但只作为一次非阻塞状态复查。）
+        self.assertNotIn("thread::sleep", media_view)
+        self.assertNotIn("std::time::Duration", media_view)
+        self.assertIn("fn pidfd_available()", media_view)
+        # 不得再出现「整会话失效标记」这类长生命周期状态：视图按次重建即是自愈，
+        # 一旦留下会话级毒化标记，MP 恢复后本代宿主再也用不上视图。
+        self.assertNotIn("VIEW_UNUSABLE", media_view)
+        self.assertNotIn("is_usable", media_view)
+
+        # 子进程泄漏面必须被结构钉死：宿主的直接子进程只能是「监督进程」（不接触任何
+        # FUSE，必在有限时间内退出），worker 由它收尸、放弃时被 init 收养——僵尸不会
+        # 跨父进程存活，也就不会在宿主名下按失败次数累积。
+        self.assertIn("fn supervise_worker(", media_view)
+        self.assertIn("fn child_view_unlink(", media_view)
+        supervisor = section(media_view, "fn supervise_worker(", "/// 读回监督进程的结论")
+        self.assertIn("libc::fork()", supervisor)
+        self.assertNotIn("SYS_open_tree", supervisor)
+        self.assertNotIn("libc::setns", supervisor)
+        # 残留进程台账：没离开进程表之前不再起新的 worker，泄漏上界钉成 1。
+        self.assertIn("PENDING_CHILD_PID", media_view)
+        self.assertIn("INFLIGHT", media_view)
+        pending = section(media_view, "fn pending_child_alive(", "/// 经 MediaProvider 视图删除")
+        self.assertIn("PENDING_CHILD_PID.load", pending)
+        self.assertIn("/proc/{pid}", pending)
+        # 任何失败都要进冷却（含起不了子进程），否则毒化反复命中会打成 fork 风暴。
+        self.assertIn("enter_fail_cooldown();", section(media_view, "ChildOutcome::Failed => {", "}\n    }\n}"))
+
+        # 长生命周期绑定必须整条移除：策略里不再缓存视图根，宿主模块不再有绑定函数，
+        # 登记路径也不再做绑定准备（否则又会在调用方进程内阻塞）。
+        policy = read("src/fuse_redirect/policy.rs")
+        self.assertNotIn("media_sqlite_real_root", policy)
+        self.assertNotIn("media_sqlite_view_root", policy)
+        host = read_fuse_host_module()
+        self.assertNotIn("ensure_host_media_fuse_view", host)
+        self.assertNotIn("FUSE_HOST_MEDIA_VIEW_DIR.join", policy)
+
+        callbacks = read("src/fuse_redirect/callbacks.rs")
+        self.assertIn("super::media_view::unlink_relative(user_id, rel)", callbacks)
+        heal = section(
+            callbacks,
+            "fn heal_poisoned_sqlite_shm_backend(",
+            "fn sqlite_sidecar_wal_path(",
+        )
+        # 视图侧删除不得在回调里直接 unlinkat（那条路径等不起停摆的连接）；f2fs 直删
+        # 兜底保留，它是毒化数据消失的最终保证。
+        self.assertNotIn("c_view", heal)
+        self.assertIn("libc::SYS_unlinkat", heal)
 
     def test_monitor_only_heals_cross_owner_sqlite_sidecars(self) -> None:
         policy = read("src/fuse_redirect/policy.rs")
@@ -226,13 +311,12 @@ class ScenarioConsistencyTest(unittest.TestCase):
         self.assertIn("let removed_backend =", media)
 
     def test_kernelsu_zygisk_next_default_uses_existing_release_tag(self) -> None:
+        # KernelSU 实验 workflow 已于 2026-10-16 移除，Zygisk Next 的默认地址只剩
+        # 安装脚本一处；A17 分片在正式矩阵里仍按 root_method=ksu 调用该脚本。
         installer = read(".github/tests/install-storage-redirect-module-ksu.sh")
-        workflow = read(".github/workflows/ci-kernelsu-a17.yml")
         expected = "https://github.com/LSPosed/ZygiskNext/releases/download/v1.5.0/Zygisk-Next-1.5.0-843-5217106-release.zip"
         self.assertIn(expected, installer)
-        self.assertIn(expected, workflow)
         self.assertNotIn("releases/download/1.5.0/", installer)
-        self.assertNotIn("releases/download/1.5.0/", workflow)
 
     def test_shared_host_precedes_namespace_redirect(self) -> None:
         daemon = read("src/daemon_mount.rs")
@@ -249,7 +333,12 @@ class ScenarioConsistencyTest(unittest.TestCase):
                 source.index("apply_sdcard_redirect(", source.index("preattach_shared_host(")),
                 f"{label} 必须先接入共享宿主再执行 namespace 重定向",
             )
-            self.assertIn("preattached_host.is_some()", source)
+            # 接入点唯一且返回 Result：Ok(Some(挂载)) 表示本次新建、Ok(None) 表示视图根
+            # 已由既有层服务、Err(原因) 表示本轮按 bind 继续。
+            self.assertIn("match preattached_host {", source)
+            self.assertIn("Ok(state) => (vec![state], ScopedMountAttempt::Ready", source)
+            # 已服务判定必须只认**当前**宿主会话：旧代际的层已经失效，仍需重新挂。
+            self.assertIn("Some(view.mount_source.as_str())", source)
             monitor_only = source.index("else if request.is_monitor_only")
             redirect = source.index("apply_sdcard_redirect(", source.index("preattach_shared_host("))
             self.assertLess(monitor_only, redirect, label)
@@ -301,7 +390,7 @@ class ScenarioConsistencyTest(unittest.TestCase):
         # 日志轮转或过滤无匹配属于正常情况，空诊断不能中断后面的行为断言。
         for name in ("logcatOut", "dirOut", "runningOut", "installStateOut", "markerOut"):
             self.assertIn(f"$lines.AddRange([string[]]@(${name} | Where-Object {{ $null -ne $_ }}))", body)
-        self.assertIn("../../temp/scenario-2-mediastore-hook-diag.txt", body)
+        self.assertIn('Join-Path $script:ArtifactDir "scenario-2-mediastore-hook-diag.txt"', body)
 
     def test_private_fixture_is_prepared_after_nested_mapping_cleanup(self) -> None:
         # 场景 37 清理的父目录包含场景 34 的 data 子目录，顺序反转会产生 ENOENT。
@@ -678,6 +767,156 @@ class ScenarioConsistencyTest(unittest.TestCase):
         # 失败清理只在本就发布时才尝试删除草稿 Release。
         self.assertIn("PUBLISH_CI: ${{ needs.prepare.outputs.publish_ci }}", ci)
 
+    def test_ci_release_tag_is_stable_across_rerun_attempts(self) -> None:
+        # 失败任务重跑会让 github.run_attempt 递增，而 init-ci-release（唯一创建
+        # 草稿 Release 的 job）首轮已成功、重跑时不执行：标签一旦掺入 attempt，
+        # 重跑后的发布环节就按新标签查不到草稿，报 release not found（run
+        # 40331496700 实证：attempt 1 建 `-1`，重跑 attempt 2 找 `-2` 直接失败）。
+        # 标签只按 run_id 生成，五处引用必须一致；重跑命中已有草稿时复用不重建。
+        ci = read(".github/workflows/ci.yml")
+        self.assertNotIn("github.run_attempt", ci)
+        self.assertNotIn("GITHUB_RUN_ATTEMPT", ci)
+        self.assertEqual(ci.count("CI_TAG: ci-build-${{ github.run_id }}"), 5)
+        init = section(ci, "  init-ci-release:", "  module:")
+        self.assertIn('if gh release view "$CI_TAG"', init)
+        self.assertIn("draft CI release already exists", init)
+
+    def test_ci_failed_draft_release_survives_for_rerun(self) -> None:
+        # 草稿 Release 是 module/app 构建产物的唯一副本。此前失败清理会直接删掉
+        # 本轮草稿，导致「只重跑失败任务」时既没有标签、也没有资产，发布永远补
+        # 不回来（run 40331496700）。清理逻辑已下沉到 prune_ci_drafts.py：本轮
+        # 草稿永不删除；发布成功时才按「被本轮取代」立即清理其它轮次，未发布时
+        # 只清理超过 24 小时续发窗口的草稿（单轮 CI 最长 2 小时，不会误删在跑的）。
+        ci = read(".github/workflows/ci.yml")
+        cleanup = section(ci, "  cleanup-build-artifacts:", "  update-manifest:")
+        self.assertNotIn('gh release delete "$CI_TAG"', cleanup)
+        self.assertIn("prune_ci_drafts.py", cleanup)
+        self.assertIn('--current-tag "$CI_TAG"', cleanup)
+        self.assertIn('--current-run-created "$run_created"', cleanup)
+        # 清理逻辑在仓库脚本里，必须先 checkout，否则 cleanup 直接 command not found。
+        self.assertIn("actions/checkout@v5", cleanup)
+        # 只有发布环节成功才允许「已被本轮取代」的立即清理；失败轮一律走时间窗口。
+        self.assertIn("PUBLISHED: ${{ needs.create-ci-release.result == 'success'", cleanup)
+        self.assertIn('if [ "$PUBLISHED" = "true" ]', cleanup)
+
+        # 发布前只校验资产，不再要求草稿态：完整重跑时上一轮可能已经发布过，
+        # 此时 `gh release edit --draft=false` 是幂等的。
+        release = section(ci, "  create-ci-release:", "  cleanup-build-artifacts:")
+        self.assertNotIn("--json isDraft", release)
+        self.assertIn("storage-redirect-x-manager-v${VERSION}.apk", release)
+
+    def test_ci_test_flow_step_timeout_follows_scenario_scope(self) -> None:
+        # 模拟器异常时编排脚本可能停在场景脚本之前的准备阶段，脚本内看门狗覆盖
+        # 不到；job 级 45/50 分钟又太宽（run 40272962460 五个版本同时被拖住 33
+        # 分钟、取消请求也不立即生效）。步骤级超时必须按 prepare 解析出的场景数
+        # 自适应：窄跑十几分钟即失败，全量仍留足预算。
+        ci = read(".github/workflows/ci.yml")
+        prepare = section(ci, "  prepare:", "  init-ci-release:")
+        self.assertIn(
+            "test_flow_timeout_minutes: ${{ steps.scope.outputs.test_flow_timeout_minutes }}",
+            prepare,
+        )
+        self.assertIn(
+            "timeout-minutes: ${{ fromJSON(needs.prepare.outputs.test_flow_timeout_minutes) }}",
+            ci,
+        )
+        scope = read(".github/scripts/parse_scenario_scope.py")
+        self.assertIn("test_flow_timeout_minutes", scope)
+        self.assertIn("_test_flow_timeout_minutes", scope)
+
+    def test_download_scenario_avoids_local_network_on_api37(self) -> None:
+        # Android 17（API 37）起应用默认禁止「本地网络访问」：下载提供器在该镜像
+        # targetSdk=37，它连模拟器宿主别名 10.0.2.2（10.0.2.0/24 局域网段）的 TCP
+        # 连接被静默丢弃（connect 超时 + 服务端零请求），回环 127.0.0.1 与公网正常。
+        # 场景 39 因此必须在 API >= 37 走 adb reverse + 回环取数。
+        script = read(".github/tests/run-storage-redirect-scenarios.sh")
+        self.assertIn('adb reverse "tcp:$dl_port" "tcp:$dl_port"', script)
+        self.assertIn('dl_url="http://127.0.0.1:$dl_port/srt_download.bin"', script)
+        self.assertIn('if [ "${dl_api:-0}" -ge 37 ] 2>/dev/null', script)
+        # 低版本与真机通路保持不变：A13-A16 仍用 10.0.2.2，真机仍走 APK 内置 URL。
+        self.assertIn('dl_url="http://10.0.2.2:$dl_port/srt_download.bin"', script)
+
+
+    def test_download_scenario_cleans_before_mount_restart(self) -> None:
+        # 场景 39 的探测目录清理必须排在应用重启**之前**：应用重启会触发一轮挂载，
+        # 挂载阶段负责补建映射目标（`ensure_app_owned_mapping_target`）。先重启后清理
+        # 会把刚补建出来的目录当场删掉，让挂载期补建永远白做——2026-10-26 本地实证：
+        # 顺序调换后连续两轮 PASS（653ms/611ms，文件落映射目标、请求路径零穿透）；
+        # 调换前稳定报 "Failed to create parent for /storage/emulated/0/Download/..."。
+        script = read(".github/tests/run-storage-redirect-scenarios.sh")
+        clean_at = script.index(
+            "rm -rf '${BACKEND_ROOT}/${DL_OWNER_REQUEST_REL}' "
+            "'${BACKEND_ROOT}/${DL_OWNER_MAPPED_REL}'"
+        )
+        provider_restart_at = script.index(
+            'restart_media_provider_with_hook_ready "scenario-${scenario}-dlowner-provider"'
+        )
+        app_restart_at = script.index(
+            'start_app_and_confirm_mount "scenario-${scenario}-dlowner-apprestart" 1'
+        )
+        self.assertLess(clean_at, provider_restart_at, "清理必须先于 MediaProvider 重启")
+        self.assertLess(
+            clean_at, app_restart_at, "清理必须先于测试应用重启，否则挂载期补建被删"
+        )
+
+    def test_download_scenario_diag_proves_verbose_gate_first(self) -> None:
+        # 失败诊断不能只看 running.log 的 tail 窗口：下载窗口的判定记录会被随后的
+        # 调度/reconcile 日志冲出窗口（run 40286639350 只截尾部，于是拿不到 realpath
+        # 的任何一行，与「回退没生效」无法区分）。同时必须先验证 verbose 门禁本身：
+        # 门禁值由各 hook 进程启动时读取一次，不确认它，任何「某条 debug 日志不存在」
+        # 的结论都不成立。
+        script = read(".github/tests/run-storage-redirect-scenarios.sh")
+        self.assertIn("grep -a 'SrtDlOwner' '$LOG_DIR'/running.log*", script)
+        self.assertIn("debug_lines=", script)
+        self.assertIn("hook registered profile", script)
+        # running.log 会按大小轮转成 running.log.1（本地实测 514 : 17709 行）。只搜主
+        # 文件会把 hook 安装记录整段漏掉——run 40291854472 的 hook_registered 全空
+        # 就是这个原因，当时被误读成「hook 没装」。
+        self.assertNotIn("grep -a 'SrtDlOwner' '$LOG_PATH'", script)
+        self.assertIn("'$LOG_DIR'/running.log*", script)
+        # 「进程没加载模块」与「日志被轮转」在"没有记录"上完全同形，必须留下
+        # /proc/<pid>/maps 证据才能归因，否则只能在重定向判定里空转。
+        self.assertIn(r"grep -ac -e 'storage.redirect' -e 'libsrx_core' /proc/\$pid/maps", script)
+        self.assertIn("srx_maps=", script)
+        # 诊断里不能引用不存在的变量名，否则整段静默失效（守卫发现的真实笔误）。
+        self.assertNotIn("$DL_OWNER_PROBE_NAME", script)
+
+    def test_provider_sandbox_accepts_both_governance_topologies(self) -> None:
+        # 场景 38 断言「下载提供器自身的原生写入被模块接管」。提供器被纳入
+        # system-writer 后（场景 39 需要它在自己进程内解析映射请求路径），pre 阶段
+        # 直接走 `writer skip companion mount`，不再发挂载请求，于是只认
+        # `perf companion mount ... ok=true` 的判据会把修好 39 的改动判成 38 回归
+        # （2026-10-26 本地实证：单跑场景 38 稳定 EXIT=1，日志里只有
+        # `hook refresh start profile=system-writer pkg=com.android.providers.downloads`）。
+        # 因此判据必须是拓扑无关的：mount 拓扑或 per-caller hook 拓扑命中其一即通过。
+        script = read(".github/tests/run-storage-redirect-scenarios.sh")
+        body = section(
+            script, "run_provider_sandbox_scenario() {", "\nrun_download_owner_attribution_scenario()"
+        )
+        self.assertIn(
+            "perf companion mount pkg=${PROVIDER_PACKAGE} pid=[0-9]+ .*ok=true", body
+        )
+        self.assertIn(
+            "hook refresh start profile=system-writer pkg=${PROVIDER_PACKAGE} ", body
+        )
+        # 两条判据必须落在同一个 if 里（`||` 串联），否则等于只有一条生效。
+        lines = body.splitlines()
+        hook_index = [
+            index
+            for index, line in enumerate(lines)
+            if "hook refresh start profile=system-writer" in line and "adb_su" in line
+        ]
+        self.assertTrue(hook_index, "缺少 system-writer hook 判据")
+        # `||` 写在上一条 stderr 检查行的行尾，因此看前一行的结尾。
+        self.assertTrue(
+            lines[hook_index[0] - 1].rstrip().endswith("||"),
+            "两条拓扑判据之间必须是「或」关系",
+        )
+        # 回归守卫本身不得被放宽：零规则挂载请求、策略登记失败、提供器自起 FUSE
+        # 会话三种形态仍必须判失败。
+        self.assertIn("sandbox=0", body)
+        self.assertIn("policy_registration_failed", body)
+        self.assertIn("fuse redirect mount start pkg=${PROVIDER_PACKAGE}", body)
 
     def test_shared_fuse_host_b2a_contract(self) -> None:
         # B2-a 先建立独立宿主会话骨架：它必须在 daemon 的私有 namespace 中创建，
@@ -693,8 +932,10 @@ class ScenarioConsistencyTest(unittest.TestCase):
         self.assertIn('"srx_fuse_host"', config)
         self.assertIn("if !crate::fuse_host::ensure_global()", daemon)
         self.assertIn("crate::fuse_host::ensure_global()", daemon)
-        self.assertIn("scoped path remains active", daemon)
-        # B2-a 不能改变现有应用 scoped 挂载路径；host 只是新增基础设施。
+        # 宿主不可用时应用照常拿到 namespace bind 视图（scoped 会话已退役）。
+        self.assertIn("namespace bind remains active", daemon)
+        # scoped 会话退役后，`srx_fuse_redirect` 前缀仍必须保留：它用于识别并清理旧版本
+        # 遗留的 scoped 挂载层，删掉会让历史死层失去归属判据。
         self.assertIn('"srx_fuse_redirect"', config)
 
     def test_shared_fuse_host_registers_app_policy_before_attach(self) -> None:
@@ -705,7 +946,12 @@ class ScenarioConsistencyTest(unittest.TestCase):
         # 3) 闸门本身仍然存在——打开接入必须是一次有意的改动（默认由环境变量关闭）。
         for path in ("src/daemon_mount.rs", "src/lifecycle/companion_mount.rs"):
             source = read(path)
-            body = section(source, "fn start_fuse_service_for_root", "let mut ready_sockets")
+            end_marker = (
+                "fn preattach_skip_reason("
+                if path.endswith("daemon_mount.rs")
+                else "fn shared_host_preattach_candidate("
+            )
+            body = section(source, "fn preattach_shared_host(", end_marker)
             compact = "".join(body.split())
             if path.endswith("daemon_mount.rs"):
                 register_at = body.index("crate::fuse_host::register_app_policy(")
@@ -758,6 +1004,125 @@ class ScenarioConsistencyTest(unittest.TestCase):
             config,
         )
 
+    def test_cursor_row_action_is_single_entry_and_plan_gated(self) -> None:
+        # 行循环此前每行跨 JNI 三到六次（改写 + 隐藏 + 两次存在性），并在每行跑一遍
+        # 完整策略路由；原生 MediaProvider 的行循环不做任何判定。这里钉死「整行判定
+        # 收敛为一次调用」，且「整库同判」只在没有任何规则与映射时才允许成立：
+        # 1) Java 行循环只调 cursorRowAction，原生侧同签名注册（名字/签名错会整批失败）；
+        # 2) 计划的准入条件必须同时包含「无路径规则」与「无映射」；
+        # 3) 私有根与点开头的名字不得走同判（它们有独立视图/例外分支）；
+        # 4) 详细日志下保留差分校验，用旧序列证明新入口等价。
+        java = read("java_src/org/srx/hook/Hooker.java")
+        self.assertIn(
+            "private static native String cursorRowAction(",
+            java,
+        )
+        self.assertIn("cursorRowAction(path, callerUid, allowMissingMappedTarget)", java)
+        self.assertIn("verifyCursorRowAction(", java)
+        self.assertIn("cursor row action mismatch path=", java)
+        native = read("src/java_hook/hooker_class.rs")
+        self.assertIn(
+            'b"cursorRowAction' + chr(92) + '0"',
+            native,
+        )
+        self.assertIn("(Ljava/lang/String;IZ)Ljava/lang/String;", native)
+        self.assertIn("crate::hook::cursor_row_action(&original, caller_uid, allow_missing)", native)
+        rewrite = read("src/hook/jni_query/rewrite.rs")
+        self.assertIn("pub(crate) fn cursor_row_action(", rewrite)
+        self.assertIn("writer::caller_has_no_path_rules(caller_package, caller_uid)", rewrite)
+        self.assertIn("writer::get_caller_mappings(caller_package, caller_uid).is_empty()", rewrite)
+        self.assertIn('path_text.contains("/Android/data/")', rewrite)
+        self.assertIn("name.starts_with('.')", rewrite)
+        # 退回完整判定时必须仍走原序列（改写 → 隐藏 → 原始存在性 → 改写目标存在性）。
+        legacy = section(rewrite, "fn legacy_row_action(", "fn storage_path_exists_for_caller(")
+        self.assertIn("rewrite_cursor_storage_path_for_caller(original_text", legacy)
+        self.assertIn("should_hide_cursor_storage_path_for_caller(original_text", legacy)
+        self.assertIn("storage_path_exists_for_caller(path_text", legacy)
+        self.assertIn("is_mapping_view_rewrite(path_text", legacy)
+        writer = read("src/redirect/writer.rs")
+        self.assertIn("pub fn caller_has_no_path_rules(", writer)
+        for field in (
+            "allowed_real_paths",
+            "excluded_real_paths",
+            "sandboxed_paths",
+            "read_only_paths",
+            "read_only_excluded_paths",
+        ):
+            self.assertIn(field + ".is_empty()", writer)
+
+    def test_cursor_row_existence_folds_by_directory(self) -> None:
+        # MediaStore 行循环的存在性判定必须按父目录折叠枚举：逐行 faccessat 的 FUSE
+        # 往返是 issue #7 冷启动相册首屏的主成本（实测单次约 250µs）。这里钉死三件事，
+        # 任一条丢失都会让优化悄悄退回逐行系统调用：
+        # 1) Java 行循环用的是行级入口，不是逐条 syscall 入口；
+        # 2) 原生侧该入口存在且已注册（名字/签名错会在 RegisterNatives 时整批失败）；
+        # 3) 折叠只按「父目录 + 名字」，目录不可枚举时必须退回逐条判定。
+        java = read("java_src/org/srx/hook/Hooker.java")
+        self.assertIn("private static native boolean pathExistsForCursorRow(String path);", java)
+        self.assertIn("if (pathExistsForCursorRow(path)) return true;", java)
+        native = read("src/java_hook/hooker_class.rs")
+        self.assertIn('b"pathExistsForCursorRow' + chr(92) + '0"', native)
+        self.assertIn("(Ljava/lang/String;)Z", native)
+        self.assertIn("crate::hook::path_exists_for_cursor_row(&path_text)", native)
+        snapshot = read("src/hook/jni_query/dir_snapshot.rs")
+        self.assertIn("libc::SYS_getdents64", snapshot)
+        self.assertIn("libc::X_OK", snapshot)
+        # 不可枚举必须退回逐条判定，不能把失败态当成「不存在」。
+        self.assertIn("DirState::Unlisted => return path_exists_by_syscall", snapshot)
+        self.assertIn("names.contains(name)", snapshot)
+        # 按代价切换：小分页逐条查、整库查询才枚举，避免枚举大目录反噬小分页。
+        self.assertIn("DIR_ENUMERATE_AFTER_ROWS", snapshot)
+        self.assertIn("Observation::Enumerate", snapshot)
+        rewrite = read("src/hook/jni_query/rewrite.rs")
+        compact = "".join(rewrite.split())
+        self.assertIn("use super::dir_snapshot::path_exists_for_cursor_row as row_path_exists;", rewrite)
+        self.assertIn("row_path_exists(&fallback_path)", compact)
+        self.assertIn("row_path_exists(path_text)", compact)
+
+    def test_host_namespace_policy_registered_ahead_of_uid_idempotency(self) -> None:
+        # namespace 策略按 ns inode 绑定，而按 uid 的幂等指纹刻意不含应用 pid：应用重启后
+        # namespace 换代但指纹仍然命中，跳过路径会让新 namespace 永久缺席，该 namespace
+        # 里的 root 调用方（挂载子进程、MediaProvider 的 root 线程）请求随之落进
+        # deny_all，表现为整片 ENOENT——自有私有目录恢复窗口的失败正是这个形态。
+        # 这里钉死「补登早于按 uid 的幂等判断」，并锁定它只写 namespace 表。
+        daemon_src = read_daemon_mount_module()
+        pre_register = section(
+            daemon_src, "pub(crate) fn pre_register_host_policy(", "fn write_mount_state("
+        )
+        compact = "".join(pre_register.split())
+        self.assertIn("register_app_namespace_ahead(request);", compact)
+        self.assertLess(
+            compact.index("register_app_namespace_ahead(request);"),
+            compact.index("PreRegisterOutcome::AlreadyRegistered"),
+            "命名空间补登必须先于按 uid 的幂等跳过",
+        )
+        self.assertIn("register_app_namespace_only(", daemon_src)
+        self.assertIn("REGISTERED_APP_NAMESPACES", daemon_src)
+        control = read("src/fuse_host_control.rs")
+        self.assertIn("pub fn register_app_namespace_only(", control)
+        self.assertIn("config.namespace_policy_only = true;", control)
+        # 只写 namespace 表时不得更新宿主快照：否则 companion 会在 uid 表仍为空时接入。
+        namespace_only = section(
+            control,
+            "pub fn register_app_namespace_only(",
+            "/// 把 daemon 自身的 mount namespace",
+        )
+        self.assertNotIn("record_registered_policy(", namespace_only)
+
+
+    def test_write_parent_walk_stops_when_repair_disabled(self) -> None:
+        # 写打开的父链治理此前对每一级都 fstatat + 可能的 chmod/chown，即使父目录已存在；
+        # 原生写路径只创建缺失目录，不回头治理已存在的父级。元数据修复关闭时上溯是纯开销，
+        # 这里钉死「父目录存在且修复关闭 → 立即返回」，避免以后又被改成逐级治理。
+        runtime = read("src/hook/runtime.rs")
+        body = section(runtime, "fn create_parent_dirs_recursive_until(", "fn process_redirect_path_for_runtime(")
+        self.assertIn("if !crate::metadata_repair::enabled() {", body)
+        self.assertLess(
+            body.index("if !crate::metadata_repair::enabled() {"),
+            body.index("normalize_redirect_dir_metadata(&parent, mode, owner)"),
+            "修复关闭时必须先返回，不能继续逐级归一",
+        )
+
     def test_shared_fuse_host_attach_contract(self) -> None:
         # 应用接入共享宿主会话的四条硬约束，任一条被放宽都会让应用静默失去重定向或让
         # 清理流程误伤其它应用：
@@ -783,14 +1148,35 @@ class ScenarioConsistencyTest(unittest.TestCase):
         self.assertIn("if!host_attach_enabled(){", gate)
         # 开关方向必须与目标形态一致：只有显式写成关闭取值才关闭，未设置即接入。
         switch = section(host, "fn host_attach_enabled() -> bool", "/// 共享宿主会话当前")
-        self.assertIn('"0"|"false"|"no"|"off"', "".join(switch.split()))
-        self.assertIn("!disabled", switch)
-        self.assertNotIn('"1"|"true"|"yes"', "".join(switch.split()))
+        compact_switch = "".join(switch.split())
+        self.assertIn('"0"|"false"|"no"|"off"', compact_switch)
+        self.assertIn("!disabled", compact_switch)
+        self.assertNotIn('"1"|"true"|"yes"', compact_switch)
+        # 开关必须覆盖宿主的**全部**使用路径，而不只是应用接入：宿主会话建立与外部
+        # abort 兜底监控只要漏掉一处，「关闭接入」就变成假关闭——宿主照样建立、照样
+        # 换代，每次换代仍会给已附着命名空间留下死挂载层，设备侧用它做 A/B 归因时
+        # 看到的现象与开启时没有差别。
+        self.assertIn("HOST_ATTACH_DISABLE_FILE", compact_switch)
+        ensure = section(host, "pub fn ensure_global() -> bool", "/// 等待宿主会话就绪的预算")
+        self.assertIn("if!host_attach_enabled(){", "".join(ensure.split()))
+        monitor = section(
+            host, "pub fn spawn_external_abort_monitor()", "fn external_abort_monitor_main("
+        )
+        self.assertIn("if!host_attach_enabled(){", "".join(monitor.split()))
         self.assertIn(
             "paths::normalize_syntax(mount_root)==paths::normalize_syntax(&view_root)", gate
         )
 
-        attach = section(host, "fn host_attach_child_main(", "fn open_detached_mount(")
+        # 别名覆盖函数（attach_host_view_to_storage_aliases）使用同命名空间 MS_BIND，
+        # 不属于「跨命名空间 bind 回退」禁令范围，因此 MS_BIND 检查只圈定 child_main 本体。
+        attach = section(
+            host, "fn host_attach_child_main(", "fn attach_host_view_to_storage_aliases("
+        )
+        aliases = section(
+            host, "fn attach_host_view_to_storage_aliases(", "fn open_detached_mount("
+        )
+        # 别名 bind 必须带同命名空间说明（主目标挂载已属于应用命名空间，bind 合法）。
+        self.assertIn("同一命名空间内的 bind 不跨命名空间", aliases)
         host_ns_at = attach.index("setns(host_ns.get(), libc::CLONE_NEWNS)")
         clone_at = attach.index("open_detached_mount(&c_mount_point)")
         app_ns_at = attach.index("setns(app_ns.get(), libc::CLONE_NEWNS)")
@@ -806,9 +1192,11 @@ class ScenarioConsistencyTest(unittest.TestCase):
         self.assertNotIn("libc::MS_BIND", attach)
 
         # 登记必须有应答：只按 `send` 是否成功判断，会让应用在策略尚未进宿主会话时接入，
-        # 结果是整片 ENOENT（未登记即拒绝）。应答带 uid，因为控制通道被所有挂载 worker 共用。
+        # 结果是整片 ENOENT（未登记即拒绝）。应答带 uid，因为控制通道被所有挂载 worker 共用；
+        # 等待受 ack 预算约束（全额用于应答等待：登记不再做任何挂载/视图绑定准备，
+        # 因此没有需要先从预算里扣除的前置耗时），不无界阻塞。
         self.assertIn("fn await_policy_ack(", host)
-        self.assertIn("await_policy_ack(fd, config.uid)", host)
+        self.assertIn("await_policy_ack(fd, config.uid, ack_budget_ms)", host)
         ack = section(host, "fn await_policy_ack(", "/// 把某个应用的策略登记到共享宿主会话")
         self.assertIn("if ack_uid != uid {", ack)
 
@@ -837,11 +1225,15 @@ class ScenarioConsistencyTest(unittest.TestCase):
             daemon_src, "pub(crate) fn pre_register_host_policy(", "fn write_mount_state("
         )
         self.assertIn("fuse_config_from_request(request,None,None)", "".join(pre_register.split()))
-        self.assertIn("register_app_policy(&config, request.policy_fingerprint)", pre_register)
+        # 登记必须带指纹与 ack 预算（8992240b 起签名含 ack_budget_ms），缺预算会把
+        # 开机风暴期的登记挂死在共享 dgram 上，被父进程误判 child stuck 后 SIGKILL。
+        self.assertIn("register_app_policy(", pre_register)
+        self.assertIn("request.policy_fingerprint,", pre_register)
+        self.assertIn("HOST_POLICY_ACK_BUDGET_MAX_MS", pre_register)
         self.assertIn("request.policy_fingerprint", pre_register)
         self.assertIn("view.policy_fingerprints.get(&(request.uid as u32))", pre_register)
         collapse = section(
-            daemon_src, "fn scoped_fuse_mount_roots(", "fn start_fuse_service_for_root("
+            daemon_src, "fn scoped_fuse_mount_roots(", "fn try_bind_to_fuse_host("
         )
         self.assertIn("crate::fuse_host::wait_for_host_session()", collapse)
         self.assertIn("crate::config::StorageBackendMode::Auto", collapse)
@@ -906,13 +1298,18 @@ class ScenarioConsistencyTest(unittest.TestCase):
         # 都不得再直读会话绑定策略的字段，一律经注册表取值。
         source = read("src/fuse_redirect/mod.rs")
         # `shared_table()` 与 `for_uid_exact()` 都是注册表出口：前者交给宿主登记，后者用于
-        # root 子进程跨 namespace 接续已由 inode/path 记住的应用策略；除它们之外的 `self.policy.`
-        # 仍然只能走 `for_request` / `session`。
+        # root 子进程跨 namespace 接续已由 inode/path 记住的应用策略（含 2026-10-21 fd 属主
+        # 回退按 inode 属主 uid 解析）；除它们之外的 `self.policy.` 仍然只能走 `for_request` /
+        # `session`。
+        # `find_owner_policy_by_package()` 是系统读取者路径反解出口（2026-10-21）：跨进程
+        # fd 的文件身份在 open 时刻固定，fstat/getxattr 不能按请求者 uid 重路由，只能按
+        # inode 属主包经注册表解析；仅限 Read 且由 is_system_reader_uid 门控。
         allowed = (
             "self.policy.for_request(req.uid(), req.pid())",
             "self.policy.session()",
             "self.policy.shared_table()",
-            "self.policy.for_uid_exact(cached_uid)",
+            "self.policy.for_uid_exact(",
+            "self.policy.find_owner_policy_by_package(",
         )
         for number, line in enumerate(source.splitlines(), 1):
             if "self.policy." not in line:
@@ -969,7 +1366,39 @@ class ScenarioConsistencyTest(unittest.TestCase):
     def test_all_selector_expands_to_every_manifest_scenario(self) -> None:
         expected_max = max(self.ids)
         self.assertIn(f"scenarios=($(seq 1 {expected_max}))", self.bash)
-        self.assertIn(f"return @(1..{expected_max})", self.powershell)
+        # PowerShell 版同样以 1..max 作为全量范围（旧实现用手写清单且停在 37，
+        # 本地全量验证会漏跑 38-40）。
+        self.assertIn(f"@(1..{expected_max})", self.powershell)
+
+    def test_version_scenario_exclude_prunes_instead_of_replacing_scope(self) -> None:
+        # 版本级限制只能从已确定的范围里剔除，不能替换范围本身：旧实现直接用它
+        # 覆盖 SRT_SCENARIOS，既让默认范围退化成窄场景，也吞掉了 dispatch 输入与
+        # 提交标记的单点回归（2026-10-25 修复）。
+        for body in (self.bash, self.powershell):
+            self.assertIn("SRT_VERSION_SCENARIO_EXCLUDE", body)
+            self.assertNotIn("SRT_VERSION_SCENARIO_FILTER", body)
+        self.assertIn("prune_version_scenario_excludes", self.bash)
+        self.assertIn("Remove-ExcludedScenarios", self.powershell)
+
+    def test_ci_matrix_does_not_hardcode_scenario_scope(self) -> None:
+        # 场景范围必须由测试流参数动态决定（SRT_SCENARIOS / dispatch 输入 / 提交
+        # 信息标记），矩阵只负责把版本级排除项透传给脚本。任何写死包含列表或排除
+        # 项都会让默认范围或单点回归静默失真（2026-10-25：A17 也曾写死排除 39）。
+        workflow = yaml.safe_load(read(".github/workflows/ci.yml"))
+        matrix = workflow["jobs"]["test-flow"]["strategy"]["matrix"]["android"]
+        self.assertTrue(matrix)
+        for entry in matrix:
+            version = entry.get("version")
+            self.assertNotIn("version_scenario_filter", entry, f"A{version}")
+            self.assertNotIn("version_scenario_exclude", entry, f"A{version}")
+        env = workflow["jobs"]["test-flow"]["env"]
+        self.assertIn("SRT_VERSION_SCENARIO_EXCLUDE", env)
+        self.assertNotIn("SRT_VERSION_SCENARIO_FILTER", env)
+        # 正式发布固定执行全量，不参与矩阵排除（环境问题必须在 CI 阶段暴露）。
+        release = yaml.safe_load(read(".github/workflows/release.yml"))
+        release_env = release["jobs"]["test-flow"]["env"]
+        self.assertEqual(release_env["SRT_SCENARIOS"], "all")
+        self.assertNotIn("SRT_VERSION_SCENARIO_EXCLUDE", release_env)
 
     def test_any_path_workflow_runs_all_android_test_flow_shards(self) -> None:
         if not (ROOT / ".github/workflows/ci-any-path.yml").exists():
@@ -1206,7 +1635,7 @@ class ScenarioConsistencyTest(unittest.TestCase):
             self.assertIn("Upload shared FUSE snapshots", source)
             self.assertIn("test-flow-shared-fuse-before.txt", source)
             self.assertIn("test-flow-shared-fuse-after.txt", source)
-            self.assertIn("hashFiles('test-flow-shared-fuse-before.txt', 'test-flow-shared-fuse-after.txt')", source)
+            self.assertIn("hashFiles('temp/test-flow/**/test-flow-shared-fuse-before.txt', 'temp/test-flow/**/test-flow-shared-fuse-after.txt')", source)
 
     def test_workflows_share_runtime_build_and_failure_artifacts(self) -> None:
         expected_artifacts = {
@@ -1590,13 +2019,19 @@ class ScenarioConsistencyTest(unittest.TestCase):
         source = read("src/java_hook/hot_reload.rs")
         java_hook = read("src/java_hook.rs")
         specialize_post = read("src/lifecycle/specialize_post.rs")
+        module_paths = read("src/platform/module_paths.rs")
+        log_daemon = read("src/log_daemon.rs")
         srxctl = read("assets/zygisk_module/bin/srxctl")
         webui = read("assets/zygisk_module/webroot/js/api.js")
         self.assertIn("MEDIA_PROVIDER_HOT_RELOAD_REQUEST_FILE", source)
-        self.assertIn("MEDIA_PROVIDER_HOT_RELOAD_ACK_FILE", source)
-        self.assertIn("stage=hot_reload_ok", source)
+        # 回执文件由 daemon 代写：MP 域对模块目录无写权限，MP 侧只发 HotReload 标签。
+        self.assertIn("MEDIA_PROVIDER_HOT_RELOAD_ACK_FILE", module_paths)
+        self.assertIn("MEDIA_PROVIDER_HOT_RELOAD_ACK_FILE", log_daemon)
+        self.assertIn("stage=hot_reload_ok", log_daemon)
         self.assertIn("SIGUSR2", source)
-        self.assertIn("SIGNAL_PENDING", source)
+        # 唤醒走自管道：信号处理器只 write 一个字节，监视线程 poll 等待。
+        self.assertIn("SIGNAL_PIPE_WRITE_FD", source)
+        self.assertIn("drain_signal_pipe", source)
         self.assertIn("hot_reload_completed_count", srxctl)
         self.assertIn('boot_id=$boot_id"', srxctl)
         self.assertIn("stage=hot_reload_ok", srxctl)
@@ -1712,6 +2147,24 @@ class ScenarioConsistencyTest(unittest.TestCase):
         deferred = section(boot, "restart_media_provider_for_deferred_hooks() {", "  media_pkgs=")
         self.assertIn('getprop ro.build.version.sdk', deferred)
         self.assertIn('skip MediaProvider restart for lazy Android', deferred)
+
+    def test_package_event_wait_never_blocks_on_fifo_open(self) -> None:
+        # FIFO 的 open(O_RDONLY) 在对端缺失时会无限期阻塞，而 `read -t` 的超时只约束
+        # 读取、管不到 open：收集器一旦卡在这里就再也不会消费 package_events.log，
+        # 新装应用自动开启、卸载清理与基线更新会全部静默失效（duchamp 实测收集器
+        # wchan=wait_for_partner、offset 恒为 0，而事件已堆积在日志里）。
+        # 因此等待必须自持读写两端（fd 3）+ 监听进程存活检查，不得回到裸输入重定向。
+        events = read("assets/zygisk_module/service.d/config_events.sh")
+        wait = section(
+            events,
+            "wait_for_package_event_notification() {",
+            "\nstart_package_event_collector() {",
+        )
+        self.assertIn('exec 3<>"$notification_fifo"', wait)
+        self.assertIn('read -t 1 -r event_line <&3', wait)
+        self.assertNotIn('< "$notification_fifo"', wait)
+        self.assertIn('kill -0 "$notification_pid"', wait)
+        self.assertIn("exec 3>&-", wait)
 
     def test_test_app_install_waits_for_package_service(self) -> None:
         install = read(".github/tests/install-storage-redirect-module.sh")
@@ -2071,8 +2524,10 @@ class ScenarioConsistencyTest(unittest.TestCase):
             source, "pub fn app_redirect_mounts_in(", "\n}\n")
         self.assertIn("is_module_redirect_mount(", app_mounts)
         # 三个调用点都要把挂载点传进去，漏一个就会在那条路径上失配。
+        # mount_ledger 的登记已改为 capture_explicit_mount_identity（不经归属谓词，
+        # 直接取显式目标的 topmost 事实），不再调用 is_module_redirect_mount；
+        # 谓词调用点只剩 daemon_mount 的摘除归属。
         for path, anchor, target_arg in (
-            ("src/mount_ledger.rs", "pub fn capture_mount_identity(", "mount_point,"),
             ("src/daemon_mount.rs", "fn clear_mount_target_stack_verified(", "target,"),
         ):
             body = section(read(path), anchor, "\n}\n")
@@ -2095,9 +2550,13 @@ class ScenarioConsistencyTest(unittest.TestCase):
         self.assertNotIn("is_module_mount_source(", clear)
 
         ledger = read("src/mount_ledger.rs")
-        capture = section(ledger, "pub fn capture_mount_identity(", "\n/// 按本次挂载的目标集合登记账本")
-        self.assertIn("is_module_redirect_mount(", capture)
-        self.assertIn("package_name: &str", capture)
+        capture = section(
+            ledger, "pub fn capture_explicit_mount_identity(", "\n/// 按本次挂载的目标集合登记账本"
+        )
+        # 登记必须走显式目标的 topmost 事实，不得经归属谓词：private-dir alias bind
+        # 的 root 形态与系统挂载完全同形，谓词会把它漏出账本，cleanup 判 foreign
+        # 永不完整、重挂循环不停（真机实测 wetype 等应用每次 reload 都触发）。
+        self.assertNotIn("is_module_redirect_mount(", capture)
         # `root` 是判据的唯一可靠依据，`LiveMount` 必须把它读出来。
         self.assertIn("pub root: String", ledger)
 
@@ -2240,25 +2699,30 @@ class ScenarioConsistencyTest(unittest.TestCase):
         统一可检索标记而不是自由文本；自行预置夹具的场景必须显式豁免，否则断言会误报。
         """
         helper = section(self.bash, "assert_fixture_roots_empty() {", "\nclean_results() {")
-        self.assertIn("-type f || exit 1", helper)
+        # find 的失败必须传播（`|| exit 1`），并且输出字段供残留对照；不得用 -maxdepth 收窄。
+        self.assertIn("-type f -printf", helper)
+        self.assertIn("|| exit 1", helper)
         self.assertNotIn("-maxdepth 2", helper)
         self.assertIn("fixture_scan_failed", helper)
         self.assertIn("fixture_residue label=", helper)
         runner = section(self.bash, "run_scenario() {", "\n# 与 PowerShell 共用设备端锁")
         self.assertIn('assert_fixture_roots_empty "scenario-${scenario}" || return 1', runner)
-        self.assertRegex(runner, r"9\|20\|21\|22\|28\|31\) ;;")
+        # 场景 38 自行清理并预置探测目录（下载提供器沙盒夹具），与 9/20/21/22/28/31 同为豁免场景。
+        self.assertRegex(runner, r"9\|20\|21\|22\|28\|31\|38\) ;;")
         # 容忍式清理必须留下统一前缀，便于在日志里统计与定位，不能只写一句自由文本。
         self.assertIn("cleanup_tolerated reason=probe_fuse_edom", self.bash)
         self.assertIn("cleanup_tolerated reason=own_dir_fuse", self.bash)
 
         ps = section(self.powershell, "function Assert-FixtureRootsEmpty", "function Clear-Targets")
         self.assertIn("fixture_residue label=", ps)
-        self.assertIn("-type f || exit 1", ps)
+        # 与 SH 同口径：带输出字段的 find，且失败必须传播。
+        self.assertIn("-type f -printf", ps)
+        self.assertIn("|| exit 1", ps)
         self.assertNotIn("-maxdepth 2", ps)
         self.assertIn("fixture_scan_failed", ps)
         ps_runner = section(self.powershell, "function Invoke-Scenario {", "\n    $scenarioOk = switch")
         self.assertIn('Assert-FixtureRootsEmpty "scenario-$Scenario"', ps_runner)
-        self.assertIn("-notin @(9, 10, 20, 21, 22, 28, 31)", ps_runner)
+        self.assertIn("-notin @(9, 10, 20, 21, 22, 28, 31, 38)", ps_runner)
 
     def test_fixture_cleanup_sweeps_directories_by_prefix(self) -> None:
         """夹具清理必须按 `Srt*` 通配动态枚举目录，不能只依赖手写清单。
@@ -2591,6 +3055,48 @@ class ScenarioConsistencyTest(unittest.TestCase):
             self.assertNotEqual(
                 bad_proc.returncode, 0,
                 f"非法标记 {bad_message!r} 必须报错，不得静默回退全量",
+            )
+
+    def test_download_probe_server_replaces_subshell_and_drops_stdin(self) -> None:
+        """取数服务必须用 exec 顶替子 shell 并断开 stdin。
+
+        `( ... python3 -m http.server ... ) &` 的 `$!` 是子 shell 的 PID，脚本
+        末尾的 `kill "$dl_server_pid"` 只杀中间层，python 变孤儿继续监听并持有
+        step 的管道。GitHub Actions 在 step 的 shell 退出后仍会等这根管道关闭，
+        表现为脚本早已失败、action 收尾日志也打完，job 却静默挂到步骤超时
+        （run 40286639350：07:45:48 之后 11 分 44 秒零输出，直到 17 分钟看门狗）。
+        """
+        script = read(".github/tests/run-storage-redirect-scenarios.sh")
+        line = next(
+            (item for item in script.splitlines() if "http.server" in item),
+            None,
+        )
+        self.assertIsNotNone(line, "下载取数服务的启动行已被移除，请同步本守卫")
+        self.assertIn("exec python3 -m http.server", line)
+        self.assertIn("</dev/null", line)
+        self.assertNotIn("&& python3 -m http.server", line)
+
+    def test_emulator_is_killed_only_on_watchdog_timeout(self) -> None:
+        """正常失败路径不得提前杀模拟器。
+
+        先杀模拟器会让 android-emulator-runner 收尾的 `adb emu kill` 拿到
+        Connection refused（run 40286639350 实证），收尾不干净；只有看门狗
+        超时（124）时设备侧状态才不可预期，需要主动清场。
+        """
+        script = read(".github/tests/run-android-test-flow.sh")
+        kill_lines = [
+            index
+            for index, line in enumerate(script.splitlines())
+            if "adb emu kill" in line
+        ]
+        self.assertTrue(kill_lines, "模拟器兜底 kill 被整体移除，请同步本守卫")
+        lines = script.splitlines()
+        for index in kill_lines:
+            # 向上找最近的条件判断行，必须限定在 124 超时分支内
+            window = "\n".join(lines[max(0, index - 6) : index + 1])
+            self.assertIn(
+                'scenario_exit" -eq 124', window,
+                "adb emu kill 必须只出现在看门狗超时分支内",
             )
 
 

@@ -47,6 +47,15 @@ pub mod platform {
             "/../../src/platform/paths_safety.rs"
         ));
     }
+    pub mod uid {
+        include!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../src/platform/uid.rs"
+        ));
+    }
+    // domain.rs（夹具同源 include）调用 crate::platform::user_id_from_uid；
+    // 与 src/platform.rs 一致地重导出，保持两侧调用路径相同。
+    pub use uid::{ANDROID_USER_ID_OFFSET, user_id_from_uid};
     // inotify 的 FileChangeWaiter 经 super:: 引用 unique_fd；夹具的 platform 模块
     // 必须同步声明，否则 include 进来的 inotify 在夹具内解析不到该模块（CI 编译失败，
     // 而 Windows 本地因平台差异编译不出而被掩盖）。

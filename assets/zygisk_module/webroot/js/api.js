@@ -229,7 +229,7 @@ const NativeBridge = {
             finish(0, result, "");
           }
         } catch (e) {
-          cleanup();
+          // 兼容调用同样受原超时保护；这里只切换签名，不能提前清除计时器。
           try {
             const result = ksu.exec(cmd, finish);
             if (result && typeof result.then === "function") {
@@ -351,6 +351,15 @@ function srxCtlCommand(action) {
   return "/system/bin/sh " + shellQuote(SRXCTL) + " " + action;
 }
 
+/**
+ * 从 exec 失败信息中提取 srxctl 输出的重挂失败原因令牌（remount_reason=<key>）。
+ * exec 在非零退出码时只把 stderr 作为 Error message 抛出，因此令牌必须从 stderr 文本里解析。
+ */
+function extractRemountReason(text) {
+  const match = /remount_reason=([a-z0-9-]+)/.exec(String(text || ""));
+  return match ? match[1] : "";
+}
+
 function withSrxCtlFallback(action, fallback) {
   return (
     "if [ -r " +
@@ -361,6 +370,35 @@ function withSrxCtlFallback(action, fallback) {
     fallback +
     "; fi"
   );
+}
+
+/** 解析 srxctl host-status 输出为结构化状态；未知输出一律归为 unknown。 */
+function parseStorageBackendStatus(output) {
+  const text = String(output || "").trim();
+  if (text === "inactive") return { state: "inactive", pid: null, policies: null };
+  const match = /^active pid=(\d+) policies=(\d+)$/.exec(text);
+  if (match) {
+    return { state: "active", pid: Number(match[1]), policies: Number(match[2]) };
+  }
+  return { state: "unknown", pid: null, policies: null };
+}
+
+/** 解析共享宿主快照 policies 行（uid:fingerprint 列表），按 Android 用户 id 分组计数。 */
+function parseHostPolicyUserCounts(output) {
+  const line = String(output || "")
+    .split("\n")
+    .find((candidate) => candidate.startsWith("policies="));
+  if (!line) return {};
+  const body = line.slice("policies=".length).trim();
+  if (!body) return {};
+  const counts = {};
+  body.split(",").forEach((entry) => {
+    const uid = Number(entry.split(":")[0]);
+    if (!Number.isInteger(uid) || uid < 0) return;
+    const user = Math.floor(uid / 100000);
+    counts[user] = (counts[user] || 0) + 1;
+  });
+  return counts;
 }
 
 function isManagedTempPath(path) {
@@ -465,40 +503,6 @@ function diagnosticArchiveWorkerScript() {
   ].join("\n");
 }
 
-function parseDiagnosticProgress(line) {
-  const parts = String(line || "")
-    .trim()
-    .split("|");
-  if (parts.length < 3) return null;
-  const percent = Math.max(0, Math.min(100, Number.parseInt(parts[0], 10)));
-  if (!Number.isFinite(percent)) return null;
-  return {
-    percent,
-    phase: String(parts[1] || "").slice(0, 32),
-    message: parts.slice(2).join("|").slice(0, 80) || "正在导出日志",
-  };
-}
-
-function parseDiagnosticArchivePoll(stdout) {
-  let progressLine = "";
-  let doneCode = null;
-  String(stdout || "")
-    .split(/\r?\n/)
-    .forEach((line) => {
-      if (line.startsWith("__SRX_DONE__=")) {
-        const value = line.slice("__SRX_DONE__=".length).trim();
-        if (value !== "") doneCode = Number.parseInt(value, 10);
-      } else if (line.includes("|")) {
-        progressLine = line.trim();
-      }
-    });
-  return {
-    progress: parseDiagnosticProgress(progressLine),
-    progressLine,
-    doneCode: Number.isFinite(doneCode) ? doneCode : null,
-  };
-}
-
 function isSafePackageName(packageName) {
   return /^[A-Za-z0-9_.-]+$/.test(packageName || "");
 }
@@ -507,20 +511,78 @@ function isSafeUserId(userId) {
   return /^[0-9]+$/.test(String(userId || ""));
 }
 
+/**
+ * dex 输出中标志「该用户视角下的系统应用」的行前缀。
+ * 由 tools/list_apps/Main.java 生成，以 `#` 开头，旧读取端会整行跳过。
+ */
+const COMPAT_APP_LIST_SYSTEM_MARKER = "#system=";
+
 function parseCompatAppList(content) {
   const apps = [];
+  const systemPackages = new Set();
   String(content || "")
     .split("\n")
     .forEach((line) => {
       const text = line.trim();
-      if (!text || text.startsWith("#")) return;
+      if (!text) return;
+      if (text.startsWith(COMPAT_APP_LIST_SYSTEM_MARKER)) {
+        text
+          .slice(COMPAT_APP_LIST_SYSTEM_MARKER.length)
+          .split(/\s+/)
+          .forEach((name) => {
+            if (isSafePackageName(name)) systemPackages.add(name);
+          });
+        return;
+      }
+      if (text.startsWith("#")) return;
       const splitAt = text.indexOf("=");
       const packageName = splitAt >= 0 ? text.slice(0, splitAt).trim() : text.split(/\s+/)[0];
       const appLabel = splitAt >= 0 ? text.slice(splitAt + 1).trim() : packageName;
       if (isSafePackageName(packageName))
-        apps.push({ packageName, appLabel: appLabel || packageName, isSystem: false });
+        apps.push({ packageName, appLabel: appLabel || packageName });
     });
+  // 系统应用只在 dex 给出了标记时按用户结果覆盖；旧版 dex 没有该标记，
+  // 此时保持 isSystem 未定义，让调用方继续沿用包名前缀兜底判断。
+  if (systemPackages.size) {
+    apps.forEach((app) => {
+      app.isSystem = systemPackages.has(app.packageName);
+    });
+  }
   return apps;
+}
+
+/**
+ * 解析 `pm list packages -f -U --user <id>` 与 `pm list packages -s --user <id>` 两段输出。
+ *
+ * 判据与 Kotlin 侧 `parseUserPackageList` 一致：`-f` 段给出成员与 APK 路径，`-s` 段给出
+ * 该用户视角的系统应用；分段靠调用方显式 echo 的标记行，不靠包名前缀猜。
+ */
+function parseUserPackageListing(content, systemMarker) {
+  const packageSet = new Set();
+  const system = new Set();
+  let inSystemSection = false;
+  String(content || "")
+    .split("\n")
+    .forEach((line) => {
+      const text = line.trim();
+      if (!text) return;
+      if (text === systemMarker) {
+        inSystemSection = true;
+        return;
+      }
+      if (!text.startsWith("package:")) return;
+      const body = text.slice("package:".length);
+      if (inSystemSection) {
+        const name = body.split(/\s+/)[0].trim();
+        if (isSafePackageName(name)) system.add(name);
+        return;
+      }
+      // APK 路径里可能出现 `==`（如 /data/app/~~xxxx==/base.apk），包名只在最后一个 `=` 之后。
+      const split = body.lastIndexOf("=");
+      const name = (split >= 0 ? body.slice(split + 1) : body).split(/\s+/)[0].trim();
+      if (isSafePackageName(name)) packageSet.add(name);
+    });
+  return { packages: Array.from(packageSet), system };
 }
 
 function normalizePackageResult(raw) {
@@ -917,9 +979,9 @@ const Api = {
   },
 
   /** 以字符串形式读取文件内容 */
-  async readFile(path) {
+  async readFile(path, options) {
     try {
-      return await this.exec(shellCommand("cat", path) + " 2>/dev/null");
+      return await this.exec(shellCommand("cat", path) + " 2>/dev/null", options);
     } catch {
       return "";
     }
@@ -935,19 +997,21 @@ const Api = {
     }
   },
 
-  /** 读取当前日志及全部轮转备份，按时间顺序合并。 */
+  /** 从当前日志与轮转备份读取最近记录，避免把全部历史传入 WebView。 */
   async readFileWithBackups(path) {
+    const lines = 1000;
     const command =
       "base=" +
       shellQuote(path) +
       '; { for f in "$base".*; do [ -f "$f" ] || continue; suffix="${f##*.}"; case "$suffix" in ' +
       "''|*[!0-9]*) continue;; esac; printf '%s\\t%s\\n' \"$suffix\" \"$f\"; done | " +
-      'sort -rn | while IFS="$(printf \'\\t\')" read -r _ f; do cat "$f"; done; cat "$base" 2>/dev/null; }';
-    try {
-      return await this.exec(command);
-    } catch {
-      return "";
-    }
+      'sort -rn | while IFS="$(printf \'\\t\')" read -r _ f; do tail -n ' +
+      lines +
+      ' "$f" 2>/dev/null; done; tail -n ' +
+      lines +
+      ' "$base" 2>/dev/null; } | tail -n ' +
+      lines;
+    return await this.exec(command, { timeoutMs: 10000 });
   },
 
   /** 将内容写入文件 */
@@ -1251,7 +1315,7 @@ const Api = {
       'logcat -g > "$stage/logcat-buffers.txt" 2>&1 || true; ' +
       'logcat -b main,system,crash -d -t 10000 -v threadtime -s StorageRedirect:V SRX:V FileMonitorOp:I Stats:I AndroidRuntime:E DEBUG:F libc:F ActivityManager:I WindowManager:I MediaProvider:V ExternalStorage:V DocumentsUI:V Vold:V > "$stage/logcat-srx-filtered.txt" 2>&1 || true; ' +
       'logcat -b crash -d -v threadtime > "$stage/logcat-crash.txt" 2>&1 || true; ' +
-      'logcat -b main,system -d -t 8000 -v threadtime > "$stage/logcat-main-system-context.txt" 2>&1 || true; ' +
+      'logcat -b main,system -d -t 20000 -v threadtime > "$stage/logcat-main-system-context.txt" 2>&1 || true; ' +
       'logcat -b events -d -t 1500 -v threadtime > "$stage/logcat-events.txt" 2>&1 || true; ' +
       'echo "initial_capture_completed_at=$(date "+%Y-%m-%d %H:%M:%S %z" 2>/dev/null || date 2>/dev/null)" >> "$stage/state/logcat-capture.txt"; ' +
       diagnosticProgressCommand(progress, 18, "files", "正在复制模块日志和配置") +
@@ -1440,6 +1504,26 @@ const Api = {
           return target;
         }
       }
+      // Download 不可写（存储挂载异常时的典型现场）：降级把日志包留在模块目录
+      // （root 直连路径，不经 FUSE 视图），用户用 root 文件管理器或 adb 手动拷贝。
+      const fallbackTarget = MODULE_DIR + "/" + safeName;
+      const fallbackCopy = await this.exec(
+        "cp " + shellQuote(tmpArchive) + " " + shellQuote(fallbackTarget) + " && echo ok",
+        { timeoutMs: 30000 },
+      ).catch(() => "");
+      if (
+        String(fallbackCopy || "")
+          .trim()
+          .split(/\s+/)
+          .pop() === "ok"
+      ) {
+        options?.onProgress?.({
+          percent: 100,
+          phase: "done",
+          message: "Download 不可写，日志包已保存到模块目录",
+        });
+        return fallbackTarget;
+      }
       throw new Error("日志包写入 Download 失败");
     } finally {
       try {
@@ -1590,7 +1674,9 @@ const Api = {
   async readMonitorFilters(options) {
     if (options?.force) this.invalidateMonitorFiltersCache();
     if (this._monitorFiltersCache) return JSON.parse(JSON.stringify(this._monitorFiltersCache));
-    const content = await this.readFile(FILE_MONITOR_FILTERS_CONFIG);
+    const content = await this.readFile(FILE_MONITOR_FILTERS_CONFIG, {
+      timeoutMs: options?.timeoutMs,
+    });
     if (!content) {
       this._monitorFiltersCache = JSON.parse(JSON.stringify(DEFAULT_FILE_MONITOR_FILTERS));
       return JSON.parse(JSON.stringify(this._monitorFiltersCache));
@@ -1771,17 +1857,15 @@ const Api = {
     }
     try {
       const marker = "__SRX_APP_CONFIG__";
+      // 单个 awk 进程一次读完所有配置。早先逐文件 `cat` 的有 56 次 fork，
+      // 实测 1.9s 以上（输出只有 18KB），改成一条命令后降到 0.1~0.2s。
       const out = await this.exec(
-        "mkdir -p " +
-          shellQuote(APPS_DIR) +
-          "; " +
-          "for f in " +
-          shellQuote(APPS_DIR) +
-          "/*.json; do " +
-          '[ -f "$f" ] || continue; b="${f##*/}"; p="${b%.json}"; ' +
-          'printf "\\n' +
+        'awk \'FILENAME != prev { prev = FILENAME; n = FILENAME; sub(/.*\\//, "", n); ' +
+          'sub(/\\.json$/, "", n); printf "\\n' +
           marker +
-          '%s\\n" "$p"; cat "$f"; printf "\\n"; done 2>/dev/null',
+          "%s\\n\", n } { print }' " +
+          shellQuote(APPS_DIR) +
+          "/*.json 2>/dev/null",
       );
       const items = [];
       const lines = String(out || "").split("\n");
@@ -1843,7 +1927,9 @@ const Api = {
   /** 获取已安装应用列表（用户应用与系统应用） */
   async getInstalledApps(userId) {
     const safeUser = isSafeUserId(userId) ? String(userId) : "";
-    const fromKsu = this.getInstalledAppsFromKsu();
+    // KSU 的包列表接口没有用户维度，只反映当前进程视角，因此仅对主用户可用；
+    // 其它用户必须走可按用户查询的 dex/pm 通道，否则切换用户后列表不会变化。
+    const fromKsu = !safeUser || safeUser === "0" ? this.getInstalledAppsFromKsu() : [];
     if (fromKsu.length) return fromKsu;
     const fromDex = await this.getInstalledAppsFromDex(safeUser);
     if (fromDex.length) return fromDex;
@@ -1853,15 +1939,39 @@ const Api = {
   async getInstalledAppsFromPackageManager(userId) {
     const safeUser = isSafeUserId(userId) ? String(userId) : "";
     const userArg = safeUser ? " --user " + safeUser : "";
+    // 标记必须加引号：裸写 `#srx-system` 会被 sh 当成注释，连带吃掉后面的 `-s` 查询，
+    // 系统应用集合就会静默变成空集，界面只能退化成按包名前缀猜。
+    const marker = 'echo "srx-system-section"';
     const commands = [
-      "pm list packages -f" + userArg + " 2>/dev/null",
-      "cmd package list packages -f" + userArg + " 2>/dev/null",
+      "pm list packages -f -U" +
+        userArg +
+        " 2>/dev/null; " +
+        marker +
+        "; pm list packages -s" +
+        userArg +
+        " 2>/dev/null",
+      "cmd package list packages -f -U" +
+        userArg +
+        " 2>/dev/null; " +
+        marker +
+        "; cmd package list packages -s" +
+        userArg +
+        " 2>/dev/null",
     ];
     for (const command of commands) {
       try {
-        const out = await this.exec(command + ' | sed "s/package://" | awk -F= "{print \$2}"');
-        const packages = out.split("\n").filter(Boolean).filter(isSafePackageName);
-        if (packages.length) return packages;
+        const listing = parseUserPackageListing(await this.exec(command), "srx-system-section");
+        if (!listing.packages.length) continue;
+        // 把系统标记写进包信息缓存：列表分桶直接用该用户视角的真实结果。
+        listing.packages.forEach((pkg) => {
+          const prev = this._packageInfo.get(pkg) || {};
+          this._packageInfo.set(pkg, {
+            ...prev,
+            packageName: pkg,
+            isSystem: listing.system.has(pkg),
+          });
+        });
+        return listing.packages;
       } catch {}
     }
     return [];
@@ -2072,9 +2182,10 @@ const Api = {
 
   async ensureLogCollectors() {
     try {
-      if (await this.fileExists(SRXCTL)) {
-        await this.exec(srxCtlCommand("ensure-collectors"));
-      }
+      await this.exec(
+        "if [ -r " + shellQuote(SRXCTL) + " ]; then " + srxCtlCommand("ensure-collectors") + "; fi",
+        { timeoutMs: 5000 },
+      );
     } catch {}
   },
 
@@ -2344,12 +2455,37 @@ const Api = {
         timeoutMs: 30_000,
       });
       return { ok: true };
-    } catch {
-      return { ok: false };
+    } catch (error) {
+      return { ok: false, failureReason: extractRemountReason(error?.message) };
     } finally {
       try {
         await this.ensureLogCollectors();
       } catch {}
+    }
+  },
+
+  /** 读取共享宿主会话状态指示，供概览页展示；读取失败按 unknown 处理。 */
+  async readStorageBackendStatus() {
+    try {
+      const out = await this.exec(withSrxCtlFallback("host-status", "echo unknown"), {
+        timeoutMs: 10_000,
+      });
+      return parseStorageBackendStatus(out);
+    } catch {
+      return { state: "unknown", pid: null, policies: null };
+    }
+  },
+
+  /** 读取共享宿主快照，返回按用户拆分的已登记策略数；快照缺失或读取失败返回空对象。 */
+  async readHostPolicyUserCounts() {
+    try {
+      const path = shellQuote("/data/adb/modules/storage.redirect.x/tmp/fuse_host.snapshot");
+      const out = await this.exec("if [ -r " + path + " ]; then cat " + path + "; fi", {
+        timeoutMs: 10_000,
+      });
+      return parseHostPolicyUserCounts(out);
+    } catch {
+      return {};
     }
   },
 

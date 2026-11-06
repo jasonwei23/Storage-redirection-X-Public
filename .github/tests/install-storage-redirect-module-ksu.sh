@@ -10,7 +10,8 @@ set -eu
 #      （Zygisk Next，module id=zygisksu），必须先于 SRX 安装并在同一次重启生效；
 #   3. 模块安装器是 ksud，安装后同样落到 /data/adb/modules_update，重启后合并。
 #
-# 该脚本只由 KernelSU 实验 workflow（ci-kernelsu-a17.yml）调用，不参与正式测试矩阵。
+# 该脚本由正式测试矩阵的 A17 分片调用：ci.yml 矩阵项 root_method=ksu 时
+# MODULE_INSTALL_SCRIPT 切到本脚本，root shell 走 su 0 sh -c。
 
 export MSYS_NO_PATHCONV=1
 export MSYS2_ARG_CONV_EXCL="*"

@@ -3,7 +3,7 @@ use super::{caller, context, diagnostic, monitor, path as path_utils};
 use crate::config::SettingsHub;
 use crate::platform::{self, fs, paths};
 use crate::redirect::{policy, process_redirect_path, record_redirect_hit, writer};
-use libc::{AT_FDCWD, c_char, c_void, mode_t};
+use libc::{AT_FDCWD, c_char, c_int, c_void, mode_t};
 use std::ffi::CString;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -12,8 +12,28 @@ static FORK_CHILD_HOOK_BYPASS: AtomicU64 = AtomicU64::new(0);
 const ANDROID_APP_UID_START: i32 = 10000;
 const MEDIA_RW_GID: u32 = 1023;
 const STORAGE_DIR_MODE: mode_t = 0o2773;
+/// 私有树目录的原生 MediaProvider 语义（owner→group 镜像、others 清零）。
+/// auto-mkdir 曾对私有树沿用公共目标的 0o2773（others 可写可穿越），与原生
+/// 02770 相悖且弱化隔离——用户 2026-10-21 反馈的微信私有目录 2773 即此来源。
+const PRIVATE_TREE_DIR_MODE: mode_t = 0o2770;
+
+/// 按路径形态派生 auto-mkdir 的目录 mode：私有树（Android/{data,media,obb}）
+/// 对齐原生 02770，其余（公共重定向目标等）维持 0o2773。
+fn redirect_mkdir_mode_for(path: &str, base: mode_t) -> mode_t {
+    let normalized = crate::platform::paths::normalize(path);
+    if let Some(rest) = normalized.strip_prefix("/data/media/") {
+        let mut parts = rest.split('/');
+        if let Some(user) = parts.next()
+            && user.chars().all(|ch| ch.is_ascii_digit())
+            && parts.next() == Some("Android")
+            && matches!(parts.next(), Some("data" | "media" | "obb"))
+        {
+            return PRIVATE_TREE_DIR_MODE;
+        }
+    }
+    base
+}
 const PRIVATE_CHILD_DIR_REQUIRED_MODE: mode_t = 0o2751;
-const PRIVATE_CHILD_FILE_REQUIRED_MODE: mode_t = 0o664;
 
 struct RedirectDirOwner {
     uid: i32,
@@ -36,7 +56,7 @@ fn log_call_prev_fallback(site: &str) {
 
 #[inline]
 fn should_bypass_hook_in_fork_child(hub: &InterceptHub) -> bool {
-    if !srx_hook::is_forked_child() {
+    if !srx_hook::is_forked_child() || srx_hook::fork_safe() {
         return false;
     }
 
@@ -214,7 +234,7 @@ pub fn normalize_redirect_directory(path: &str) {
     normalize_redirect_dir_metadata(path, STORAGE_DIR_MODE, owner.as_ref());
 }
 
-pub fn fix_system_writer_android_private_owner(path: &str, include_path: bool) {
+pub fn fix_system_writer_android_private_owner(path: &str, include_path: bool, fd: i32) {
     if !crate::metadata_repair::enabled() || path.is_empty() {
         return;
     }
@@ -225,7 +245,7 @@ pub fn fix_system_writer_android_private_owner(path: &str, include_path: bool) {
     }
 
     let saved_errno = current_errno();
-    fix_system_writer_android_private_owner_inner(path, include_path);
+    fix_system_writer_android_private_owner_inner(path, include_path, fd);
     fix_system_writer_mapping_target_access(path);
     set_errno(saved_errno);
 }
@@ -265,8 +285,13 @@ fn fix_system_writer_mapping_target_access(path: &str) {
         return;
     }
     let mode = (st.st_mode as mode_t) & 0o7777;
-    // MediaProvider 创建的目标文件通常为 0660/0664；QQ 等调用方随后仍需
-    // 通过系统代写链路继续写入同一文件，因此映射目标必须具备其它用户读写位。
+    // 映射目标常由 MediaProvider 以 `media_rw:media_rw 0660/0664` 创建，属主不是
+    // 应用。namespace bind 形态下没有 MP 代做 I/O，后续访问的 DAC 检查落在调用方
+    // 自己身上：映射属主应用经系统代写链路续写同一文件（2026-11-01 场景 5/6 实证：
+    // 0600 会让应用读不到自己刚写的文件），以及另一个映射到同一公共目标的应用经
+    // 自己的别名写入——两者都既非属主、也不在 media_rw 组，只能靠 **other 读写位**。
+    // 这里补的是 `0o006`（组写 + 其它读写），不是创建口径、不能按原生 0664 收敛成
+    // 其它只读：那会把跨应用共享映射目标的写入直接打成 EACCES。
     let required = mode | 0o006;
     // SAFETY: c_path 仍在本地作用域内有效，required 仅包含文件权限位。
     if required != mode && unsafe { libc::chmod(c_path.as_ptr(), required) } == 0 {
@@ -361,7 +386,9 @@ fn create_storage_parent_dirs_recursive(
     }
 
     if !fs::is_directory(&base) {
-        log::warn!(
+        // 该进程的命名空间里看不到数据媒体顶层目录（例如系统写入进程只映射了视图），
+        // 是每次写入都会复现的正常形态，不能按告警每访问一次的节奏刷屏。
+        log::debug!(
             "skip auto mkdir missing storage top dir base={} path={}",
             base,
             path
@@ -376,7 +403,7 @@ fn data_media_user_dir(path: &str) -> String {
     paths::data_media_user_root(path).unwrap_or_default()
 }
 
-fn fix_system_writer_android_private_owner_inner(path: &str, include_path: bool) {
+fn fix_system_writer_android_private_owner_inner(path: &str, include_path: bool, fd: i32) {
     let normalized = paths::normalize(path);
     let storage_path = if normalized.starts_with("/data/media/") {
         paths::data_media_to_storage_path(&normalized)
@@ -397,15 +424,18 @@ fn fix_system_writer_android_private_owner_inner(path: &str, include_path: bool)
         return;
     }
 
+    // 不再要求 owner 配置了重定向：A17 原生 FUSE 对属主非本应用的
+    // Android/{data,media,obb}/<pkg> 只给 others 位，该语义与是否开启重定向
+    // 无关——未配置应用（真机 2026-10-18 反馈的 Unity 存档）被系统代写污染后
+    // 同样不可读写，而挂载应答期修复只覆盖已配置应用，未配置应用此前仅剩
+    // 30 分钟普查兜底。这里在代写创建的当下把属主即时修回应用 uid，是污染
+    // 源头治理；uid 解析失败与跨 caller 保护仍然生效。
     let allow_cross_caller_sqlite = should_allow_sqlite_private_owner_fix_for_current_caller(
         &storage_path,
         &owner_package,
         owner_uid,
         user_id,
     );
-    if !allow_cross_caller_sqlite && !is_private_owner_fix_enabled(&owner_package, owner_uid) {
-        return;
-    }
     if !allow_cross_caller_sqlite
         && !is_private_owner_fix_allowed_for_current_caller(&owner_package, owner_uid)
     {
@@ -425,11 +455,11 @@ fn fix_system_writer_android_private_owner_inner(path: &str, include_path: bool)
     };
     let parent = paths::parent(&backend_path);
     if path_is_same_or_child(&parent, &private_root) {
-        chown_private_path_if_needed(&parent, owner_uid, &owner_package, &private_root);
+        chown_private_path_if_needed(&parent, owner_uid, &owner_package, &private_root, -1);
     }
 
     if should_fix_private_path_node(&backend_path, &private_root, include_path) {
-        chown_private_path_if_needed(&backend_path, owner_uid, &owner_package, &private_root);
+        chown_private_path_if_needed(&backend_path, owner_uid, &owner_package, &private_root, fd);
     }
 }
 
@@ -458,10 +488,6 @@ fn android_private_owner_package(normalized_path: &str) -> Option<String> {
 
 fn resolve_private_owner_uid(package_name: &str) -> i32 {
     policy::get_fresh_uid_for_package(package_name)
-}
-
-fn is_private_owner_fix_enabled(owner_package: &str, owner_uid: i32) -> bool {
-    SettingsHub::instance().should_redirect(owner_package, owner_uid)
 }
 
 fn is_private_owner_fix_allowed_for_current_caller(owner_package: &str, owner_uid: i32) -> bool {
@@ -556,6 +582,7 @@ fn chown_private_path_if_needed(
     owner_uid: i32,
     owner_package: &str,
     private_root: &str,
+    fd: i32,
 ) {
     let Ok(c_path) = CString::new(path) else {
         return;
@@ -567,12 +594,18 @@ fn chown_private_path_if_needed(
         return;
     }
     let st = unsafe { st.assume_init() };
-    if st.st_uid == owner_uid as u32 && st.st_gid == MEDIA_RW_GID {
+    // owner 已经是应用 UID 时，gid 可能是 ext_data_rw（1078）或 media_rw
+    //（1023），两者都属于系统管理的原生私有目录语义，不能因为 hook 偏好
+    // media_rw 就覆盖已有组。
+    if st.st_uid == owner_uid as u32 {
         chmod_private_node_if_needed(&c_path, path, &st, owner_package, private_root);
         return;
     }
 
-    let ret = unsafe { libc::lchown(c_path.as_ptr(), owner_uid as u32, MEDIA_RW_GID) };
+    // 只修复 owner，保留 MediaProvider 为该层选择的 gid。companion_fchown 同样
+    // 使用 gid=-1，因此进程内成功与 root companion 回退的结果保持一致。
+    // SAFETY: c_path 由 CString 保证以 NUL 结尾；gid=u32::MAX 明确表示保留原组。
+    let ret = unsafe { libc::lchown(c_path.as_ptr(), owner_uid as u32, u32::MAX) };
     if ret == 0 {
         chmod_private_node_if_needed(&c_path, path, &st, owner_package, private_root);
         log::debug!(
@@ -587,6 +620,29 @@ fn chown_private_path_if_needed(
     let error_no = current_errno();
     if error_no == libc::EPERM || error_no == libc::EACCES {
         chmod_private_node_if_needed(&c_path, path, &st, owner_package, private_root);
+        // 进程内 lchown 被 EPERM 拒绝（MP 等普通 uid 无 CAP_CHOWN，真机 2026-10-18
+        // 实证 media.module 全链 denied）：经 companion（root）对 open fd 即时
+        // fchown——fd 在应用拿到之前已是正确属主，零竞态零扫描。
+        if fd >= 0 && crate::hook::companion_api::companion_fchown(fd, owner_uid) {
+            return;
+        }
+        // 目录（mkdir/mkdirat 钩子不持有 fd）此前在此处静默失败：无 CAP_CHOWN
+        // 的代写进程对私有树目录的属主修复全部落空，累积成 uid=1023/2773 的
+        // 漂移目录（2026-10-21 用户反馈）。就地打开一个只读 fd 交给 companion
+        // fchown，补上「目录无 fd 通道」的结构性缺口；文件路径 O_DIRECTORY
+        // 打开会 ENOTDIR，回退普通只读打开再试一次。
+        if fd < 0
+            && open_fd_for_owner_fix(path, true)
+                .or_else(|| open_fd_for_owner_fix(path, false))
+                .is_some_and(|opened| {
+                    let fixed = crate::hook::companion_api::companion_fchown(opened, owner_uid);
+                    // SAFETY: opened 是刚打开的合法 fd，close 不借用其它数据。
+                    unsafe { libc::close(opened) };
+                    fixed
+                })
+        {
+            return;
+        }
     }
     if error_no != libc::ENOENT && error_no != libc::EPERM && error_no != libc::EACCES {
         log::warn!(
@@ -597,6 +653,18 @@ fn chown_private_path_if_needed(
             error_no
         );
     }
+}
+
+/// 为无 fd 的属主修复目标打开一个只读 fd（目录用 O_DIRECTORY，文件回退普通打开）。
+fn open_fd_for_owner_fix(path: &str, directory: bool) -> Option<libc::c_int> {
+    let mut flags = libc::O_RDONLY | libc::O_CLOEXEC;
+    if directory {
+        flags |= libc::O_DIRECTORY;
+    }
+    let c_path = CString::new(path).ok()?;
+    // SAFETY: c_path 以 NUL 结尾且在调用期间保持有效，open 只返回新 fd。
+    let opened = unsafe { libc::open(c_path.as_ptr(), flags) };
+    (opened >= 0).then_some(opened)
 }
 
 fn chmod_private_node_if_needed(
@@ -610,14 +678,19 @@ fn chmod_private_node_if_needed(
         return;
     }
     let file_type = st.st_mode & libc::S_IFMT as mode_t;
+    let current_mode = st.st_mode & 0o7777;
+    // 目录沿用既有的「最小可穿越 + 组可读写」口径；文件**不再写死 0664**，只把属主
+    // 已有的权限位镜像到组位：原生视图给的就是「属主能做的，服务方（media_rw/
+    // ext_data_rw 组）也能做」，不给 other 任何位，也不替属主决定更宽的权限。
+    // 此前固定 `| 0o664` 会把属主只想要的 0600 抬成 0664（多出 other 读），
+    // 属于模块自己发明的放宽。
     let required_mode = match file_type {
         mode if mode == libc::S_IFDIR as mode_t => private_dir_required_mode(path),
-        mode if mode == libc::S_IFREG as mode_t => PRIVATE_CHILD_FILE_REQUIRED_MODE,
+        mode if mode == libc::S_IFREG as mode_t => (current_mode & 0o700) >> 3,
         _ => return,
     };
-    let current_mode = st.st_mode & 0o7777;
 
-    if current_mode & required_mode == required_mode {
+    if required_mode == 0 || current_mode & required_mode == required_mode {
         return;
     }
 
@@ -746,6 +819,7 @@ fn normalize_redirect_dir_metadata(path: &str, mode: mode_t, owner: Option<&Redi
         return;
     };
 
+    let mode = redirect_mkdir_mode_for(path, mode);
     let ret = unsafe { libc::chmod(c_path.as_ptr(), mode) };
     if ret != 0 {
         let error_no = current_errno();
@@ -842,6 +916,7 @@ fn package_matches_owner(package_name: &str, owner: &RedirectDirOwner) -> bool {
 pub fn with_redirected_path<F, R>(
     hub: &InterceptHub,
     op_name: &str,
+    dirfd: c_int,
     pathname: *const c_char,
     call_original: F,
 ) -> R
@@ -861,30 +936,38 @@ where
         return call_original(pathname);
     }
 
-    if !path_utils::is_relevant_storage_path(hub, &path_text) {
-        diagnostic::record_fast_bypass(op_name, &path_text);
+    // 相对路径必须先按 dirfd/cwd 解析成绝对形态；绝对路径也要先折叠
+    // `.`/`..` 与重复斜杠，再做存储前缀判断，否则 //storage 或
+    // /storage/../storage 写法会绕过整条决策链。
+    let decision_path = if path_text.starts_with('/') {
+        path_utils::normalize_decision_path(&path_text)
+    } else {
+        path_utils::resolve_path_for_dirfd(dirfd, &path_text)
+    };
+    if decision_path.is_empty() || !path_utils::is_relevant_storage_path(hub, &decision_path) {
+        diagnostic::record_fast_bypass(op_name, &decision_path);
         return call_original(pathname);
     }
 
-    diagnostic::log_diag_path_event(hub, op_name, "input", &path_text, -1);
+    diagnostic::log_diag_path_event(hub, op_name, "input", &decision_path, -1);
 
-    let redirect_result = process_redirect_path_for_runtime(hub, &path_text);
-    diagnostic::log_diag_redirect_decision(hub, op_name, &path_text, &redirect_result);
+    let redirect_result = process_redirect_path_for_runtime(hub, &decision_path);
+    diagnostic::log_diag_redirect_decision(hub, op_name, &decision_path, &redirect_result);
     // MediaStore 提交阶段对 .pending- 文件的存在性检查决定了改名能否找到源文件，
     // 而常规决策日志按操作类型采样输出，stat 这类高频操作几乎不会命中。这里对
     // pending 形态单独无条件记录一次：该形态仅在 MediaStore 提交时出现，频率极低。
-    if paths::media_store_pending_display_path(&path_text).is_some() {
+    if paths::media_store_pending_display_path(&decision_path).is_some() {
         log::info!(
             "pending probe op={} path={} action={:?} new={}",
             op_name,
-            path_text,
+            decision_path,
             redirect_result.action,
             redirect_result.new_path
         );
     }
 
     if redirect_result.is_redirect() {
-        record_redirect_hit(hub, op_name, &path_text, &redirect_result.new_path);
+        record_redirect_hit(hub, op_name, &decision_path, &redirect_result.new_path);
         if let Ok(c_path) = CString::new(redirect_result.new_path) {
             return call_original(c_path.as_ptr());
         }
@@ -912,9 +995,20 @@ fn create_parent_dirs_recursive(path: &str, mode: mode_t, owner: Option<&Redirec
 
     create_parent_dirs_recursive(&parent, mode, owner);
 
-    let ret = unsafe { libc::mkdirat(AT_FDCWD, c_parent.as_ptr(), mode) };
+    // SAFETY: c_parent 以 NUL 结尾并在调用期间保持有效；mode 由路径形态派生。
+    let ret = unsafe {
+        libc::mkdirat(
+            AT_FDCWD,
+            c_parent.as_ptr(),
+            redirect_mkdir_mode_for(&parent, mode),
+        )
+    };
     if ret == 0 {
         normalize_redirect_dir_metadata(&parent, mode, owner);
+        // 自动补建的父目录逐级交由系统代写属主治理：链中间层不经过 open/mkdir
+        // 钩子触发面，漏掉就会残留 media_rw 属主（uid=1023/2773 签名，2026-10-21
+        // 用户反馈）。治理入口自带系统代写进程门控与 errno 保存，应用进程内零开销。
+        fix_system_writer_android_private_owner(&parent, true, -1);
         log::debug!("auto mkdir parent {}", parent);
         return;
     }
@@ -943,6 +1037,12 @@ fn create_parent_dirs_recursive_until(
     let mut st = std::mem::MaybeUninit::<libc::stat>::uninit();
     let ret = unsafe { libc::fstatat(AT_FDCWD, c_parent.as_ptr(), st.as_mut_ptr(), 0) };
     if ret == 0 {
+        // 父目录存在即意味着整条祖先链都在（目录不可能凭空挂在缺失的父级下），
+        // 唯一还需要往上走的原因是把祖先的元数据也归一。元数据修复关闭时这是纯开销：
+        // 原生写路径只创建缺失目录，不会回头治理已存在的父级。
+        if !crate::metadata_repair::enabled() {
+            return;
+        }
         create_parent_dirs_recursive_until(&parent, stop_dir, mode, owner);
         normalize_redirect_dir_metadata(&parent, mode, owner);
         return;
@@ -950,9 +1050,18 @@ fn create_parent_dirs_recursive_until(
 
     create_parent_dirs_recursive_until(&parent, stop_dir, mode, owner);
 
-    let ret = unsafe { libc::mkdirat(AT_FDCWD, c_parent.as_ptr(), mode) };
+    // SAFETY: c_parent 以 NUL 结尾并在调用期间保持有效；mode 由路径形态派生。
+    let ret = unsafe {
+        libc::mkdirat(
+            AT_FDCWD,
+            c_parent.as_ptr(),
+            redirect_mkdir_mode_for(&parent, mode),
+        )
+    };
     if ret == 0 {
         normalize_redirect_dir_metadata(&parent, mode, owner);
+        // 同 create_parent_dirs_recursive：存储父链每一级都要过属主治理。
+        fix_system_writer_android_private_owner(&parent, true, -1);
         log::debug!("auto mkdir storage parent {}", parent);
         return;
     }

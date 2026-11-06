@@ -297,6 +297,23 @@ try {
 
     Assert-ModuleRuntimeState
 
+    # 等待 FBE CE 解锁（/data/media/0 可写）。boot 后 15-25 秒内 CE 密钥尚未就绪
+    # （真机实测 ENOTKEY=126）：共享宿主的策略登记与重定向根 mkdir 会连续失败、
+    # 宿主反复自退，应用回退 scoped 会话后 fresh-app 首操作大面积 ENOENT——
+    # 这是全量跑失败集（scenario 4/5/9/12/15/20/22/24/36）的根因链。
+    # 场景必须等共享存储真正可写后再开跑；CI 模拟器解锁时序不同所以一直未暴露。
+    Write-Step "等待共享存储 CE 解锁（/data/media/0 可写）"
+    $unlockDeadline = (Get-Date).AddSeconds(180)
+    $probe = ""
+    do {
+        $probe = (& adb shell "su 0 sh -c 'test -w /data/media/0 && echo unlocked'" 2>$null | Out-String).Trim()
+        if ($probe -match "unlocked") { break }
+        Start-Sleep -Seconds 3
+    } while ((Get-Date) -lt $unlockDeadline)
+    if ($probe -notmatch "unlocked") {
+        Fail "等待 180 秒后 /data/media/0 仍不可写（FBE CE 未解锁），共享宿主无法稳定工作。"
+    }
+
     Write-Step "安装测试 APK"
     Invoke-Checked -FilePath "adb" -Arguments @("install", "-r", $testAppApk)
 
@@ -331,6 +348,11 @@ try {
         )
         if (-not [string]::IsNullOrWhiteSpace($env:SRT_SCENARIOS)) {
             $wrapperLines += "`$env:SRT_SCENARIOS = '$($env:SRT_SCENARIOS -replace "'", "''")'"
+        }
+        # 版本级场景排除与 CI 矩阵同语义（如 A17 排除依赖外网的场景 39）：本地复现
+        # 该类形态时必须一起透传，否则默认全量会跑出与 CI 不一致的范围。
+        if (-not [string]::IsNullOrWhiteSpace($env:SRT_VERSION_SCENARIO_EXCLUDE)) {
+            $wrapperLines += "`$env:SRT_VERSION_SCENARIO_EXCLUDE = '$($env:SRT_VERSION_SCENARIO_EXCLUDE -replace "'", "''")'"
         }
         $wrapperLines += @(
             "# adb server 若由工具会话派生会随 Job 回收中途死亡；先杀掉再由本进程树重建。",

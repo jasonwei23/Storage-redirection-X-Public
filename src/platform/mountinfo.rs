@@ -6,8 +6,16 @@
 
 /// `/proc/self/mountinfo` 中一条挂载记录。
 pub struct MountInfoEntry<'a> {
-    /// 挂载 ID，同一 namespace 内递增，可用来判断同路径多层挂载的先后。
+    /// 挂载 ID。**不能**用它判断同挂载点多层挂载的叠放顺序：经 detached tree +
+    /// `move_mount` 搬运进命名空间的层保留创建侧分配的 ID，可能与后挂的层大小倒挂
+    /// （真机 2026-10-15：scoped FUSE 层 id=233 小于其下屏障层 id=10034）。叠层
+    /// 顺序只能按 `parent_mount_id` 父链判定，见 [`topmost_by_stack`]。
     pub mount_id: u64,
+    /// 父挂载 ID：本层挂载所叠在的那一层（同挂载点叠放时即下面一层）的挂载 ID。
+    pub parent_mount_id: u64,
+    /// 设备号（`major:minor`）。同一文件系统内 bind 前后的层共享同一设备号，
+    /// 覆盖挂载感知的源路径换算用它寻找该文件系统根（`root=="/"`）的挂载点。
+    pub dev: &'a str,
     /// 挂载在文件系统内的根，未展开八进制转义。
     pub root: &'a str,
     /// 挂载点，未展开八进制转义。
@@ -23,8 +31,8 @@ pub fn parse_entry(line: &str) -> Option<MountInfoEntry<'_>> {
     let separator = line.find(" - ")?;
     let mut before_fields = line[..separator].split_whitespace();
     let mount_id = before_fields.next()?.parse::<u64>().ok()?;
-    before_fields.next()?;
-    before_fields.next()?;
+    let parent_mount_id = before_fields.next()?.parse::<u64>().ok()?;
+    let dev = before_fields.next()?;
     let root = before_fields.next()?;
     let target = before_fields.next()?;
     let mut after_fields = line[separator + 3..].split_whitespace();
@@ -32,11 +40,42 @@ pub fn parse_entry(line: &str) -> Option<MountInfoEntry<'_>> {
     let source = after_fields.next()?;
     Some(MountInfoEntry {
         mount_id,
+        parent_mount_id,
+        dev,
         root,
         target,
         fs_type,
         source,
     })
+}
+
+/// 从同一挂载点上的多条挂载记录中选出栈顶。
+///
+/// 内核语义：同挂载点的叠层构成父链（上层 `parent_mount_id` = 下层挂载 ID），栈顶 =
+/// 没有任何同挂载点条目叠在它上面的那一层，即「没有被其它同挂载点条目引用为父」的层。
+/// 病态的多条独立父链（detached tree 搬运出的兄弟叠层）时取文件序最后一条兜底（与
+/// /proc/mounts 的栈顶约定一致），因此 `entries` 必须保持 mountinfo 原始文件序。
+pub fn topmost_by_stack<T, M, P>(entries: &[T], mount_id: M, parent_mount_id: P) -> Option<&T>
+where
+    M: Fn(&T) -> u64,
+    P: Fn(&T) -> u64,
+{
+    let entry_ids: std::collections::HashSet<u64> = entries.iter().map(&mount_id).collect();
+    // 被其它同挂载点条目引用为父的层，上面还压着层，不是栈顶。
+    let covered: std::collections::HashSet<u64> = entries
+        .iter()
+        .map(parent_mount_id)
+        .filter(|parent| entry_ids.contains(parent))
+        .collect();
+    let mut top: Option<&T> = None;
+    for entry in entries {
+        if covered.contains(&mount_id(entry)) {
+            continue;
+        }
+        // 兜底并列时文件序靠后者胜出（后挂的层在 mountinfo 里靠后）。
+        top = Some(entry);
+    }
+    top
 }
 
 /// 展开 `mountinfo` 字段里的八进制转义（空格、换行、反斜杠等）。

@@ -18,6 +18,7 @@ import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
 import org.srx.manager.GlassCard
 import org.srx.manager.PageHeader
+import org.srx.manager.SectionTitle
 import org.srx.manager.data.formatCompactRuntimeActivationCount
 import org.srx.manager.ui.AppUiState
 import top.yukonga.miuix.kmp.icon.MiuixIcons
@@ -39,6 +40,7 @@ internal fun DashboardScreen(
   var pendingModuleToggle by remember { mutableStateOf<Boolean?>(null) }
   var pendingMediaProviderRestart by remember { mutableStateOf(false) }
   var showRuntimeActivationDetails by remember { mutableStateOf(false) }
+  var showHostPolicyDetails by remember { mutableStateOf(false) }
   var pendingRuntimeStatsReset by remember { mutableStateOf(false) }
   LazyColumn(
       modifier = Modifier.fillMaxSize().overScrollVertical(),
@@ -64,9 +66,11 @@ internal fun DashboardScreen(
           enabledApps = state.dashboard.enabledApps,
           runtimeActivations =
               formatCompactRuntimeActivationCount(state.dashboard.runtimeActivations),
+          storageBackend = state.dashboard.storageBackend,
           onToggleModule = { pendingModuleToggle = it },
           onRuntimeActivationClick = { showRuntimeActivationDetails = true },
           onRuntimeActivationLongClick = { pendingRuntimeStatsReset = true },
+          onHostPolicyClick = { showHostPolicyDetails = true },
       )
     }
     item {
@@ -111,6 +115,12 @@ internal fun DashboardScreen(
     RuntimeActivationDetailsDialog(
         exactValue = state.dashboard.runtimeActivations,
         onDismiss = { showRuntimeActivationDetails = false },
+    )
+  }
+  if (showHostPolicyDetails) {
+    HostPolicyDetailsDialog(
+        storageBackend = state.dashboard.storageBackend,
+        onDismiss = { showHostPolicyDetails = false },
     )
   }
   if (pendingRuntimeStatsReset) {

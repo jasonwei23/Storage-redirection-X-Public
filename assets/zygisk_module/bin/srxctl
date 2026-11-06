@@ -19,6 +19,13 @@ log_ctl() {
   log -p i -t SRXCTL "$*" 2>/dev/null
 }
 
+# 重挂/热重载失败原因的机器可读输出：stdout 供管理器 APP 解析，
+# stderr 供 WebUI exec 在非零退出码的拒绝错误信息里携带同一令牌。
+remount_fail_reason() {
+  printf 'remount_reason=%s\n' "$1"
+  printf 'remount_reason=%s\n' "$1" >&2
+}
+
 stop_pid_file() {
   pid_file="$1"
   [ -f "$pid_file" ] || return 0
@@ -184,6 +191,7 @@ request_running_app_remount() {
   required="${1:-1}"
   if ! is_daemon_alive; then
     log_ctl "running app remount skipped: daemon not running"
+    remount_fail_reason daemon-not-running
     [ "$required" = "1" ] && return 1
     return 0
   fi
@@ -193,6 +201,7 @@ request_running_app_remount() {
   daemon_bin="$MODDIR/bin/srx_daemon"
   if [ ! -x "$daemon_bin" ] || ! "$daemon_bin" control "reconcile-running:$request_id" >/dev/null 2>&1; then
     log_ctl "running app remount request failed"
+    remount_fail_reason daemon-control-failed
     return 1
   fi
   attempts=100
@@ -207,6 +216,7 @@ request_running_app_remount() {
     i=$((i + 1))
   done
   log_ctl "running app remount timed out request=$request_id"
+  remount_fail_reason remount-timeout
   return 1
 }
 
@@ -248,15 +258,18 @@ restart_media_provider() {
   done
   if [ -z "$provider_pid" ]; then
     log_ctl "media provider hot reload skipped: provider not running"
+    remount_fail_reason provider-not-running
     return 1
   fi
   request_id=$(write_media_provider_hot_reload_request "$provider_pid") || {
     log_ctl "media provider hot reload request write failed"
+    remount_fail_reason hot-reload-request-failed
     return 1
   }
   before_count=$(hot_reload_completed_count "$provider_pid")
   if ! signal_media_provider_hot_reload "$provider_pid"; then
     log_ctl "media provider hot reload signal failed pid=$provider_pid"
+    remount_fail_reason hot-reload-signal-failed
     return 1
   fi
   if wait_for_media_provider_hot_reload "$request_id" "$provider_pid" "$before_count" 100 100000; then
@@ -264,6 +277,7 @@ restart_media_provider() {
     ready=0
   else
     log_ctl "media provider hot reload timed out pid=$provider_pid"
+    remount_fail_reason hot-reload-timeout
     ready=1
   fi
   if [ "$ready" -eq 0 ]; then
@@ -389,6 +403,40 @@ is_daemon_alive() {
   is_pid_file_alive "$DAEMON_PID_FILE" || pidof srx_daemon >/dev/null 2>&1
 }
 
+# 共享宿主会话状态指示：校验快照 boot_id 与宿主进程身份（pid + start_ticks）。
+# 不探测宿主挂载点可达性——宿主 FUSE 挂载位于 daemon 命名空间，其它命名空间不可见；
+# endpoint 失效的假活宿主由 daemon 侧 reconcile 自愈，这里只做概览展示级别的判活。
+host_status() {
+  snapshot="$MODDIR/tmp/fuse_host.snapshot"
+  boot_id=$(cat /proc/sys/kernel/random/boot_id 2>/dev/null)
+  if [ -r "$snapshot" ] && [ -n "$boot_id" ]; then
+    snap_boot_id=$(sed -n 's/^boot_id=//p' "$snapshot")
+    pid=$(sed -n 's/^pid=//p' "$snapshot")
+    start_ticks=$(sed -n 's/^start_ticks=//p' "$snapshot")
+    policies=$(sed -n 's/^policies=//p' "$snapshot")
+    proc_ticks=$(awk '{print $22}' "/proc/$pid/stat" 2>/dev/null)
+    if [ -n "$proc_ticks" ] && [ "$proc_ticks" != "$start_ticks" ]; then
+      : # pid 复用或宿主换代，判定不活跃
+    elif [ -z "$proc_ticks" ]; then
+      # awk 不可用时退化为仅 kill -0 判活，避免误报。
+      is_process_alive "$pid" && proc_ticks="$start_ticks"
+    fi
+    if [ "$snap_boot_id" = "$boot_id" ] &&
+      [ -n "$pid" ] &&
+      [ -n "$start_ticks" ] &&
+      [ "$proc_ticks" = "$start_ticks" ]; then
+      policy_count=0
+      if [ -n "$policies" ]; then
+        without_commas=${policies//,/}
+        policy_count=$(( ${#policies} - ${#without_commas} + 1 ))
+      fi
+      echo "active pid=$pid policies=$policy_count"
+      return 0
+    fi
+  fi
+  echo inactive
+}
+
 start_collectors_if_needed() {
   if is_runtime_disabled; then
     stop_pid_file "$LOGS_DIR/.monitor_collector.pid"
@@ -489,6 +537,7 @@ case "$1" in
   reset-stats) reset_runtime_stats ;;
   doctor) run_doctor ;;
   diagnostic-archive) build_diagnostic_archive "$2" "$3" "$4" ;;
+  host-status) host_status ;;
   status|"") status_runtime ;;
-  *) echo "用法：srxctl {start|stop|restart|remount-running|ensure-collectors|clear-monitor|reset-stats|doctor|diagnostic-archive|status}" >&2; exit 2 ;;
+  *) echo "用法：srxctl {start|stop|restart|remount-running|ensure-collectors|clear-monitor|reset-stats|doctor|diagnostic-archive|host-status|status}" >&2; exit 2 ;;
 esac

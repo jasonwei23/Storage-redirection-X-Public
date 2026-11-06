@@ -776,7 +776,7 @@ body.blur-effect-disabled .app-user-menu { backdrop-filter: none; -webkit-backdr
 .module-feature-chip { min-width: 94px; min-height: 31px; padding: 8px 13px; border: 1px solid var(--glass-border); border-radius: var(--radius-full); background: var(--glass-bg-strong); box-shadow: var(--glass-inner), var(--shadow-sm); font-size: 12px; }
 .status-dot { width: 8px; height: 8px; flex-basis: 8px; }
 .module-stat-divider { display: block; position: relative; z-index: 1; width: 100%; height: 1px; margin: 9px 0 3px; background: var(--color-border); }
-.module-status-metrics { position: relative; z-index: 1; width: 100%; grid-template-columns: 1fr 1fr; gap: 0; margin: 0; }
+.module-status-metrics { position: relative; z-index: 1; width: 100%; grid-template-columns: 1fr 1fr 1fr; gap: 0; margin: 0; }
 .module-status-metric { min-height: 66px; padding: 8px 8px 2px; align-items: center; border: 0; border-radius: 0; background: transparent; gap: 8px; }
 .module-status-metric[role="button"] { cursor: pointer; user-select: none; -webkit-user-select: none; touch-action: pan-y; }
 .module-status-metric[role="button"]:focus-visible { outline: 2px solid var(--color-primary); outline-offset: -3px; }

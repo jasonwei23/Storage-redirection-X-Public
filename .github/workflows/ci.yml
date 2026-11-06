@@ -29,7 +29,7 @@ env:
 jobs:
   quality:
     if: github.repository == 'z1298808165/Storage-redirection-X-Public' && (github.event_name != 'push' || (!startsWith(github.event.head_commit.message, 'Releases:') && !startsWith(github.event.head_commit.message, 'CI：更新更新清单') && !startsWith(github.event.head_commit.message, '发布：更新更新清单')))
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     timeout-minutes: 15
     steps:
       - name: Checkout repository
@@ -65,6 +65,7 @@ jobs:
         run: |
           node scripts/verify-webui-structure.js
           node scripts/verify-webui-config-fixtures.js
+          node scripts/verify-webui-app-list-parser.js
           cargo test -p native-config-fixtures
           python -m unittest discover -s .github/tests -p "test_*.py" -v
 
@@ -82,13 +83,14 @@ jobs:
 
   prepare:
     if: github.repository == 'z1298808165/Storage-redirection-X-Public' && (github.event_name != 'push' || (!startsWith(github.event.head_commit.message, 'Releases:') && !startsWith(github.event.head_commit.message, 'CI：更新更新清单') && !startsWith(github.event.head_commit.message, '发布：更新更新清单')))
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     timeout-minutes: 15
     outputs:
       version: ${{ steps.version.outputs.version }}
       version_code: ${{ steps.version.outputs.version_code }}
       scenarios: ${{ steps.scope.outputs.scenarios }}
       publish_ci: ${{ steps.scope.outputs.publish_ci }}
+      test_flow_timeout_minutes: ${{ steps.scope.outputs.test_flow_timeout_minutes }}
     steps:
       - name: Checkout repository
         uses: actions/checkout@v5
@@ -123,16 +125,25 @@ jobs:
       - quality
       - prepare
     if: github.event_name == 'push' && !contains(github.event.head_commit.message, '仅验证CI') && needs.prepare.outputs.publish_ci == 'true'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     timeout-minutes: 10
     env:
       VERSION: ${{ needs.prepare.outputs.version }}
-      CI_TAG: ci-build-${{ github.run_id }}-${{ github.run_attempt }}
+      # 标签只用 run_id：失败任务重跑（gh run rerun --failed）会让 run_attempt
+      # 递增，而 init-ci-release 首轮已成功、重跑时不再执行，掺了 attempt 的标签
+      # 就再也不会被创建——发布环节按新标签查不到草稿，直接 release not found
+      # （run 40331496700：attempt 1 建 `-1`，重跑 attempt 2 找 `-2`）。
+      CI_TAG: ci-build-${{ github.run_id }}
     steps:
       - name: Create draft CI release
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
+          # 完整重跑（所有 job 重来）时草稿已在，复用即可：重建会清空已上传资产。
+          if gh release view "$CI_TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "draft CI release already exists: $CI_TAG"
+            exit 0
+          fi
           gh release create "$CI_TAG" \
             --repo "$GITHUB_REPOSITORY" \
             --target "$GITHUB_SHA" \
@@ -148,7 +159,7 @@ jobs:
       - prepare
       - init-ci-release
     if: always() && needs.quality.result == 'success' && needs.prepare.result == 'success' && (needs.init-ci-release.result == 'success' || needs.init-ci-release.result == 'skipped') && needs.prepare.outputs.publish_ci == 'true'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     timeout-minutes: 30
     env:
       VERSION: ${{ needs.prepare.outputs.version }}
@@ -304,15 +315,24 @@ jobs:
         if: github.event_name == 'push' && !contains(github.event.head_commit.message, '仅验证CI')
         env:
           GH_TOKEN: ${{ github.token }}
-          CI_TAG: ci-build-${{ github.run_id }}-${{ github.run_attempt }}
+          CI_TAG: ci-build-${{ github.run_id }}
         run: |
           for attempt in 1 2 3 4 5 6 7 8 9 10; do
-            if [ "$(gh release view "$CI_TAG" --repo "$GITHUB_REPOSITORY" --json isDraft --jq '.isDraft' 2>/dev/null || true)" = "true" ]; then
+            if gh release view "$CI_TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
               break
             fi
             if [ "$attempt" -eq 10 ]; then
-              gh release view "$CI_TAG" --repo "$GITHUB_REPOSITORY" || true
-              exit 1
+              # 草稿 Release 不存在（例如重跑时 init-ci-release 已被跳过、草稿被
+              # 清理）：就地补建，让构建产物仍有落点，不要直接失败。
+              gh release create "$CI_TAG" \
+                --repo "$GITHUB_REPOSITORY" \
+                --target "$GITHUB_SHA" \
+                --title "CI Build $VERSION" \
+                --notes "构建与测试进行中。" \
+                --draft \
+                --prerelease \
+                --latest=false
+              continue
             fi
             sleep 2
           done
@@ -327,7 +347,7 @@ jobs:
       - prepare
       - init-ci-release
     if: always() && needs.quality.result == 'success' && needs.prepare.result == 'success' && (needs.init-ci-release.result == 'success' || needs.init-ci-release.result == 'skipped') && needs.prepare.outputs.publish_ci == 'true'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     timeout-minutes: 30
     env:
       VERSION: ${{ needs.prepare.outputs.version }}
@@ -397,15 +417,23 @@ jobs:
         if: github.event_name == 'push' && !contains(github.event.head_commit.message, '仅验证CI')
         env:
           GH_TOKEN: ${{ github.token }}
-          CI_TAG: ci-build-${{ github.run_id }}-${{ github.run_attempt }}
+          CI_TAG: ci-build-${{ github.run_id }}
         run: |
           for attempt in 1 2 3 4 5 6 7 8 9 10; do
-            if [ "$(gh release view "$CI_TAG" --repo "$GITHUB_REPOSITORY" --json isDraft --jq '.isDraft' 2>/dev/null || true)" = "true" ]; then
+            if gh release view "$CI_TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
               break
             fi
             if [ "$attempt" -eq 10 ]; then
-              gh release view "$CI_TAG" --repo "$GITHUB_REPOSITORY" || true
-              exit 1
+              # 同 module：草稿缺失时补建，保证资产有落点。
+              gh release create "$CI_TAG" \
+                --repo "$GITHUB_REPOSITORY" \
+                --target "$GITHUB_SHA" \
+                --title "CI Build $VERSION" \
+                --notes "构建与测试进行中。" \
+                --draft \
+                --prerelease \
+                --latest=false
+              continue
             fi
             sleep 2
           done
@@ -420,7 +448,7 @@ jobs:
       - quality
       - prepare
     if: always() && needs.quality.result == 'success' && needs.prepare.result == 'success'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     timeout-minutes: 30
     env:
       VERSION: ${{ needs.prepare.outputs.version }}
@@ -541,7 +569,7 @@ jobs:
       - prepare
       - test-flow-build
     if: always() && needs.quality.result == 'success' && needs.prepare.result == 'success' && needs.test-flow-build.result == 'success'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     timeout-minutes: ${{ matrix.android.timeout_minutes }}
     env:
       VERSION: ${{ needs.prepare.outputs.version }}
@@ -562,6 +590,10 @@ jobs:
       # 标记）；无标记时 prepare 输出 all，全 5 个 Android 版本覆盖保持不变。
       # 不再在此处就地解析提交标记，避免与 prepare 双源头。
       SRT_SCENARIOS: ${{ needs.prepare.outputs.scenarios }}
+      # 版本级场景排除（如 A17 排除依赖外网验证的场景 39）：矩阵字段直传，由测试
+      # 脚本内消费。语义是「从已确定的场景范围里剔除」而不是替换范围——默认范围
+      # 始终是全场景，dispatch 输入的窄范围也不会被矩阵覆盖。
+      SRT_VERSION_SCENARIO_EXCLUDE: ${{ matrix.android.version_scenario_exclude || '' }}
       SRT_FAIL_FAST: 1
       SRT_SKIP_FINAL_CLEANUP: 1
       SRT_SCENARIO_TIMEOUT_SECONDS: 300
@@ -588,6 +620,10 @@ jobs:
             boot_timeout: 1500
             disable_animations: true
             disable_linux_hw: auto
+            # 默认跑全场景（1-40）：39 已在 A14 模拟器实测通过（组内代写 mkdir 的
+            # 发起者映射在引擎层生效，取数走脚本内建本地 HTTP 服务 10.0.2.2）。
+            # 矩阵不写死场景：范围由测试流参数（SRT_SCENARIOS / dispatch 输入 /
+            # 提交信息标记）决定，如需环境级限制才用 version_scenario_exclude。
           - api: 34
             version: 14
             api_level: "34"
@@ -598,6 +634,7 @@ jobs:
             boot_timeout: 1500
             disable_animations: true
             disable_linux_hw: auto
+            # 同 A13：默认全场景，39 在 A14 已实测通过，无环境级排除项。
           - api: 35
             version: 15
             api_level: "35"
@@ -608,6 +645,7 @@ jobs:
             boot_timeout: 1500
             disable_animations: true
             disable_linux_hw: auto
+            # 同 A13：默认全场景，无环境级排除项。
           - api: 36
             version: 16
             api_level: "36"
@@ -618,6 +656,7 @@ jobs:
             boot_timeout: 1500
             disable_animations: true
             disable_linux_hw: auto
+            # 同 A13：默认全场景，无环境级排除项。
           - api: 37
             version: 17
             api_level: "37.0"
@@ -628,6 +667,10 @@ jobs:
             root_method: ksu
             adb_root_mode: su0
             fresh_app_scenarios: "1,2,29,32,33"
+            # A17 与其他版本一致执行全量 1-40，含依赖下载的场景 39。此前曾用
+            # version_scenario_exclude 排除 39 规避镜像网络验证失败，现改为不在矩阵
+            # 里写死排除项：场景范围只由测试流参数决定，网络不可达时由 39 在 CI 直接
+            # 暴露而不是被静默跳过。
             gpu_mode: swiftshader_indirect
             timeout_minutes: 50
             boot_timeout: 1800
@@ -689,6 +732,11 @@ jobs:
 
       - name: Run Android test-flow scenarios
         if: ${{ (!contains(github.event.head_commit.message, '延迟全量探针') && !contains(github.event.head_commit.message, '全量组合比较探针') && !contains(github.event.head_commit.message, '全量组合探针') && !contains(github.event.head_commit.message, '核心组探针') && !contains(github.event.head_commit.message, '扩展组探针')) || matrix.android.api == 34 || matrix.android.api == 37 }}
+        # 步骤级超时（按场景数自适应，由 prepare 从同一份范围解析结果输出）：
+        # 模拟器异常时脚本可能停在场景脚本之前的准备阶段，看门狗覆盖不到，
+        # 而 job 级 45/50 分钟太宽（run 40272962460 五版本同时被拖住 33 分钟、
+        # 取消请求也不立即生效）。这里把兜底前移到步骤级，窄跑十几分钟即失败。
+        timeout-minutes: ${{ fromJSON(needs.prepare.outputs.test_flow_timeout_minutes) }}
         uses: reactivecircus/android-emulator-runner@v2.37.0
         with:
           api-level: ${{ matrix.android.api_level }}
@@ -700,7 +748,10 @@ jobs:
           disable-animations: ${{ matrix.android.disable_animations }}
           emulator-boot-timeout: ${{ matrix.android.boot_timeout }}
           disable-linux-hw-accel: ${{ matrix.android.disable_linux_hw }}
-          emulator-options: -no-window -gpu swiftshader_indirect -no-snapshot-load -no-snapshot-save -noaudio -no-boot-anim -no-metrics -feature -Vulkan
+          # -dns-server：A17 模拟器镜像在 runner 上网络验证失败（R5/R6 实证
+          # github 不可达、下载停在 WAITING_FOR_NETWORK），显式指定公共 DNS
+          # 让 connectivity check 可完成；对其它版本无副作用。
+          emulator-options: -no-window -gpu swiftshader_indirect -no-snapshot-load -no-snapshot-save -noaudio -no-boot-anim -no-metrics -feature -Vulkan -dns-server 8.8.8.8
           script: bash .github/tests/run-android-test-flow.sh
 
       - name: Skip non-target probe shard
@@ -708,26 +759,26 @@ jobs:
         run: echo "仅验证 Fuse 探针：跳过 Android ${{ matrix.android.version }} 测试分片"
 
       - name: Upload test-flow artifacts
-        if: always() && matrix.android.version != 17 && hashFiles('scenario-*-result.txt', 'scenario-2-mediastore-hook-diag.txt', 'test-flow-preflight.txt', 'test-flow-app-mountinfo.txt', 'test-flow-fuse-sample.txt', 'test-flow-logcat.txt', 'test-flow-module-state.txt', 'test-flow-backend-diagnostic.txt', 'test-flow-monitor-state.txt', 'media-health.txt') != ''
+        if: always() && matrix.android.version != 17 && hashFiles('temp/test-flow/**/scenario-*-result.txt', 'temp/test-flow/**/scenario-2-mediastore-hook-diag.txt', 'temp/test-flow/**/test-flow-preflight.txt', 'temp/test-flow/**/test-flow-app-mountinfo.txt', 'temp/test-flow/**/test-flow-fuse-sample.txt', 'temp/test-flow/**/test-flow-logcat.txt', 'temp/test-flow/**/test-flow-module-state.txt', 'temp/test-flow/**/test-flow-backend-diagnostic.txt', 'temp/test-flow/**/test-flow-monitor-state.txt', 'temp/test-flow/**/media-health.txt') != ''
         uses: actions/upload-artifact@v7.0.1
         with:
           name: test-flow-android${{ matrix.android.version }}-artifacts
           if-no-files-found: ignore
           retention-days: 14
           path: |
-            scenario-*-result.txt
-            scenario-2-mediastore-hook-diag.txt
-            test-flow-preflight.txt
-            test-flow-app-mountinfo.txt
-            test-flow-fuse-sample.txt
-            test-flow-logcat.txt
-            test-flow-module-state.txt
-            test-flow-backend-diagnostic.txt
-            test-flow-monitor-state.txt
-            media-health.txt
+            temp/test-flow/**/scenario-*-result.txt
+            temp/test-flow/**/scenario-2-mediastore-hook-diag.txt
+            temp/test-flow/**/test-flow-preflight.txt
+            temp/test-flow/**/test-flow-app-mountinfo.txt
+            temp/test-flow/**/test-flow-fuse-sample.txt
+            temp/test-flow/**/test-flow-logcat.txt
+            temp/test-flow/**/test-flow-module-state.txt
+            temp/test-flow/**/test-flow-backend-diagnostic.txt
+            temp/test-flow/**/test-flow-monitor-state.txt
+            temp/test-flow/**/media-health.txt
 
       - name: Upload shared FUSE snapshots
-        if: always() && hashFiles('test-flow-shared-fuse-before.txt', 'test-flow-shared-fuse-after.txt') != ''
+        if: always() && hashFiles('temp/test-flow/**/test-flow-shared-fuse-before.txt', 'temp/test-flow/**/test-flow-shared-fuse-after.txt') != ''
         uses: actions/upload-artifact@v7.0.1
         with:
           name: test-flow-android${{ matrix.android.version }}-shared-fuse
@@ -735,8 +786,8 @@ jobs:
           retention-days: 14
           compression-level: 0
           path: |
-            test-flow-shared-fuse-before.txt
-            test-flow-shared-fuse-after.txt
+            temp/test-flow/**/test-flow-shared-fuse-before.txt
+            temp/test-flow/**/test-flow-shared-fuse-after.txt
 
   test-flow-required:
     name: Test-flow required gate
@@ -745,7 +796,7 @@ jobs:
       - prepare
       - test-flow
     if: always() && needs.prepare.result != 'skipped'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     timeout-minutes: 10
     steps:
       - name: Require all test-flow matrix jobs to pass
@@ -767,12 +818,13 @@ jobs:
       - module
       - app
       - test-flow-required
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     timeout-minutes: 15
     outputs:
       ci_tag: ${{ steps.release.outputs.ci_tag }}
     env:
       VERSION: ${{ needs.prepare.outputs.version }}
+      CI_TAG: ci-build-${{ github.run_id }}
     steps:
       - name: Checkout repository
         uses: actions/checkout@v5
@@ -786,15 +838,12 @@ jobs:
             --mode ci \
             --version "$VERSION" \
             --output build/CHANGELOG.md
-      - name: Verify draft CI release assets
+      - name: Verify CI release assets before publishing
         env:
           GH_TOKEN: ${{ github.token }}
-          CI_TAG: ci-build-${{ github.run_id }}-${{ github.run_attempt }}
         run: |
-          test "$(gh release view "$CI_TAG" \
-            --repo "$GITHUB_REPOSITORY" \
-            --json isDraft \
-            --jq '.isDraft')" = "true"
+          # 不校验 isDraft：完整重跑时上一轮可能已把草稿发布出去，此时资产仍在、
+          # 直接再走一次发布是幂等的；真正要保证的是模块 zip 与 APK 都在。
           gh release view "$CI_TAG" \
             --repo "$GITHUB_REPOSITORY" \
             --json assets \
@@ -807,9 +856,7 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          TAG="ci-build-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
-
-          gh release edit "$TAG" \
+          gh release edit "$CI_TAG" \
             --repo "$GITHUB_REPOSITORY" \
             --title "CI Build $VERSION" \
             --notes-file build/CHANGELOG.md \
@@ -817,7 +864,7 @@ jobs:
             --prerelease \
             --latest=false
 
-          echo "ci_tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "ci_tag=$CI_TAG" >> "$GITHUB_OUTPUT"
 
       - name: Verify CI build assets
         env:
@@ -842,30 +889,47 @@ jobs:
       - create-ci-release
       - update-manifest
     if: always() && github.event_name == 'push' && needs.prepare.result == 'success'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     timeout-minutes: 10
     permissions:
       actions: write
       contents: write
     env:
       VERSION: ${{ needs.prepare.outputs.version }}
-      CI_TAG: ci-build-${{ github.run_id }}-${{ github.run_attempt }}
-      # 只有真正发布时才尝试删除草稿 Release；范围受限（不发布）时跳过。
+      CI_TAG: ci-build-${{ github.run_id }}
+      # 只有真正发布时才做草稿清理；范围受限（不发布）时跳过。
       PUBLISH_CI: ${{ needs.prepare.outputs.publish_ci }}
     steps:
-      - name: 删除失败 CI Release
-        if: env.PUBLISH_CI == 'true' && github.event_name == 'push' && !contains(github.event.head_commit.message, '仅验证CI') && (needs.create-ci-release.result != 'success' || needs.update-manifest.result != 'success')
+      - name: Checkout repository
+        uses: actions/checkout@v5
+
+      - name: 清理废弃的 CI 草稿
+        if: env.PUBLISH_CI == 'true' && github.event_name == 'push' && !contains(github.event.head_commit.message, '仅验证CI')
         env:
           GH_TOKEN: ${{ github.token }}
+          # 本轮发布环节是否成功。只有成功时才允许按「已被本轮取代」立即清理：
+          # 发布成功后版本基线已推进，其它 run 里不高于本轮版本的草稿不会再有
+          # 任何一轮复用它，留着就是同版本号不同内容的废弃副本。
+          PUBLISHED: ${{ needs.create-ci-release.result == 'success' && needs.update-manifest.result == 'success' }}
         run: |
-          # 草稿发布可能尚未创建 tag；仅删除草稿，保留已有 tag 作为诊断锚点。
-          if gh release view "$CI_TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
-            gh release delete "$CI_TAG" \
-              --repo "$GITHUB_REPOSITORY" \
-              --yes
-          else
-            echo "failed CI release not found: $CI_TAG"
+          # 草稿 Release 是 module/app 构建产物的唯一副本，任务级重跑
+          # （gh run rerun --failed）要靠它续接发布，所以本轮草稿永远保留，
+          # 其余草稿的判定细则见 .github/scripts/prune_ci_drafts.py 模块文档。
+          args=()
+          if [ "$PUBLISHED" = "true" ]; then
+            args+=(--published)
           fi
+          # 取本轮 run 的创建时间：早于它创建的草稿才可能被本轮取代，晚于它的
+          # 可能是并行轮次正在用，必须保留。取不到就只按 24 小时窗口处理。
+          run_created="$(gh api \
+            "repos/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}" \
+            --jq '.created_at' 2>/dev/null || true)"
+          python3 .github/scripts/prune_ci_drafts.py \
+            --repository "$GITHUB_REPOSITORY" \
+            --current-tag "$CI_TAG" \
+            --current-version "$VERSION" \
+            --current-run-created "$run_created" \
+            ${args[@]+"${args[@]}"}
 
       - name: 保留失败 CI 诊断资源
         if: needs.create-ci-release.result != 'success' || needs.update-manifest.result != 'success'
@@ -898,7 +962,7 @@ jobs:
     needs:
       - prepare
       - create-ci-release
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     timeout-minutes: 15
     env:
       VERSION: ${{ needs.prepare.outputs.version }}

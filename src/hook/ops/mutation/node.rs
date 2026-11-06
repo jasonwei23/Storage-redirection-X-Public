@@ -29,9 +29,7 @@ pub unsafe extern "C" fn hooked_mknod(
         },
         |hub| {
             hub.increment_mkdir_calls();
-            if runtime::should_resolve_caller_context(hub) {
-                crate::hook::caller::update_caller_package_for_current_thread(hub);
-            }
+            crate::hook::caller::update_caller_for_mutation(hub, pathname);
 
             handle_mknod_like(hub, "mknod", AT_FDCWD, pathname, mode, |call_path| {
                 runtime::call_prev(
@@ -73,9 +71,7 @@ pub unsafe extern "C" fn hooked_mknodat(
         },
         |hub| {
             hub.increment_mkdir_calls();
-            if runtime::should_resolve_caller_context(hub) {
-                crate::hook::caller::update_caller_package_for_current_thread(hub);
-            }
+            crate::hook::caller::update_caller_for_mutation(hub, pathname);
 
             handle_mknod_like(hub, "mknodat", dirfd, pathname, mode, |call_path| {
                 runtime::call_prev(
@@ -128,7 +124,7 @@ where
         mode as i32,
     );
 
-    if hub.is_monitor_only() && !should_enforce_monitor_only_writer_policy(hub) {
+    if hub.effective_monitor_only() && !should_enforce_monitor_only_writer_policy(hub) {
         let result = call_original(pathname);
         let error_no = runtime::errno_for_result(result);
         monitor::record_mkdir_result(hub, op_name, path_for_decision.as_ref(), result, error_no);
@@ -181,4 +177,87 @@ where
         monitor::record_mkdir_result(hub, op_name, path_for_decision.as_ref(), result, error_no);
     }
     result
+}
+
+pub unsafe extern "C" fn hooked_remove(pathname: *const c_char) -> c_int {
+    let self_ptr = hooked_remove as *mut c_void;
+    runtime::with_hook_guard(
+        || {
+            runtime::call_prev(
+                self_ptr,
+                || libc::remove(pathname),
+                |prev| {
+                    let f: unsafe extern "C" fn(*const c_char) -> c_int = std::mem::transmute(prev);
+                    f(pathname)
+                },
+            )
+        },
+        |hub| {
+            handle_single_path_audit(
+                hub,
+                SinglePathAuditRequest {
+                    kind: crate::monitor::OpKind::Unlink,
+                    op_name: "remove",
+                    dirfd: AT_FDCWD,
+                    pathname,
+                    log_flags: 0,
+                    extra_tail: None,
+                    redirect_mutation: hub.is_redirect_via_hook(),
+                },
+                |call_path| {
+                    runtime::call_prev(
+                        self_ptr,
+                        || libc::remove(call_path),
+                        |prev| {
+                            let f: unsafe extern "C" fn(*const c_char) -> c_int =
+                                std::mem::transmute(prev);
+                            f(call_path)
+                        },
+                    )
+                },
+            )
+        },
+    )
+}
+
+pub unsafe extern "C" fn hooked_mkfifo(pathname: *const c_char, mode: mode_t) -> c_int {
+    let self_ptr = hooked_mkfifo as *mut c_void;
+    runtime::with_hook_guard(
+        || {
+            runtime::call_prev(
+                self_ptr,
+                || libc::mkfifo(pathname, mode),
+                |prev| {
+                    let f: unsafe extern "C" fn(*const c_char, mode_t) -> c_int =
+                        std::mem::transmute(prev);
+                    f(pathname, mode)
+                },
+            )
+        },
+        |hub| {
+            handle_single_path_audit(
+                hub,
+                SinglePathAuditRequest {
+                    kind: crate::monitor::OpKind::Mknod,
+                    op_name: "mkfifo",
+                    dirfd: AT_FDCWD,
+                    pathname,
+                    log_flags: mode as i32,
+                    extra_tail: Some(format!("mode=0{:o}", mode)),
+                    redirect_mutation: hub.is_redirect_via_hook(),
+                },
+                |call_path| {
+                    runtime::call_prev(
+                        self_ptr,
+                        || libc::mkfifo(call_path, mode),
+                        |prev| {
+                            let f: unsafe extern "C" fn(*const c_char, mode_t) -> c_int =
+                                std::mem::transmute(prev);
+                            f(call_path, mode)
+                        },
+                    )
+                },
+            )
+        },
+    )
 }

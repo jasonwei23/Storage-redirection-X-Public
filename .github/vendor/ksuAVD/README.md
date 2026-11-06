@@ -47,5 +47,6 @@ LKM。CI 流程与 rootAVD 一致：先由 `android-emulator-runner` 启动模�
 ## 升级注意事项
 
 - 更新时整文件替换 `ksuAVD.sh`，同步更新本文件的「引入提交」，并保持脚本头部注释完整。
-- 上游为 2026-09-30 首次发布的单日新项目，API 与参数可能变动；升级后必须先在实验
-  workflow `.github/workflows/ci-kernelsu-a17.yml` 上验证，再考虑进入正式测试矩阵。
+- 上游为 2026-09-30 首次发布的单日新项目，API 与参数可能变动；升级后必须先在收窄范围的
+  A17 分片上验证（`ci.yml` 的 `scenarios` 派发输入，配合 `KERNELSU_APK_URL` /
+  `ZYGISK_NEXT_URL` 覆盖资产地址），再考虑进入正式测试矩阵。

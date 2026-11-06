@@ -6,18 +6,20 @@ use log::{Level as LogLevel, LevelFilter, Log, Metadata, Record};
 use std::ffi::CString;
 use std::mem;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Once, OnceLock};
+use std::sync::{Mutex, Once, OnceLock};
 
-const LOG_LEVEL_VERBOSE: i32 = 0;
-const LOG_LEVEL_DEBUG: i32 = 1;
-const LOG_LEVEL_INFO: i32 = 2;
-const LOG_LEVEL_WARN: i32 = 3;
-const LOG_LEVEL_ERROR: i32 = 4;
-
-const CURRENT_LOG_LEVEL: i32 = LOG_LEVEL_DEBUG;
+/// 进程内日志的编译期门限：Trace 一律丢弃，Debug 及以上再交给运行期 verbose 开关裁决。
+const MAX_LOG_LEVEL: LevelFilter = LevelFilter::Debug;
 const DEFAULT_LOG_TAG: &str = "StorageRedirect";
 const FILE_MONITOR_LOG_TAG: &str = "FileMonitorOp";
 const STATS_LOG_TAG: &str = "Stats";
+/// MP 热重载完成回执标签：与 FileMonitorOp/Stats 一样不受 verbose 门禁约束——
+/// 它是低频的一次性状态事件，且是 daemon 侧补写 ack 回执的唯一触发源；
+/// MP 进程对模块目录无写权限（sepolicy），必须经该通道交由 daemon（root）落盘。
+pub const HOT_RELOAD_LOG_TAG: &str = "HotReload";
+/// 机器可校验的低频状态事件标签（如运行应用重挂载完成）：srxctl 等待循环以
+/// running.log 中的这些行作为唯一完成判据，不受 verbose 门禁约束。
+pub const STATUS_LOG_TAG: &str = "Status";
 const PRIVATE_LOG_SOCKET_NAME: &[u8] = b"storage.redirect.x.logd";
 
 const ANDROID_LOG_VERBOSE: i32 = 2;
@@ -26,14 +28,13 @@ const ANDROID_LOG_INFO: i32 = 4;
 const ANDROID_LOG_WARN: i32 = 5;
 const ANDROID_LOG_ERROR: i32 = 6;
 
-#[repr(i32)]
 #[derive(Copy, Clone, Eq, PartialEq)]
 pub enum Level {
-    Verbose = LOG_LEVEL_VERBOSE,
-    Debug = LOG_LEVEL_DEBUG,
-    Info = LOG_LEVEL_INFO,
-    Warn = LOG_LEVEL_WARN,
-    Error = LOG_LEVEL_ERROR,
+    Verbose,
+    Debug,
+    Info,
+    Warn,
+    Error,
 }
 
 static LOG_INIT: Once = Once::new();
@@ -58,7 +59,16 @@ impl Logger {
 }
 
 pub fn set_debug_logging_enabled(enabled: bool) {
-    DEBUG_LOGGING_ENABLED.store(enabled, Ordering::Relaxed);
+    let previous = DEBUG_LOGGING_ENABLED.swap(enabled, Ordering::Relaxed);
+    // 开关此前只作用于本进程：共享宿主会话子进程在 fork 时继承当时的取值，运行期
+    // 再开/关完全不影响它。于是「先在设置页打开详细日志，再复现问题」的操作在会话
+    // 侧没有任何效果——目录扫描耗时、目录缓存命中率与会话 perf_snapshot 全部落空，
+    // 而这正是「媒体读取慢」一类问题的唯一直接证据（2026-11-03 真机实测：开关打开
+    // 后 running.log 里 fuse_dir_cache_sample/perf_snapshot 计数仍为 0，重启 daemon
+    // 后才出现）。宿主控制 fd 不存在时（hook 进程、应用进程）这里是 no-op。
+    if previous != enabled {
+        crate::fuse_host_control::notify_host_verbose(enabled);
+    }
 }
 
 impl PrivateLogSocket {
@@ -141,7 +151,7 @@ fn format_record_message(level: Level, tag: &str, message: &str) -> String {
 fn ensure_log_adapter() {
     LOG_INIT.call_once(|| {
         let _ = log::set_logger(&LOG_ADAPTER);
-        log::set_max_level(current_level_filter());
+        log::set_max_level(MAX_LOG_LEVEL);
     });
 }
 
@@ -154,10 +164,6 @@ pub extern "C" fn srx_is_debug_logging_enabled() -> bool {
     is_debug_logging_enabled()
 }
 
-pub fn is_level_enabled(level: Level) -> bool {
-    (level as i32) >= CURRENT_LOG_LEVEL
-}
-
 pub fn write_log(level: Level, tag: &str, message: &str) {
     if tag.is_empty() || message.is_empty() {
         return;
@@ -165,6 +171,8 @@ pub fn write_log(level: Level, tag: &str, message: &str) {
     let is_critical = matches!(level, Level::Warn | Level::Error);
     if tag != FILE_MONITOR_LOG_TAG
         && tag != STATS_LOG_TAG
+        && tag != HOT_RELOAD_LOG_TAG
+        && tag != STATUS_LOG_TAG
         && !is_critical
         && !is_debug_logging_enabled()
     {
@@ -174,6 +182,13 @@ pub fn write_log(level: Level, tag: &str, message: &str) {
     let private_sent = private_log_socket()
         .map(|socket| socket.send(level, tag, message))
         .unwrap_or(false);
+    // zygote 域内连不上 daemon 的私有通道（SELinux 拒绝），pre 阶段的结论因此只能
+    // 落在 logcat；而 logcat 缓冲在开机后几十秒就会被滚掉——恰好是 MediaProvider、
+    // 代写者与共享组进程 specialize 的时段，也就是最需要复盘的那一段。这里按行暂存，
+    // 等进程 specialize 完成（post 阶段、域已切换）再补投到 running.log。
+    if !private_sent && is_critical && tag == DEFAULT_LOG_TAG && is_zygote_selinux_context() {
+        defer_log(level, message);
+    }
     if is_critical || (!private_sent && matches!(tag, FILE_MONITOR_LOG_TAG | STATS_LOG_TAG)) {
         android_log(level_to_priority(level), tag, message);
     }
@@ -244,7 +259,7 @@ fn build_file_monitor_timestamp() -> String {
 }
 
 fn is_record_enabled(metadata: &Metadata) -> bool {
-    if !is_level_enabled(map_log_level(metadata.level())) {
+    if metadata.level() > MAX_LOG_LEVEL {
         return false;
     }
     metadata.target() == FILE_MONITOR_LOG_TAG
@@ -283,6 +298,40 @@ fn is_zygote_selinux_context() -> bool {
         .unwrap_or(false)
 }
 
+/// zygote 阶段暂存的关键日志上限。这只是"开机那几十秒"的结论，正常远小于此；
+/// 设上限是为防止某个进程在 pre 阶段异常刷日志把内存带走。
+const DEFERRED_LOG_CAPACITY: usize = 32;
+
+static DEFERRED_LOGS: Mutex<Vec<(Level, String)>> = Mutex::new(Vec::new());
+
+fn defer_log(level: Level, message: &str) {
+    let mut pending = DEFERRED_LOGS.lock().unwrap_or_else(|err| err.into_inner());
+    if pending.len() >= DEFERRED_LOG_CAPACITY {
+        pending.remove(0);
+    }
+    pending.push((level, message.to_string()));
+}
+
+/// 把 zygote 阶段暂存的行补投到 daemon 私有通道（最终落 running.log）。
+///
+/// 由 post specialize 入口调用：那时进程域已切换，私有通道可用。send 失败的行
+/// 直接丢弃——它们已经写过 logcat，重复暂存会让下一次投递又带上陈旧内容。
+pub fn flush_deferred_logs() {
+    let drained: Vec<(Level, String)> = {
+        let mut pending = DEFERRED_LOGS.lock().unwrap_or_else(|err| err.into_inner());
+        if pending.is_empty() {
+            return;
+        }
+        std::mem::take(&mut *pending)
+    };
+    let Some(socket) = private_log_socket() else {
+        return;
+    };
+    for (level, message) in drained {
+        let _ = socket.send(level, DEFAULT_LOG_TAG, &message);
+    }
+}
+
 fn sanitize_transport_message(message: &str) -> String {
     if !message.contains(['\n', '\r', '\t']) {
         return message.to_string();
@@ -303,17 +352,6 @@ fn map_log_level(level: LogLevel) -> Level {
         LogLevel::Info => Level::Info,
         LogLevel::Debug => Level::Debug,
         LogLevel::Trace => Level::Verbose,
-    }
-}
-
-fn current_level_filter() -> LevelFilter {
-    match CURRENT_LOG_LEVEL {
-        LOG_LEVEL_VERBOSE => LevelFilter::Trace,
-        LOG_LEVEL_DEBUG => LevelFilter::Debug,
-        LOG_LEVEL_INFO => LevelFilter::Info,
-        LOG_LEVEL_WARN => LevelFilter::Warn,
-        LOG_LEVEL_ERROR => LevelFilter::Error,
-        _ => LevelFilter::Info,
     }
 }
 

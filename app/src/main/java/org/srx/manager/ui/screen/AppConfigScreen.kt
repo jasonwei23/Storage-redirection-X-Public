@@ -14,8 +14,6 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.statusBars
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.shape.RoundedCornerShape
-import androidx.compose.material.icons.Icons
-import androidx.compose.material.icons.rounded.Save
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.CompositionLocalProvider
 import androidx.compose.runtime.LaunchedEffect
@@ -31,16 +29,13 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import org.srx.manager.CenteredDialog
-import org.srx.manager.EmptyText
 import org.srx.manager.GlassCard
 import org.srx.manager.GlassTextButton
 import org.srx.manager.LocalSrxBackdrop
 import org.srx.manager.RoundIconAction
-import org.srx.manager.SectionTitle
 import org.srx.manager.data.AppConfig
 import org.srx.manager.data.ConfigTemplate
 import org.srx.manager.data.InstalledApp
-import org.srx.manager.data.LogEntry
 import org.srx.manager.data.UiPreferences
 import org.srx.manager.data.UserProfile
 import org.srx.manager.floatingGlassPanel
@@ -61,6 +56,7 @@ import top.yukonga.miuix.kmp.blur.rememberLayerBackdrop
 import top.yukonga.miuix.kmp.icon.MiuixIcons
 import top.yukonga.miuix.kmp.icon.extended.Back
 import top.yukonga.miuix.kmp.icon.extended.Delete
+import top.yukonga.miuix.kmp.icon.extended.Ok
 import top.yukonga.miuix.kmp.icon.extended.Tune
 import top.yukonga.miuix.kmp.theme.MiuixTheme
 import top.yukonga.miuix.kmp.utils.overScrollVertical
@@ -97,29 +93,6 @@ private fun TemplateNameDialog(
             { onConfirm(name.trim()) },
             modifier = Modifier.weight(1f),
             primary = true,
-        )
-      }
-    }
-  }
-}
-
-@Composable
-private fun LogsPreview(logs: List<LogEntry>) {
-  var showFullTime by rememberSaveable { mutableStateOf(false) }
-  SectionTitle("最近文件监视")
-  GlassCard(
-      insideMargin = PaddingValues(0.dp),
-      cornerRadius = 24.dp,
-      alpha = 0.66f,
-  ) {
-    if (logs.isEmpty()) {
-      EmptyText("暂无文件操作记录")
-    } else {
-      logs.take(4).forEach {
-        LogRow(
-            entry = it,
-            showFullTime = showFullTime,
-            onToggleTime = { showFullTime = !showFullTime },
         )
       }
     }
@@ -204,7 +177,7 @@ private fun AppConfigHeader(
         )
         if (showSave) {
           RoundIconAction(
-              icon = Icons.Rounded.Save,
+              icon = MiuixIcons.Ok,
               contentDescription = "保存配置",
               onClick = onSave,
               size = 38.dp,

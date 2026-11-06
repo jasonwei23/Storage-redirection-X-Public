@@ -153,6 +153,29 @@ pub(super) fn mount_source_for_target_from_mountinfo(
     matched_root
 }
 
+/// 挂载点 `target` 上那条记录的 `major:minor`（superblock 身份）。
+///
+/// 用于判断两个挂载点是否属于**同一次** FUSE 连接：MediaProvider 重启、`vold`
+/// 重新拉起用户视图后，`/mnt/user/<user>/emulated` 会换成新的 minor，而旧锚点仍
+/// 绑在上一代连接上——此时 dev+ino 完全一致（同一 superblock 的根 dentry），
+/// `is_directory` 也可能为真，但实际访问会 ENOTCONN/ENOENT。
+pub(super) fn mountinfo_device_for_target(content: &str, target: &str) -> Option<String> {
+    let normalized_target = paths::normalize(target);
+    let mut matched: Option<String> = None;
+    for line in content.lines() {
+        let Some(entry) = mountinfo::parse_entry(line) else {
+            continue;
+        };
+        if paths::eq_ignore_case(
+            &paths::normalize(&mountinfo::unescape_field(entry.target)),
+            &normalized_target,
+        ) {
+            matched = Some(entry.dev.to_string());
+        }
+    }
+    matched
+}
+
 /// 只判断挂载点是否存在，命中首个匹配即返回，不解析也不分配 root 字段。
 pub(super) fn mountinfo_has_target(content: &str, target: &str) -> bool {
     let normalized_target = paths::normalize(target);
@@ -225,6 +248,31 @@ pub(super) fn mountinfo_root_is_app_sandbox(
         })
         .unwrap_or(false)
 }
+/// 判断挂载点 `target` 上是否已存在 root 精确等于 `expected_root` 的挂载记录。
+///
+/// 自有私有目录恢复的幂等判定：`std::fs::metadata` 的 dev+ino 在「目标上叠着
+/// MediaProvider 二级用户 FUSE 视图」时与恢复源恒不相等（二者是不同的 FUSE
+/// superblock），会把「已恢复」误判成「未恢复」并触发每轮全量重 bind；改比
+/// mountinfo 的 root 字段不受该干扰。命中**任意一条**即算已恢复——即使恢复层
+/// 之上又叠了 MP 的用户视图（root `/<user>`），内容仍取自同一棵底层树，重复
+/// bind 只会触发下一轮重建循环。
+pub(super) fn mountinfo_has_own_private_restore_layer(
+    content: &str,
+    target: &str,
+    expected_root: &str,
+) -> bool {
+    let normalized_target = paths::normalize(target);
+    content.lines().any(|line| {
+        let Some(entry) = mountinfo::parse_entry(line) else {
+            return false;
+        };
+        paths::eq_ignore_case(
+            &paths::normalize(&mountinfo::unescape_field(entry.target)),
+            &normalized_target,
+        ) && paths::eq_ignore_case(&mountinfo::unescape_field(entry.root), expected_root)
+    })
+}
+
 pub(super) fn detach_mount_if_present(target: &str) {
     // 该函数会 umount2 改变挂载表，且被 bind_mount 之间反复调用，必须每次重新读取；
     // 这里只需要判断挂载点是否存在，用存在性探测替代取 source 的整表扫描。

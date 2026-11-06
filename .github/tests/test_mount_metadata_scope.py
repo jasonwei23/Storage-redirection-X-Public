@@ -75,6 +75,8 @@ class MountMetadataScopeTest(unittest.TestCase):
         cls.mount_core = read("src/mount/planner.rs")
         cls.fuse_mod = read("src/fuse_redirect/mod.rs")
         cls.fuse_config = read("src/fuse_redirect/config.rs")
+        cls.runtime = read("src/hook/runtime.rs")
+        cls.owner_migration = read("src/owner_migration.rs")
 
     def test_mapping_mode_only_apps_skip_private_owner_repair(self) -> None:
         # 私有外部存储由 MediaProvider 管理，监视侧不应再建立任何私有目录属主修复根。
@@ -84,6 +86,19 @@ class MountMetadataScopeTest(unittest.TestCase):
         )
         self.assertIn("MediaProvider", body)
         self.assertIn("Vec::new()", body)
+
+    def test_mapping_target_created_when_missing(self) -> None:
+        # 映射目标目录缺失时必须在挂载阶段补建：应用视图把它 bind 到请求路径，
+        # 源不存在会让应用写入报 ENOENT，系统代写者（下载提供器）对请求路径的
+        # mkdir 也会被 MediaProvider 判为拒绝，表现成 DownloadManager 的
+        # "Failed to create parent"（run 40277331532 五版本一致实证）。
+        body = function_body(
+            self.mount_core,
+            "pub(super) fn ensure_app_owned_mapping_target(&self, path: &str, owner_uid: i32) -> bool",
+        )
+        self.assertIn("fs::create_directory(&metadata_path, creation_uid)", body)
+        self.assertIn("mapping target mkdir failed", body)
+        self.assertNotIn("这里不做补建", body)
 
     def test_stuck_mount_circuit_is_scoped_to_one_package(self) -> None:
         # 熔断判据必须带上包名，否则单个应用的挂载超时会连坐整机其它应用。
@@ -126,20 +141,38 @@ class MountMetadataScopeTest(unittest.TestCase):
         # 属主已正确时必须在 chown/chmod 之前直接返回，跳过整段元数据修正。
         self.assertIn("return true", body[keep_index:chmod_index])
 
-    def test_scoped_fuse_start_isolates_single_root_failure(self) -> None:
-        # 单根启动失败后以存储根会话恢复规则覆盖；daemon 与 companion 行为保持一致。
-        # 根会话重试同样失败时才交给 namespace 回退与能力失败记账。
-        # 启动编排已下沉到 fuse_session 共享模块（按根启动函数经闭包注入），
-        # 因此隔离不变量锚定共享实现，两侧只断言走共享入口。
-        body = function_body(read("src/fuse_session.rs"), "fn start_scoped_fuse_services(")
-        self.assertIn("failed_roots", body)
-        self.assertIn("storage_root", body)
-        self.assertIn("collapsed to storage root", body)
-        # 全部根都失败时仍要返回 None，保住"FUSE 整体不可用"的降级记账语义。
-        self.assertIn("states.is_empty()", body)
+    def test_scoped_fuse_sessions_are_retired(self) -> None:
+        # per-app scoped FUSE 会话已退役：它是应用命名空间的自持引用，应用退出后仍在
+        # 服务自己的挂载、永远等不到退出条件（issue #4：单机累积 1198 个常驻会话）。
+        # 契约改为「只接共享宿主」：任一根本地 fork 出常驻会话都算回归。
+        session = read("src/fuse_session.rs")
+        self.assertNotIn("fn start_scoped_fuse_services(", session)
+        self.assertNotIn("libc::fork()", session)
+        # 不可用原因集中定义在共享模块，供两侧与日志共用同一套取值。
+        for reason in (
+            "NoSharedHost",
+            "AttachGateClosed",
+            "PolicyRegistrationFailed",
+            "NoPolicyRules",
+            "AttachFailed",
+        ):
+            self.assertIn(reason, session)
         for path in ("src/daemon_mount.rs", "src/lifecycle/companion_mount.rs"):
-            wrapper = function_body(read(path), "fn start_scoped_fuse_services(")
-            self.assertIn("crate::fuse_session::start_scoped_fuse_services(", wrapper, path)
+            source = read(path)
+            # 只允许一个接入点：接入在挂载前完成，规划阶段一律 bind。事后再接会在已 bind
+            # 的目标上叠一层 FUSE，清理时按路径只能摘栈顶，底层 bind 残留成永久叠挂。
+            self.assertEqual(
+                source.count("fn preattach_shared_host("),
+                1,
+                f"{path} 只能有一个宿主接入点",
+            )
+            self.assertNotIn("attach_shared_host_sessions", source, path)
+            # 已由当前宿主层服务的视图根也要按宿主挂载记账，否则状态文件缺这条目标、
+            # 下一轮清理会漏摘，挂载层失去归属判据。
+            self.assertIn("crate::fuse_session::storage_view_top_source(", source, path)
+            self.assertIn("host_session: Some((view.child_pid, view.child_start_time_ticks))", source, path)
+            # 两条挂载路径都不得再 fork per-app 会话。
+            self.assertNotIn("srx_fuse\\0", source, path)
 
     def test_scoped_fuse_budget_preserves_dynamic_rules(self) -> None:
         # 多会话预算只控制进程/内存开销，预算超限必须折叠为单个存储根 FUSE 会话，
@@ -183,10 +216,37 @@ class MountMetadataScopeTest(unittest.TestCase):
         policy = read("src/fuse_redirect/policy.rs")
         self.assertIn("is_android_private_backend_path", policy)
         self.assertIn("keep existing Android private metadata", policy)
+        # 私有树事后属主修复链已于 2026-10-20 随属主翻转案定案整体拆除：守护侧不再
+        # 对 Android/{data,media,obb} 做 chown/chmod 修复，元数据保持由 MediaProvider
+        # 所有权管理与上方 mount/policy 的 keep-existing 守卫共同保证。断言修复链与
+        # 类别级私有修复入口没有回潮。
         monitor = read("src/daemon_monitor/events.rs")
-        repair_body = function_body(monitor, "fn chown_android_private_path_if_needed(")
-        self.assertIn("private_root", repair_body)
-        self.assertIn("eq_ignore_case(path, private_root)", repair_body)
+        self.assertNotIn("chown_android_private_path_if_needed", monitor)
+        self.assertNotIn("repair_private_category_owner", monitor)
+
+    def test_system_writer_owner_fix_preserves_native_gid(self) -> None:
+        # 系统代写 hook 只负责把 owner 修回应用 UID；1078(ext_data_rw) 与
+        # 1023(media_rw) 都是设备上可能出现的原生私有目录组，不能固定覆盖。
+        body = function_body(self.runtime, "fn chown_private_path_if_needed(")
+        self.assertIn("st.st_uid == owner_uid as u32", body)
+        self.assertNotIn("st.st_uid == owner_uid as u32 && st.st_gid", body)
+        self.assertIn("owner_uid as u32, u32::MAX", body)
+
+    def test_owner_migration_restores_only_private_data_directory_gid(self) -> None:
+        # 一次性迁移只把 Android/data 下、owner 正确且无 other 权限位的目录从
+        # media_rw 组恢复到 AOSP 定义的 ext_data_rw；文件与共享媒体目录保留 1023。
+        self.assertIn("owner-migration-1023-v4.done", self.owner_migration)
+        self.assertIn("const EXT_DATA_RW_GID: u32 = 1078", self.owner_migration)
+        body = function_body(
+            self.owner_migration,
+            "fn should_restore_ext_data_gid(",
+        )
+        self.assertIn('metadata.is_dir()', body)
+        self.assertIn('metadata.uid() == target_uid || metadata.uid() == MEDIA_RW_UID', body)
+        self.assertIn('metadata.mode() & 0o007 != 0', body)
+        self.assertIn('path.rfind("/Android/data/")', body)
+        self.assertNotIn('"/Android/media/"', body)
+        self.assertNotIn('"/Android/obb/"', body)
 
     def test_storage_alias_binding_skips_source_self_bind(self) -> None:
         # 私有目录恢复会同时遍历 /storage、/mnt 和 /data/media 别名；源路径对应的
@@ -198,13 +258,17 @@ class MountMetadataScopeTest(unittest.TestCase):
         self.assertIn("eq_ignore_case(source, &target)", overlay_body)
 
     def test_own_private_restore_prefers_system_fuse_anchor(self) -> None:
-        # 自有 Android/data|media|obb 不能从 /data/media 直绑到应用视图；直绑会绕过
+        # 自有 Android 私有目录不能从 /data/media 直绑到应用视图；直绑会绕过
         # MediaProvider FUSE 并带入 media_rw_data_file 上下文，应用仍会被 SELinux 拒绝。
+        # 2026-10-25 起（f84a29dd）源改为独立的系统视图锚点 ensure_system_view_anchor，
+        # 且只恢复 Android/media/<pkg>（data 是沙箱宿主、obb 无跨进程共享需求），
+        # 锚点缺失时以 "own private system view anchor unavailable" 留痕等待重试。
         apply = read("src/mount/apply.rs")
         body = function_body(apply, "fn restore_own_private_directories(")
-        self.assertIn("real_storage_anchor", body)
+        self.assertIn("ensure_system_view_anchor", body)
         self.assertIn("backend_source", body)
-        self.assertIn("FUSE anchor unavailable", body)
+        self.assertIn("own private system view anchor unavailable", body)
+        self.assertIn('format!("Android/media/{}", self.package_name)', body)
         self.assertNotIn("unwrap_or_else(|| backend_source.clone())", body)
         self.assertNotIn('relative.starts_with("Android/data/")', body)
 

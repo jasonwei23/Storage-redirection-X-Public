@@ -19,7 +19,7 @@ env:
 jobs:
   quality:
     if: github.repository == 'z1298808165/Storage-redirection-X-Public' && startsWith(github.ref, 'refs/tags/v')
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     timeout-minutes: 15
     steps:
       - name: Checkout repository
@@ -52,6 +52,7 @@ jobs:
           ./gradlew --no-daemon --console=plain spotlessCheck
           node scripts/verify-webui-structure.js
           node scripts/verify-webui-config-fixtures.js
+          node scripts/verify-webui-app-list-parser.js
           cargo test -p native-config-fixtures
           python -m unittest discover -s .github/tests -p "test_*.py" -v
 
@@ -63,7 +64,7 @@ jobs:
 
   prepare:
     if: github.repository == 'z1298808165/Storage-redirection-X-Public' && startsWith(github.ref, 'refs/tags/v')
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     timeout-minutes: 15
     outputs:
       version: ${{ steps.version.outputs.version }}
@@ -102,7 +103,7 @@ jobs:
       - quality
       - prepare
     if: startsWith(github.ref, 'refs/tags/v')
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     timeout-minutes: 10
     env:
       VERSION: ${{ needs.prepare.outputs.version }}
@@ -124,7 +125,7 @@ jobs:
       - quality
       - prepare
       - init-release
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     timeout-minutes: 30
     env:
       VERSION: ${{ needs.prepare.outputs.version }}
@@ -278,7 +279,7 @@ jobs:
       - quality
       - prepare
       - init-release
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     timeout-minutes: 30
     env:
       VERSION: ${{ needs.prepare.outputs.version }}
@@ -368,7 +369,7 @@ jobs:
     needs:
       - quality
       - prepare
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     timeout-minutes: 30
     env:
       VERSION: ${{ needs.prepare.outputs.version }}
@@ -489,7 +490,7 @@ jobs:
       - quality
       - prepare
       - test-flow-build
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     timeout-minutes: ${{ matrix.android.timeout_minutes }}
     env:
       VERSION: ${{ needs.prepare.outputs.version }}
@@ -645,26 +646,26 @@ jobs:
           script: bash .github/tests/run-android-test-flow.sh
 
       - name: Upload test-flow artifacts
-        if: always() && matrix.android.version != 17 && hashFiles('scenario-*-result.txt', 'scenario-2-mediastore-hook-diag.txt', 'test-flow-preflight.txt', 'test-flow-app-mountinfo.txt', 'test-flow-fuse-sample.txt', 'test-flow-logcat.txt', 'test-flow-module-state.txt', 'test-flow-backend-diagnostic.txt', 'test-flow-monitor-state.txt', 'media-health.txt') != ''
+        if: always() && matrix.android.version != 17 && hashFiles('temp/test-flow/**/scenario-*-result.txt', 'temp/test-flow/**/scenario-2-mediastore-hook-diag.txt', 'temp/test-flow/**/test-flow-preflight.txt', 'temp/test-flow/**/test-flow-app-mountinfo.txt', 'temp/test-flow/**/test-flow-fuse-sample.txt', 'temp/test-flow/**/test-flow-logcat.txt', 'temp/test-flow/**/test-flow-module-state.txt', 'temp/test-flow/**/test-flow-backend-diagnostic.txt', 'temp/test-flow/**/test-flow-monitor-state.txt', 'temp/test-flow/**/media-health.txt') != ''
         uses: actions/upload-artifact@v7.0.1
         with:
           name: release-test-flow-android${{ matrix.android.version }}-artifacts
           if-no-files-found: ignore
           retention-days: 14
           path: |
-            scenario-*-result.txt
-            scenario-2-mediastore-hook-diag.txt
-            test-flow-preflight.txt
-            test-flow-app-mountinfo.txt
-            test-flow-fuse-sample.txt
-            test-flow-logcat.txt
-            test-flow-module-state.txt
-            test-flow-backend-diagnostic.txt
-            test-flow-monitor-state.txt
-            media-health.txt
+            temp/test-flow/**/scenario-*-result.txt
+            temp/test-flow/**/scenario-2-mediastore-hook-diag.txt
+            temp/test-flow/**/test-flow-preflight.txt
+            temp/test-flow/**/test-flow-app-mountinfo.txt
+            temp/test-flow/**/test-flow-fuse-sample.txt
+            temp/test-flow/**/test-flow-logcat.txt
+            temp/test-flow/**/test-flow-module-state.txt
+            temp/test-flow/**/test-flow-backend-diagnostic.txt
+            temp/test-flow/**/test-flow-monitor-state.txt
+            temp/test-flow/**/media-health.txt
 
       - name: Upload shared FUSE snapshots
-        if: always() && hashFiles('test-flow-shared-fuse-before.txt', 'test-flow-shared-fuse-after.txt') != ''
+        if: always() && hashFiles('temp/test-flow/**/test-flow-shared-fuse-before.txt', 'temp/test-flow/**/test-flow-shared-fuse-after.txt') != ''
         uses: actions/upload-artifact@v7.0.1
         with:
           name: release-test-flow-android${{ matrix.android.version }}-shared-fuse
@@ -672,8 +673,8 @@ jobs:
           retention-days: 14
           compression-level: 0
           path: |
-            test-flow-shared-fuse-before.txt
-            test-flow-shared-fuse-after.txt
+            temp/test-flow/**/test-flow-shared-fuse-before.txt
+            temp/test-flow/**/test-flow-shared-fuse-after.txt
 
   test-flow-required:
     name: Test-flow required gate
@@ -682,7 +683,7 @@ jobs:
       - prepare
       - test-flow
     if: always() && needs.prepare.result != 'skipped'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     timeout-minutes: 10
     steps:
       - name: Require all test-flow matrix jobs to pass
@@ -704,7 +705,7 @@ jobs:
       - module
       - app
       - test-flow-required
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     timeout-minutes: 20
     env:
       VERSION: ${{ needs.prepare.outputs.version }}
@@ -714,13 +715,25 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Generate changelog from AI commit descriptions
+      - name: Generate Chinese changelog
         run: |
           mkdir -p build
           python .github/scripts/generate_changelog.py \
             --mode release \
             --version "$VERSION" \
             --output build/changelog.md
+          RELEASE_NOTES="docs/release-notes/v${VERSION}.md"
+          if [ -f "$RELEASE_NOTES" ]; then
+            cp "$RELEASE_NOTES" build/changelog.md
+          fi
+          # 覆盖正文之后仍需致谢：人工写的发布说明若漏了致谢段，按本发布周期内的
+          # 提交补齐（已有时保持人工措辞不动）。
+          python .github/scripts/generate_changelog.py \
+            --mode release \
+            --ensure-credits build/changelog.md
+          python .github/scripts/validate_release_notes.py \
+            --file build/changelog.md \
+            --version "$VERSION"
       - name: Verify draft GitHub Release assets
         env:
           GH_TOKEN: ${{ github.token }}
@@ -802,7 +815,7 @@ jobs:
       - test-flow-required
       - publish-release
     if: always() && needs.prepare.result == 'success'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     timeout-minutes: 10
     permissions:
       actions: write

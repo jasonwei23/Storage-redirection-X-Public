@@ -91,7 +91,17 @@ class LoggingArchitectureTest(unittest.TestCase):
         self.assertIn('get("monitor_only")', request)
         policy = read("src/fuse_redirect/policy.rs")
         backend = policy[policy.index("fn backend_decision") : policy.index("fn matches_any")]
-        self.assertLess(backend.index("if self.is_monitor_only"), backend.index("BackendKind::Redirect"))
+        # 2026-10-21 起沙盒命中（仅限配置了 sandboxed_paths 的应用）优先于监视
+        # 直通短路：未配置应用的沙盒索引为空，is_sandbox 恒 false，监视直通
+        # 语义不变；监视分支仍须先于其余映射类 Redirect 分支。
+        self.assertLess(
+            backend.index("let is_sandbox = self.is_mapping_mode_only"),
+            backend.index("if self.is_monitor_only"),
+        )
+        self.assertLess(
+            backend.index("if self.is_monitor_only"),
+            backend.rindex("BackendKind::Redirect"),
+        )
         self.assertIn('"fuse_monitor_only"', policy)
         constructor_start = policy.index("impl RedirectPolicy")
         constructor = policy[constructor_start : policy.index("        let mut path_mappings", constructor_start)]
@@ -123,7 +133,9 @@ class LoggingArchitectureTest(unittest.TestCase):
         slow_collection = script.index("collect_basic_files", main_flow)
         self.assertLess(initial_capture, slow_collection)
         self.assertIn("-t 10000", script)
-        self.assertIn("-t 8000", script)
+        # 高频 OEM Error 日志会在半分钟内耗尽 8000 行，主缓冲快照需 20000 行
+        # 才能覆盖「复现后 1-2 分钟内导出」的窗口。
+        self.assertIn("-t 20000", script)
         self.assertIn("-b crash -d -v threadtime", script)
         self.assertIn('-T "$LOGCAT_CAPTURE_START"', script)
         self.assertIn("tail -n 3000", script)
@@ -145,7 +157,7 @@ class LoggingArchitectureTest(unittest.TestCase):
         ):
             source = read(path)
             self.assertIn("-t 10000", source)
-            self.assertIn("-t 8000", source)
+            self.assertIn("-t 20000", source)
             self.assertIn("logcat-buffers.txt", source)
             self.assertIn("logcat-capture.txt", source)
             self.assertIn("tail -n 3000", source)
@@ -190,25 +202,37 @@ class LoggingArchitectureTest(unittest.TestCase):
         self.assertIn("process_start_time_ticks", intent)
         self.assertIn("mount_intent::prune_stale", daemon)
 
-    def test_namespace_fallback_reexpands_wildcard_rules_after_fuse_failure(self) -> None:
-        config = read("src/fuse_redirect/config.rs")
-        daemon = read("src/daemon_mount.rs")
-        companion = read("src/lifecycle/companion_mount.rs")
-        self.assertIn("expand_namespace_fallback_rules", config)
-        # 回退降级已下沉到 fuse_session 共享模块（经 MountRequestFields 泛型），
-        # 通配展开断言锚定共享实现；两条挂载路径只断言走共享入口。
+    def test_fuse_unavailable_reason_is_reported_per_mount(self) -> None:
+        """FUSE 视图没建起来时必须留下可判定原因。
+
+        scoped 会话退役后只剩共享宿主一种载体，宿主接入失败就直接降级成 namespace
+        bind。降级本身是对的，但如果只写一句 "unavailable"，用户设备上出现不支持时
+        无从判断是设备没有 `/dev/fuse`、配置里没有规则、策略没登记进宿主，还是接入
+        本身失败。因此要求：原因类型集中定义、挂载结论里带上原因、两条路径都打一行
+        带设备事实的结论日志。
+        """
         session = read("src/fuse_session.rs")
-        self.assertIn("expand_namespace_fallback_rules", session)
-        for source, path in ((daemon, "daemon"), (companion, "companion")):
-            self.assertIn(
-                "crate::fuse_session::apply_mount_namespace_fallback(", source, path
-            )
-            self.assertNotIn("fn apply_mount_namespace_fallback(", source, path)
-        # 后端结论串只出现在单一实现里；两条挂载路径通过 needs_namespace_fallback 消费它。
+        for reason in (
+            "NoSharedHost",
+            "AttachGateClosed",
+            "PolicyRegistrationFailed",
+            "NoPolicyRules",
+            "AttachFailed",
+        ):
+            self.assertIn(reason, session)
+        self.assertIn("no_shared_host_session", session)
+        self.assertIn("host_attach_failed", session)
         shared = read("src/fuse_redirect/scoped_mount.rs")
+        self.assertIn("unavailable_reason", shared)
         self.assertIn("scoped_mount_failed_namespace_fallback", shared)
-        for source in (daemon, companion):
-            self.assertIn("needs_namespace_fallback", source)
+        for path in ("src/daemon_mount.rs", "src/lifecycle/companion_mount.rs"):
+            source = read(path)
+            self.assertIn("fuse view unavailable reason=", source, path)
+            self.assertIn("fallback=namespace_bind", source, path)
+            self.assertIn("fuse_device=", source, path)
+            self.assertIn("unavailable_reason: host_skip.map(", source, path)
+            # 回退重挂的旧机制已随 scoped 退役删除，不能重新长出第二套降级实现。
+            self.assertNotIn("fn apply_mount_namespace_fallback(", source, path)
 
     def test_fuse_capability_failures_are_bucketed_per_scope(self) -> None:
         """能力熔断不得是全设备单点：分桶、多应用升格、退避自愈三者缺一不可。
@@ -294,7 +318,7 @@ class LoggingArchitectureTest(unittest.TestCase):
         ledger = read("src/mount_ledger.rs")
         for entry in (
             "pub fn record_mount_identity(",
-            "pub fn capture_mount_identity(",
+            "pub fn capture_explicit_mount_identity(",
             "pub fn namespace_identity(",
             "pub fn load(",
             "pub fn save(",
@@ -588,14 +612,15 @@ class LoggingArchitectureTest(unittest.TestCase):
 
         self.assertIn('if root.source == "public_owner"', reconfigure)
         self.assertIn("self.repair_public_owner_root(root)", reconfigure)
-        self.assertIn("self.repair_public_owner_roots_if_due()", reconfigure)
         self.assertIn("public_owner_roots", reconfigure)
-        self.assertIn("fn repair_public_owner_roots_if_due", monitor)
-        self.assertIn("PUBLIC_OWNER_REPAIR_INTERVAL_MS", monitor)
         self.assertIn("MAX_PUBLIC_OWNER_REPAIR_DIRS: usize = 32768", monitor)
+        # 1 秒周期扫描已移除（2026-10-21 用户拍板）：周期入口与节流常量不得回潮，
+        # 建树一次性扫描 + inotify 事件驱动修复 + missing 重试是仅存通道。
+        self.assertNotIn("repair_public_owner_roots_if_due", monitor)
+        self.assertNotIn("PUBLIC_OWNER_REPAIR_INTERVAL_MS", monitor)
+        self.assertNotIn("last_public_owner_repair_ms", monitor)
         reset = monitor[monitor.index("fn reset") : monitor.index("fn repair_public_owner_root")]
         self.assertIn("self.public_owner_roots.clear()", reset)
-        self.assertIn("self.last_public_owner_repair_ms = 0", reset)
         self.assertIn('if root.source == "public_owner"', retry)
         self.assertIn("self.repair_public_owner_root(&root)", retry)
         self.assertIn("self.repair_existing_public_tree(&node)", repair)

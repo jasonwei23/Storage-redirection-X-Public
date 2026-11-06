@@ -3,8 +3,10 @@ use super::super::path as path_utils;
 use super::super::runtime;
 use super::super::stats::InterceptHub;
 use super::super::util::c_str_to_string;
-use crate::platform::paths;
-use crate::redirect::{policy, process_redirect_path, writer};
+use crate::platform::{self, paths};
+use crate::redirect::{
+    policy, process_redirect_path, resolve_mapping_request_owner_for_path, writer,
+};
 use libc::{AT_FDCWD, c_char, c_int, c_uint, c_void};
 use std::ffi::CString;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -22,6 +24,9 @@ const STATX_TYPE_MASK: c_uint = 0x0000_0001;
 // 转发原函数时使用的签名别名，避免在调用点反复书写跨行的裸指针参数列表
 type FstatatFn = unsafe extern "C" fn(c_int, *const c_char, *mut libc::stat, c_int) -> c_int;
 type StatxFn = unsafe extern "C" fn(c_int, *const c_char, c_int, c_uint, *mut libc::statx) -> c_int;
+type RealpathFn = unsafe extern "C" fn(*const c_char, *mut c_char) -> *mut c_char;
+// POSIX 约定 realpath 的 resolved 缓冲区至少 PATH_MAX 字节；bionic 同约定
+const REALPATH_BUFFER_LIMIT: usize = 4096;
 
 fn should_bypass_system_writer_query(hub: &InterceptHub, op_name: &str) -> bool {
     if !hub.with_package_name(policy::is_system_writer_package) {
@@ -69,12 +74,13 @@ where
     if ret == 0 || !is_retryable_system_writer_query_error(error_no) {
         return ret;
     }
-    if !should_attempt_system_writer_query_fallback(hub) {
+    let query_path = resolve_system_writer_query_path(dirfd, pathname);
+    if !should_attempt_system_writer_query_fallback(hub, query_path.as_deref()) {
         runtime::set_errno(error_no);
         return ret;
     }
 
-    if let Some(redirected) = writer_fallback_redirect(hub, dirfd, pathname)
+    if let Some(redirected) = writer_fallback_redirect(hub, query_path.as_deref().unwrap_or(""))
         && let Ok(c_path) = CString::new(redirected)
     {
         return call_path(c_path.as_ptr());
@@ -109,12 +115,13 @@ where
     if !ret.is_null() || !is_retryable_system_writer_query_error(error_no) {
         return ret;
     }
-    if !should_attempt_system_writer_query_fallback(hub) {
+    let query_path = resolve_system_writer_query_path(AT_FDCWD, pathname);
+    if !should_attempt_system_writer_query_fallback(hub, query_path.as_deref()) {
         runtime::set_errno(error_no);
         return ret;
     }
 
-    if let Some(redirected) = writer_fallback_redirect(hub, AT_FDCWD, pathname)
+    if let Some(redirected) = writer_fallback_redirect(hub, query_path.as_deref().unwrap_or(""))
         && let Ok(c_path) = CString::new(redirected)
     {
         return call_path(c_path.as_ptr());
@@ -132,7 +139,7 @@ fn should_fix_system_writer_private_owner_for_query_error(error_no: c_int) -> bo
     error_no == libc::EACCES || error_no == libc::EPERM
 }
 
-fn should_attempt_system_writer_query_fallback(hub: &InterceptHub) -> bool {
+fn should_attempt_system_writer_query_fallback(hub: &InterceptHub, path: Option<&str>) -> bool {
     if context::is_current_caller_scope_active() {
         return true;
     }
@@ -142,7 +149,53 @@ fn should_attempt_system_writer_query_fallback(hub: &InterceptHub) -> bool {
         hub.get_current_caller_uid(),
         context::get_current_caller_age_ms(),
         context::is_current_caller_from_external_signal(),
-    )
+    ) || has_recent_mapping_request_owner_signal_for_query_fallback(hub)
+        || has_mapping_request_path_signal_for_query_fallback(hub, path)
+        || has_process_mapped_dir_signal_for_query_fallback(path)
+}
+
+/// 本进程刚把该路径（或其祖先）重定向到映射目标时的放行判据。
+///
+/// 覆盖系统写者落盘之后用**原请求路径**回查 attr 的窗口：此时写请求的线程上下文
+/// 已经结束（MediaProvider 的 FUSE 读线程与处理线程分离），请求路径在真实存储里
+/// 也不存在，只有进程级登记能证明它属于一次已完成的映射重定向。
+fn has_process_mapped_dir_signal_for_query_fallback(path: Option<&str>) -> bool {
+    path.is_some_and(|value| {
+        !value.is_empty() && crate::hook::process_mapped_dir_target(value).is_some()
+    })
+}
+
+/// 冷查询（前面没有同线程写操作）时的放行判据：查询路径本身就落在某应用的映射
+/// 请求侧/映射目标，那么这次查询必须按该应用的映射视图回答。
+///
+/// 典型场景是 MediaProvider 的 FuseDaemon 在没有任何写操作的情况下对请求侧子树做
+/// LOOKUP/stat：请求侧目录在后端不存在，不放行就一律 ENOENT，映射子树对宿主视图
+/// 完全不可见（MT 浏览、删除都失败）。
+fn has_mapping_request_path_signal_for_query_fallback(
+    hub: &InterceptHub,
+    path: Option<&str>,
+) -> bool {
+    let Some(path) = path else {
+        return false;
+    };
+    if path.is_empty() {
+        return false;
+    }
+    let mut caller_uid = hub.get_current_caller_uid();
+    let user_id = writer::resolve_system_writer_user_id(path, &mut caller_uid);
+    user_id >= 0 && !resolve_mapping_request_owner_for_path(user_id, path).is_empty()
+}
+
+/// 映射重定向后的 attr 回查：MediaProvider 的 FuseDaemon 在 create/mkdir 成功后
+/// 用原始路径 lstat，此时没有外部调用方信号，只有写路径留下的「映射请求侧归属」。
+/// 该归属必须能触发同一套回退，否则重定向后的应答一律 ENOENT（真机 MT 移动失败）。
+fn has_recent_mapping_request_owner_signal_for_query_fallback(hub: &InterceptHub) -> bool {
+    if !hub.is_current_caller_from_mapping_request_owner() {
+        return false;
+    }
+    let caller_uid = hub.get_current_caller_uid();
+    (0..=QUERY_FALLBACK_CALLER_MAX_AGE_MS).contains(&context::get_current_caller_age_ms())
+        && caller_uid >= writer::ANDROID_APP_UID_START
 }
 
 fn has_recent_external_caller_signal_for_query_fallback(
@@ -161,7 +214,7 @@ unsafe fn fix_system_writer_private_owner_for_query(dirfd: c_int, pathname: *con
     let Some(path_text) = resolve_system_writer_query_path(dirfd, pathname) else {
         return;
     };
-    runtime::fix_system_writer_android_private_owner(&path_text, false);
+    runtime::fix_system_writer_android_private_owner(&path_text, false, -1);
 }
 
 // 用原始系统调用判断目录是否真实存在。这里不能走 libc 包装，否则会再次进入本模块的
@@ -330,7 +383,7 @@ pub unsafe extern "C" fn hooked_stat(pathname: *const c_char, statbuf: *mut libc
                     )
                 });
             }
-            runtime::with_redirected_path(hub, "stat", pathname, |final_path| {
+            runtime::with_redirected_path(hub, "stat", AT_FDCWD, pathname, |final_path| {
                 runtime::call_prev(
                     self_ptr,
                     || libc::stat(final_path, statbuf),
@@ -386,7 +439,7 @@ pub unsafe extern "C" fn hooked_lstat(pathname: *const c_char, statbuf: *mut lib
                     )
                 });
             }
-            runtime::with_redirected_path(hub, "lstat", pathname, |final_path| {
+            runtime::with_redirected_path(hub, "lstat", AT_FDCWD, pathname, |final_path| {
                 runtime::call_prev(
                     self_ptr,
                     || libc::lstat(final_path, statbuf),
@@ -453,7 +506,7 @@ pub unsafe extern "C" fn hooked_fstatat(
                     )
                 });
             }
-            runtime::with_redirected_path(hub, "fstatat", pathname, |final_path| {
+            runtime::with_redirected_path(hub, "fstatat", dirfd, pathname, |final_path| {
                 runtime::call_prev(
                     self_ptr,
                     || libc::fstatat(dirfd, final_path, statbuf, flags),
@@ -513,7 +566,7 @@ pub unsafe extern "C" fn hooked_access(pathname: *const c_char, mode: c_int) -> 
                     )
                 });
             }
-            runtime::with_redirected_path(hub, "access", pathname, |final_path| {
+            runtime::with_redirected_path(hub, "access", AT_FDCWD, pathname, |final_path| {
                 runtime::call_prev(
                     self_ptr,
                     || libc::access(final_path, mode),
@@ -577,7 +630,7 @@ pub unsafe extern "C" fn hooked_faccessat(
                     )
                 });
             }
-            runtime::with_redirected_path(hub, "faccessat", pathname, |final_path| {
+            runtime::with_redirected_path(hub, "faccessat", dirfd, pathname, |final_path| {
                 runtime::call_prev(
                     self_ptr,
                     || libc::faccessat(dirfd, final_path, mode, flags),
@@ -647,7 +700,7 @@ pub unsafe extern "C" fn hooked_statx(
                     )
                 });
             }
-            runtime::with_redirected_path(hub, "statx", pathname, |final_path| {
+            runtime::with_redirected_path(hub, "statx", dirfd, pathname, |final_path| {
                 runtime::call_prev(
                     self_ptr,
                     || call_statx_syscall(dirfd, final_path, flags, mask, statxbuf),
@@ -708,7 +761,7 @@ pub unsafe extern "C" fn hooked_opendir(name: *const c_char) -> *mut libc::DIR {
                     )
                 });
             }
-            runtime::with_redirected_path(hub, "opendir", name, |final_path| {
+            runtime::with_redirected_path(hub, "opendir", AT_FDCWD, name, |final_path| {
                 runtime::call_prev(
                     self_ptr,
                     || libc::opendir(final_path),
@@ -754,7 +807,7 @@ pub unsafe extern "C" fn hooked_readlink(
                     },
                 )
             } else {
-                runtime::with_redirected_path(hub, "readlink", pathname, |final_path| {
+                runtime::with_redirected_path(hub, "readlink", AT_FDCWD, pathname, |final_path| {
                     runtime::call_prev(
                         self_ptr,
                         || libc::readlink(final_path, buf, bufsiz),
@@ -814,7 +867,7 @@ pub unsafe extern "C" fn hooked_readlinkat(
                     },
                 )
             } else {
-                runtime::with_redirected_path(hub, "readlinkat", pathname, |final_path| {
+                runtime::with_redirected_path(hub, "readlinkat", dirfd, pathname, |final_path| {
                     runtime::call_prev(
                         self_ptr,
                         || libc::readlinkat(dirfd, final_path, buf, bufsiz),
@@ -985,14 +1038,13 @@ fn reverse_mapping_readlink_path_for_visible_caller(path: &str) -> String {
 }
 
 // 系统写入进程查询遇到 ENOENT 时，通过重定向决策重试。
-unsafe fn writer_fallback_redirect(
-    hub: &InterceptHub,
-    dirfd: c_int,
-    pathname: *const c_char,
-) -> Option<String> {
-    let path_text = resolve_system_writer_query_path(dirfd, pathname)?;
+fn writer_fallback_redirect(hub: &InterceptHub, path_text: &str) -> Option<String> {
+    if path_text.is_empty() {
+        return None;
+    }
+    register_mapping_request_owner_for_query_fallback(hub, path_text);
     let _no_path_owner_infer = crate::hook::enter_path_owner_inference_disabled();
-    let decision = process_redirect_path_for_query_fallback(hub, &path_text);
+    let decision = process_redirect_path_for_query_fallback(hub, path_text);
     if decision.is_redirect() && !decision.new_path.is_empty() {
         Some(decision.new_path)
     } else {
@@ -1000,9 +1052,224 @@ unsafe fn writer_fallback_redirect(
     }
 }
 
+/// 冷查询没有「同线程近期写过」信号可用，改由**查询路径本身**确定映射请求侧归属
+/// 并登记为调用方，使随后的重定向决策能解析到映射目标。
+///
+/// 已有真实应用归属时不覆盖：那种情况下归属比路径推断更可信。
+fn register_mapping_request_owner_for_query_fallback(hub: &InterceptHub, path_text: &str) {
+    let caller_package = hub.get_current_caller_package();
+    let caller_uid = hub.get_current_caller_uid();
+    if caller_uid >= writer::ANDROID_APP_UID_START
+        && !caller_package.is_empty()
+        && !policy::is_system_writer_package(&caller_package)
+    {
+        return;
+    }
+
+    let mut uid_for_user = caller_uid;
+    let user_id = writer::resolve_system_writer_user_id(path_text, &mut uid_for_user);
+    if user_id < 0 {
+        return;
+    }
+    let owner = resolve_mapping_request_owner_for_path(user_id, path_text);
+    if owner.is_empty() {
+        return;
+    }
+    let mut owner_uid = policy::get_fresh_uid_for_package(&owner);
+    if owner_uid < writer::ANDROID_APP_UID_START {
+        // 启动早期 uid 缓存文件可能还没有该应用的条目，此时拿不到真实 uid。
+        // 归属的作用是让重定向决策按包名解析映射，user_id 与真实值一致即可，
+        // 因此退到同用户的合成 uid，避免这一窗口内请求侧查询全部落到 ENOENT。
+        owner_uid = user_id
+            .saturating_mul(platform::ANDROID_USER_ID_OFFSET)
+            .saturating_add(writer::ANDROID_APP_UID_START);
+        log::debug!(
+            "query fallback mapping owner synthetic uid caller={} uid={} path={}",
+            owner,
+            owner_uid,
+            path_text
+        );
+    } else {
+        log::debug!(
+            "query fallback mapping owner caller={} uid={} path={}",
+            owner,
+            owner_uid,
+            path_text
+        );
+    }
+    hub.set_current_caller_from_mapping_request_owner(&owner, owner_uid);
+}
+
 fn process_redirect_path_for_query_fallback(
     hub: &InterceptHub,
     path: &str,
 ) -> crate::redirect::RedirectDecision {
     process_redirect_path(hub, path)
+}
+
+// ── realpath(3)：映射请求侧的规范化路径回退 ───────────────────────────────
+//
+// bionic 的 realpath 在 libc 内部逐级调用 `__lstat`（非导出符号，PLT 侧完全抓
+// 不到），因此请求侧目录一旦不在真实存储落地，realpath 一定失败。Java 侧
+// `File.getCanonicalFile()` 直接依赖它：失败即抛 IOException，`File.mkdirs()`
+// 随之返回 false，最终表现成 DownloadProvider 报告无法创建父目录（2026-10-26
+// A17 场景 39，与 mkdir 本身已成功重定向形成对照）。
+//
+// 回退只对**本进程内刚被映射重定向过**的请求侧路径生效，返回请求侧自己的规范化
+// 路径：调用方拿到的 canonical path 与它写入时使用的命名空间一致，映射目标不外泄。
+
+/// 命中进程级映射登记时，构造请求侧自己的规范化路径。
+///
+/// 含 `.`/`..` 的路径不伪造：realpath 需要先解析这些分量，直接回显会给出错误结果，
+/// 此时保留原失败更安全。
+fn mapped_request_realpath(hub: &InterceptHub, path_text: &str) -> Option<String> {
+    if path_text.is_empty() || !path_text.starts_with('/') {
+        return None;
+    }
+    let segments: Vec<&str> = path_text.split('/').collect();
+    if segments
+        .iter()
+        .any(|segment| *segment == "." || *segment == "..")
+    {
+        return None;
+    }
+    let normalized = paths::normalize(path_text);
+    // 本进程刚做过 mkdir 重定向的路径最可靠，优先采信。
+    if crate::hook::process_mapped_dir_target(&normalized).is_some() {
+        return Some(normalized);
+    }
+    // 配置驱动兜底：MediaProvider 的 FuseDaemon 是把下层写直接打到映射目标上的，
+    // 它不经过 hook，进程内不会有任何登记。只靠登记表的话，这条回退在 CI
+    // （下载提供器经 MP 代写）永远不命中——2026-10-26 run 40291854472 实证：
+    // 整条链路只留下 1 条 req map，没有任何 mkdir 登记可供 realpath 使用。
+    let mut caller_uid = hub.get_current_caller_uid();
+    let user_id = writer::resolve_system_writer_user_id(&normalized, &mut caller_uid);
+    if user_id >= 0 && !resolve_mapping_request_owner_for_path(user_id, &normalized).is_empty() {
+        return Some(normalized);
+    }
+    None
+}
+
+/// 把规范化路径写入 realpath 的输出位置。
+///
+/// `resolved` 为 NULL 时按 bionic 契约返回 malloc 分配的内存，由调用方 free；
+/// 非 NULL 时按 POSIX 约定假定缓冲区至少 PATH_MAX 字节，并额外用 `capacity`
+/// 兜住调用方已知的上限。
+unsafe fn fill_realpath_result(
+    resolved: *mut c_char,
+    capacity: Option<usize>,
+    value: &str,
+) -> *mut c_char {
+    let length = value.len() + 1;
+    let limit = capacity.unwrap_or(REALPATH_BUFFER_LIMIT);
+    if length > limit {
+        runtime::set_errno(libc::ENAMETOOLONG);
+        return std::ptr::null_mut();
+    }
+    if resolved.is_null() {
+        // SAFETY: malloc 返回的块至少 length 字节，随后写入 value 与结尾 NUL。
+        let buffer = unsafe { libc::malloc(length) } as *mut u8;
+        if buffer.is_null() {
+            runtime::set_errno(libc::ENOMEM);
+            return std::ptr::null_mut();
+        }
+        // SAFETY: buffer 已按 length 分配，源串长度与拷贝长度一致。
+        unsafe {
+            std::ptr::copy_nonoverlapping(value.as_ptr(), buffer, value.len());
+            *buffer.add(value.len()) = 0;
+        }
+        return buffer as *mut c_char;
+    }
+    // SAFETY: 调用方按 POSIX 约定提供至少 PATH_MAX（或 capacity）字节的缓冲区。
+    unsafe {
+        let out = resolved.cast::<u8>();
+        std::ptr::copy_nonoverlapping(value.as_ptr(), out, value.len());
+        *out.add(value.len()) = 0;
+    }
+    resolved
+}
+
+unsafe fn call_realpath_prev(
+    proxy_fn: *mut c_void,
+    path: *const c_char,
+    resolved: *mut c_char,
+) -> *mut c_char {
+    runtime::call_prev(
+        proxy_fn,
+        // SAFETY: path/resolved 由调用方按 realpath 契约传入，本次调用期间有效。
+        || unsafe { libc::realpath(path, resolved) },
+        |prev| {
+            let f: RealpathFn = unsafe { std::mem::transmute(prev) };
+            // SAFETY: prev 是 realpath 原函数指针，签名与 RealpathFn 一致。
+            unsafe { f(path, resolved) }
+        },
+    )
+}
+
+unsafe fn realpath_with_mapped_fallback(
+    hub: &InterceptHub,
+    proxy_fn: *mut c_void,
+    path: *const c_char,
+    resolved: *mut c_char,
+    capacity: Option<usize>,
+) -> *mut c_char {
+    // SAFETY: 指针由 hook 调用方按 realpath 契约传入。
+    let ret = unsafe { call_realpath_prev(proxy_fn, path, resolved) };
+    if !ret.is_null() {
+        return ret;
+    }
+    let error_no = runtime::current_errno();
+    if !is_retryable_system_writer_query_error(error_no) {
+        return ret;
+    }
+    // 只服务系统写者：应用进程里请求侧由 bind 挂载点承接，realpath 本就成功。
+    if !hub.with_package_name(policy::is_system_writer_package) {
+        runtime::set_errno(error_no);
+        return ret;
+    }
+    // SAFETY: path 由 hook 原样透传，调用方保证其指向以 NUL 结尾的字符串。
+    let path_text = unsafe { c_str_to_string(path) };
+    // 命中日志走 W 级：hook 的 verbose 门禁取自**各进程启动时**的配置，系统写者的
+    // 常驻进程（MediaProvider / 下载提供器）不会跟着 global.json 重载，debug 级在
+    // CI 里根本落不了盘——于是「回退没命中」与「回退不存在」在日志上完全同形
+    // （run 40286639350 全库零 realpath 痕迹，无法裁决）。这条路径只有「系统写者 +
+    // 可重试 ENOENT」才走到，出现频次远低于挂载类日志。
+    let Some(fake_path) = mapped_request_realpath(hub, &path_text) else {
+        log::debug!(
+            "realpath mapped miss path={} errno={} registered={}",
+            path_text,
+            error_no,
+            crate::hook::process_mapped_dir_count()
+        );
+        runtime::set_errno(error_no);
+        return ret;
+    };
+    // SAFETY: resolved 与 capacity 由调用方按对应契约提供。
+    let filled = unsafe { fill_realpath_result(resolved, capacity, &fake_path) };
+    if filled.is_null() {
+        runtime::set_errno(error_no);
+        return ret;
+    }
+    log::warn!(
+        "realpath mapped fallback pkg={} path={} errno={}",
+        hub.get_package_name(),
+        path_text,
+        error_no
+    );
+    filled
+}
+
+pub unsafe extern "C" fn hooked_realpath(
+    path: *const c_char,
+    resolved: *mut c_char,
+) -> *mut c_char {
+    let self_ptr = hooked_realpath as *mut c_void;
+    runtime::with_hook_guard(
+        // SAFETY: path/resolved 由 hook 调用方传入。
+        || unsafe { call_realpath_prev(self_ptr, path, resolved) },
+        |hub| {
+            // SAFETY: 同上，指针有效性由 hook 调用方保证。
+            unsafe { realpath_with_mapped_fallback(hub, self_ptr, path, resolved, None) }
+        },
+    )
 }

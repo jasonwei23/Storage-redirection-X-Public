@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: 排障说明（日志位置、关键日志标记、常见崩溃原因）
+    url: https://github.com/z1298808165/Storage-redirection-X-Public/blob/SRX-R/docs/troubleshooting.md
+    about: 提交问题前请先阅读，很多常见现象这里已有结论和解决方式。
+  - name: 配置与使用说明
+    url: https://github.com/z1298808165/Storage-redirection-X-Public/blob/SRX-R/README.md
+    about: 配置项含义、路径规则、备份还原与日志导出入口说明。

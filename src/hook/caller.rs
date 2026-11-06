@@ -1,18 +1,28 @@
 use super::context;
+use super::runtime;
 use super::stats::InterceptHub;
 use crate::config::SettingsHub;
 use crate::monitor::AuditTrail;
+use crate::platform::paths;
 use crate::redirect::policy;
-use libc::{RTLD_LOCAL, RTLD_NOW, c_int, c_void, dlopen, dlsym, getpid, getuid, prctl};
+use libc::{RTLD_LOCAL, RTLD_NOW, c_char, c_int, c_void, dlopen, dlsym, getpid, getuid, prctl};
 use std::cell::Cell;
 use std::ffi::CString;
 use std::sync::{
-    OnceLock,
-    atomic::{AtomicU64, Ordering},
+    Mutex, OnceLock,
+    atomic::{AtomicI64, AtomicU64, Ordering},
 };
 
 const ANDROID_APP_UID_START: i32 = 10000;
 const FUSE_CALLER_MAX_AGE_MS: i64 = 1500;
+/// 系统 uid FUSE 请求跨线程接力槽的取用窗口：读线程与处理线程分离时
+/// （FuseDaemon 工作池模型），分发延迟可超过 100ms（2026-10-24 真机：shell
+/// 的 mkdir 在繁忙窗口下槽过期导致归因落空）。系统 uid 请求本身低频，
+/// 1s 窗口的串味风险（相邻两个不同系统进程的请求互相错配）远小于
+/// 归因落空，取 1s。
+const SYSTEM_FUSE_SLOT_MAX_AGE_MS: i64 = 1000;
+/// 系统 uid 归因 miss 运维诊断的限频间隔。
+const SYSTEM_MISS_LOG_INTERVAL_MS: i64 = 10_000;
 const BINDER_SAVED_CALLER_MAX_AGE_MS: i64 = 1500;
 const BINDER_SAVED_CALLER_HARD_LIMIT_MS: i64 = 30_000;
 const CURRENT_CALLER_MAX_AGE_MS: i64 = 500;
@@ -27,6 +37,13 @@ static CALLER_RECENT_REUSE_COUNT: AtomicU64 = AtomicU64::new(0);
 thread_local! {
     // Binder 线程名终身不变，缓存避免重复 prctl 系统调用
     static BINDER_THREAD_CACHED: Cell<Option<bool>> = const { Cell::new(None) };
+    // 写形态操作在调用 update_caller 前置位：系统 uid 接力槽只允许公共路径
+    // 的写形态操作消费（产品边界：仅公共路径的共享/系统 uid FUSE 写需要
+    // 源头发起应用识别）。MP 的高频读操作（stat/access，占 hook 流量 99%+）
+    // 与私有路径写不取槽，否则并发读会在毫秒内把待归因的公共路径写请求
+    // 的槽内容抢走（2026-10-24 真机：mkdir 槽内容被 stat 秒抢，监视记录
+    // 全部 unknown）。标记在 update_caller 入口读取并复位，不跨调用泄漏。
+    static SYSTEM_SLOT_TAKE_ALLOWED: Cell<bool> = const { Cell::new(false) };
 }
 
 fn is_likely_binder_thread_cached() -> bool {
@@ -43,7 +60,7 @@ fn is_likely_binder_thread_cached() -> bool {
 // FUSE / Binder saved UID / Binder 线程三者皆无时调用方解析必定失败，可直接跳过
 fn has_caller_signal(hub: &InterceptHub) -> bool {
     let fuse_uid = hub.get_fuse_caller_uid();
-    if fuse_uid >= ANDROID_APP_UID_START {
+    if fuse_uid >= 0 {
         let fuse_age = context::get_fuse_caller_uid_age_ms();
         if (0..=FUSE_CALLER_MAX_AGE_MS).contains(&fuse_age) {
             return true;
@@ -68,6 +85,28 @@ fn has_caller_signal(hub: &InterceptHub) -> bool {
 
 // 通过 Binder / FUSE / PID 多级回退解析当前线程调用方
 pub fn update_caller_package_for_current_thread(hub: &InterceptHub) {
+    // 读取并复位槽取用资格标记（由写形态 hook 经 update_caller_for_mutation
+    // 置位）；复位放在入口，任何退出路径都不会向后续操作泄漏。
+    let system_slot_take_allowed = SYSTEM_SLOT_TAKE_ALLOWED.with(|cell| cell.replace(false));
+    // 同理复位「监视记录用请求方 uid/pid」：本次请求若拿不到 FUSE 头 pid，记录里就
+    // 不该出现上一次请求的 uid/pid（daemon 会据此反查出错误源头）。
+    //
+    // 但**处在 Java 调用方作用域内时不能复位**：MediaProvider 的 provider 入口会把
+    // binder 给出的调用方 uid/pid 先落进这两个槽（含系统 uid），随后该调用内部的
+    // 文件操作还会走一遍 FUSE 侧入口；若无条件复位，Java 侧刚捕获的证据立刻被抹掉，
+    // 记录退回 MediaProvider 自己的 uid（真机实测：shell 的 MediaStore insert 因此
+    // 记成 caller_uid=10217、identity 未知）。
+    if !context::is_current_caller_scope_active() {
+        context::set_monitor_caller_pid(-1);
+        context::set_monitor_caller_uid(-1);
+    }
+    // MediaProvider 的文件操作持续经过这里：借调用节流探测晚加载的
+    // FUSE 引擎 libfuse.so 并补装 read 补丁（/dev/fuse 请求的真实读取方，晚于 hook
+    // 安装）。仅媒体提供器进程探测，其它进程一次字符串比较即短路。
+    if hub.with_package_name(policy::is_media_provider_package) {
+        super::ops::read::ensure_fuse_engine_read_patch();
+    }
+
     let previous_package = hub.get_current_caller_package();
     let previous_uid = hub.get_current_caller_uid();
     let previous_age_ms = context::get_current_caller_age_ms();
@@ -84,6 +123,7 @@ pub fn update_caller_package_for_current_thread(hub: &InterceptHub) {
             previous_age_ms,
             previous_from_external_signal,
             can_reuse_recent_caller,
+            system_slot_take_allowed,
         );
         return;
     }
@@ -114,6 +154,14 @@ pub fn update_caller_package_for_current_thread(hub: &InterceptHub) {
             package_name = resolve_caller_package_by_pid(caller_pid);
             if !package_name.is_empty() {
                 caller_source = "binder_pid";
+            } else if let Some((resolved_pkg, _)) =
+                resolve_system_fuse_identity(caller_uid, caller_pid)
+            {
+                // 命令行不是包名形态：这一 pid 的进程身份只能由 pid → /proc 反查给出
+                // （native 名 + uid 唯一归属时换算成包名）。与 FUSE 请求头那条路径共用
+                // 同一实现，避免两处口径漂移。
+                package_name = resolved_pkg;
+                caller_source = "pid_proc";
             }
         }
         // clearCallingIdentity 前保存的调用方 UID 作为末级回退
@@ -155,8 +203,32 @@ pub fn update_caller_package_for_current_thread(hub: &InterceptHub) {
             }
         }
         if package_name.is_empty() && caller_uid < ANDROID_APP_UID_START {
-            caller_uid = -1;
+            // 系统 uid 请求（root / system 二进制）解析不出包名时，内核 FUSE 头的
+            // uid 仍是权威请求方；清成 -1 会让记录侧回退 fsuid，把「mediaprovider
+            // 自己」写成请求方（实测 caller_uid=10217）。头部有 uid 就保留它，
+            // 配合 caller_pid 一起落进记录，由 daemon 侧继续反查。
+            if caller_source != "fuse_uid_system_fallback" {
+                caller_uid = -1;
+            }
         }
+    }
+
+    // 系统 uid 且只剩头部 uid：不回退到 fsuid，直接把「权威 uid + pid」挂到
+    // 当前调用方上下文，让本条记录写出 caller_uid/caller_pid 而不是 MP 自身。
+    if package_name.is_empty() && caller_source == "fuse_uid_system_fallback" && caller_uid >= 0 {
+        context::set_current_caller_from_external_signal("", caller_uid);
+        let count = CALLER_UNRESOLVED_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
+        if should_log_sample(count) {
+            log::debug!(
+                "caller unresolved uid kept proc={} uid={} fuse_pid={} fuse_age_ms={} n={}",
+                hub.get_package_name(),
+                caller_uid,
+                caller_pid,
+                fuse_age_ms,
+                count
+            );
+        }
+        return;
     }
 
     if !package_name.is_empty() {
@@ -236,8 +308,124 @@ struct CallerUidResolution {
     caller_source: &'static str,
 }
 
+/// 公共存储路径的廉价判定（hook 收到的原始显示路径形态）：/storage/emulated/
+/// <user>/ 或其 /data/media 别名，且不在 Android/data、Android/obb 私有子树。
+/// 与 monitor 侧完整归一化判定相比只做前缀与子树排除，供写形态 hook 在
+/// update_caller 前做槽取用资格标记（产品边界：仅公共路径的共享/系统 uid
+/// FUSE 写需要源头发起应用识别）。
+fn is_public_display_path_for_slot(path: &str) -> bool {
+    (paths::starts_with(path, "/storage/emulated/") || paths::starts_with(path, "/data/media/"))
+        && !path.contains("/Android/data/")
+        && !path.contains("/Android/obb/")
+}
+
+/// 写形态 hook（mkdir/mknod/rename/unlink/link/写意图 open/creat 等）的
+/// 调用方解析入口：按目标路径是否公共存储标记系统 uid 接力槽的取用资格，
+/// 再复用基础解析；退出时无条件复位标记（should_resolve_caller_context
+/// 短路时也不向同线程的后续操作泄漏）。
+///
+/// # SAFETY (参数约定)
+/// `pathname` 由 hook 调用方保证指向 NUL 结尾 C 字符串或为空（与
+/// `prepare_relevant_path` 的读取约定一致）；空指针按无槽取用资格处理。
+pub fn update_caller_for_mutation(hub: &InterceptHub, pathname: *const c_char) {
+    // SAFETY: pathname 有效性见函数级 SAFETY 约定；c_str_to_string 内部
+    // 处理空指针并按 NUL 结尾读取。
+    let path_text = unsafe { super::util::c_str_to_string(pathname) };
+    SYSTEM_SLOT_TAKE_ALLOWED.with(|cell| cell.set(is_public_display_path_for_slot(&path_text)));
+    if runtime::should_resolve_caller_context(hub) {
+        update_caller_package_for_current_thread(hub);
+    }
+    SYSTEM_SLOT_TAKE_ALLOWED.with(|cell| cell.set(false));
+}
+
 /// 无调用方信号路径：优先复用最近的代写外部信号或当前调用方；两者都不适用时
 /// 采样记一条 skip 并清空当前调用方。本函数执行完毕后调用方必须直接返回。
+/// 系统 uid FUSE 请求的身份解析：pid 表（root 扫描 /proc 的权威快照）优先，
+/// /proc cmdline（包名形态 → native basename）兜底；解析出的身份必须能通过
+/// uid 校验（表内 uid / uid 缓存 / /proc status 任一）才可信。
+/// 返回 (包名, uid)。MP 域读 platform/shell 等进程的 /proc 常被 SELinux 拒绝，
+/// 此时 pid 表是唯一可信来源。
+fn resolve_system_fuse_identity(fuse_uid: i32, fuse_pid: i32) -> Option<(String, i32)> {
+    if let Some((table_pkg, table_uid)) = lookup_system_pid_table(fuse_pid)
+        && table_uid == fuse_uid
+    {
+        // pid 表记的是 /proc 命令行身份：Java 进程是包名，native 进程（`sh`、下载器
+        // helper）只是 basename。后者规则必然查不到，直接采信会把写入当成「未配置
+        // 应用」放行到真实存储——2026-11-06 真机：进程存活超过一个扫描周期后入表，
+        // 立即写入被重定向、存活 2s 再写却泄漏，差别就在这里。native 名交给 daemon
+        // 按 uid 唯一归属换算；多包 uid 仍保留表内原名，不猜。
+        if table_pkg.contains('.') {
+            return Some((table_pkg, table_uid));
+        }
+        let resolved = crate::daemon_identity_query::query_process_identity(fuse_pid, fuse_uid)
+            .map(|(package, _)| package)
+            .filter(|package| package.contains('.'))
+            .unwrap_or(table_pkg);
+        return Some((resolved, table_uid));
+    }
+    // 表未命中：区分「表里根本没有该 pid」（daemon 扫描空窗）与「uid 不匹配」
+    //（身份错误），10 秒限频记录一次供运维判断竞态边界。
+    let table_seen = lookup_system_pid_table(fuse_pid).is_some();
+    let mut pkg = resolve_caller_package_by_pid(fuse_pid);
+    if pkg.is_empty() {
+        pkg = resolve_native_identity_by_pid(fuse_pid);
+    }
+    // 本地 /proc 读不到（MP 域读 platform 应用的 cmdline 被 SELinux 拒绝）时同步问
+    // daemon：它是 root，读得到；而且这条证据与记录侧用的是同一份内核请求头 pid，
+    // 因此决策与事后取证不会各说一套。**这不是按规则反推源头**——答案来自 /proc。
+    let needs_remote_lookup = pkg.is_empty() || !pkg.contains('.');
+    if needs_remote_lookup
+        && let Some((remote_pkg, _)) =
+            crate::daemon_identity_query::query_process_identity(fuse_pid, fuse_uid)
+    {
+        // daemon 侧还会按 packages.list 把「native 名 + 唯一 uid」收敛成包名；多包 uid
+        // 不猜，仍回 native 名。包名形态才覆盖本地结果，否则保留本地证据。
+        if pkg.is_empty() || remote_pkg.contains('.') {
+            pkg = remote_pkg;
+        }
+    }
+    if pkg.is_empty() {
+        static LAST_STAGE_LOG_MS: AtomicI64 = AtomicI64::new(-1);
+        let now_ms = crate::platform::paths::monotonic_ms();
+        let last_log_ms = LAST_STAGE_LOG_MS.load(Ordering::Relaxed);
+        if last_log_ms < 0 || now_ms.saturating_sub(last_log_ms) >= SYSTEM_MISS_LOG_INTERVAL_MS {
+            LAST_STAGE_LOG_MS.store(now_ms, Ordering::Relaxed);
+            log::warn!(
+                "fuse system resolve failed pid={} uid={} table_seen={} table_hint={:?}",
+                fuse_pid,
+                fuse_uid,
+                table_seen,
+                lookup_system_pid_table(fuse_pid)
+            );
+        }
+        return None;
+    }
+    let pkg_uid = policy::get_uid_for_package(&pkg);
+    let uid_matches = if pkg_uid >= 0 {
+        pkg_uid == fuse_uid
+    } else {
+        read_uid_from_proc_status(fuse_pid) == fuse_uid
+    };
+    if uid_matches {
+        return Some((pkg, fuse_uid));
+    }
+    static LAST_STAGE_LOG_MS: AtomicI64 = AtomicI64::new(-1);
+    let now_ms = crate::platform::paths::monotonic_ms();
+    let last_log_ms = LAST_STAGE_LOG_MS.load(Ordering::Relaxed);
+    if last_log_ms < 0 || now_ms.saturating_sub(last_log_ms) >= SYSTEM_MISS_LOG_INTERVAL_MS {
+        LAST_STAGE_LOG_MS.store(now_ms, Ordering::Relaxed);
+        log::warn!(
+            "fuse system resolve failed pid={} uid={} table_seen={} pkg={} pkg_uid={}",
+            fuse_pid,
+            fuse_uid,
+            table_seen,
+            pkg,
+            pkg_uid
+        );
+    }
+    None
+}
+
 fn resolve_missing_caller_signal(
     hub: &InterceptHub,
     previous_package: &str,
@@ -245,7 +433,44 @@ fn resolve_missing_caller_signal(
     previous_age_ms: i64,
     previous_from_external_signal: bool,
     can_reuse_recent_caller: bool,
+    system_slot_take_allowed: bool,
 ) {
+    // 系统 uid FUSE 请求的跨线程接力：MediaProvider 读 /dev/fuse 的线程与处理
+    // 请求的线程分离时，读线程捕获的请求头经全局槽传到这里（见 context.rs）。
+    // 内核请求头的 pid 是强信号，优先于 recent 复用；cmdline 为包名形态且与
+    // 请求 uid 匹配才采信，否则槽内容作废继续走既有回退。
+    // 取槽资格由调用方（写形态 hook）标记：公共路径的写形态操作才允许消费，
+    // 读操作与私有路径写直接跳过（见 SYSTEM_SLOT_TAKE_ALLOWED 注释）。
+    if system_slot_take_allowed
+        && let Some((request_uid, request_pid)) =
+            context::take_recent_system_fuse_request(SYSTEM_FUSE_SLOT_MAX_AGE_MS)
+        && request_pid > 0
+    {
+        // 即使随后解析失败，pid 本身仍是这次请求的权威证据：写进记录后由
+        // daemon（root）反查，MP 域读不到的 /proc 才不会白丢。
+        context::set_monitor_caller_pid(request_pid);
+        // 跨线程接力的权威解析走 pid 表（root daemon 落盘的快照）：MP 域对
+        // shell/platform 等进程的 /proc cmdline/status 直读常被 SELinux 拒绝，
+        // 只靠 /proc 会让槽内容在跨线程场景全部作废（2026-10-24 真机：同线程
+        // 路径归因成功日志在，跨线程的监视记录仍 unknown 的根因）。
+        // resolve_system_fuse_identity 内部为「pid 表优先 + /proc 兜底 + uid
+        // 校验」，是原 /proc 直读分支的严格超集，miss 时保留 10 秒限频诊断。
+        if let Some((pkg, resolved_uid)) = resolve_system_fuse_identity(request_uid, request_pid) {
+            context::set_current_caller_from_external_signal(&pkg, resolved_uid);
+            AuditTrail::instance().update_caller_package(&pkg);
+            let count = CALLER_FALLBACK_HIT_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
+            if should_log_sample(count) {
+                log::debug!(
+                    "caller fallback src=fuse_slot_system pkg={} uid={} pid={} n={}",
+                    pkg,
+                    resolved_uid,
+                    request_pid,
+                    count
+                );
+            }
+            return;
+        }
+    }
     if try_reuse_recent_external_signal_for_system_writer(
         hub,
         previous_package,
@@ -293,6 +518,16 @@ fn resolve_caller_uid_with_fuse_fallback(hub: &InterceptHub) -> Option<CallerUid
     if caller_uid < 0 {
         fuse_uid = hub.get_fuse_caller_uid();
         fuse_age_ms = context::get_fuse_caller_uid_age_ms();
+        // FUSE 头的 tid 是「哪个进程发起了这次请求」的最精确证据，比 uid 反查
+        // 可靠得多（同一 uid 可能对应多个包，uid 段还可能被 RRO 资源包占位）。
+        // 解析结束时 fuse 槽会被清空，所以另存一份给监视记录用；具体反查交给
+        // daemon（root）：MP 域读不到 root / 特权 helper 的 /proc cmdline。
+        if fuse_uid >= 0 && (0..=FUSE_CALLER_MAX_AGE_MS).contains(&fuse_age_ms) {
+            let header_pid = context::get_fuse_caller_pid();
+            if header_pid > 0 {
+                context::set_monitor_caller_pid(header_pid);
+            }
+        }
         // SAFETY: getuid 只返回调用进程的真实 UID，无指针参数与副作用。
         let self_uid = unsafe { getuid() } as i32;
         if fuse_uid >= ANDROID_APP_UID_START && (0..=FUSE_CALLER_MAX_AGE_MS).contains(&fuse_age_ms)
@@ -324,6 +559,59 @@ fn resolve_caller_uid_with_fuse_fallback(hub: &InterceptHub) -> Option<CallerUid
                         return None;
                     }
                 }
+            }
+        } else if fuse_uid >= 0 && (0..=FUSE_CALLER_MAX_AGE_MS).contains(&fuse_age_ms) {
+            // 系统 uid（如 system 1000）的 FUSE 请求：uid 区间解析不出包名，
+            // 但内核请求头的 pid 就是发起进程。cmdline 为包名形态且与请求
+            // uid 匹配时按发起进程归因（2026-10-24 真机：开机创建
+            // MIUI/Mirror/MainCache 的系统服务此前只能记录 unknown）。
+            let fuse_pid = context::get_fuse_caller_pid();
+            // SAFETY: getpid 只返回调用进程的 PID，无指针参数与副作用。
+            let self_pid = unsafe { getpid() } as i32;
+            if fuse_pid > 0 && fuse_pid != self_pid {
+                if let Some((pkg, resolved_uid)) = resolve_system_fuse_identity(fuse_uid, fuse_pid)
+                {
+                    context::set_current_caller_from_external_signal(&pkg, resolved_uid);
+                    AuditTrail::instance().update_caller_package(&pkg);
+                    let count = CALLER_FALLBACK_HIT_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
+                    if should_log_sample(count) {
+                        log::debug!(
+                            "caller fallback src=fuse_pid_system pkg={} uid={} fuse_pid={} n={}",
+                            pkg,
+                            resolved_uid,
+                            fuse_pid,
+                            count
+                        );
+                    }
+                    context::clear_fuse_caller_uid();
+                    return None;
+                }
+                // 运维诊断：系统 uid 请求未归因时按 10 秒限频记录发起任务 id 与
+                // 解析现场。短命进程/线程在 pid 表快照间隙消亡属已知边界；持久
+                // 服务若持续命中此日志则需要排查 daemon pid 表链路。
+                static LAST_MISS_LOG_MS: AtomicI64 = AtomicI64::new(-1);
+                let now_ms = crate::platform::paths::monotonic_ms();
+                let last_log_ms = LAST_MISS_LOG_MS.load(Ordering::Relaxed);
+                if last_log_ms < 0
+                    || now_ms.saturating_sub(last_log_ms) >= SYSTEM_MISS_LOG_INTERVAL_MS
+                {
+                    LAST_MISS_LOG_MS.store(now_ms, Ordering::Relaxed);
+                    log::warn!(
+                        "fuse system pid miss pid={} uid={} proc_pkg={} proc_uid={} table_hint={:?} fuse_age={}",
+                        fuse_pid,
+                        fuse_uid,
+                        resolve_caller_package_by_pid(fuse_pid),
+                        read_uid_from_proc_status(fuse_pid),
+                        lookup_system_pid_table(fuse_pid),
+                        fuse_age_ms
+                    );
+                }
+                // pid 表未命中时回退到裸 uid：内核 FUSE 头的 uid 由内核按请求方
+                // fsuid 填写，仍是权威请求方（2026-10-30 A17 实测：shell 写入此前
+                // 被归因为 MediaProvider 自身 10218）；优于 resolve 调用方随后的
+                // fsuid 兜底。
+                caller_uid = fuse_uid;
+                caller_source = "fuse_uid_system_fallback";
             }
         } else if fuse_uid >= ANDROID_APP_UID_START && fuse_age_ms > FUSE_CALLER_MAX_AGE_MS {
             let count = CALLER_FUSE_STALE_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
@@ -514,7 +802,52 @@ fn resolve_caller_pid_by_binder() -> i32 {
 }
 
 // 通过 /proc/PID/cmdline 取包名
+//
+// 先按原有语义取 argv[0]（包名形态时直接返回）；argv[0] 不是包名时（root helper
+// 常见形态 `mtio daemon @bin.mt.plus-2967573 0`），再扫描完整 argv 里的包名形态
+// token。真实发起者由内核 FUSE 头的 pid 指定，pid 对应的命令行是比 uid 更精确的
+// 证据：同一个 root helper 可能以任意 uid 运行（真机：MT 管理器 helper 以
+// fsuid=10000 写入，而 uid 10000 被某个 RRO 资源包占用，只按 uid 反查必然归错）。
 fn resolve_caller_package_by_pid(pid: i32) -> String {
+    if pid <= 0 {
+        return String::new();
+    }
+
+    let path = format!("/proc/{}/cmdline", pid);
+    // hook 侧只能用裸系统调用读文件：本进程装着 PLT hook，std::fs 会走被拦截的
+    // open/read，既可能递归也会污染监视记录（见 read_file_by_syscall 注释）。
+    let raw = read_file_by_syscall(&path, 4096);
+    if raw.is_empty() {
+        return String::new();
+    }
+
+    // 包名解析与 daemon 侧共用同一实现：优先 uid 表命中，其次 `@<pkg>-<ver>`
+    // 形态，子进程名会截断到父包（HyperOS 的 `pkg.remote`）。
+    if let Some(package) = crate::platform::proc_identity::parse_package_from_cmdline(&raw) {
+        return package;
+    }
+
+    // 兜底保持包名语义：argv0 是包名（Java 进程）才返回；native 二进制（`sh`、
+    // 下载器 helper、`/data/local/tmp/xxx`）没有包名，这里返回空，交由调用方按 pid
+    // 继续解析。此前把 basename 当包名返回，规则必然查不到，写入就被当成「未配置
+    // 应用」放行到真实存储（2026-11-05 真机 issue #2 的泄漏路径之一）。
+    let mut head = raw.split('\0').next().unwrap_or("").to_string();
+    if let Some(pos) = head.find(':') {
+        head.truncate(pos);
+    }
+    let head = normalize_caller_package_text(&head);
+    if head.contains('.') {
+        head
+    } else {
+        String::new()
+    }
+}
+
+/// native 二进制进程的身份提取：argv0 带路径时取 basename（如 adb shell 派生
+/// 的 /system/bin/sh → "sh"）。仅供系统 uid 分支使用——共享的
+/// resolve_caller_package_by_pid 保持包名语义不变，native 二进制没有包名，
+/// basename 是 pid 归因能给出的最诚实身份。
+fn resolve_native_identity_by_pid(pid: i32) -> String {
     if pid <= 0 {
         return String::new();
     }
@@ -527,6 +860,10 @@ fn resolve_caller_package_by_pid(pid: i32) -> String {
 
     if let Some(pos) = cmdline.find('\0') {
         cmdline.truncate(pos);
+    }
+
+    if let Some(pos) = cmdline.rfind('/') {
+        cmdline.drain(..=pos);
     }
 
     if let Some(pos) = cmdline.find(':') {
@@ -559,7 +896,8 @@ fn resolve_caller_package_by_uid(caller_uid: i32, hub: &InterceptHub) -> String 
         if package.is_empty() || package == self_package {
             continue;
         }
-        if policy::is_system_writer_package(&package) {
+        if policy::is_system_writer_package(&package) || policy::is_overlay_or_rro_package(&package)
+        {
             continue;
         }
         candidates.push(package);
@@ -748,7 +1086,7 @@ fn read_file_by_syscall(path: &str, max_len: usize) -> String {
         return String::new();
     }
 
-    let mut buffer = vec![0u8; max_len.min(16 * 1024)];
+    let mut buffer = vec![0u8; max_len.min(512 * 1024)];
     let mut total = 0usize;
     while total < buffer.len() {
         let n = unsafe {
@@ -863,6 +1201,82 @@ fn c_str(value: &str) -> Option<CString> {
     CString::new(value).ok()
 }
 
+/// daemon 落盘的系统进程 pid 表（tmp/system_pids，"pid uid 包名" 行）读取缓存。
+///
+/// 表由 root daemon 事件化重建（进程/线程集合变化即刷）；本缓存在 TTL 内复用，
+/// 避免高频归因反复读文件。新进程/新线程的首次存储操作可能撞上缓存窗口，
+/// 因此 miss 且缓存已具备重读条件时强制重读一次。
+struct SystemPidTable {
+    loaded_at_ms: i64,
+    entries: std::collections::HashMap<i32, (String, i32)>,
+}
+
+static SYSTEM_PID_TABLE: OnceLock<Mutex<SystemPidTable>> = OnceLock::new();
+const SYSTEM_PID_TABLE_TTL_MS: i64 = 2_000;
+/// miss 强制重读的最小缓存年龄：低于它时新表大概率也尚未落盘，直接放弃；
+/// 高于它时表文件很可能已被 daemon 刷新，重读一次能接住刚启动进程的首次写入。
+const SYSTEM_PID_TABLE_RECHECK_MIN_AGE_MS: i64 = 300;
+
+/// 按任务 id 反查 (包名, uid)：先查缓存，过期后从模块目录经 Zygisk 保留 FD
+/// 读取 daemon 写入的表并重建缓存；未命中且缓存已老于重读门槛时再强制刷新
+/// 一次。表缺失或不可读返回 None。
+pub(crate) fn lookup_system_pid_table(pid: i32) -> Option<(String, i32)> {
+    let table_mutex = SYSTEM_PID_TABLE.get_or_init(|| {
+        Mutex::new(SystemPidTable {
+            loaded_at_ms: -1,
+            entries: std::collections::HashMap::new(),
+        })
+    });
+    let mut table = table_mutex.lock().unwrap_or_else(|err| err.into_inner());
+    let now_ms = get_monotonic_ms();
+    let mut force_reload = table.loaded_at_ms < 0
+        || now_ms.saturating_sub(table.loaded_at_ms) >= SYSTEM_PID_TABLE_TTL_MS;
+    if let Some(entry) = table.entries.get(&pid) {
+        return Some(entry.clone());
+    }
+    // miss：缓存窗口可能盖住了 daemon 刚刷新的新表，年龄达标就强制重读一次。
+    if !force_reload
+        && now_ms.saturating_sub(table.loaded_at_ms) >= SYSTEM_PID_TABLE_RECHECK_MIN_AGE_MS
+    {
+        force_reload = true;
+    }
+    if force_reload {
+        table.entries.clear();
+        table.loaded_at_ms = now_ms;
+        let content = read_system_pid_table_file();
+        for line in content.lines() {
+            let mut fields = line.split_whitespace();
+            let Some(entry_pid) = fields.next().and_then(|v| v.parse::<i32>().ok()) else {
+                continue;
+            };
+            let Some(uid) = fields.next().and_then(|v| v.parse::<i32>().ok()) else {
+                continue;
+            };
+            let Some(package) = fields.next() else {
+                continue;
+            };
+            table.entries.insert(entry_pid, (package.to_string(), uid));
+        }
+        if let Some(entry) = table.entries.get(&pid) {
+            return Some(entry.clone());
+        }
+    }
+    None
+}
+
+fn get_monotonic_ms() -> i64 {
+    crate::platform::paths::monotonic_ms()
+}
+
+/// 读系统进程 pid 表：hook 进程内经 Zygisk 保留 FD（/proc/self/fd/<fd>/tmp/...）
+/// 读取；直接模块路径仅 root 可见，普通 hook 进程不可达时返回空。
+fn read_system_pid_table_file() -> String {
+    let config_dir = SettingsHub::instance().config_dir();
+    let module_dir = config_dir.strip_suffix("/config").unwrap_or(&config_dir);
+    let table_path = format!("{module_dir}/tmp/system_pids");
+    read_file_by_syscall(&table_path, 512 * 1024)
+}
+
 // clearCallingIdentity 之前提前快照 UID，供后续 restore 区间回查
 pub fn capture_binder_caller_uid_if_available() {
     let uid = resolve_caller_uid_by_binder();
@@ -886,6 +1300,20 @@ pub fn capture_binder_caller_uid_if_available() {
 }
 
 pub fn capture_java_binder_caller(caller_uid: i32, caller_pid: i32) {
+    if caller_uid < 0 {
+        return;
+    }
+    // 系统 uid（< 应用起始值）的 binder 调用方此前被整体丢弃：ColorOS/HyperOS 上大量
+    // 系统应用与共享组跑在 uid 1000/1001，它们在 MediaProvider 入口因此一条证据都留不下，
+    // 记录里只剩 MP 自己的 uid。这里只写「监视记录专用」槽（uid + pid），不进
+    // CALLER_UID / saved caller 的应用分支，重定向决策语义不变。
+    context::set_monitor_caller_uid(caller_uid);
+    if caller_pid > 0 {
+        context::set_monitor_caller_pid(caller_pid);
+    }
+    // 同一份证据再存一份进程级副本：MediaProvider 的 binder 线程与 FuseDaemon 的
+    // 处理线程不同，thread_local 到不了 FUSE 记录（见 context::remember_cross_thread_caller）。
+    context::remember_cross_thread_caller(caller_uid, caller_pid);
     if caller_uid < ANDROID_APP_UID_START {
         return;
     }
@@ -898,6 +1326,15 @@ pub fn capture_java_binder_caller(caller_uid: i32, caller_pid: i32) {
 
 pub fn enter_java_caller_scope(caller_uid: i32, caller_pid: i32) {
     if caller_uid < ANDROID_APP_UID_START {
+        // 作用域仍按「无调用方」入栈（CALLER_UID 参与决策，不能塞系统 uid），
+        // 但把 uid/pid 交给监视记录槽，记录才能写出真实请求方。
+        if caller_uid >= 0 {
+            context::set_monitor_caller_uid(caller_uid);
+        }
+        if caller_pid > 0 {
+            context::set_monitor_caller_pid(caller_pid);
+        }
+        context::remember_cross_thread_caller(caller_uid, caller_pid);
         context::push_current_caller_scope("", -1);
         return;
     }
@@ -921,6 +1358,25 @@ pub fn exit_java_caller_scope() {
 fn resolve_java_caller_package(caller_uid: i32, caller_pid: i32) -> Option<String> {
     let hub = InterceptHub::instance();
     if caller_pid > 0 {
+        // 系统 uid 优先查 daemon 落盘的 pid 表：表由 root 读取并原子替换，MP 域读不到
+        // root/系统应用进程的 /proc 时，这是唯一还能拿到身份的来源。表内 uid 必须与
+        // binder 给的 uid 一致，避免 pid 复用导致张冠李戴。
+        if caller_uid < ANDROID_APP_UID_START
+            && let Some((package, uid)) = lookup_system_pid_table(caller_pid)
+            && uid == caller_uid
+            && !package.is_empty()
+        {
+            // 表内 native 名（`sh` 之类）不是包名，规则查不到；交给 daemon 按 uid 唯一
+            // 归属换算，多包 uid 保留原名（与 FUSE 请求头那条路径同一口径）。
+            if package.contains('.') {
+                return Some(package);
+            }
+            let resolved = crate::daemon_identity_query::query_process_identity(caller_pid, uid)
+                .map(|(remote, _)| remote)
+                .filter(|remote| remote.contains('.'))
+                .unwrap_or(package);
+            return Some(resolved);
+        }
         let package_name = resolve_caller_package_by_pid(caller_pid);
         if !package_name.is_empty()
             && (is_package_uid_match(&package_name, caller_uid, hub)

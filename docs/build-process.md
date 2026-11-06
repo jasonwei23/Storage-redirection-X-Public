@@ -14,7 +14,7 @@ cargo build --target aarch64-linux-android --release
 
 产物位于 `target/aarch64-linux-android/release/libsrx_core.so`。
 
-模块二进制不再区分 debug/release 两套日志能力。`FileMonitorOp`、native 详细日志和概览页轻量运行时生效计数通过 `srx_daemon` 私有 datagram 通道落盘，避免默认常驻 `logcat` 以及普通日志反复经过 Android `logd`。运行时生效计数始终启用；需要普通 Rust/Java 调试日志和诊断快照时，在设置页“模块设置”中打开“详细日志”，详细模式仅保留 Java/崩溃上下文所需的一条合并 `logcat` 管道。
+模块二进制不再区分 debug/release 两套日志能力。`FileMonitorOp`、native 详细日志和概览页轻量运行时生效计数通过 `srx_daemon` 私有 datagram 通道落盘，避免默认常驻 `logcat` 以及普通日志反复经过 Android `logd`。运行时生效计数始终启用；需要普通 Rust/Java 调试日志和诊断快照时，在管理 App 或模块 WebUI 的设置页“模块设置”中打开“详细日志”，详细模式仅保留 Java/崩溃上下文所需的一条合并 `logcat` 管道。
 
 Windows PowerShell 设备侧测试建议固定设置 NDK 和 CMake：
 
@@ -73,7 +73,7 @@ Kotlin、R8 和 Lint 可能需要数分钟；缓存命中后通常会显著缩�
 .\gradlew.bat --no-daemon --console=plain --stacktrace :storageRedirectTestApp:testDebugUnitTest :storageRedirectTestMediaFileApi:testDebugUnitTest :storageRedirectTestApp:assembleDebug
 ```
 
-需要在本地预检或复现 GitHub Actions 失败时，可以运行完整测试流验证。默认会构建当前模块、刷入测试设备、重启设备、安装测试 APP 并执行当前清单中的 37 个设备侧场景（scenario 1-37）：
+需要在本地预检或复现 GitHub Actions 失败时，可以运行完整测试流验证。默认会构建当前模块、刷入测试设备、重启设备、安装测试 APP 并执行当前清单中的 40 个设备侧场景（scenario 1-40）。只验证个别场景时用 `SRT_SCENARIOS=29`（可逗号列举）收窄，CI 侧的窄场景触发方式与判据见 [设备侧测试说明](device-testing.md) 的「场景范围的触发条件」：
 
 ```bash
 bash scripts/verify-test-flow.sh
@@ -93,9 +93,20 @@ $env:SRX_TEST_MODULE_ABI = "x86_64"
 pwsh -NoProfile -ExecutionPolicy Bypass -File .\scripts\verify-test-flow.ps1
 ```
 
-调试测试 APP 构建问题时可以临时设置 `RUN_DEVICE_SCENARIOS=0`。公开仓库 PR、CI Build 和 Release workflow 会强制执行测试流门禁；CI/Release 会先构建一次 x86_64 测试模块 zip 和测试 APK，再以 Android 版本为矩阵维度（Android 13/14/15/16/17 x86_64 模拟器）各自运行完整 scenario 1-37，矩阵跨版本 fail-fast。Android 17（API 37.0）并入同一矩阵，不再单独成 job。CI 测试流默认启用 `SRT_FAIL_FAST=1` 和 300 秒单场景超时，并在临时模拟器中设置 `SRT_SKIP_FINAL_CLEANUP=1` 跳过最终清理；本地完整验证默认仍执行最终白名单清理，适合复用真机或模拟器。CI/Release 只有在测试流全部通过后才会继续发布资产、更新 `update.json` 或创建正式 Release。
+调试测试 APP 构建问题时可以临时设置 `RUN_DEVICE_SCENARIOS=0`。公开仓库 PR、CI Build 和 Release workflow 会强制执行测试流门禁；CI/Release 会先构建一次 x86_64 测试模块 zip 和测试 APK，再以 Android 版本为矩阵维度（Android 13/14/15/16/17 x86_64 模拟器）各自运行完整 scenario 1-40，矩阵跨版本 fail-fast。Android 17（API 37.0）并入同一矩阵，不再单独成 job。CI 测试流默认启用 `SRT_FAIL_FAST=1` 和 300 秒单场景超时，并在临时模拟器中设置 `SRT_SKIP_FINAL_CLEANUP=1` 跳过最终清理；本地完整验证默认仍执行最终白名单清理，适合复用真机或模拟器。CI/Release 只有在测试流全部通过后才会继续发布资产、更新 `update.json` 或创建正式 Release。
+
+CI 预发布使用 `ci-build-<run_id>` 作为 Release 标签，**不掺 `run_attempt`**：任务级重跑（`gh run rerun --failed`）会让 `run_attempt` 递增，而创建草稿 Release 的 `init-ci-release` 首轮已经成功、重跑时不再执行，标签一旦带 attempt，重跑后的发布步骤就按新标签查不到草稿并直接失败（实测报 `release not found`）。草稿 Release 是模块 zip 与管理 APK 的唯一副本，因此**本轮草稿永不删除**——测试流偶发失败时优先重跑失败任务续接发布，不必重跑整轮。
+
+其余草稿由 `.github/scripts/prune_ci_drafts.py` 逐条判定。同一个版本号可能同时存在多份失败草稿（连续几轮都失败时序号不推进），所以判定按 Release 逐条进行，不按版本号去重：
+
+- 版本严格低于本轮、且创建时间早于本轮的草稿：本轮已在同一基础版本里构建更大的序号，旧那一轮的代码已被取代，直接删除；
+- 本轮发布成功时，同版本号的旧草稿一并删除，不留下同版本号不同内容的副本；
+- 本轮没发布成功时，其余草稿保留 24 小时续发窗口（单轮 CI 上限 2 小时），超过窗口仍未被任何一轮接走的视为废弃；
+- 创建时间晚于本轮的草稿可能是并行轮次正在使用，一律保留；版本号解析不出来时只按 24 小时窗口处理，宁可多留一天也不误删。
 
 ### 版本号规则
+
+版本号采用语义化版本 `主版本.次版本.修订号`（MAJOR.MINOR.PATCH）：缺陷修复递增修订号，新增功能或较大优化递增次版本，不兼容变更或核心架构重写递增主版本；纯文档、CI 与测试流变更不递增版本号。本项目自 `v2.0.0` 起使用独立版本线，与上游项目的版本号相互独立。次版本或修订号达到 99 时必须进位到更高一位（见下方 `versionCode` 布局）。
 
 `Cargo.toml` 中的 `[package].version` 是当前目标基础版本。提交前需要进入下一轮测试时，先手动修改 `Cargo.toml` 版本并提交；CI 不再自动把补丁号加 1。
 
@@ -111,15 +122,15 @@ CI 和本地测试构建默认生成预发布版本：
 
 本地脚本按同一规则解析：工作区干净时说明当前提交对应的构建已经产出，直接复用记录中的最高序号，`-SkipBuild` 复用现有产物也不会推进版本；存在未提交改动时才算作下一次构建，避免本地测试包与最后一次 CI 包版本号冲突。
 
-CI 版本名中的 `N` 不设上限，可以连续生成 `1.2.58-ci.100`、`1.2.58-ci.101` 等版本。Android `versionCode` 规则仍确保正式版可覆盖安装：正式版使用 `major * 1000000 + minor * 10000 + patch * 100`；`ci.1` 到 `ci.99` 使用 `baseCode - 100 + N`；`ci.100` 及以后固定使用 `baseCode - 1`。因此超过 99 后版本先后由完整的 SemVer 版本名判断，正式版 `versionCode` 始终高于同一基础版本的 CI 包。
+CI 版本名中的 `N` 不设上限，可以连续生成 `2.0.0-ci.100`、`2.0.0-ci.101` 等版本。Android `versionCode` 规则仍确保正式版可覆盖安装：正式版使用 `major * 1000000 + minor * 10000 + patch * 100`；`ci.1` 到 `ci.99` 使用 `baseCode - 100 + N`；`ci.100` 及以后固定使用 `baseCode - 1`。因此超过 99 后版本先后由完整的 SemVer 版本名判断，正式版 `versionCode` 始终高于同一基础版本的 CI 包。
 
-正式 Release 仍使用纯基础版本，例如 `1.2.57`，tag 必须是 `v1.2.57`。如需查看当前仓库会解析出的版本，可运行：
+正式 Release 仍使用纯基础版本，例如 `2.0.0`，tag 必须是 `v2.0.0`。如需查看当前仓库会解析出的版本，可运行：
 
 ```powershell
 py .github\scripts\resolve_build_version.py --include-dirty --format json
 ```
 
-从 CI 转正式版时保持同一目标基础版本：例如 `Cargo.toml` 为 `1.2.58` 时，CI 产出 `1.2.58-ci.N`，正式发布仍使用 `1.2.58` 和 tag `v1.2.58`，不额外增加补丁号。正式版发布完成后，如果继续触发普通 CI，才把 `Cargo.toml` 提升到下一个目标版本，例如改为 `1.2.59` 并从 `1.2.59-ci.1` 开始。`.github/scripts/validate_ci_transition.py` 会在 CI `prepare` 和本地公开同步前检查这一转换；跳过 CI 的提交不执行检查。
+从 CI 转正式版时保持同一目标基础版本：例如 `Cargo.toml` 为 `2.0.0` 时，CI 产出 `2.0.0-ci.N`，正式发布仍使用 `2.0.0` 和 tag `v2.0.0`，不额外增加补丁号。正式版发布完成后，如果继续触发普通 CI，才把 `Cargo.toml` 提升到下一个目标版本（按语义化版本判据递增对应位），例如改为 `2.0.1` 并从 `2.0.1-ci.1` 开始。`.github/scripts/validate_ci_transition.py` 会在 CI `prepare` 和本地公开同步前检查这一转换；跳过 CI 的提交不执行检查。
 
 ### 更新清单
 
@@ -151,12 +162,13 @@ CI 构建成功后会把测试版信息写入 `beta`；正式 Release 成功后�
   "schema": 1,
   "repository": "owner/repo",
   "stable": {
-    "version": "1.2.57",
-    "tag": "v1.2.57",
-    "title": "Storage Redirect X v1.2.57",
-    "url": "https://github.com/owner/repo/releases/tag/v1.2.57",
+    "version": "2.0.0",
+    "tag": "v2.0.0",
+    // quality-allow(chinese-language): Storage Redirect X 是产品名，示例保留真实发布标题格式。
+    "title": "Storage Redirect X v2.0.0",
+    "url": "https://github.com/owner/repo/releases/tag/v2.0.0",
     "prerelease": false,
-    "downloadUrl": "https://github.com/owner/repo/releases/download/v1.2.57/storage-redirect-x-manager-v1.2.57.apk"
+    "downloadUrl": "https://github.com/owner/repo/releases/download/v2.0.0/storage-redirect-x-manager-v2.0.0.apk"
   },
   "beta": null,
   "releases": []
@@ -183,6 +195,17 @@ CI 构建成功后会把测试版信息写入 `beta`；正式 Release 成功后�
    ```
 
 如果 Hooker.dex 编译失败，Android release 构建会直接失败，避免产出缺少 Java hook 的模块。仅在 host/debug 开发场景，或显式设置 `SRX_ALLOW_EMPTY_HOOKER_DEX=1` 时，构建脚本才会写入空文件并输出 warning；此类产物不应用于日常刷入或发布。
+
+### 关闭路径元数据修复的编译开关（`srx_no_path_metadata_repair`）
+
+仓库支持用 `RUSTFLAGS="--cfg srx_no_path_metadata_repair"`（或等价 `[build] rustflags`）编出
+「不做任何路径元数据修复」的调试构建，用于二分定位「属主/权限修复引发的问题」。
+
+该开关关闭的是**全部**元数据修复，其中包含 `Android/{data,media,obb}/<pkg>` 创建时对齐系统视图
+创建口径（`(mode & ~0777) | 0664` / `| 0775`）这一步：关掉之后 app-private 新建条目会退回
+`mode & !umask` 的语义，应用 umask 077 会把 `-wal`/`-shm` 落成 owner-only `0600`——这正是
+「MediaProvider 打不开自己边车」的原始成因。**该构建只用于诊断，不要用于发布**；若必须在真机
+长期使用，请同时在日志里确认没有出现 `SQLITE_CANTOPEN`。
 
 ## Windows 注意事项
 

@@ -174,7 +174,7 @@ internal fun SettingsScreen(
         )
         CompactSwitchRow(
             title = "Fuse Fixer",
-            summary = "SRX 内置 Fuse Fixer 兼容保护，处理特殊 Unicode 字符",
+            summary = "SRX 内置 Fuse Fixer 兼容保护，修正 MediaProvider 的 FUSE 可访问性判定与 passthrough 行为",
             checked = global.fuseFixEnabled,
             onCheckedChange = { onGlobal(global.copy(fuseFixEnabled = it)) },
         )

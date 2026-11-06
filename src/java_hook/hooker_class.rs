@@ -4,8 +4,8 @@ use super::lsplant;
 use crate::hook::{
     resolve_download_media_placeholder_path_for_caller, resolve_open_storage_path_for_caller,
     rewrite_cursor_storage_path_for_caller, rewrite_media_store_bucket_id_for_caller,
-    rewrite_media_store_storage_path_for_caller, should_allow_public_mapping_target_access,
-    should_hide_cursor_storage_path_for_caller,
+    rewrite_media_store_storage_path_for_caller, should_allow_own_android_private_path_access,
+    should_allow_public_mapping_target_access, should_hide_cursor_storage_path_for_caller,
 };
 use crate::zygisk::jni::{
     call_object_method_a, call_static_object_method_a, delete_local_ref, get_method_id,
@@ -15,7 +15,7 @@ use jni_sys::{
     _jobject, JNIEnv, JNINativeMethod, jboolean, jclass, jobject, jobjectArray, jstring, jvalue,
 };
 use std::ffi::c_void;
-use std::sync::atomic::{AtomicBool, AtomicPtr, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU64, Ordering};
 
 static HOOKER_CLASS_GLOBAL: AtomicPtr<_jobject> = AtomicPtr::new(std::ptr::null_mut());
 static LSPLANT_INITIALIZED: AtomicBool = AtomicBool::new(false);
@@ -40,6 +40,10 @@ const RESOLVE_OPEN_PATH_NAME: &[u8] = b"resolveOpenPath\0";
 const RESOLVE_OPEN_PATH_SIG: &[u8] = b"(Ljava/lang/String;I)Ljava/lang/String;\0";
 const STORAGE_PATH_EXISTS_NAME: &[u8] = b"storagePathExistsBySyscall\0";
 const STORAGE_PATH_EXISTS_SIG: &[u8] = b"(Ljava/lang/String;)Z\0";
+const CURSOR_ROW_ACTION_NAME: &[u8] = b"cursorRowAction\0";
+const CURSOR_ROW_ACTION_SIG: &[u8] = b"(Ljava/lang/String;IZ)Ljava/lang/String;\0";
+const CURSOR_ROW_PATH_EXISTS_NAME: &[u8] = b"pathExistsForCursorRow\0";
+const CURSOR_ROW_PATH_EXISTS_SIG: &[u8] = b"(Ljava/lang/String;)Z\0";
 const PROVIDER_VIRTUAL_PATH_VISIBLE_NAME: &[u8] = b"isProviderVirtualPathVisible\0";
 const PROVIDER_VIRTUAL_PATH_VISIBLE_SIG: &[u8] = b"(Ljava/lang/String;)Z\0";
 const REMEMBER_PROVIDER_REDIRECT_SOURCE_NAME: &[u8] = b"rememberProviderRedirectSourceDirectory\0";
@@ -54,9 +58,9 @@ const REWRITE_BUCKET_ID_SIG: &[u8] = b"(Ljava/lang/String;I)Ljava/lang/String;\0
 const RECORD_QUERY_ACCESS_PATH_NAME: &[u8] = b"recordQueryAccessPath\0";
 const RECORD_QUERY_ACCESS_PATH_SIG: &[u8] = b"(Ljava/lang/String;I)V\0";
 const RECORD_PROVIDER_OPEN_PATH_NAME: &[u8] = b"recordProviderOpenPath\0";
-const RECORD_PROVIDER_OPEN_PATH_SIG: &[u8] = b"(Ljava/lang/String;ILjava/lang/String;)V\0";
+const RECORD_PROVIDER_OPEN_PATH_SIG: &[u8] = b"(Ljava/lang/String;IILjava/lang/String;)V\0";
 const RECORD_PROVIDER_DIRECTORY_PATH_NAME: &[u8] = b"recordProviderDirectoryPath\0";
-const RECORD_PROVIDER_DIRECTORY_PATH_SIG: &[u8] = b"(Ljava/lang/String;ILjava/lang/String;)V\0";
+const RECORD_PROVIDER_DIRECTORY_PATH_SIG: &[u8] = b"(Ljava/lang/String;IILjava/lang/String;)V\0";
 const RECORD_PROVIDER_OPEN_SUCCESS_NAME: &[u8] = b"recordProviderOpenSuccess\0";
 const RECORD_PROVIDER_OPEN_SUCCESS_SIG: &[u8] =
     b"(Ljava/lang/String;ILjava/lang/String;Ljava/lang/String;I)V\0";
@@ -65,6 +69,8 @@ const RECORD_READ_ONLY_FUSE_OPERATION_SIG: &[u8] =
     b"(ILjava/lang/String;Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;II)Z\0";
 const ALLOW_PUBLIC_MAPPING_TARGET_NAME: &[u8] = b"allowsPublicMappingTarget\0";
 const ALLOW_PUBLIC_MAPPING_TARGET_SIG: &[u8] = b"(Ljava/lang/String;I)Z\0";
+const ALLOW_OWN_ANDROID_PRIVATE_PATH_NAME: &[u8] = b"allowsOwnAndroidPrivatePath\0";
+const ALLOW_OWN_ANDROID_PRIVATE_PATH_SIG: &[u8] = b"(Ljava/lang/String;I)Z\0";
 const CAPTURE_BINDER_CALLER_NAME: &[u8] = b"captureBinderCaller\0";
 const CAPTURE_BINDER_CALLER_SIG: &[u8] = b"(II)V\0";
 const ENTER_CALLER_SCOPE_NAME: &[u8] = b"enterCallerScope\0";
@@ -133,6 +139,16 @@ pub fn init(env: *mut JNIEnv, hooker_class: jclass) -> bool {
             fnPtr: storage_path_exists as *mut _,
         },
         JNINativeMethod {
+            name: CURSOR_ROW_PATH_EXISTS_NAME.as_ptr() as *mut _,
+            signature: CURSOR_ROW_PATH_EXISTS_SIG.as_ptr() as *mut _,
+            fnPtr: cursor_row_path_exists as *mut _,
+        },
+        JNINativeMethod {
+            name: CURSOR_ROW_ACTION_NAME.as_ptr() as *mut _,
+            signature: CURSOR_ROW_ACTION_SIG.as_ptr() as *mut _,
+            fnPtr: cursor_row_action as *mut _,
+        },
+        JNINativeMethod {
             name: PROVIDER_VIRTUAL_PATH_VISIBLE_NAME.as_ptr() as *mut _,
             signature: PROVIDER_VIRTUAL_PATH_VISIBLE_SIG.as_ptr() as *mut _,
             fnPtr: is_provider_virtual_path_visible as *mut _,
@@ -191,6 +207,11 @@ pub fn init(env: *mut JNIEnv, hooker_class: jclass) -> bool {
             name: ALLOW_PUBLIC_MAPPING_TARGET_NAME.as_ptr() as *mut _,
             signature: ALLOW_PUBLIC_MAPPING_TARGET_SIG.as_ptr() as *mut _,
             fnPtr: allows_public_mapping_target as *mut _,
+        },
+        JNINativeMethod {
+            name: ALLOW_OWN_ANDROID_PRIVATE_PATH_NAME.as_ptr() as *mut _,
+            signature: ALLOW_OWN_ANDROID_PRIVATE_PATH_SIG.as_ptr() as *mut _,
+            fnPtr: allows_own_android_private_path as *mut _,
         },
         JNINativeMethod {
             name: CAPTURE_BINDER_CALLER_NAME.as_ptr() as *mut _,
@@ -435,6 +456,31 @@ unsafe extern "C" fn on_media_provider_query(
     call_backup(env, hooker, args)
 }
 
+/// cursor 行过滤的聚合计时：issue #7（TIM 冷启动选图 3-4 秒）需要判别 3-4 秒到底
+/// 花在逐行重写的哪一段，日志包里必须有数。只做聚合原子计数，热路径零分配。
+struct CursorFilterPerf {
+    calls: AtomicU64,
+    total_ns: AtomicU64,
+    max_ns: AtomicU64,
+    /// 未发生重写（原样返回）的调用数：与发生重写的调用分开看，才能区分
+    /// 「每行都在付解析成本却没重写」与「真在重写」。
+    no_rewrite: AtomicU64,
+    /// 自上一条汇总日志以来的耗时峰值（按调用数窗口滚动）。
+    window_max_ns: AtomicU64,
+}
+
+static CURSOR_FILTER_PERF: CursorFilterPerf = CursorFilterPerf {
+    calls: AtomicU64::new(0),
+    total_ns: AtomicU64::new(0),
+    max_ns: AtomicU64::new(0),
+    no_rewrite: AtomicU64::new(0),
+    window_max_ns: AtomicU64::new(0),
+};
+
+/// 每 8192 行汇总一次：单行均值/最大值直接换算成一次万行级 MediaStore 查询的
+/// 预期总耗时（报告者形态：冷启动选图一次查询扫全表）。
+const CURSOR_FILTER_PERF_LOG_EVERY: u64 = 8192;
+
 unsafe extern "C" fn filter_path(
     env: *mut JNIEnv,
     _class: jclass,
@@ -445,7 +491,32 @@ unsafe extern "C" fn filter_path(
         return std::ptr::null_mut();
     }
     let original = crate::zygisk::jni::get_jstring_utf8(env, path);
-    let Some(rewritten) = rewrite_cursor_storage_path_for_caller(&original, caller_uid) else {
+    let started_at = std::time::Instant::now();
+    let rewritten = rewrite_cursor_storage_path_for_caller(&original, caller_uid);
+    let elapsed_ns = started_at.elapsed().as_nanos() as u64;
+    let perf = &CURSOR_FILTER_PERF;
+    let calls = perf.calls.fetch_add(1, Ordering::Relaxed) + 1;
+    perf.total_ns.fetch_add(elapsed_ns, Ordering::Relaxed);
+    perf.max_ns.fetch_max(elapsed_ns, Ordering::Relaxed);
+    perf.window_max_ns.fetch_max(elapsed_ns, Ordering::Relaxed);
+    if rewritten.is_none() {
+        perf.no_rewrite.fetch_add(1, Ordering::Relaxed);
+    }
+    if calls.is_multiple_of(CURSOR_FILTER_PERF_LOG_EVERY) {
+        let total = perf.total_ns.swap(0, Ordering::Relaxed);
+        let window_max = perf.window_max_ns.swap(0, Ordering::Relaxed);
+        let no_rewrite = perf.no_rewrite.swap(0, Ordering::Relaxed);
+        log::info!(
+            "cursor filter perf calls={} avg_us={} max_us={} window_max_us={} no_rewrite={} uid={}",
+            CURSOR_FILTER_PERF_LOG_EVERY,
+            total / CURSOR_FILTER_PERF_LOG_EVERY / 1000,
+            perf.max_ns.load(Ordering::Relaxed) / 1000,
+            window_max / 1000,
+            no_rewrite,
+            caller_uid
+        );
+    }
+    let Some(rewritten) = rewritten else {
         return path;
     };
     if rewritten.is_empty() {
@@ -481,13 +552,22 @@ unsafe extern "C" fn resolve_open_path(
         return std::ptr::null_mut();
     }
     let original = crate::zygisk::jni::get_jstring_utf8(env, path);
-    let Some(rewritten) = resolve_open_storage_path_for_caller(&original, caller_uid) else {
-        return std::ptr::null_mut();
-    };
-    if rewritten.is_empty() || rewritten == original {
+    let rewritten = resolve_open_storage_path_for_caller(&original, caller_uid)
+        .filter(|rewritten| !rewritten.is_empty() && *rewritten != original);
+    // 防御：本函数必须异常中性。归因链路上的 JNI 调用若残留 pending 异常
+    // （例如 downloads 归因查询被 SecurityException 拒绝），异常会随本
+    // native 返回交给 Java 侧 resolveOpenPathSafe 兜底；但若返回前或后续
+    // 回调里再有任何 JNI 调用（如同一次 open 处理第二个候选路径时的
+    // FindClass），ART 的 AssertNoPendingException 会直接 abort 宿主进程
+    // （2026-10-29 ishtar：media.module 因此反复 SIGABRT）。就地清理并按
+    // 未命中返回。
+    if crate::zygisk::jni::clear_pending_exception(env) {
         return std::ptr::null_mut();
     }
-    new_jstring_utf8(env, &rewritten)
+    match rewritten {
+        Some(rewritten) => new_jstring_utf8(env, &rewritten),
+        None => std::ptr::null_mut(),
+    }
 }
 
 unsafe extern "C" fn storage_path_exists(
@@ -503,6 +583,49 @@ unsafe extern "C" fn storage_path_exists(
         jni_sys::JNI_TRUE
     } else {
         jni_sys::JNI_FALSE
+    }
+}
+
+/// 游标行存在性判定：与 `storagePathExistsBySyscall` 的区别是它按父目录折叠枚举
+/// （见 `hook::path_exists_for_cursor_row`），只供 MediaStore 行循环使用。
+/// 行循环里同一个目录会有成百上千行，逐行 faccessat 的 FUSE 往返是查询耗时主体
+/// （issue #7 实测单次约 250µs），折叠后每目录只付一次。
+unsafe extern "C" fn cursor_row_path_exists(
+    env: *mut JNIEnv,
+    _class: jclass,
+    path: jstring,
+) -> jni_sys::jboolean {
+    if env.is_null() || path.is_null() {
+        return jni_sys::JNI_FALSE;
+    }
+    let path_text = crate::zygisk::jni::get_jstring_utf8(env, path);
+    if crate::hook::path_exists_for_cursor_row(&path_text) {
+        jni_sys::JNI_TRUE
+    } else {
+        jni_sys::JNI_FALSE
+    }
+}
+
+/// 整行判定：一次调用替代 Java 行循环里的改写 + 隐藏 + 两次存在性校验。
+///
+/// 返回 null 表示保留原路径，空串表示隐藏，其余为改写后的路径。判定序列与
+/// 改动前的 Java 侧完全一致（见 `hook::cursor_row_action`），只是把「整库同判」
+/// 成立时的路由与系统调用提前算掉。
+unsafe extern "C" fn cursor_row_action(
+    env: *mut JNIEnv,
+    _class: jclass,
+    path: jstring,
+    caller_uid: jni_sys::jint,
+    allow_missing: jni_sys::jboolean,
+) -> jstring {
+    if env.is_null() || path.is_null() {
+        return std::ptr::null_mut();
+    }
+    let original = crate::zygisk::jni::get_jstring_utf8(env, path);
+    let allow_missing = allow_missing != jni_sys::JNI_FALSE;
+    match crate::hook::cursor_row_action(&original, caller_uid, allow_missing) {
+        Some(action) => new_jstring_utf8(env, &action),
+        None => std::ptr::null_mut(),
     }
 }
 
@@ -660,6 +783,7 @@ unsafe extern "C" fn record_provider_open_path(
     _class: jclass,
     path: jstring,
     caller_uid: jni_sys::jint,
+    caller_pid: jni_sys::jint,
     caller_package: jstring,
 ) {
     if env.is_null() || path.is_null() {
@@ -674,6 +798,7 @@ unsafe extern "C" fn record_provider_open_path(
     crate::monitor::AuditTrail::instance().record_provider_open_path(
         &path_text,
         caller_uid,
+        caller_pid,
         &package_text,
     );
 }
@@ -683,6 +808,7 @@ unsafe extern "C" fn record_provider_directory_path(
     _class: jclass,
     path: jstring,
     caller_uid: jni_sys::jint,
+    caller_pid: jni_sys::jint,
     caller_package: jstring,
 ) {
     if env.is_null() || path.is_null() {
@@ -697,6 +823,7 @@ unsafe extern "C" fn record_provider_directory_path(
     crate::monitor::AuditTrail::instance().record_provider_directory_path(
         &path_text,
         caller_uid,
+        caller_pid,
         &package_text,
     );
 }
@@ -785,6 +912,23 @@ unsafe extern "C" fn allows_public_mapping_target(
     }
     let path_text = crate::zygisk::jni::get_jstring_utf8(env, path);
     if should_allow_public_mapping_target_access(&path_text, caller_uid) {
+        jni_sys::JNI_TRUE
+    } else {
+        jni_sys::JNI_FALSE
+    }
+}
+
+unsafe extern "C" fn allows_own_android_private_path(
+    env: *mut JNIEnv,
+    _class: jclass,
+    path: jstring,
+    caller_uid: jni_sys::jint,
+) -> jni_sys::jboolean {
+    if env.is_null() || path.is_null() {
+        return jni_sys::JNI_FALSE;
+    }
+    let path_text = crate::zygisk::jni::get_jstring_utf8(env, path);
+    if should_allow_own_android_private_path_access(&path_text, caller_uid) {
         jni_sys::JNI_TRUE
     } else {
         jni_sys::JNI_FALSE

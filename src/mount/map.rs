@@ -2,8 +2,7 @@ use super::MountPlanner;
 use crate::domain::{
     PathMapping, expand_namespace_path_mappings, sort_path_mappings_shortest_request_first,
 };
-use crate::platform::errno::last as last_errno;
-use crate::platform::{fs, module_paths, paths};
+use crate::platform::{fs, paths};
 
 pub(super) struct PathMappingApplyOptions {
     pub(super) should_chown_current_dirs: bool,
@@ -104,6 +103,9 @@ impl MountPlanner {
         options: PathMappingApplyOptions,
     ) -> bool {
         let mut is_any_applied = false;
+        // 本轮已挂上的映射（请求路径, 目标源）。映射按请求路径由短到长处理，嵌套映射的
+        // 深层请求路径会落在父映射的 bind 视图里，挂载点要在父映射目标里准备。
+        let mut mounted_mappings: Vec<(String, String)> = Vec::new();
 
         for mapping in resolved_mappings {
             let Some((target_source, should_fix_target_permissions)) = self
@@ -123,12 +125,28 @@ impl MountPlanner {
                 }
                 self.ensure_shared_mapping_parent_chain(&target_source);
             }
+            // 与 should_fix_target_permissions 无关：映射目标目录必须归调用应用所有
+            // （裸权限访问路径下的必要状态，FUSE 虚拟化设备无副作用），且元数据判定
+            // 在锚点路径上会漏判，故目标源解析成功后总是执行。
+            if !self.ensure_app_owned_mapping_target(&target_source, self.app_uid) {
+                log::warn!("map target app ownership fix failed: {}", target_source);
+                continue;
+            }
 
+            let covering_mount = mounted_mappings
+                .iter()
+                .filter(|(request, _)| {
+                    request != &mapping.request_path
+                        && paths::is_same_or_child(&mapping.request_path, request)
+                })
+                .max_by_key(|(request, _)| request.len())
+                .map(|(request, target)| (request.as_str(), target.as_str()));
             if !self.ensure_mapping_request_mount_point(
                 &mapping.request_path,
                 storage_path,
                 options.should_chown_current_dirs,
                 options.should_create_missing_request_path,
+                covering_mount,
             ) {
                 log::warn!("map mount point unavailable: {}", mapping.request_path);
                 continue;
@@ -168,6 +186,7 @@ impl MountPlanner {
 
             if is_current_path_mounted {
                 is_any_applied = true;
+                mounted_mappings.push((mapping.request_path.clone(), target_source.clone()));
                 log::info!("map {} -> {}", mapping.request_path, mapping.final_path);
 
                 if preferred_target_source_roots
@@ -239,8 +258,16 @@ impl MountPlanner {
         for root in target_source_roots {
             let candidate = paths::join(root, target_relative);
             if fs::is_directory(&candidate) {
+                // 元数据判定必须落在真实后端路径上：锚点路径（tmp/real_storage）不是
+                // /data/media 子路径，直接判定会得到 false，导致映射目标目录的属主与
+                // 模式从未被修正——在以真实后端为访问路径的设备上（锚点为 /data/media
+                // 直绑、或应用视图本身按裸权限检查），目标目录会保持创建时的 restrictive
+                // 模式，应用列目录/按名访问全部被拒。
+                let metadata_path = self
+                    .metadata_operations_path(&candidate)
+                    .unwrap_or_else(|| candidate.clone());
                 let should_fix_permissions =
-                    mapping_target_source_needs_app_writable_metadata(&candidate, self.user_id);
+                    mapping_target_source_needs_app_writable_metadata(&metadata_path, self.user_id);
                 return Some((candidate, should_fix_permissions));
             }
         }
@@ -309,6 +336,7 @@ impl MountPlanner {
         storage_path: &str,
         should_chown_current_dirs: bool,
         should_prefer_redirect_fallback: bool,
+        covering_mount: Option<(&str, &str)>,
     ) -> bool {
         if !should_prefer_redirect_fallback {
             return mapping_mount_point_exists(request_path);
@@ -318,78 +346,66 @@ impl MountPlanner {
             return true;
         }
 
-        // 非共享存储目标（例如当前应用的 `/data/user` 目录）不参与存储
-        // fallback；只创建缺失的目录链，避免把绝对路径误转换成 storage 相对路径。
-        if !paths::is_same_or_child(request_path, storage_path) {
-            let uid = if crate::metadata_repair::enabled()
-                && should_chown_current_dirs
-                && (request_path.starts_with("/data/user/")
-                    || request_path.starts_with("/data/data/"))
-            {
-                self.app_uid
-            } else {
-                -1
-            };
-            return fs::create_directory(request_path, uid);
-        }
-
-        let uid = if crate::metadata_repair::enabled() && should_chown_current_dirs {
-            self.app_uid
-        } else {
-            -1
-        };
-        if fs::create_directory(request_path, uid) {
-            return true;
-        }
-        let direct_errno = last_errno();
-
-        // 代理应用写入时，这次公共路径 mkdir 会被本模块的写入重定向接管，落到重定向
-        // 目标目录，请求路径本身仍然缺失。此时改用真实存储后端创建挂载点再复查；
-        // 否则随后的 bind 一定以 ENOENT 失败，映射会一直无法生效。
-        if self.ensure_real_public_directory_exists(request_path)
-            && mapping_mount_point_exists(request_path)
+        // 嵌套映射（`A -> X` 与 `A/B -> Y`）：父映射已经把 X bind 到 A 上，A/B 在当前
+        // 视图里实际解析到 X/B——这是父映射的目标、应用的映射落点，不是真实公共目录里的
+        // 请求路径。在父映射目标里补建 X/B 作为深层映射的挂载点，真实存储的 A/B 依然
+        // 不会出现。不补建的话深层映射因缺挂载点被跳过，写入落到父映射目标（场景 14）。
+        if let Some((covering_request, covering_target)) = covering_mount
+            && let Some(remainder) = paths::relative_child_path(request_path, covering_request)
         {
-            log::debug!(
-                "map mount point prepared via real backend request={} direct_errno={}",
-                request_path,
-                direct_errno
-            );
-            return true;
-        }
-
-        let Some(current_relative) = paths::relative_child_path(request_path, storage_path) else {
-            return false;
-        };
-        let current_fallback = if should_prefer_redirect_fallback {
-            paths::join(&self.redirect_target, current_relative)
-        } else {
-            paths::join(
-                &paths::data_media_user_root_for_user(self.user_id),
-                current_relative,
-            )
-        };
-        let current_fallback = self.normalize_path(&current_fallback);
-        if self.ensure_directory_exists(&current_fallback, should_chown_current_dirs) {
-            // 重定向后端目录就绪不代表挂载点可用：请求路径仍然缺失时继续绑定只会
-            // 得到 ENOENT，这里按未准备处理，让调用方跳过这次映射。
-            if mapping_mount_point_exists(request_path) {
+            let mount_point_source = self.normalize_path(&paths::join(covering_target, remainder));
+            if self.ensure_directory_exists(&mount_point_source, should_chown_current_dirs)
+                && mapping_mount_point_exists(request_path)
+            {
                 log::debug!(
-                    "map mount point prepared via backend fallback request={} backend={} direct_errno={}",
+                    "map nested mount point prepared in covering target request={} source={}",
                     request_path,
-                    current_fallback,
-                    direct_errno
+                    mount_point_source
                 );
                 return true;
             }
             log::warn!(
-                "map mount point missing after backend fallback request={} backend={} direct_errno={}",
+                "map nested mount point unavailable request={} source={}",
                 request_path,
-                current_fallback,
-                direct_errno
+                mount_point_source
             );
             return false;
         }
 
+        // 非共享存储目标（例如当前应用的 `/data/user` 目录）同样不创建：请求路径是
+        // 映射视图里的挂载点，缺它就说明这条映射本轮无法成立，补一个空目录只是把
+        // 「规则没生效」伪装成「规则已生效」。
+        if !paths::is_same_or_child(request_path, storage_path) {
+            log::warn!(
+                "map mount point missing outside storage, skip bind: {}",
+                request_path
+            );
+            return false;
+        }
+
+        // 共享存储上的请求路径**永远不创建**，创建它等于在用户可见的公共目录里凭空
+        // 留一个空目录（用户配置映射/沙盒就是为了不让它出现）。bind 挂载点必须存在于
+        // 目标命名空间，所以这条路径缺失时 namespace bind 在语义上无法表达该规则：
+        // 这里按「本次映射未应用」返回，规则由共享宿主 FUSE 视图（虚拟呈现该路径）
+        // 或进程内重定向 hook 承接，两条都不改动真实存储。
+        //
+        // 重定向后端目录仍在此补建：那是本模块的私有落点，与请求路径是否会出现在
+        // 公共目录无关；不建它后续 bind 的源侧会缺失。
+        if let Some(current_relative) = paths::relative_child_path(request_path, storage_path) {
+            let current_fallback =
+                self.normalize_path(&paths::join(&self.redirect_target, current_relative));
+            if !self.ensure_directory_exists(&current_fallback, should_chown_current_dirs) {
+                log::warn!(
+                    "map redirect backend unavailable request={} backend={}",
+                    request_path,
+                    current_fallback
+                );
+            }
+        }
+        log::warn!(
+            "map mount point missing, skip bind (request path must not be created): {}",
+            request_path
+        );
         false
     }
 
@@ -434,57 +450,6 @@ impl MountPlanner {
             .iter()
             .filter_map(|rule| self.resolve_mount_rule_path(rule, storage_path))
             .any(|read_only| paths::matches(&read_only, path, true))
-    }
-
-    pub fn can_record_read_only_mapping_denials(
-        &self,
-        path_mappings: &[PathMapping],
-        read_only_paths: &[String],
-        excluded_real_paths: &[String],
-    ) -> bool {
-        if path_mappings.is_empty() || read_only_paths.is_empty() {
-            return false;
-        }
-
-        let storage_path = paths::storage_user_root_for_user(self.user_id);
-        let real_storage_anchor = paths::join(
-            module_paths::REAL_STORAGE_TMP_DIR,
-            &self.user_id.to_string(),
-        );
-        let resolved_mappings = self.resolve_path_mappings(path_mappings, &storage_path);
-        let mut has_read_only_mapping = false;
-
-        for mapping in resolved_mappings {
-            if !self.is_mapping_read_only(
-                &mapping,
-                read_only_paths,
-                excluded_real_paths,
-                &storage_path,
-            ) {
-                continue;
-            }
-            has_read_only_mapping = true;
-
-            let Some(target_relative) =
-                paths::relative_child_path(&mapping.final_path, &storage_path)
-            else {
-                log::warn!(
-                    "recordable map fallback unavailable, target outside storage: {}",
-                    mapping.final_path
-                );
-                return false;
-            };
-            let anchor_source = paths::join(&real_storage_anchor, target_relative);
-            if !fs::is_directory(&anchor_source) {
-                log::warn!(
-                    "recordable map fallback unavailable, anchor source missing: {}",
-                    anchor_source
-                );
-                return false;
-            }
-        }
-
-        has_read_only_mapping
     }
 
     fn resolve_mount_rule_path(&self, path: &str, storage_path: &str) -> Option<String> {

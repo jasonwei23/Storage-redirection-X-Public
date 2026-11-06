@@ -43,6 +43,7 @@
     dashboardModuleStateRequestId: 0,
     dashboardCountsLoaded: false,
     runtimeActivationExact: "0",
+    hostStatus: null,
     appListRequestId: 0,
     renderedApps: [],
     appListRowHeight: 67,
@@ -97,6 +98,12 @@
       name: "fusefixer",
       license: "MIT",
       url: "https://github.com/MaterialCleaner/Media-Provider-FuseFixer",
+    },
+    {
+      group: "模块核心",
+      name: "Fuse-Proxy",
+      license: "GPL-3.0",
+      url: "https://github.com/huniangitb/Fuse-Proxy",
     },
     {
       group: "Root / WebUI",
@@ -721,7 +728,10 @@
       if (page === "dashboard") refreshDashboardCounts({ force: true });
       return;
     }
-    routeTo(page, { prioritizeNav: true });
+    // 顶级标签页之间切换不产生可回退的历史：没进二级页面时，系统返回应当一步
+    // 退出 WebUI 回到模块页面，而不是逐个退回访问过的标签页（issue #2 反馈）。
+    // 二级页面（应用配置、主题、关于、更新）仍按 push 进入，返回键逐级回退。
+    routeTo(page, { prioritizeNav: true, replaceHistory: true });
   }
 
   function initNav() {
@@ -863,13 +873,15 @@
     if (showInitialLoading) {
       setDashboardCountLoading("statAppCount", true);
       setDashboardCountLoading("statEnabledAppCount", true);
+      setDashboardCountLoading("statHostStatus", true);
     }
     const run = async () => {
       State.dashboardCountsSchedule = null;
       try {
-        const [configuredConfigs, runtimeActivations] = await Promise.all([
+        const [configuredConfigs, runtimeActivations, storageBackend] = await Promise.all([
           Api.readConfiguredAppConfigs(),
           Api.readStatsCount(),
+          Api.readStorageBackendStatus(),
         ]);
         if (
           State.currentPage !== requestPage ||
@@ -886,8 +898,10 @@
           Api.formatCompactRuntimeActivationCount(runtimeActivations),
           runtimeActivations,
         );
+        renderHostStatusMetric(storageBackend);
         setDashboardCountLoading("statAppCount", false);
         setDashboardCountLoading("statEnabledAppCount", false);
+        setDashboardCountLoading("statHostStatus", false);
       } catch {
         if (
           State.currentPage === requestPage &&
@@ -897,9 +911,11 @@
           if (!State.dashboardCountsLoaded) {
             setDashboardCountValue("statAppCount", "--");
             setDashboardCountValue("statEnabledAppCount", "--");
+            setDashboardCountValue("statHostStatus", "--");
           }
           setDashboardCountLoading("statAppCount", false);
           setDashboardCountLoading("statEnabledAppCount", false);
+          setDashboardCountLoading("statHostStatus", false);
         }
       } finally {
         if (State.dashboardCountsInFlight === requestGeneration) {
@@ -951,6 +967,88 @@
     el.textContent = text;
     if (exactValue != null && String(exactValue) !== text) el.title = String(exactValue);
     else el.removeAttribute("title");
+  }
+
+  /** 渲染概览页的宿主策略指标；与管理 App 一致：活跃展示已登记策略数，未运行为 0，未知为 --。 */
+  function renderHostStatusMetric(storageBackend) {
+    State.hostStatus = storageBackend || null;
+    const state = storageBackend?.state || "unknown";
+    const display =
+      state === "active"
+        ? storageBackend?.policies != null
+          ? String(storageBackend.policies)
+          : "--"
+        : state === "inactive"
+          ? "0"
+          : "--";
+    const exact =
+      state === "active" && storageBackend?.pid != null
+        ? "pid=" +
+          storageBackend.pid +
+          (storageBackend?.policies != null
+            ? "，已登记策略 " + storageBackend.policies + " 个"
+            : "")
+        : null;
+    setDashboardCountValue("statHostStatus", display, exact);
+  }
+
+  async function showHostPolicyDetails() {
+    const backend = State.hostStatus || null;
+    const state = backend?.state || "unknown";
+    const value =
+      state === "active"
+        ? backend?.policies != null
+          ? String(backend.policies)
+          : "--"
+        : state === "inactive"
+          ? "0"
+          : "--";
+    const stateLine =
+      state === "active"
+        ? "共享宿主运行中" + (backend?.pid != null ? "，宿主进程 pid=" + backend.pid : "") + "。"
+        : state === "inactive"
+          ? "共享宿主当前未运行。"
+          : "暂时无法读取共享宿主状态。";
+    let userLines = "";
+    if (state === "active") {
+      const counts = Object.entries(await Api.readHostPolicyUserCounts()).sort(
+        (a, b) => Number(a[0]) - Number(b[0]),
+      );
+      if (counts.length > 0) {
+        userLines =
+          '<div class="modal-hint">' +
+          counts
+            .map(([user, count]) => escapeHtml("用户 " + user + "：" + count + " 个"))
+            .join("<br>") +
+          "</div>";
+      }
+    }
+    showModalWithHistory(
+      '<div class="modal-title">宿主策略</div>' +
+        '<div class="runtime-stats-exact">' +
+        escapeHtml(value) +
+        "</div>" +
+        '<div class="modal-hint">共享宿主 FUSE 会话已登记的重定向策略数量，大致对应已启用重定向的应用会话数；应用实际发起存储访问后才计入。同一应用在不同用户下分别计一条，这里显示的是所有用户合计。共享宿主未运行时显示 0，读取失败或状态未知时显示 --。</div>' +
+        userLines +
+        '<div class="modal-hint">' +
+        escapeHtml(stateLine) +
+        "</div>" +
+        '<div class="modal-actions"><button class="btn btn-primary modal-close" type="button">关闭</button></div>',
+      { backdropClose: true },
+    );
+    document.querySelector(".modal-close")?.addEventListener("click", () => closeActiveModal());
+  }
+
+  function initHostStatusMetricInteraction() {
+    const metric = document.getElementById("hostStatusMetric");
+    if (!metric) return;
+    metric.addEventListener("click", () => showHostPolicyDetails());
+    metric.addEventListener("keydown", (event) => {
+      if (event.key === "Enter" || event.key === " ") {
+        event.preventDefault();
+        showHostPolicyDetails();
+      }
+    });
   }
 
   function showRuntimeActivationDetails() {
@@ -1225,10 +1323,13 @@
       if (requestId !== State.appListRequestId) return null;
       const pkg = installed[i];
       const info = Api.getCachedAppInfo ? Api.getCachedAppInfo(pkg) : null;
-      const isSystem =
+      // 系统标记优先用所选用户的真实结果（dex 的 `#system=` 或 `pm list packages -s --user`）；
+      // 只有在完全没有包信息时，才退回包名前缀猜测——该猜法会把 Google 系普通应用误判成系统应用。
+      const guessedSystem =
         pkg.startsWith("com.android.") ||
         pkg.startsWith("com.google.android.") ||
         pkg.startsWith("android.");
+      const isSystem = info && typeof info.isSystem === "boolean" ? info.isSystem : guessedSystem;
       const label = info ? info.appLabel || info.label || info.name || "" : "";
       const status = configuredState.get(pkg) || "unconfigured";
       const app = {
@@ -1373,9 +1474,12 @@
       const cfg = item.config || {};
       const users = cfg.users || {};
       const profile = users[String(userId || "0")];
+      // 旧格式只有全局 enabled，对任何用户都生效；新格式按 users.<id> 判定，
+      // 当前用户没有档案时该应用不应出现在他的「已配置/缺失」集合里。
       const legacyEnabled = Object.prototype.hasOwnProperty.call(cfg, "enabled")
         ? cfg.enabled === true
-        : false;
+        : null;
+      if (!profile && legacyEnabled === null) return;
       map.set(
         item.packageName,
         (profile ? profile.enabled === true : legacyEnabled) ? "enabled" : "disabled",
@@ -1426,6 +1530,11 @@
       chip.addEventListener("click", () => {
         State.currentUserId = chip.dataset.user;
         switcher.classList.remove("open");
+        // 批量选择与滚动位置都属于上一名用户，切换后必须一并清掉并立即回到顶部。
+        exitAppSelectionMode();
+        State.appListScrollTop = 0;
+        const scroller = getAppListScroller();
+        if (scroller) setScrollerTopInstant(scroller, 0);
         renderAppUserSwitcher();
         Theme.showToast("已切换到用户 " + State.currentUserId);
         loadAppList(true);
@@ -1655,9 +1764,7 @@
     if (!bar) {
       bar = document.createElement("div");
       bar.id = "appBatchBar";
-      bar.className = "app-batch-bar visible miuix-floating-container miuix-blur";
-      bar.dataset.miuixUi = "floating-container";
-      bar.dataset.miuixBlur = "realtime";
+      bar.className = "app-batch-bar visible";
       document.body.appendChild(bar);
     }
     bar.innerHTML =
@@ -1771,6 +1878,31 @@
         Theme.updateFilterIndicator();
         applyFilters();
       });
+    });
+  }
+
+  /**
+   * 应用列表标题栏刷新入口。
+   * 长列表下回到顶部再下拉刷新的成本太高，因此与模块管理器一致，在标题栏保留常驻刷新按钮。
+   */
+  function initAppListRefresh() {
+    const button = $("#appListRefresh");
+    if (!button || button._srxBound) return;
+    button._srxBound = true;
+    button.addEventListener("click", () => {
+      if (button.disabled) return;
+      // 刷新语义包含「看最新结果」，先回到顶部，避免刷完仍停在旧位置。
+      const scroller = getAppListScroller();
+      if (scroller) setScrollerTopInstant(scroller, 0);
+      State.appListScrollTop = 0;
+      button.disabled = true;
+      button.setAttribute("aria-busy", "true");
+      loadAppList(true)
+        .catch(() => {})
+        .finally(() => {
+          button.disabled = false;
+          button.removeAttribute("aria-busy");
+        });
     });
   }
 
@@ -3908,33 +4040,6 @@
     );
   }
 
-  function accentPaletteHtml(selected) {
-    return (
-      '<div class="theme-color-palette" role="radiogroup" aria-label="强调色">' +
-      WEBUI_ACCENT_COLOR_OPTIONS.map((option) => {
-        const active = option.value === selected;
-        const color = option.color || "var(--system-accent-color, var(--color-primary))";
-        return (
-          '<button class="theme-color-swatch' +
-          (active ? " active" : "") +
-          (option.value === 0 ? " system" : "") +
-          '" type="button" data-value="' +
-          option.value +
-          '" role="radio" aria-checked="' +
-          String(active) +
-          '" aria-label="' +
-          option.label +
-          '" title="' +
-          option.label +
-          '" style="--swatch-color:' +
-          color +
-          '"><span aria-hidden="true"></span></button>'
-        );
-      }).join("") +
-      "</div>"
-    );
-  }
-
   function pageScaleControlHtml(scale) {
     const percent = webUiPageScalePercent(scale);
     const progress = ((percent - 80) / 30) * 100;
@@ -4182,7 +4287,7 @@
           "Fuse Fixer",
           "fuseFix",
           State.globalConfig.fuse_fix_enabled !== false,
-          "SRX 内置 Fuse Fixer 兼容保护，处理特殊 Unicode 字符",
+          "SRX 内置 Fuse Fixer 兼容保护，修正 MediaProvider 的 FUSE 可访问性判定与 passthrough 行为",
         ) +
         switchRow(
           "详细日志",
@@ -5644,7 +5749,16 @@
       }
       loading.close();
       loading = null;
-      Theme.showToast(path ? "日志包已导出：" + path : "日志导出失败", path ? "success" : "error");
+      if (!path) {
+        Theme.showToast("日志导出失败", "error");
+      } else if (path.indexOf("/data/adb/modules/") === 0) {
+        Theme.showToast(
+          "Download 不可写，日志包已保存到模块目录（请用 root 文件管理器或 adb 手动拷贝）：" + path,
+          "success",
+        );
+      } else {
+        Theme.showToast("日志包已导出：" + path, "success");
+      }
     } catch (error) {
       loading?.close();
       if (error?.name === "AbortError") return;
@@ -5919,13 +6033,36 @@
     const loading = Theme.showLoadingDialog("正在重新挂载运行中应用...");
     try {
       const result = await Api.restartMediaProvider();
-      if (!result?.ok) throw new Error("MediaProvider hot reload timeout");
+      if (!result?.ok) {
+        Theme.showToast(remountFailureMessage(result?.failureReason), "error");
+        return;
+      }
       Api.showManagerToast("运行中应用已重新挂载，MediaProvider 已同步热重载");
     } catch (error) {
       Theme.showToast("重新挂载运行中应用失败", "error");
     } finally {
       loading.close();
       State.mediaProviderReloadRunning = false;
+    }
+  }
+
+  /** 把 srxctl 的 remount_reason 令牌翻译成用户可读的失败提示。 */
+  function remountFailureMessage(reason) {
+    switch (reason) {
+      case "provider-not-running":
+        return "MediaProvider 未在运行，无法同步热重载";
+      case "daemon-not-running":
+        return "模块 daemon 未运行，无法重新挂载运行中应用";
+      case "hot-reload-timeout":
+        return "MediaProvider 热重载超时";
+      case "remount-timeout":
+        return "运行中应用重新挂载超时";
+      case "daemon-control-failed":
+      case "hot-reload-request-failed":
+      case "hot-reload-signal-failed":
+        return "热重载或重挂请求发送失败";
+      default:
+        return "重新挂载运行中应用失败";
     }
   }
 
@@ -5945,10 +6082,13 @@
       viewer.innerHTML =
         '<div class="loading-state"><div class="spinner"></div><span>加载日志...</span></div>';
     try {
-      await Api.ensureLogCollectors?.();
+      // 采集器自愈独立于快照读取，维护命令变慢时仍可查看已有日志。
+      Api.ensureLogCollectors?.().catch(() => {});
       const [content, filters] = await Promise.all([
         Api.readFileWithBackups(FILE_MONITOR_LOG),
-        Api.readMonitorFilters({ force: true }).catch(() => State.monitorFilters || null),
+        Api.readMonitorFilters({ force: true, timeoutMs: 5000 }).catch(
+          () => State.monitorFilters || null,
+        ),
       ]);
       if (loadGeneration !== State.logLoadGeneration) return;
       if (filters) State.monitorFilters = filters;
@@ -5959,7 +6099,7 @@
         Theme.showToast("刷新文件监视失败", "error");
         throw new Error("refresh failed");
       } else {
-        viewer.innerHTML = '<div class="log-empty">暂无日志或无法读取</div>';
+        viewer.innerHTML = '<div class="log-empty">日志读取失败，请下拉重试</div>';
       }
     }
   }
@@ -6039,8 +6179,8 @@
     } else {
       infoEl.textContent =
         renderedCount < filteredCount
-          ? "显示 " + renderedCount + " / 共 " + totalCount + " 条"
-          : "共 " + totalCount + " 条";
+          ? "最近记录：显示 " + renderedCount + " / 共 " + totalCount + " 条（最多读取1000行）"
+          : "最近记录：共 " + totalCount + " 条（最多读取1000行）";
     }
   }
 
@@ -6149,10 +6289,15 @@
       pkg,
       extras.source || "",
     );
+    const unattributedIntermediateSource =
+      !isModuleWebUiExport &&
+      isUnattributedIntermediateSource(pkg, identifyMethod, extras.identify_reliability || "");
     const appName =
       eventRole === "observation" && !isModuleWebUiExport && !attributedObservation
         ? "文件系统观察"
-        : getLogPackageLabel(pkg);
+        : unattributedIntermediateSource
+          ? "未知来源"
+          : getLogPackageLabel(pkg);
     const operationLabel = isModuleWebUiExport
       ? "export"
       : eventRole === "observation"
@@ -6177,6 +6322,8 @@
     if (extras.identify_reliability)
       meta.push("可靠性 " + formatReliability(extras.identify_reliability));
     if (eventRole === "observation") meta.unshift("文件系统观察");
+    if (unattributedIntermediateSource && processPkg)
+      meta.push("代写进程 " + getLogPackageLabel(processPkg));
     if (observerPackage && eventRole === "observation") meta.push("落盘进程 " + observerPackage);
     if (watchPkg && eventRole === "observation") meta.push("监视上下文 " + watchPkg);
     if (correlationId) meta.push("关联 " + correlationId);
@@ -6938,15 +7085,32 @@
         ""
       );
     }
+    // 无点原生身份（如 MT 管理器 root 复制时 helper 进程的 basename mtio）：
+    // 归因链已经抓到调用方，只是身份是原生 basename。落盘进程又是媒体组件时
+    // 不能退回其标签（issue #2：.boot_ok 因此显示成“媒体选择工具”），保留
+    // 原身份展示，详情里的 caller_uid / native 字段仍可核查。
+    const dotlessCallerIdentity =
+      callerPkg !== processPkg &&
+      callerPkg !== "-" &&
+      callerPkg &&
+      !isIntermediateLogPackage(callerPkg) &&
+      isIntermediateLogPackage(processPkg)
+        ? callerPkg
+        : "";
     return (
       [
         callerPkg !== processPkg && !isIntermediateLogPackage(callerPkg) ? callerPkg : "",
         identifyMethod === "watch_package" && !isIntermediateLogPackage(watchPkg) ? watchPkg : "",
         !isIntermediateLogPackage(callerPkg) ? callerPkg : "",
         !isIntermediateLogPackage(processPkg) ? processPkg : "",
+        dotlessCallerIdentity,
         callerPkg,
         processPkg,
-      ].find(isSinglePackageName) ||
+      ].find(
+        (value) =>
+          isSinglePackageName(value) ||
+          (value && value === dotlessCallerIdentity && !isIntermediateLogPackage(value)),
+      ) ||
       processPkg ||
       ""
     );
@@ -6967,7 +7131,19 @@
       pkg === "com.android.externalstorage" ||
       pkg === "com.android.mtp" ||
       pkg.includes(".documentsui") ||
-      pkg.includes(".photopicker")
+      pkg.includes("photopicker") ||
+      pkg.includes("mediapicker")
+    );
+  }
+
+  // 归因不可靠、展示包又落在系统代写中间层时，不再把中间层应用当成来源。
+  // 落盘进程是 MediaProvider、相册选择器这类代写进程，直接显示它的标签会让用户
+  // 以为文件是那个系统应用写出来的（issue #2 反馈“显示为媒体选择工具”），而实际
+  // 调用方是当时在场、无法归因的第三方应用。中间层进程仍保留在详情行里。
+  function isUnattributedIntermediateSource(pkg, identifyMethod, identifyReliability) {
+    return (
+      isIntermediateLogPackage(pkg) &&
+      (identifyMethod === "unknown" || identifyReliability === "none" || !identifyReliability)
     );
   }
 
@@ -7508,12 +7684,14 @@
     setupHistory();
     initNav();
     initSearch();
+    initAppListRefresh();
     initLogSearch();
     initAppIconFallback();
     initListPerformanceControls();
     initPullRefreshControls();
     initDashboardRefreshHooks();
     initRuntimeActivationInteractions();
+    initHostStatusMetricInteraction();
     loadDashboard();
   }
   if (document.readyState === "loading") document.addEventListener("DOMContentLoaded", init);
