@@ -4,6 +4,8 @@ pub mod allocator;
 pub mod anti_detect;
 #[path = "platform/child_wait.rs"]
 pub mod child_wait;
+#[path = "platform/companion_socket.rs"]
+pub mod companion_socket;
 #[path = "platform/elf_img.rs"]
 pub mod elf_img;
 #[path = "platform/errno.rs"]
@@ -12,16 +14,24 @@ pub mod errno;
 pub mod fs;
 #[path = "platform/gnu_debugdata.rs"]
 pub mod gnu_debugdata;
+#[path = "platform/host_beat.rs"]
+pub mod host_beat;
 #[path = "platform/inotify.rs"]
 pub mod inotify;
 #[path = "platform/linker.rs"]
 pub mod linker;
+#[path = "platform/log_fields.rs"]
+pub mod log_fields;
 #[path = "platform/lru_cache.rs"]
 pub mod lru_cache;
 #[path = "platform/module_paths.rs"]
 pub mod module_paths;
+#[path = "platform/mount_namespace.rs"]
+pub mod mount_namespace;
 #[path = "platform/mountinfo.rs"]
 pub mod mountinfo;
+#[path = "platform/packages.rs"]
+pub mod packages;
 #[path = "platform/paths.rs"]
 pub mod paths;
 #[path = "platform/paths_alias.rs"]
@@ -32,6 +42,8 @@ pub mod paths_roots;
 pub mod paths_rules;
 #[path = "platform/paths_safety.rs"]
 pub mod paths_safety;
+#[path = "platform/proc_direct.rs"]
+pub mod proc_direct;
 #[path = "platform/proc_identity.rs"]
 pub mod proc_identity;
 #[path = "platform/uid.rs"]
@@ -115,17 +127,7 @@ pub fn read_boot_id() -> String {
         .to_string()
 }
 
-/// 读取 Linux `/proc/<pid>/stat` 的进程启动时钟值（字段 22）。
-///
-/// PID 会被复用；需要跨异步清理周期识别同一个进程实例时，必须同时比较该值。
-pub fn process_start_time_ticks(pid: i32) -> Option<u64> {
-    if pid <= 0 {
-        return None;
-    }
-    let stat = std::fs::read_to_string(format!("/proc/{}/stat", pid)).ok()?;
-    let after_name = stat.rsplit_once(')')?.1.trim_start();
-    after_name.split_whitespace().nth(19)?.parse().ok()
-}
+pub use proc_identity::process_start_time_ticks;
 
 /// 判断 PID 当前是否仍指向指定的进程实例。
 pub fn is_process_instance_alive(pid: i32, start_time_ticks: u64) -> bool {

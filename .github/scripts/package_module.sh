@@ -33,6 +33,8 @@ build_module_dir() {
       ;;
   esac
   cp "$SO_FILE" "$module_dir/zygisk/${MODULE_ABI}.so"
+  sha256sum "$module_dir/zygisk/${MODULE_ABI}.so" | awk '{print $1}' > "$module_dir/zygisk/${MODULE_ABI}.so.sha256"
+  sed -i "s|zygisk/arm64-v8a.so|zygisk/${MODULE_ABI}.so|g" "$module_dir/zn_modules.txt"
   mkdir -p "$module_dir/bin"
   if [[ -d assets/zygisk_module/bin ]]; then
     chmod 755 "$module_dir/bin"/* 2>/dev/null || true
@@ -40,14 +42,13 @@ build_module_dir() {
   cp "$DAEMON_FILE" "$module_dir/bin/srx_daemon"
   chmod 755 "$module_dir/bin/srx_daemon"
   [[ -f "$module_dir/bin/srxctl" ]] && chmod 755 "$module_dir/bin/srxctl"
-  [[ -f "$module_dir/bin/list_apps.dex" ]] && chmod 644 "$module_dir/bin/list_apps.dex"
 
   printf 'id=storage.redirect.x\nname=Storage Redirect X\nversion=v%s\nversionCode=%s\nauthor=Kindness-Kismet\ndescription=Storage Redirect X Core Module\nwebui=1\n' \
     "$VERSION" "$VERSION_CODE" > "$module_dir/module.prop"
 
   (
     cd "$module_dir"
-    find . -type f \( -name '*.sh' -o -name '*.prop' -o -name '*.rule' -o -path './META-INF/*' -o -path './bin/srxctl' \) \
+    find . -type f \( -name '*.sh' -o -name '*.prop' -o -name '*.rule' -o -name 'zn_modules.txt' -o -path './META-INF/*' -o -path './bin/srxctl' \) \
       -exec perl -0pi -e 's/\r\n?/\n/g' {} \;
   )
 }
@@ -61,8 +62,8 @@ if [[ "$OUTPUT_PATH" == *.zip ]]; then
   (
     cd "$MODULE_DIR"
     zip -9 -r "$OUTPUT_ABS_PATH" . \
-      -x '*.sh' '*.prop' '*.rule' 'META-INF/*' 'bin/srxctl'
-    find . -type f \( -name '*.sh' -o -name '*.prop' -o -name '*.rule' -o -path './META-INF/*' -o -path './bin/srxctl' \) \
+      -x '*.sh' '*.prop' '*.rule' 'zn_modules.txt' 'META-INF/*' 'bin/srxctl'
+    find . -type f \( -name '*.sh' -o -name '*.prop' -o -name '*.rule' -o -name 'zn_modules.txt' -o -path './META-INF/*' -o -path './bin/srxctl' \) \
       -print | zip -0 "$OUTPUT_ABS_PATH" -@
   )
 else

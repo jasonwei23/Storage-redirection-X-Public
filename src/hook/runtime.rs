@@ -10,15 +10,18 @@ use std::sync::atomic::{AtomicU64, Ordering};
 static CALL_PREV_FALLBACK_MISS: AtomicU64 = AtomicU64::new(0);
 static FORK_CHILD_HOOK_BYPASS: AtomicU64 = AtomicU64::new(0);
 const ANDROID_APP_UID_START: i32 = 10000;
-const MEDIA_RW_GID: u32 = 1023;
-const STORAGE_DIR_MODE: mode_t = 0o2773;
+/// 自动补建的**公共**目录模式：与 `platform::fs::REAL_PUBLIC_DIR_MODE`
+/// （原生 `02770 media_rw:media_rw` + 供应用穿越的 other-execute）同一个口径。
+/// 这里曾是本仓最后一处 `0o2773`（other 可写）：那等于把模块替应用补建的公共
+/// 目录对全系统第三方 uid 开放写权限，既非原生语义也没有任何链路需要它。
+const PUBLIC_DIR_MODE: mode_t = crate::platform::fs::REAL_PUBLIC_DIR_MODE;
 /// 私有树目录的原生 MediaProvider 语义（owner→group 镜像、others 清零）。
 /// auto-mkdir 曾对私有树沿用公共目标的 0o2773（others 可写可穿越），与原生
 /// 02770 相悖且弱化隔离——用户 2026-10-21 反馈的微信私有目录 2773 即此来源。
 const PRIVATE_TREE_DIR_MODE: mode_t = 0o2770;
 
 /// 按路径形态派生 auto-mkdir 的目录 mode：私有树（Android/{data,media,obb}）
-/// 对齐原生 02770，其余（公共重定向目标等）维持 0o2773。
+/// 对齐原生 02770，其余（公共重定向目标等）用公共目录口径。
 fn redirect_mkdir_mode_for(path: &str, base: mode_t) -> mode_t {
     let normalized = crate::platform::paths::normalize(path);
     if let Some(rest) = normalized.strip_prefix("/data/media/") {
@@ -56,6 +59,7 @@ fn log_call_prev_fallback(site: &str) {
 
 #[inline]
 fn should_bypass_hook_in_fork_child(hub: &InterceptHub) -> bool {
+    // fork_safe 只覆盖 srx_hook 自身状态，SRX 自有锁仍需单独处理 fork 生命周期。
     if !srx_hook::is_forked_child() || srx_hook::fork_safe() {
         return false;
     }
@@ -183,11 +187,11 @@ pub fn ensure_redirect_parent_directory(op_name: &str, from_path: &str, to_path:
     }
 
     if fs::is_directory(&parent_dir) {
-        ensure_redirect_parent_dirs(to_path, STORAGE_DIR_MODE);
+        ensure_redirect_parent_dirs(to_path, PUBLIC_DIR_MODE);
         return;
     }
 
-    ensure_redirect_parent_dirs(to_path, STORAGE_DIR_MODE);
+    ensure_redirect_parent_dirs(to_path, PUBLIC_DIR_MODE);
     if fs::is_directory(&parent_dir) {
         log::debug!("redirect parent mkdir ok op={} dir={}", op_name, parent_dir);
         return;
@@ -217,9 +221,9 @@ pub fn ensure_redirect_parent_dirs(path: &str, mode: mode_t) {
 
     if path.starts_with("/storage/emulated/") {
         let underlying = paths::storage_to_data_media_path(path);
-        create_storage_parent_dirs_recursive(&underlying, STORAGE_DIR_MODE, owner.as_ref());
+        create_storage_parent_dirs_recursive(&underlying, PUBLIC_DIR_MODE, owner.as_ref());
     } else if path.starts_with("/data/media/") {
-        create_storage_parent_dirs_recursive(path, STORAGE_DIR_MODE, owner.as_ref());
+        create_storage_parent_dirs_recursive(path, PUBLIC_DIR_MODE, owner.as_ref());
     } else {
         create_parent_dirs_recursive(path, mode, owner.as_ref());
     }
@@ -231,7 +235,7 @@ pub fn normalize_redirect_directory(path: &str) {
     }
 
     let owner = resolve_redirect_dir_owner();
-    normalize_redirect_dir_metadata(path, STORAGE_DIR_MODE, owner.as_ref());
+    normalize_redirect_dir_metadata(path, PUBLIC_DIR_MODE, owner.as_ref());
 }
 
 pub fn fix_system_writer_android_private_owner(path: &str, include_path: bool, fd: i32) {
@@ -322,7 +326,11 @@ pub fn fix_mapped_private_alias_access(hub: &InterceptHub, path: &str, flags: i3
     } else {
         private_owner.clone()
     };
-    let owner_uid = policy::get_fresh_uid_for_package(&effective_package);
+    let user_id = paths::extract_user_id_from_storage_path(path);
+    if user_id < 0 {
+        return;
+    }
+    let owner_uid = policy::get_fresh_uid_for_package_in_user(&effective_package, user_id);
     if owner_uid < ANDROID_APP_UID_START
         || !SettingsHub::instance().should_redirect(&effective_package, owner_uid)
     {
@@ -419,7 +427,7 @@ fn fix_system_writer_android_private_owner_inner(path: &str, include_path: bool,
         return;
     }
 
-    let owner_uid = resolve_private_owner_uid(&owner_package);
+    let owner_uid = resolve_private_owner_uid(&owner_package, user_id);
     if owner_uid < ANDROID_APP_UID_START || platform::user_id_from_uid(owner_uid) != user_id {
         return;
     }
@@ -486,8 +494,8 @@ fn android_private_owner_package(normalized_path: &str) -> Option<String> {
     }
 }
 
-fn resolve_private_owner_uid(package_name: &str) -> i32 {
-    policy::get_fresh_uid_for_package(package_name)
+fn resolve_private_owner_uid(package_name: &str, user_id: i32) -> i32 {
+    policy::get_fresh_uid_for_package_in_user(package_name, user_id)
 }
 
 fn is_private_owner_fix_allowed_for_current_caller(owner_package: &str, owner_uid: i32) -> bool {
@@ -717,9 +725,16 @@ fn chmod_private_node_if_needed(
     }
 }
 
+/// 系统代写进程在他人私有树里工作时，目录至少要具备的权限位。
+///
+/// 沙盒根（`Android/data/<pkg>/sdcard`）按原生 `02770` 要求：它的组必须是可继承
+/// 的 `ext_data_rw`，代写进程靠组位进出。这里曾用公共目录的 `0o2773`，等于用
+/// 「other 可写可穿越」给沙盒根的错误组打补丁——组正确之后这层放宽就没有存在
+/// 理由，还会把私有树对全系统第三方 uid 打开（2026-11-09 真机 `Documents/ringtone`
+/// 泄漏目录的 `2773` 签名即此来源）。
 fn private_dir_required_mode(path: &str) -> mode_t {
     if paths::is_default_redirect_backend_path(path) {
-        STORAGE_DIR_MODE
+        PRIVATE_TREE_DIR_MODE
     } else {
         PRIVATE_CHILD_DIR_REQUIRED_MODE
     }
@@ -845,7 +860,15 @@ fn normalize_redirect_dir_metadata(path: &str, mode: mode_t, owner: Option<&Redi
         return;
     }
 
-    let ret = unsafe { libc::chown(c_path.as_ptr(), owner.uid as u32, MEDIA_RW_GID) };
+    // 私有树只归位属主，**组交给 setgid 继承**：原生口径是
+    // `应用uid:ext_data_rw(1078):02770`，而这里曾把组恒写成 media_rw(1023)，
+    // 与 owner_migration v4「把 1023 恢复成 1078」互相抵消，纯属内耗；对系统
+    // 代写进程（同时在 media_rw/ext_data_rw 两个组里）两个值都能进，本就不构成
+    // 功能问题，但不该由模块自己发明组值。私有树之外的分支不会走到这里
+    // （`should_apply_shared_media_owner` 只认 Android/{data,media,obb}/<pkg>）。
+    // SAFETY: c_path 以 NUL 结尾并在调用期间保持有效；gid 传 `u32::MAX` 即
+    // `(gid_t)-1`，是 chown 的标准「不改组」语义，组保持父目录 setgid 继承的结果。
+    let ret = unsafe { libc::chown(c_path.as_ptr(), owner.uid as u32, u32::MAX) };
     if ret == 0 {
         return;
     }
@@ -903,7 +926,11 @@ fn package_matches_owner(package_name: &str, owner: &RedirectDirOwner) -> bool {
         return package_name == owner.package_name;
     }
 
-    if policy::get_fresh_uid_for_package(package_name) == owner.uid {
+    if policy::get_fresh_uid_for_package_in_user(
+        package_name,
+        platform::user_id_from_uid(owner.uid),
+    ) == owner.uid
+    {
         return true;
     }
 

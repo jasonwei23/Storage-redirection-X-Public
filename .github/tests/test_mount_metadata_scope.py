@@ -131,15 +131,34 @@ class MountMetadataScopeTest(unittest.TestCase):
         # 访问自有 Android/data|media|obb/<pkg> 的应用失去写权限。
         body = function_body(
             self.mount_core,
-            "pub(super) fn ensure_writable_mapped_directory(&self, path: &str, owner_uid: i32) "
+            "pub(crate) fn ensure_writable_mapped_directory(&self, path: &str, owner_uid: i32) "
             "-> bool",
         )
         self.assertIn("st.st_uid == uid", body)
         keep_index = body.index("st.st_uid == uid")
-        chmod_index = body.index("chmod(c_path.as_ptr(), MAPPED_DIR_MODE)")
+        chmod_index = body.index("chmod(c_path.as_ptr(), target_mode)")
         self.assertLess(keep_index, chmod_index)
         # 属主已正确时必须在 chown/chmod 之前直接返回，跳过整段元数据修正。
         self.assertIn("return true", body[keep_index:chmod_index])
+
+        # 组与 mode 按路径形态二选一：私有树回到原生口径（组交给父目录 setgid 继承、
+        # mode 02770），公共映射目标沿用 media_rw(1023) + 02771。写死 1023 会让
+        # Android/data 一支长期偏离真机形态，也让 owner_migration 每次开机都要改回来。
+        target_body = function_body(
+            self.mount_core, "fn mapped_dir_target(&self, backend_path: &str)"
+        )
+        self.assertIn("is_android_private_backend_path(backend_path, self.user_id)", target_body)
+        self.assertIn("(u32::MAX, 0o2770)", target_body)
+        self.assertIn("(MEDIA_RW_GID, MAPPED_DIR_MODE)", target_body)
+        # 两个写入点都必须用派生值，不能再各自写常量。
+        self.assertIn("chown(c_path.as_ptr(), uid, target_gid)", body)
+        self.assertNotIn("chown(c_path.as_ptr(), uid, MEDIA_RW_GID)", body)
+        owned_body = function_body(
+            self.mount_core,
+            "pub(super) fn ensure_app_owned_mapping_target(&self, path: &str, owner_uid: i32)",
+        )
+        self.assertIn("chown(c_path.as_ptr(), owner_uid as u32, target_gid)", owned_body)
+        self.assertIn("chmod(c_path.as_ptr(), target_mode)", owned_body)
 
     def test_scoped_fuse_sessions_are_retired(self) -> None:
         # per-app scoped FUSE 会话已退役：它是应用命名空间的自持引用，应用退出后仍在
@@ -169,27 +188,10 @@ class MountMetadataScopeTest(unittest.TestCase):
             self.assertNotIn("attach_shared_host_sessions", source, path)
             # 已由当前宿主层服务的视图根也要按宿主挂载记账，否则状态文件缺这条目标、
             # 下一轮清理会漏摘，挂载层失去归属判据。
-            self.assertIn("crate::fuse_session::storage_view_top_source(", source, path)
+            self.assertIn("crate::fuse_session::storage_view_top_dev(", source, path)
             self.assertIn("host_session: Some((view.child_pid, view.child_start_time_ticks))", source, path)
             # 两条挂载路径都不得再 fork per-app 会话。
             self.assertNotIn("srx_fuse\\0", source, path)
-
-    def test_scoped_fuse_budget_preserves_dynamic_rules(self) -> None:
-        # 多会话预算只控制进程/内存开销，预算超限必须折叠为单个存储根 FUSE 会话，
-        # 不能返回空列表让 namespace 按当前已存在目录展开而丢失动态通配语义。
-        hard_limit = const_value(self.fuse_mod, "MAX_SCOPED_FUSE_ROOTS")
-        self.assertGreater(hard_limit, 0)
-
-        target_limit = const_value(self.fuse_mod, "TARGET_SCOPED_FUSE_ROOTS")
-        self.assertLessEqual(target_limit, hard_limit)
-
-        # 一级压缩用软目标、二级降级用硬上限，两级判据不能退回同一个常量。
-        compact_body = function_body(self.fuse_config, "fn compact_scoped_mount_roots(")
-        target_index = compact_body.index("super::TARGET_SCOPED_FUSE_ROOTS")
-        hard_index = compact_body.index("super::MAX_SCOPED_FUSE_ROOTS")
-        self.assertLess(target_index, hard_index)
-        self.assertIn("vec![storage_root.to_string()]", compact_body)
-        self.assertIn("collapse to single storage-root fuse session", compact_body)
 
     def test_fuse_child_cleanup_rechecks_process_identity(self) -> None:
         # 状态文件携带启动时间后，SIGTERM/SIGKILL 两个阶段都必须重复校验 PID 身份，
@@ -207,7 +209,7 @@ class MountMetadataScopeTest(unittest.TestCase):
         # chown/chmod；这些目录由 MediaProvider 管理，改写会造成应用必须额外配置放行路径。
         mount_body = function_body(
             self.mount_core,
-            "pub(super) fn ensure_writable_mapped_directory(&self, path: &str, owner_uid: i32) "
+            "pub(crate) fn ensure_writable_mapped_directory(&self, path: &str, owner_uid: i32) "
             "-> bool",
         )
         self.assertIn("is_android_private_backend_path", mount_body)
@@ -233,9 +235,11 @@ class MountMetadataScopeTest(unittest.TestCase):
         self.assertIn("owner_uid as u32, u32::MAX", body)
 
     def test_owner_migration_restores_only_private_data_directory_gid(self) -> None:
-        # 一次性迁移只把 Android/data 下、owner 正确且无 other 权限位的目录从
-        # media_rw 组恢复到 AOSP 定义的 ext_data_rw；文件与共享媒体目录保留 1023。
-        self.assertIn("owner-migration-1023-v4.done", self.owner_migration)
+        # 一次性迁移只把 Android/data 下、owner 正确且无 other 权限位的目录恢复到
+        # AOSP 定义的 ext_data_rw；文件与共享媒体目录保留 1023。两种漂移都要收：
+        # gid=media_rw(1023)（旧 hook 覆盖了继承来的组）与 gid=应用自身 uid
+        # （目录创建入口 chown(uid, uid) 的产物，系统代写进程连穿越都做不到）。
+        self.assertIn("owner-migration-1023-v5.done", self.owner_migration)
         self.assertIn("const EXT_DATA_RW_GID: u32 = 1078", self.owner_migration)
         body = function_body(
             self.owner_migration,
@@ -243,7 +247,10 @@ class MountMetadataScopeTest(unittest.TestCase):
         )
         self.assertIn('metadata.is_dir()', body)
         self.assertIn('metadata.uid() == target_uid || metadata.uid() == MEDIA_RW_UID', body)
-        self.assertIn('metadata.mode() & 0o007 != 0', body)
+        self.assertIn('metadata.gid() == MEDIA_RW_UID || metadata.gid() == target_uid', body)
+        self.assertIn('metadata.mode() & 0o007 == 0', body)
+        # 「02773 + 组漂移」双重污染必须能在同一次扫描里收敛，因此判据按收敛后的形态取。
+        self.assertIn('0o2773', body)
         self.assertIn('path.rfind("/Android/data/")', body)
         self.assertNotIn('"/Android/media/"', body)
         self.assertNotIn('"/Android/obb/"', body)
@@ -260,28 +267,208 @@ class MountMetadataScopeTest(unittest.TestCase):
     def test_own_private_restore_prefers_system_fuse_anchor(self) -> None:
         # 自有 Android 私有目录不能从 /data/media 直绑到应用视图；直绑会绕过
         # MediaProvider FUSE 并带入 media_rw_data_file 上下文，应用仍会被 SELinux 拒绝。
-        # 2026-10-25 起（f84a29dd）源改为独立的系统视图锚点 ensure_system_view_anchor，
-        # 且只恢复 Android/media/<pkg>（data 是沙箱宿主、obb 无跨进程共享需求），
-        # 锚点缺失时以 "own private system view anchor unavailable" 留痕等待重试。
+        # 2026-10-25 起（f84a29dd）源改为独立的系统视图锚点；2026-11-02 起锚点改为
+        # **临时**（create_transient_system_view_anchor + Drop 摘除）：锚点常驻会在应用
+        # 挂载表里留下 /data/adb/modules/.../tmp/system_view/<user> 这条模块私有路径。
+        # 锚点缺失时仍以 "own private system view anchor unavailable" 留痕等待重试。
         apply = read("src/mount/apply.rs")
         body = function_body(apply, "fn restore_own_private_directories(")
-        self.assertIn("ensure_system_view_anchor", body)
+        self.assertIn("create_transient_system_view_anchor", body)
         self.assertIn("backend_source", body)
         self.assertIn("own private system view anchor unavailable", body)
         self.assertIn('format!("Android/media/{}", self.package_name)', body)
         self.assertNotIn("unwrap_or_else(|| backend_source.clone())", body)
         self.assertNotIn('relative.starts_with("Android/data/")', body)
 
-    def test_wildcard_mapping_from_android_private_subtree_uses_scoped_fuse(self) -> None:
-        # Android/data/<pkg>/file/* -> Download/AAA 这类规则必须纳入 scoped FUSE 根索引，
-        # 否则 namespace 只能展开当前已存在目录，后续新建匹配目录无法动态映射。
+        # 锚点必须"建立→用完即摘"：守卫靠 Drop 保证任何提前返回也不会把它留在命名空间里。
+        #
+        # 两条分支都必须走 **克隆**（`open_tree(OPEN_TREE_CLONE)` + `move_mount`），
+        # 不得退化成 `bind_mount`：本函数被 companion 与 daemon 各调用一次，克隆随
+        # `move_mount` 一次性消费，第二次必然进回退分支；而 `mount(MS_BIND)` 的源必须
+        # 属于调用方**当前命名空间**（内核 `do_loopback` 的 `check_mnt`），跨命名空间的
+        # `/proc/1/root/...` magic link 作源恒失败——锚点拿不到，自有私有目录就整段
+        # 没交回系统视图（真机 2026-11-13 AVD(A15)：`restored count=0`，场景 35 判
+        # `file_missing`）。修复后同点位 `restored count=3`。
+        anchor_body = function_body(apply, "fn create_transient_system_view_anchor(")
+        self.assertIn("clone.attach_at(&anchor_root)", anchor_body)
+        self.assertIn("SystemViewClone::capture(", anchor_body)
+        self.assertNotIn("bind_mount(&source", anchor_body)
+        self.assertIn("detach_mount_if_present(&anchor_root)", anchor_body)
+        drop_body = function_body(apply, "impl Drop for SystemViewAnchor {")
+        self.assertIn("detach_mount_if_present(&self.root)", drop_body)
+
+    def test_auto_backend_prefers_fuse_full_view_root(self) -> None:
+        # auto 语义为 FUSE 优先：能力可用时整棵视图根由本会话接管，规则仍在策略层
+        # 逐请求判定；能力不可用时由能力门禁返回空根，挂载层回落 namespace。
         body = function_body(
             self.fuse_config,
-            "pub fn scoped_mount_roots_for_hybrid_rules(",
+            "pub fn scoped_fuse_mount_roots_for_request",
         )
-        self.assertIn("mapping_wildcard_rules", body)
-        self.assertIn(".chain(mapping_wildcard_rules)", body)
-        self.assertIn("resolve_scoped_path_mappings(path_mappings, user_id, &storage_root)", body)
+        self.assertIn("storage_user_root_for_user(user_id)", body)
+        self.assertIn("scoped_mount_allowed_for_scope", body)
+        self.assertNotIn("scoped_mount_roots_for_hybrid_rules", body)
+
+    def test_fuse_mode_prepares_mapping_target_dirs(self) -> None:
+        # bind 布局在挂载时由规划器顺带建好映射目标目录；FUSE 布局没有对应挂载动作，
+        # 必须在接入前由特权进程预建，否则下载提供器等系统代写链路会判定目标父目录缺失
+        # 而放弃写入（CI 场景 39：Failed to create parent for …）。
+        planner = read("src/mount/planner.rs")
+        body = function_body(planner, "pub(crate) fn prepare_mapping_target_dirs(")
+        self.assertIn("ensure_writable_mapped_directory", body)
+        self.assertIn("final_path", body)
+        # 两条挂载路径都必须预建：daemon 执行自己那份挂载，companion 负责应用侧接入。
+        # 只补一边会让走另一边的平台继续失败（A14/A17 走 companion、A13/15/16 走 daemon）。
+        daemon = read("src/daemon_mount.rs")
+        self.assertIn("prepare_mapping_target_dirs", daemon)
+        # daemon 侧必须在 fork 之前准备：子进程只允许 setns/mount/write，禁止堆分配。
+        self.assertLess(
+            daemon.index("prepare_mapping_target_dirs(request);"),
+            daemon.index("run_mount_in_forked_child(request);"),
+        )
+        companion = read("src/lifecycle/companion_mount.rs")
+        self.assertIn("mount_mgr.prepare_mapping_target_dirs(", companion)
+
+    def test_path_mapping_resolution_chains_to_fixpoint(self) -> None:
+        # 场景 37 的契约「父映射结果继续命中子映射」：bind 布局下两层挂载天然串联，FUSE 只在
+        # 策略层解析，因此 resolve_mapping 必须迭代到不动点。退回单跳会让中间路径落在后端不存在
+        # 的位置，应用侧表现为写入 ENOENT（CI run 42259826817 的 A17 现场即此）。
+        policy = read("src/fuse_redirect/policy.rs")
+        body = function_body(policy, "pub(super) fn resolve_mapping(&self, storage_path: &str)")
+        self.assertIn("MAX_MAPPING_HOPS", body)
+        # 双步振荡与恒等映射必须提前收敛，否则手写的 A→B / B→A 环会让解析永不停止。
+        self.assertIn("previous.as_deref() == Some(next.as_str())", body)
+        self.assertIn("next == path", body)
+        # 自嵌套映射（目标落在自己请求路径的子树内）只能生效一次：bind 布局下它只挂一层，
+        # 连续串联会把目录名逐跳叠加。判据必须按路径分段，不能按字符串前缀——`Download/X`
+        # 与 `Download/XMapped` 只共享前缀，用 starts_with 会把正常映射判成自嵌套并整跳丢失。
+        self.assertIn("paths::is_same_or_child", body)
+        self.assertNotIn("starts_with(mapping.request_path", body)
+        # 终止条件只决定「还有没有下一跳」：必须先落这一跳再判停，否则等同于映射未命中。
+        self.assertLess(body.index("previous = current;"), body.index("if stop {"))
+        # 单跳实现的标志：命中第一条映射就直接 return。出现即说明链式语义被改回去了。
+        self.assertNotIn("return Some(mapping.final_path.clone());", body)
+
+    def test_public_directory_mode_is_repaired_only_when_deficient(self) -> None:
+        # 既有共享目录（DCIM/Pictures/Android…）的权限由 MediaProvider 决定：原型可能是
+        # 02773 也可能是 02771。把这些目录归一成模块常量会改写用户磁盘上的既有权限，
+        # 属于应用侧可观测的模块痕迹。因此只允许"缺能力位才补位"，且只追加不回收。
+        planner_paths = read("src/mount/planner_paths.rs")
+        helper = function_body(planner_paths, "pub(super) fn repair_missing_mode_bits(")
+        self.assertIn("mode & required == required", helper)
+        self.assertIn("mode | repair", helper)
+        self.assertNotIn("chmod(c_path.as_ptr(), required)", helper)
+        for signature in (
+            "pub(super) fn fix_real_public_directory_metadata(path: &str)",
+            "pub(super) fn fix_allowed_real_directory_metadata(path: &str)",
+        ):
+            body = function_body(planner_paths, signature)
+            self.assertIn("repair_missing_mode_bits(", body)
+            self.assertNotIn("chmod(c_path.as_ptr(), REAL_PUBLIC_DIR_MODE)", body)
+            self.assertNotIn("chmod(c_path.as_ptr(), ALLOWED_REAL_DIR_MODE)", body)
+        # 归一常量本身必须已经不在实现里，否则改回"等于常量才跳过"的旧口径不会被发现。
+        self.assertNotIn("REAL_PUBLIC_DIR_MODE", read("src/mount/planner.rs"))
+        self.assertNotIn("ALLOWED_REAL_DIR_MODE", read("src/mount/planner.rs"))
+        # allowed-real 修复必须先 stat 再决定是否写，既有目录一个元数据系统调用都不发。
+        allowed_body = function_body(
+            planner_paths,
+            "pub(super) fn fix_allowed_real_directory_metadata(path: &str)",
+        )
+        self.assertIn("allowed real stat", allowed_body)
+
+    def test_lifted_alias_expansion_keeps_mnt_aliases(self) -> None:
+        # 上提一层后主目标是用户根的父级，旧的"同层或更深"判据会退化成单条，三个 /mnt 别名
+        # 会同时失效。展开必须先识别上提根并补齐别名集合，否则应用经别名路径访问存储直接断。
+        alias = read("src/mount/alias.rs")
+        body = function_body(alias, "pub(super) fn expand_storage_alias_paths(")
+        lift_at = body.find("lifted_alias_roots(canonical_path)")
+        root_at = body.find("storage_user_root_for_user(self.user_id)")
+        self.assertGreater(lift_at, -1, "缺少上提根的别名展开分支")
+        self.assertGreater(root_at, lift_at, "上提根判定必须早于用户根判据")
+        helper = function_body(alias, "fn lifted_alias_roots(")
+        self.assertIn('ends_with("/emulated")', helper)
+        for root in ("/storage/emulated", "/mnt/user/", "/mnt/installer/", "/mnt/androidwritable/"):
+            self.assertIn(root, helper)
+
+    def test_lifted_view_root_entries_synthesized_before_backend(self) -> None:
+        # 视图根上提后根 inode 的条目必须由我们自己合成（0/999/obb），且必须发生在候选缓存、
+        # 虚拟目录与重试循环之前；否则空 rel 会去读后端根，把 Download/DCIM 直接列成根条目。
+        callbacks = read("src/fuse_redirect/callbacks.rs")
+        body = function_body(callbacks, "fn opendir(")
+        synth_at = body.find("policy.view_lifted && rel.is_empty()")
+        cache_at = body.find("dir_candidate_cache")
+        loop_at = body.find("let (fh, entry_count) = loop {")
+        self.assertGreater(synth_at, -1, "opendir 里缺少视图根合成分支")
+        self.assertGreater(cache_at, synth_at, "合成必须早于候选缓存")
+        self.assertGreater(loop_at, synth_at, "合成必须早于扫描/重试循环")
+        self.assertIn("lifted_root_names(policy.user_id)", body)
+        names = function_body(callbacks, "fn lifted_root_names(")
+        self.assertIn('"obb"', names)
+        self.assertIn("is_ascii_digit", names)
+
+    def test_view_lift_switch_follows_mount_shape(self) -> None:
+        # P5-c 的开关必须由挂载点形态唯一决定（`…/emulated` 为已上提），不能另开一份配置项，
+        # 否则开关与真实挂载点会漂移：开关说已上提、挂载点还在用户目录级，解析就会少剥一层。
+        policy = read("src/fuse_redirect/policy.rs")
+        lift = function_body(policy, "pub(super) fn is_lifted_view_root(")
+        self.assertIn('ends_with("/emulated")', lift)
+        self.assertIn("Self::is_lifted_view_root(&mount_root)", policy)
+        resolve = function_body(policy, "fn resolve_relative(")
+        self.assertIn("if self.view_lifted", resolve)
+        self.assertIn("self.lifted_view_rel(rel)", resolve)
+        # 上提后根自身与"非本用户子树"必须分开处理：根为空 rel（不能 ENOENT，否则视图根
+        # 自身 stat 失败），非本用户/obb 直通系统视图（基线里它们是普通目录）。
+        self.assertIn("rel.trim_matches('/').is_empty()", resolve)
+        self.assertIn("passthrough_foreign_view_rel", resolve)
+        passthrough = function_body(policy, "fn passthrough_foreign_view_rel(")
+        # 能力必须与基线一致（应用域自检实测）：`obb` 写入在基线失败、其它用户目录写入
+        # 在基线被拒，因此两条直通都按只读处理——放开写才是"多给能力"。
+        self.assertIn("is_read_only: true", passthrough)
+        # `obb` 在系统视图里是独立挂载（OBB 的 FUSE），必须直通 `/storage/emulated/<rel>`。
+        self.assertIn('paths::join("/storage/emulated", &rel)', passthrough)
+        # 其它用户要走那个用户自己的视图根，否则落到本会话对系统视图的 uid 0 请求上
+        # （应用域自检实测：目录可进但列表为空）。
+        self.assertIn('"/mnt/user/{other_user}/emulated/{other_user}"', passthrough)
+        self.assertIn('head == "obb"', passthrough)
+
+    def test_lifted_view_probe_stays_side_effect_free(self) -> None:
+        # P5-c 之前必须先证明"视图根上提一层"是等价变换：`<user>/…` 与今天的 `…` 必须
+        # 解析到同一后端。探针只允许读，不允许影响真实解析，也不允许在非 debug 档位
+        # 产生任何开销/日志。
+        policy = read("src/fuse_redirect/policy.rs")
+        wrapper = function_body(
+            policy,
+            "pub(super) fn backend_for_relative(",
+        )
+        self.assertIn("self.resolve_relative(rel, operation)", wrapper)
+        self.assertIn("self.probe_lifted_view_resolution(", wrapper)
+        probe = function_body(policy, "fn probe_lifted_view_resolution(")
+        self.assertIn("is_debug_logging_enabled()", probe)
+        self.assertIn("self.lifted_view_rel(", probe)
+        lift = function_body(policy, "pub(super) fn lifted_view_rel<")
+        self.assertIn("parse::<i32>()", lift)
+        self.assertIn("self.user_id", lift)
+
+    def test_dead_layer_cleanup_protects_system_view_roots(self) -> None:
+        # 死宿主层清理按 dev ∈ known_module_fuse_devs() 在整个命名空间摘层。本模块对系统视图
+        # 做过 bind，bind 继承系统 MediaProvider 的超级块，其 dev 会随账本混进 known 集合；
+        # 若不做保护，系统自己的 `…/emulated` 根层会被当成本模块死层摘掉（真机表现：
+        # 重定向应用别名根层消失、只剩 `…/emulated/<user>`）。因此清理前必须取
+        # system_view_root_devs 并跳过这些 dev。
+        companion = read("src/lifecycle/companion_mount.rs")
+        self.assertIn("system_view_root_devs", companion)
+        propagation = read("src/mount/propagation.rs")
+        body = function_body(propagation, "pub fn system_view_root_devs(user_id: i32)")
+        self.assertIn("/storage/emulated", body)
+        self.assertIn("/mnt/user/", body)
+        self.assertIn("/mnt/androidwritable/", body)
+        self.assertIn("/mnt/pass_through/", body)
+
+    def test_daemon_public_directory_fix_keeps_native_mode(self) -> None:
+        # 守护侧同一口径：监控到公共目录事件时只补缺失能力位，不改写成固定模式。
+        monitor = read("src/daemon_monitor/events.rs")
+        self.assertIn("REQUIRED_PUBLIC_DIR_ACCESS_MODE", monitor)
+        self.assertNotIn("current_mode != REAL_PUBLIC_DIR_MODE", monitor)
+        self.assertNotIn("const REAL_PUBLIC_DIR_MODE", monitor)
 
 
 if __name__ == "__main__":

@@ -1,9 +1,9 @@
-// 应用 specialize 后流程：等待挂载状态并安装 PLT Hook
+// 应用 specialize 后流程：确认挂载结论并安装 PLT Hook
 use super::RuntimeFlow;
 use super::mount_timing;
 use crate::hook::{InterceptHub, install_fuse_fix_if_enabled};
 use crate::java_hook;
-use crate::module_mount_source::{app_redirect_mounts_in, is_collapsed_host_view_root};
+use crate::module_mount_source::{app_redirect_mounts_in, storage_view_root_is_module_session};
 use crate::platform::paths::monotonic_ms;
 use crate::platform::{self, anti_detect};
 use crate::redirect::policy;
@@ -11,17 +11,6 @@ use crate::zygisk::abi;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 static PLT_HOOK_INSTALLED: AtomicBool = AtomicBool::new(false);
-
-/// 认定挂载落定所需的连续稳定轮数。
-///
-/// 一个应用可能有多个挂载根，逐条建立。只看"出现了挂载"就返回，应用会在挂载只完成一半时
-/// 开始访问被重定向的路径。要求连续多轮看到完全相同的挂载 ID 集合再放行，用很小的延迟
-/// 换取"挂载集合已不再变化"这一判据。
-///
-/// 只数稳定轮数仍不够：多进程并发启动时（同一 uid 的 `:appbrand0`/`:appbrand1`/主进程），
-/// 先启动进程挂好的 FUSE 根会让后启动进程一进来就看到**稳定的非空集合**，于是在重定向本体
-/// 建立之前就放行。因此判据里还必须叠加"沙箱根已出现"，见 `wait_for_module_mount`。
-const MOUNT_SETTLE_POLLS: u32 = 4;
 
 impl RuntimeFlow {
     pub fn post_app_specialize(&mut self, _args: *const abi::AppSpecializeArgs) {
@@ -53,7 +42,7 @@ impl RuntimeFlow {
             return;
         }
 
-        let mut mount_wait_ms = 0;
+        let mut mount_check_ms = 0;
         if self.should_redirect && !self.is_system_writer_hook_redirect {
             if policy::is_file_monitor_bridge_package(&self.package_name) {
                 // 桥接进程保留自身重定向时不挂模块 FUSE 会话
@@ -74,15 +63,17 @@ impl RuntimeFlow {
                 );
             } else {
                 let mount_started_ms = monotonic_ms();
+                // pre 阶段通常已经发出请求；这里只补发"延迟负载"这一类。
                 self.send_deferred_mount_request();
-                wait_for_module_mount(
+                conclude_mount_readiness(
                     &self.package_name,
                     self.app_pid,
+                    self.app_uid,
                     self.is_mount_request_sent,
                     self.is_mapping_mode_only,
                     &mut self.is_mount_applied,
                 );
-                mount_wait_ms = monotonic_ms().saturating_sub(mount_started_ms);
+                mount_check_ms = monotonic_ms().saturating_sub(mount_started_ms);
             }
         } else if self.should_redirect && self.is_system_writer_hook_redirect {
             self.is_mount_applied = false;
@@ -160,7 +151,7 @@ impl RuntimeFlow {
         log_post_perf(
             self,
             "done",
-            mount_wait_ms,
+            mount_check_ms,
             hook_ms,
             anti_ms,
             perf_started_ms,
@@ -181,21 +172,31 @@ fn should_install_process_plt_hook(flow: &RuntimeFlow, is_redirect_via_hook: boo
         || (flow.should_monitor && policy::is_saf_native_monitor_bridge_package(&flow.package_name))
 }
 
-// 等待本模块的重定向挂载出现在当前进程的命名空间里。
+// 确认本次挂载请求的结论。
 //
-// **本函数整套轮询是"每个应用进程各自建立 FUSE 会话"这一实现的直接后果。共享宿主 FUSE
-// 会话落地后（见 `docs/shared-fuse-daemon-architecture.md` 阶段 2）应当整体删除**：届时
-// 应用侧只需一次 `MS_BIND` 注入，原子完成，不存在"挂载只完成了一半"的中间态，也就
-// 不需要任何落定判据。在那之前这里是最小必要的补偿，不要再往上加轮次或预算。
-fn wait_for_module_mount(
+// 判据只有一条：**应用此刻能不能在自己的命名空间里看见重定向结果**。曾经的做法是等
+// 挂载执行方写回执，但那条通道在本项目里不可能成立（SELinux 域迁移：socket 由 zygote
+// 域创建，应用 specialize 后属于 untrusted_app 域，`read` 直接被拒——`mount_request`
+// 模块头注释里有真机 AVC 证据）。每次启动白等 50~60 毫秒，换来一条
+// `avc: denied { read } ... unix_stream_socket` 审计痕迹，而判据本身没有任何功能
+// 消费者（只进 `perf post` 与结论日志）。执行方的结论由执行方自己记
+// （`perf companion mount ... ok=` / `companion fuse view unavailable reason=`）。
+//
+// 因此这里是一次**观测**，不是等待：不轮询、不睡眠、不占预算。
+//
+// 日志里的 `app mount confirmed pid=` 前缀被测试流匹配，改动前必须同步 .github/tests 下
+// 的检测式；前缀本身与 `pid=` 之后紧邻的取值不能改。结论分两级，措辞不得混淆：
+// `app mount confirmed`（观测到重定向生效）／`app mount unconcluded`（这一刻观测不到
+// 证据——**没有结论**，不是失败，info）。
+fn conclude_mount_readiness(
     package_name: &str,
     app_pid: i32,
+    app_uid: i32,
     is_mount_request_sent: bool,
     is_mapping_mode_only: bool,
     is_mount_applied_out: &mut bool,
 ) {
     *is_mount_applied_out = false;
-    let mount_started_ms = monotonic_ms();
 
     if app_pid <= 0 {
         log::warn!("mount ctx invalid, skip wait");
@@ -206,105 +207,47 @@ fn wait_for_module_mount(
         log::warn!("mount req not sent, wait daemon mount fallback");
     }
 
-    log::info!(
-        "wait module mount pid={} budget_ms={} polls={} delay_us={} map_only={}",
-        app_pid,
-        mount_timing::post_mount_status_wait_budget_ms(),
-        mount_timing::POST_MOUNT_STATUS_POLL_COUNT,
-        mount_timing::POST_MOUNT_STATUS_POLL_DELAY_US,
-        is_mapping_mode_only
-    );
+    let observed_started_ms = monotonic_ms();
+    let mounts = app_redirect_mounts_in(0, package_name);
+    let mount_count = mounts.len();
+    // 就绪证据分三条，全部与模块标识无关：
+    // 1. 仅映射模式：本就不建立存储根重定向；
+    // 2. 沙箱根（`<包名>/sdcard`）出现在 `root` 字段——命名空间 bind 后端的判据；
+    // 3. collapsed 形态：视图根的设备号已换成模块会话的（见 `storage_view_root_is_module_session`）。
+    let observed_ready = is_mapping_mode_only
+        || mounts.iter().any(|mount| mount.is_sandbox_root)
+        || storage_view_root_is_module_session(crate::platform::user_id_from_uid(app_uid));
+    let observed_ms = monotonic_ms().saturating_sub(observed_started_ms);
+    *is_mount_applied_out = observed_ready;
 
-    let mut settled: Vec<(u64, String)> = Vec::new();
-    let mut settle_polls = 0u32;
-    let mut poll_count = 0;
-    let mut last_mount_count = 0usize;
-    let mut has_sandbox_root = false;
-    for _ in 0..mount_timing::POST_MOUNT_STATUS_POLL_COUNT {
-        poll_count += 1;
-        let mounts = app_redirect_mounts_in(0, package_name);
-        // 重定向本体是否已就位：沙箱根（`<包名>/sdcard`）是命名空间 bind 后端唯一在所有
-        // 重定向模式下都必然出现的层，锚点与 FUSE 根都不满足这一点（前者任何模式都有但不
-        // 代表重定向生效，后者的数量取决于 `allowed_real_paths`）。只看"出现了挂载"就放行
-        // 会让应用在 `own private restored` 尚未执行时开始读配置——多进程并发启动时尤其容易
-        // 命中，因为先启动的进程挂好的 FUSE 根会让后启动进程一进来就看到稳定的非空签名。
-        //
-        // collapsed hybrid FUSE 形态（`backend=auto` 把 scoped 根收敛成视图根）是例外：
-        // 它按设计不创建沙箱根 bind，重定向本体就是落在 `/storage/emulated/<user>` 上的
-        // 共享宿主视图根，由 `is_collapsed_host_view_root` 认定。缺了这条判定，这一形态的
-        // 每个应用进程都会空等满预算并误报 `mount unknown/failed`。
-        //
-        // 仅映射模式**不建立存储根重定向**，沙箱根永远不出现；这类应用只能退回"集合稳定
-        // 即放行"，否则每个进程都要空等满预算。
-        has_sandbox_root = mounts.iter().any(|mount| {
-            mount.is_sandbox_root || is_collapsed_host_view_root(&mount.source, &mount.mount_point)
-        });
-        let is_ready = is_mapping_mode_only || has_sandbox_root;
-        let signature = mounts
-            .into_iter()
-            .map(|mount| (mount.mount_id, mount.mount_point))
-            .collect::<Vec<_>>();
-        last_mount_count = signature.len();
-        if signature.is_empty() {
-            // 仅映射模式且本进程没有任何映射需求时，模块确实不会挂任何东西：空集合就是
-            // 终态，继续轮询只会白等满预算。用已轮询的轮数当作"观察过一段时间"的证据，
-            // 避免把"首轮还没挂上"误判成终态。重定向应用不适用这条：它们的沙箱根必然
-            // 出现，空集合只能是"还没开始挂"。
-            if is_mapping_mode_only && poll_count > MOUNT_SETTLE_POLLS {
-                *is_mount_applied_out = true;
-                break;
-            }
-            // 挂载被摘除或尚未建立，重新开始计数，避免把一次瞬时观测当作落定。
-            settled.clear();
-            settle_polls = 0;
-        } else if signature == settled {
-            settle_polls += 1;
-            // 集合稳定且重定向本体已就位才算落定。缺后者时继续轮询（预算耗尽后按未落定
-            // 处理），避免把"挂载还没开始"误判成"挂载已经稳定"。
-            if settle_polls >= MOUNT_SETTLE_POLLS && is_ready {
-                *is_mount_applied_out = true;
-                break;
-            }
-        } else {
-            settled = signature;
-            settle_polls = 1;
-        }
-        // SAFETY: usleep 只接收整型参数，不涉及借用指针。
-        unsafe { libc::usleep(mount_timing::POST_MOUNT_STATUS_POLL_DELAY_US) };
-    }
-
-    let elapsed_ms = monotonic_ms().saturating_sub(mount_started_ms);
-    if *is_mount_applied_out {
-        // 这一行的措辞被测试流的挂载确认流程匹配，改动前必须同步 .github/tests 下的检测式。
-        // 检测式按 `app mount confirmed pid=` 前缀匹配，因此末尾追加字段是安全的；
-        // 但前缀本身与 `pid=` 之后紧邻的取值不能改。
+    if observed_ready {
         log::info!(
-            "app mount confirmed pid={} mounts={} polls={} elapsed_ms={} root_ready={}",
+            "app mount confirmed pid={} mounts={} observed_ms={} pkg={}",
             app_pid,
-            last_mount_count,
-            poll_count,
-            elapsed_ms,
-            has_sandbox_root
+            mount_count,
+            observed_ms,
+            package_name
         );
-    } else {
-        // 预算耗尽仍未落定。对重定向应用这通常是"存储根重定向没建立起来"，应用读到的
-        // 是未重定向的真实视图；`root_ready=false` 与 `map_only=true` 要分开看。
-        log::warn!(
-            "mount unknown/failed pid={} mounts={} polls={} elapsed_ms={} root_ready={} map_only={}",
-            app_pid,
-            last_mount_count,
-            poll_count,
-            elapsed_ms,
-            has_sandbox_root,
-            is_mapping_mode_only
-        );
+        return;
     }
+    // 「这一刻看不见」不等于失败：应用可能在挂载落定之前就跑到了这里（真机实测：同一次
+    // 启动里该 pid 稍后 `/storage/emulated` 的设备号就是本会话的）。按 info 记，并带上
+    // 是否发出过请求，便于区分「没发」与「发了但还没落定」。
+    log::info!(
+        "app mount unconcluded pid={} mounts={} observed_ms={} map_only={} sent={} pkg={}",
+        app_pid,
+        mount_count,
+        observed_ms,
+        is_mapping_mode_only,
+        is_mount_request_sent,
+        package_name
+    );
 }
 
 fn log_post_perf(
     flow: &RuntimeFlow,
     exit_reason: &str,
-    mount_wait_ms: i64,
+    mount_check_ms: i64,
     hook_ms: i64,
     anti_ms: i64,
     started_ms: i64,
@@ -318,7 +261,7 @@ fn log_post_perf(
         return;
     }
     log::info!(
-        "perf post pkg={} pid={} exit={} redirect={} monitor={} hook_redirect={} boot_lite={} fuse_fix={} mount_sent={} mount_applied={} mount_wait_ms={} hook_ms={} anti_ms={} total_ms={}",
+        "perf post pkg={} pid={} exit={} redirect={} monitor={} hook_redirect={} boot_lite={} fuse_fix={} mount_sent={} mount_applied={} mount_check_ms={} hook_ms={} anti_ms={} total_ms={}",
         flow.package_name,
         flow.app_pid,
         exit_reason,
@@ -329,7 +272,7 @@ fn log_post_perf(
         flow.should_install_fuse_fix,
         flow.is_mount_request_sent,
         flow.is_mount_applied,
-        mount_wait_ms,
+        mount_check_ms,
         hook_ms,
         anti_ms,
         total_ms

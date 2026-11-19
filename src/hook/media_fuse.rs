@@ -4,10 +4,9 @@ use crate::config::SettingsHub;
 use crate::monitor::{AuditTrail, OpKind};
 use crate::platform::{self, paths};
 use crate::redirect::{policy, writer};
-use once_cell::sync::Lazy;
 use std::collections::VecDeque;
 use std::ffi::CString;
-use std::sync::Mutex;
+use std::sync::{LazyLock, Mutex};
 
 const READ_ONLY_DENY_REASON: &str = "deny_reason=read_only_rule";
 const FUSE_CALLER_MAX_AGE_MS: i64 = 1500;
@@ -30,8 +29,9 @@ struct RecentPrivateOwnerSqliteAccess {
     updated_ms: i64,
 }
 
-static RECENT_PRIVATE_OWNER_SQLITE_ACCESS: Lazy<Mutex<VecDeque<RecentPrivateOwnerSqliteAccess>>> =
-    Lazy::new(|| Mutex::new(VecDeque::new()));
+static RECENT_PRIVATE_OWNER_SQLITE_ACCESS: LazyLock<
+    Mutex<VecDeque<RecentPrivateOwnerSqliteAccess>>,
+> = LazyLock::new(|| Mutex::new(VecDeque::new()));
 
 pub fn record_read_only_fuse_operation(
     kind_code: i32,
@@ -42,6 +42,14 @@ pub fn record_read_only_fuse_operation(
     caller_uid: i32,
     flags: i32,
 ) -> bool {
+    if context::is_caller_attribution_stopped()
+        || context::is_current_caller_scope_active()
+            && InterceptHub::instance()
+                .get_current_caller_package()
+                .is_empty()
+    {
+        return false;
+    }
     let normalized_path = normalize_storage_path(path);
     let normalized_from = normalize_storage_path(from_path);
     if normalized_path.is_empty() && normalized_from.is_empty() {
@@ -60,6 +68,8 @@ pub fn record_read_only_fuse_operation(
         resolve_read_only_caller_package(caller_uid, &probe_paths)
     {
         caller_package
+    } else if context::is_current_caller_scope_active() {
+        return false;
     } else if let Some(recent) = resolve_recent_read_only_owner(caller_uid, &probe_paths) {
         let Some(caller_package) = recent else {
             return false;
@@ -97,12 +107,10 @@ pub fn record_read_only_fuse_operation(
     }
     if !normalized_from.is_empty() && normalized_from != record_path {
         extra.push_str("|from=");
-        extra.push_str(&normalized_from);
+        extra.push_str(&crate::platform::log_fields::encode(&normalized_from));
     }
     extra.push_str("|source=");
     extra.push_str(source);
-    extra.push_str("|caller_uid=");
-    extra.push_str(&caller_uid.to_string());
     extra.push('|');
     extra.push_str(READ_ONLY_DENY_REASON);
 
@@ -110,9 +118,13 @@ pub fn record_read_only_fuse_operation(
         kind,
         &caller_package,
         record_path,
-        -1,
-        libc::EROFS,
+        (-1, libc::EROFS),
         &extra,
+        (
+            caller_uid,
+            context::get_effective_caller_pid_for_monitor(),
+            None,
+        ),
     );
     true
 }
@@ -148,7 +160,7 @@ pub fn should_allow_private_owner_sqlite_access_for_caller(
         return false;
     }
 
-    let owner_uid = resolve_private_owner_uid(&owner_package);
+    let owner_uid = resolve_private_owner_uid(&owner_package, user_id);
     if owner_uid >= writer::ANDROID_APP_UID_START && owner_uid == caller_uid {
         return false;
     }
@@ -273,7 +285,7 @@ pub fn should_allow_private_owner_sqlite_owner_backend(path: &str) -> Option<i32
         return None;
     }
 
-    let owner_uid = resolve_private_owner_uid(&owner_package);
+    let owner_uid = resolve_private_owner_uid(&owner_package, user_id);
     if owner_uid >= writer::ANDROID_APP_UID_START {
         if platform::user_id_from_uid(owner_uid) != user_id {
             return None;
@@ -350,7 +362,7 @@ pub fn should_allow_own_android_private_path_access(path: &str, caller_uid: i32)
         return false;
     }
 
-    let owner_uid = resolve_private_owner_uid(&owner_package);
+    let owner_uid = resolve_private_owner_uid(&owner_package, user_id);
     // `Android/media/<pkg>` 恢复原生共享语义：媒体目录按设计就是跨应用共享
     // （issue #2：Sen 这类插件把配置放在宿主应用的 media 目录、由不同 uid 的模块
     // 进程读取；A17 的 MediaProvider 收紧后原生放行消失，模块直接打不开配置）。
@@ -441,7 +453,7 @@ pub fn should_force_userspace_for_private_owner_sqlite_path(path: &str) -> bool 
 ///
 /// 其余情况（健康但 owner-only、不可判定）一律保持直通：MP 的 FuseDaemon 用自己的
 /// 身份打开下层文件，owner-only 入口它必然 EACCES，硬拉回用户态等于把 EACCES 透传
-/// 给应用（真机 2026-11-04 duchamp：XRadiant.db-wal/-shm 变 0600 后 SQLITE_CANTOPEN）。
+/// 给应用（真机 2026-11-04：XRadiant.db-wal/-shm 变 0600 后 SQLITE_CANTOPEN）。
 pub fn prepare_private_owner_sqlite_sidecar(path: &str) -> bool {
     let Some((normalized_path, owner_package, user_id)) = resolve_private_owner_sqlite_path(path)
     else {
@@ -546,7 +558,7 @@ fn is_poisoned_sqlite_shm_size(size: libc::off_t) -> bool {
 /// 尺寸判定走 `O_PATH`+`fstat`：`O_PATH` 不需要读权限，owner-only 0600 的 `-shm`
 /// 也能拿到大小。此前这里用 `O_RDWR` 打开，MP 身份对 owner-only 入口必然 errno=13，
 /// 于是整条 MP 侧毒化自愈链在「应用自建 owner-only 边车」的形态下静默失效
-/// （真机 2026-11-04 duchamp：`prepare sqlite shm backend open failed errno=13`）。
+/// （真机 2026-11-04：`prepare sqlite shm backend open failed errno=13`）。
 fn prepare_sqlite_shm_backend(storage_path: &str, backend_path: &str) -> bool {
     let Some(size) = backend_file_size(backend_path) else {
         // ENOENT：全新配置目录，`-shm` 尚未由 MediaProvider 的 O_CREAT 创建，没有
@@ -750,10 +762,10 @@ fn normalize_storage_path(path: &str) -> String {
     }
 }
 
-fn resolve_private_owner_uid(package_name: &str) -> i32 {
+fn resolve_private_owner_uid(package_name: &str, user_id: i32) -> i32 {
     // FUSE 回调在 MediaProvider 请求线程内运行。此路径仅操作内存：
     // 在这里刷新 UID 缓存可能阻塞 FUSE 服务端。
-    policy::get_uid_for_package(package_name)
+    policy::get_uid_for_package_in_user(package_name, user_id)
 }
 
 fn resolve_caller_packages(caller_uid: i32) -> Vec<String> {
@@ -898,10 +910,8 @@ fn remember_private_owner_sqlite_caller_hint(
         return;
     }
 
-    if let Some(caller_package) = caller_packages
-        .iter()
-        .find(|package| is_private_owner_sqlite_caller_package(package, owner_package))
-        .map(String::as_str)
+    if let [caller_package] = caller_packages
+        && is_private_owner_sqlite_caller_package(caller_package, owner_package)
     {
         crate::monitor::remember_private_path_caller_hint_in_memory(
             normalized_path,
@@ -969,13 +979,24 @@ fn resolve_read_only_caller_package(caller_uid: i32, paths: &[&String; 2]) -> Op
         return None;
     }
 
-    let mut packages = policy::get_packages_for_uid(caller_uid);
+    let hub = InterceptHub::instance();
+    let mut packages = if context::is_current_caller_scope_active() {
+        if hub.get_current_caller_uid() != caller_uid {
+            return None;
+        }
+        vec![hub.get_current_caller_package()]
+    } else {
+        policy::get_packages_for_uid(caller_uid)
+    };
     packages.sort();
     packages.dedup();
-
+    if packages.len() != 1 {
+        return None;
+    }
     let config = SettingsHub::instance();
-    packages.into_iter().find(|package_name| {
-        !policy::is_system_writer_package(package_name)
+    packages.into_iter().next().filter(|package_name| {
+        !package_name.is_empty()
+            && !policy::is_system_writer_package(package_name)
             && config.should_redirect(package_name, caller_uid)
             && paths.iter().any(|path| {
                 !path.is_empty()
@@ -1004,7 +1025,8 @@ fn resolve_recent_read_only_owner(caller_uid: i32, paths: &[&String; 2]) -> Opti
         if policy::is_system_writer_package(&identity.package_name) {
             continue;
         }
-        let package_uid = policy::get_fresh_uid_for_package(&identity.package_name);
+        let package_uid =
+            policy::get_fresh_uid_for_package_in_user(&identity.package_name, user_id);
         if caller_uid >= writer::ANDROID_APP_UID_START
             && !is_system_writer_uid(caller_uid)
             && package_uid != caller_uid
@@ -1068,7 +1090,7 @@ fn infer_read_only_caller_package_by_path(caller_uid: i32, paths: &[&String; 2])
         if package_name.is_empty() || policy::is_system_writer_package(&package_name) {
             continue;
         }
-        let package_uid = policy::get_uid_for_package(&package_name);
+        let package_uid = policy::get_uid_for_package_in_user(&package_name, user_id);
         if caller_uid >= writer::ANDROID_APP_UID_START
             && !is_system_writer_uid(caller_uid)
             && package_uid != caller_uid

@@ -56,6 +56,14 @@ allow system_server shell_data_file dir read
 allow system_server shell_data_file dir getattr
 allow system_server shell_data_file dir write
 allow system_server shell_data_file dir add_name
+allow system_server shell_data_file dir remove_name
+allow system_server shell_data_file sock_file { create getattr setattr unlink read write }
+allow magisk system_server unix_stream_socket connectto
+allow su system_server unix_stream_socket connectto
+allow ksu system_server unix_stream_socket connectto
+# KSU 的模块服务在 root 域执行；重启后模块文件仍标记为 adb_data_file，因此需要允许执行 daemon。
+allow ksu adb_data_file dir { search open read getattr }
+allow ksu adb_data_file file { open read getattr execute execute_no_trans }
 allow system_server shell_data_file file open
 allow system_server shell_data_file file read
 allow system_server shell_data_file file write

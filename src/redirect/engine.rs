@@ -28,7 +28,6 @@ use std::sync::atomic::{AtomicU64, Ordering};
 const WRITER_ALLOWED_LOG_STEP: u64 = 256;
 const REDIRECT_SLOW_MS: i64 = 5;
 const REDIRECT_SAMPLE_STEP: u64 = 2048;
-const WRITER_CONFIG_RELOAD_INTERVAL_MS: i64 = 1000;
 static WRITER_ALLOWED_LOG_COUNT: AtomicU64 = AtomicU64::new(0);
 static REDIRECT_DECISION_COUNT: AtomicU64 = AtomicU64::new(0);
 static WRITER_LAST_CONFIG_RELOAD_CHECK_MS: AtomicU64 = AtomicU64::new(0);
@@ -399,6 +398,14 @@ fn process_redirect_path_inner(
     let is_shared_uid = redirect_policy::is_shared_uid_process(self_uid);
     let is_system_writer_process =
         redirect_policy::is_system_writer_package(&package_name) || is_shared_uid;
+    // 仅停止代写链路的 App 来源推断；自有 FUSE 的命名空间规则不经过这里。
+    if is_system_writer_process && crate::hook::is_caller_attribution_stopped() {
+        return RedirectDecision {
+            action: RedirectAction::Allow,
+            new_path: String::new(),
+            is_mapping: false,
+        };
+    }
     let is_explicit_caller_decision = crate::hook::is_explicit_caller_decision_active();
     // 监视桥接进程自身保留重定向（is_app_redirect_owner，如下载提供器的 .xlDownload）时，
     // 对自己沙盒路径的写入必须先按桥接进程自己的路由判定（含热重载轮询）：共享 uid 会把
@@ -741,7 +748,9 @@ pub fn record_redirect_hit(hub: &InterceptHub, op_name: &str, from_path: &str, t
 
 fn reload_writer_config_by_fingerprint(reload_started_ms: i64) -> i64 {
     let last_ms = WRITER_LAST_CONFIG_RELOAD_CHECK_MS.load(Ordering::Relaxed) as i64;
-    if reload_started_ms.saturating_sub(last_ms) < WRITER_CONFIG_RELOAD_INTERVAL_MS {
+    // 与 `hook::reload` 共用同一套节流判断：事件通道在线时该判据是「永不复查」，
+    // 否则两条独立的 1 秒指纹（各自一次 readdir + 几十次 stat）会同时跑。
+    if reload_started_ms.saturating_sub(last_ms) < crate::hook::fallback_reload_interval_ms() {
         return 0;
     }
     if WRITER_LAST_CONFIG_RELOAD_CHECK_MS
@@ -1052,8 +1061,8 @@ fn resolve_android_private_path_owner(normalized_path: &str) -> Option<String> {
     }
 }
 
-fn resolve_package_uid(package_name: &str) -> i32 {
-    redirect_policy::get_fresh_uid_for_package(package_name)
+fn resolve_package_uid(package_name: &str, user_id: i32) -> i32 {
+    redirect_policy::get_fresh_uid_for_package_in_user(package_name, user_id)
 }
 
 struct PrivateOwnerBackendRule {
@@ -1083,7 +1092,7 @@ fn resolve_disabled_caller_private_owner_backend_rule(
         return None;
     }
 
-    let owner_uid = resolve_package_uid(&owner_package);
+    let owner_uid = resolve_package_uid(&owner_package, user_id);
     if owner_uid < writer::ANDROID_APP_UID_START || platform::user_id_from_uid(owner_uid) != user_id
     {
         return None;

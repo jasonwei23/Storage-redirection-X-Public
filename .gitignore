@@ -29,7 +29,6 @@
 # Android/Java 临时产物
 *.class
 *.dex
-!assets/zygisk_module/bin/list_apps.dex
 *.apk
 *.aab
 *.ap_
@@ -57,11 +56,6 @@ __pycache__/
 # 编辑器与系统文件
 .idea/
 .vscode/
-# WorkBuddy 项目级 AI 资产：私人仓库追踪记忆与 skill，其余运行时数据不追踪
-# 公开快照同步（scripts/srx-sync-public.ps1）将整个 .workbuddy 列入排除路径。
-/.workbuddy/*
-!/.workbuddy/memory/
-!/.workbuddy/skills/
 *.code-workspace
 .DS_Store
 Thumbs.db
@@ -97,3 +91,10 @@ test-flow-*.txt
 # 个人流程笔记
 /docs/release-workflow.md
 /docs/version-calculation-verification.md
+
+# 测试流熔断标记（运行时产物，不应入库）
+app-view-probe-broken.flag
+
+# `test_download_test_network` 在 Windows 上会把临时目录路径当文件名落到
+# `.github/tests/` 下（形如 `C:Users...tmpXXXXdownload-network`），属本机运行残留。
+.github/tests/C:Users*tmp*download-network

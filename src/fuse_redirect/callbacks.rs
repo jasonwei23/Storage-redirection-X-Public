@@ -11,9 +11,9 @@ use super::helpers::{
 };
 use super::inode::{add_dir_entry_refs, remap_inode_path, remove_dir_entry_refs};
 use super::metadata::{
-    adjust_metadata_mode, apply_create_metadata, chmod_path, chown_path, create_metadata,
-    cstring_path, errno_from_code, errno_from_io, fix_existing_path_metadata, last_errno,
-    rename_noreplace, truncate_path, utimens_path,
+    STAGING_DIR_PREFIX, StagedEntry, adjust_metadata_mode, apply_create_metadata, chmod_path,
+    chown_path, create_metadata, cstring_path, errno_from_code, errno_from_io,
+    fix_existing_path_metadata, last_errno, rename_noreplace, truncate_path, utimens_path,
 };
 use super::perf::DirectoryCacheMissReason;
 use super::policy::OperationKind;
@@ -57,7 +57,7 @@ const SQLITE_SHM_MIN_SIZE_BYTES: u64 = 32 * 1024;
 ///
 /// **检测必须直读 f2fs 真实路径**：毒化往往由绕过 MediaProvider 视图的写入造成（外部
 /// 直写、MP 侧处理路径等），此时 MP 的 fuse 节点缓存仍持有陈旧尺寸，按 backend_path
-/// 判定会把毒化误读成健康（duchamp 18:00 实测）。删除则双管齐下：先经 MediaProvider
+/// 判定会把毒化误读成健康（真机 18:00 实测）。删除则双管齐下：先经 MediaProvider
 /// 视图 unlink（让 MP 在自己的节点簿记里显式失效该名称，供管理器等经 MP FUSE 的读取方
 /// 保持一致），再删 f2fs 真实文件兜底（保证毒化数据消失）——与人工删除 shm 的治愈路径
 /// 一致。对任何消费方都无损：文件内容本就是无效垃圾，SQLite 下次打开会从 `-wal`
@@ -123,15 +123,25 @@ fn heal_poisoned_sqlite_shm_backend(user_id: i32, rel: &str, package_name: &str)
         );
         return true;
     }
+    // 失败分支限频：中毒的 `-shm` 会被应用按 LOOKUP 反复访问，失败时逐次落 warn
+    // 会把 running.log 的轮转窗口吃掉（真机实测该日志被应用重试驱动，量可以很大）。
+    // 前 16 条全记，之后每 256 条留一条并带累计计数。
+    static SHM_UNLINK_FAILED_LOGGED: std::sync::atomic::AtomicU64 =
+        std::sync::atomic::AtomicU64::new(0);
+    let seen = SHM_UNLINK_FAILED_LOGGED.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+    if seen > 16 && !seen.is_multiple_of(256) {
+        return false;
+    }
     let errno = last_errno();
     log::warn!(
-        "fuse sqlite shm poisoned backend unlink failed errno={} {} size={} stale_wal_index={} pkg={} rel={}",
+        "fuse sqlite shm poisoned backend unlink failed errno={} {} size={} stale_wal_index={} pkg={} rel={} seen={}",
         errno,
         crate::platform::errno::text(errno),
         size,
         stale_wal_index,
         package_name,
-        rel
+        rel,
+        seen
     );
     false
 }
@@ -331,8 +341,17 @@ impl Filesystem for FuseRedirectFs {
         Self::remove_lookup_locked(&mut state, ino, nlookup);
     }
 
-    fn getattr(&self, req: &Request, ino: INodeNo, _fh: Option<FileHandle>, reply: ReplyAttr) {
+    fn getattr(&self, req: &Request, ino: INodeNo, fh: Option<FileHandle>, reply: ReplyAttr) {
         let _perf = self.perf.observe(&self.perf.metadata_calls);
+        if fh.is_some()
+            && let Some(open_file) = self.open_file_for_inode(ino, fh)
+        {
+            match open_file.attr() {
+                Ok(attr) => reply.attr(&ATTR_TTL, &attr),
+                Err(errno) => reply.error(errno),
+            }
+            return;
+        }
         let mut policy = self.policy_for_read_request(req, Some(ino), None);
         // fstat on open fd：fd 可能已跨进程（binder dup），按请求者 uid 重新路由
         // 会把合法 fstat 打成 ENOENT，回退到 inode 属主策略（文件身份已固定）。
@@ -353,6 +372,15 @@ impl Filesystem for FuseRedirectFs {
         {
             Ok(attr) => reply.attr(&ATTR_TTL, &attr),
             Err(errno) => {
+                if errno.code() == libc::ENOENT
+                    && let Some(open_file) = self.open_file_for_inode(ino, None)
+                {
+                    match open_file.attr() {
+                        Ok(attr) => reply.attr(&ATTR_TTL, &attr),
+                        Err(errno) => reply.error(errno),
+                    }
+                    return;
+                }
                 let rel = self.path_for_ino(ino);
                 self.log_reply_error("getattr", req.uid(), rel.as_deref(), errno);
                 reply.error(errno)
@@ -396,6 +424,44 @@ impl Filesystem for FuseRedirectFs {
             )
         };
         let mut lock_wait_ns = elapsed_ns(first_lock_started);
+        // P5-c：视图根上提一层后，根 inode 不再是用户根，而是 `…/emulated`。它的条目集合
+        // 必须与系统一致（`0`、`999`、`obb`），不能把用户根内容（`Download`/`DCIM`…）
+        // 直接列出来。合成必须发生在候选缓存、虚拟目录与重试循环之前，否则空 rel 会去
+        // 读后端根（= 用户根），正是"根目录内容错位"。
+        if policy.view_lifted && rel.is_empty() {
+            // 权限对齐基线：`/storage/emulated` 在原生里是 `0550 media_rw:media_rw`，
+            // 普通应用连列目录都会被内核拒（应用域自检实测：基线 `File.list()` 返回 null）。
+            // 我们的 FUSE 自己判权限，若不显式拒绝就等于凭空多给一项能力，应用据此即可
+            // 判定"这里被改过"。只放行 uid 0 与 media_rw。
+            let requester = req.uid();
+            if requester != 0 && requester != MEDIA_RW_UID {
+                log::debug!(
+                    "fuse lifted root readdir denied uid={} pkg={}",
+                    requester,
+                    policy.package_name
+                );
+                reply.error(Errno::EACCES);
+                return;
+            }
+            let candidates: Vec<DirEntryCandidate> = lifted_root_names(policy.user_id)
+                .into_iter()
+                .map(|name| DirEntryCandidate {
+                    rel: name.clone(),
+                    kind: FileType::Directory,
+                    name,
+                })
+                .collect();
+            let mut state = self.state.write().unwrap_or_else(|err| err.into_inner());
+            let fh = state.next_handle();
+            let entries: Arc<[DirEntry]> = materialize_dir_entries(&mut state, candidates).into();
+            add_dir_entry_refs(&mut state, &entries);
+            let entry_count = entries.len();
+            state.dirs.insert(fh, entries);
+            drop(state);
+            self.perf.record_dir_scan(0, lock_wait_ns, 0, entry_count);
+            reply.opened(FileHandle(fh), FopenFlags::FOPEN_CACHE_DIR);
+            return;
+        }
         let mut scan_ns = 0u64;
         let mut retries = 0u64;
         let (fh, entry_count) = loop {
@@ -451,7 +517,24 @@ impl Filesystem for FuseRedirectFs {
             } else {
                 self.perf.record_dir_cache_miss(cache_miss_reason);
                 let scan_started = track_dir_perf.then(Instant::now);
-                let (candidates, sources) = collect_dir_entry_candidates(&policy, &rel);
+                // 直通子树（obb/其它用户号）在 redirect/real 两个策略后端上没有对应目录，
+                // 常规收集恒为空；可视性由 backend_for_relative 的直通分支决定，这里直接
+                // 枚举直通后端，不做任何策略过滤。
+                let (candidates, sources) = if policy.is_foreign_view_rel(&rel) {
+                    let mut entries = Vec::new();
+                    let mut seen = HashMap::new();
+                    let mut sources = Vec::new();
+                    append_raw_dir_entries(
+                        &rel,
+                        &backend.path,
+                        &mut entries,
+                        &mut seen,
+                        &mut sources,
+                    );
+                    (entries, sources)
+                } else {
+                    collect_dir_entry_candidates(&policy, &rel)
+                };
                 scan_ns = scan_ns.saturating_add(elapsed_ns(scan_started));
                 (candidates, sources, false)
             };
@@ -532,16 +615,22 @@ impl Filesystem for FuseRedirectFs {
                     .record_dir_cache_peak_entries(state.dir_candidate_cache.len());
             }
             let fh = state.next_handle();
-            let entry_count = candidates.len().saturating_add(2);
-            let entries: Arc<[DirEntry]> =
-                materialize_dir_entries(&mut state, ino, &rel, candidates).into();
+            // 条目数不再额外 +2：readdir 不合成 `.`/`..`（与系统视图一致），统计口径同步。
+            let entry_count = candidates.len();
+            let entries: Arc<[DirEntry]> = materialize_dir_entries(&mut state, candidates).into();
             add_dir_entry_refs(&mut state, &entries);
             state.dirs.insert(fh, entries);
             break (fh, entry_count);
         };
         self.perf
             .record_dir_scan(scan_ns, lock_wait_ns, retries, entry_count);
-        reply.opened(FileHandle(fh), FopenFlags::FOPEN_CACHE_DIR);
+        // 不向内核宣告 FOPEN_CACHE_DIR：目录内容会在会话运行中途变化，而内核级目录缓存
+        // 没有失效通道。init 侧事后新建覆盖挂载（HyperOS 下载 `.siexternal` 就是这种）时，
+        // 早先缓存下来的「bind 出现前的空目录」会让覆盖改写再也回不到视图里——2026-11-18
+        // CI 场景 44 实测：改写已命中（`overlay query kind=hit`），应用视图 10 秒仍为空。
+        // 用户态仍有 `dir_candidate_cache`（2 秒 TTL + 源签名）承担同一职责，且它随覆盖表
+        // 一起失效，语义正确。
+        reply.opened(FileHandle(fh), FopenFlags::empty());
     }
 
     fn readdir(
@@ -670,7 +759,11 @@ impl Filesystem for FuseRedirectFs {
                     seen
                 );
             }
-            policy.emit_monitor_read_only_deny(fuse_open_operation_name(flags.0), &backend);
+            policy.emit_monitor_read_only_deny(
+                fuse_open_operation_name(flags.0),
+                &backend,
+                self.requester_attribution(req, &policy).as_ref(),
+            );
             reply.error(Errno::EROFS);
             return;
         }
@@ -694,16 +787,20 @@ impl Filesystem for FuseRedirectFs {
                 return;
             }
         };
+        let file = Arc::new(file);
         let fh = {
             let mut state = self.state.write().unwrap_or_else(|err| err.into_inner());
             let fh = state.next_handle();
             state.files.insert(
                 fh,
                 OpenFile {
-                    rel: backend.rel.clone(),
-                    file: file.try_clone().ok().map(Arc::new),
-                    _backing: None,
-                    is_read_only: backend.is_read_only,
+                    ino,
+                    public_uid: backend
+                        .is_shared_public_backend
+                        .then_some(policy.uid as u32),
+                    backend: Arc::clone(&backend),
+                    file: Arc::clone(&file),
+                    backing_key: None,
                 },
             );
             fh
@@ -723,15 +820,8 @@ impl Filesystem for FuseRedirectFs {
             .should_exclude_media_sqlite_shm_passthrough_rel(&backend.rel)
             || policy.should_exclude_passthrough_mmap_log_rel(&backend.rel);
         if self.passthrough_enabled.load(Ordering::Relaxed) && !shm_userspace_only {
-            match reply.open_backing(&file) {
+            match self.backing_for_open_file(fh, &file, || reply.open_backing(&file)) {
                 Ok(backing) => {
-                    let backing = Arc::new(backing);
-                    {
-                        let mut state = self.state.write().unwrap_or_else(|err| err.into_inner());
-                        if let Some(open_file) = state.files.get_mut(&fh) {
-                            open_file._backing = Some(Arc::clone(&backing));
-                        }
-                    }
                     reply.opened_passthrough(FileHandle(fh), FopenFlags::FOPEN_KEEP_CACHE, &backing)
                 }
                 Err(error) => {
@@ -768,11 +858,7 @@ impl Filesystem for FuseRedirectFs {
                 reply.error(Errno::EBADF);
                 return;
             };
-            let Some(file) = open_file.file.clone() else {
-                reply.error(Errno::ENOSYS);
-                return;
-            };
-            file
+            Arc::clone(&open_file.file)
         };
         let requested = (size as usize).min(MAX_READ_SIZE);
         FUSE_READ_BUFFER.with(|buffer| {
@@ -822,27 +908,20 @@ impl Filesystem for FuseRedirectFs {
                 reply.error(Errno::EBADF);
                 return;
             };
-            if open_file.is_read_only {
-                let rel = open_file.rel.clone();
+            if open_file.backend.is_read_only {
+                let rel = open_file.backend.rel.clone();
                 drop(state);
                 if let Some(backend) = policy.backend_for_relative(&rel, OperationKind::Write) {
-                    policy.emit_monitor_read_only_deny("write", &backend);
+                    policy.emit_monitor_read_only_deny(
+                        "write",
+                        &backend,
+                        self.requester_attribution(req, &policy).as_ref(),
+                    );
                 }
                 reply.error(Errno::EROFS);
                 return;
             }
-            let Some(file) = open_file.file.clone() else {
-                drop(state);
-                match self.backend_for_ino(&policy, ino) {
-                    Ok(backend) if backend.is_read_only => {
-                        policy.emit_monitor_read_only_deny("write", &backend);
-                        reply.error(Errno::EROFS);
-                    }
-                    _ => reply.error(Errno::ENOSYS),
-                }
-                return;
-            };
-            file
+            Arc::clone(&open_file.file)
         };
         let write_started = std::time::Instant::now();
         match write_full_at(&file, data, offset) {
@@ -887,7 +966,15 @@ impl Filesystem for FuseRedirectFs {
         reply: ReplyEmpty,
     ) {
         let mut state = self.state.write().unwrap_or_else(|err| err.into_inner());
-        state.files.remove(&fh.into());
+        if let Some(open_file) = state.files.remove(&fh.into())
+            && let Some(key) = open_file.backing_key
+            && let Some(backing) = state.backings.get_mut(&key)
+        {
+            backing.handles -= 1;
+            if backing.handles == 0 {
+                state.backings.remove(&key);
+            }
+        }
         reply.ok();
     }
 
@@ -921,11 +1008,7 @@ impl Filesystem for FuseRedirectFs {
                 reply.error(Errno::EBADF);
                 return;
             };
-            let Some(file) = open_file.file.clone() else {
-                reply.error(Errno::ENOSYS);
-                return;
-            };
-            file
+            Arc::clone(&open_file.file)
         };
         let result = if datasync {
             file.sync_data()
@@ -971,28 +1054,24 @@ impl Filesystem for FuseRedirectFs {
                 reply.error(Errno::EBADF);
                 return;
             };
-            let Some(input_file) = input.file.clone() else {
-                reply.error(Errno::ENOSYS);
-                return;
-            };
             let Some(output) = state.files.get(&fh_out.into()) else {
                 reply.error(Errno::EBADF);
                 return;
             };
-            let Some(output_file) = output.file.clone() else {
-                reply.error(Errno::ENOSYS);
-                return;
-            };
             (
-                input_file,
-                output_file,
-                output.is_read_only,
-                output.rel.clone(),
+                Arc::clone(&input.file),
+                Arc::clone(&output.file),
+                output.backend.is_read_only,
+                output.backend.rel.clone(),
             )
         };
         if output_read_only {
             if let Some(backend) = policy.backend_for_relative(&output_rel, OperationKind::Write) {
-                policy.emit_monitor_read_only_deny("copy_file_range", &backend);
+                policy.emit_monitor_read_only_deny(
+                    "copy_file_range",
+                    &backend,
+                    self.requester_attribution(req, &policy).as_ref(),
+                );
             }
             reply.error(Errno::EROFS);
             return;
@@ -1031,20 +1110,17 @@ impl Filesystem for FuseRedirectFs {
         // 原生 MP FUSE 支持 fallocate（MPEG4Writer 录制预分配依赖它，真机 2026-10-20
         // 实证：缺失时返回 EOPNOTSUPP，写入方降级为无预分配路径）。这里透传到后端
         // fd，与原生语义对齐。
-        let Some(file) = ({
+        let file = {
             let state = self.state.read().unwrap_or_else(|err| err.into_inner());
             let Some(open_file) = state.files.get(&fh.into()) else {
                 reply.error(Errno::EBADF);
                 return;
             };
-            if open_file.is_read_only {
+            if open_file.backend.is_read_only {
                 reply.error(Errno::EBADF);
                 return;
             }
-            open_file.file.clone()
-        }) else {
-            reply.error(Errno::ENOSYS);
-            return;
+            Arc::clone(&open_file.file)
         };
         let Some(offset) = libc::off_t::try_from(offset).ok() else {
             reply.error(Errno::EINVAL);
@@ -1092,7 +1168,14 @@ impl Filesystem for FuseRedirectFs {
                 return;
             }
         };
-        let c_path = match cstring_path(&backend.path) {
+        let staged = match StagedEntry::new(&backend.path) {
+            Ok(staged) => staged,
+            Err(errno) => {
+                reply.error(errno);
+                return;
+            }
+        };
+        let c_path = match cstring_path(staged.path()) {
             Ok(path) => path,
             Err(errno) => {
                 reply.error(errno);
@@ -1114,7 +1197,11 @@ impl Filesystem for FuseRedirectFs {
             backend.is_app_private_backend,
             false,
         );
-        if let Err(errno) = apply_create_metadata(&backend.path, metadata) {
+        if let Err(errno) = apply_create_metadata(staged.path(), metadata) {
+            reply.error(errno);
+            return;
+        }
+        if let Err(errno) = staged.publish(&backend.path) {
             reply.error(errno);
             return;
         }
@@ -1291,8 +1378,8 @@ impl Filesystem for FuseRedirectFs {
     ) {
         let file = {
             let state = self.state.read().unwrap_or_else(|err| err.into_inner());
-            match state.files.get(&fh.into()).and_then(|f| f.file.clone()) {
-                Some(file) => file,
+            match state.files.get(&fh.into()) {
+                Some(file) => Arc::clone(&file.file),
                 None => {
                     reply.error(Errno::EBADF);
                     return;
@@ -1351,10 +1438,20 @@ impl Filesystem for FuseRedirectFs {
             }
         };
         let create_mode = mode & !umask;
-        let file = match Self::open_backend_file(
+        let metadata = create_metadata(
+            req.uid(),
+            req.gid(),
+            policy.uid as u32,
+            create_mode,
+            backend.is_shared_public_backend,
+            backend.is_app_private_backend,
+            false,
+        );
+        let file = match Self::open_backend_file_for_create(
             &backend.path,
             flags | libc::O_CREAT | libc::O_CLOEXEC,
             create_mode,
+            metadata,
         ) {
             Ok(file) => file,
             Err(errno) => {
@@ -1385,19 +1482,6 @@ impl Filesystem for FuseRedirectFs {
                 return;
             }
         };
-        let metadata = create_metadata(
-            req.uid(),
-            req.gid(),
-            policy.uid as u32,
-            create_mode,
-            backend.is_shared_public_backend,
-            backend.is_app_private_backend,
-            false,
-        );
-        if let Err(errno) = apply_create_metadata(&backend.path, metadata) {
-            reply.error(errno);
-            return;
-        }
         self.invalidate_dir_candidate_cache();
         let ino = {
             let mut state = self.state.write().unwrap_or_else(|err| err.into_inner());
@@ -1417,16 +1501,21 @@ impl Filesystem for FuseRedirectFs {
                 return;
             }
         };
+        let backend = Arc::new(backend);
+        let file = Arc::new(file);
         let fh = {
             let mut state = self.state.write().unwrap_or_else(|err| err.into_inner());
             let fh = state.next_handle();
             state.files.insert(
                 fh,
                 OpenFile {
-                    rel,
-                    file: file.try_clone().ok().map(Arc::new),
-                    _backing: None,
-                    is_read_only: false,
+                    ino,
+                    public_uid: backend
+                        .is_shared_public_backend
+                        .then_some(policy.uid as u32),
+                    backend: Arc::clone(&backend),
+                    file: Arc::clone(&file),
+                    backing_key: None,
                 },
             );
             state.clear_dir_candidate_cache();
@@ -1440,15 +1529,8 @@ impl Filesystem for FuseRedirectFs {
             .should_exclude_media_sqlite_shm_passthrough_rel(&backend.rel)
             || policy.should_exclude_passthrough_mmap_log_rel(&backend.rel);
         if self.passthrough_enabled.load(Ordering::Relaxed) && !shm_userspace_only {
-            match reply.open_backing(&file) {
+            match self.backing_for_open_file(fh, &file, || reply.open_backing(&file)) {
                 Ok(backing) => {
-                    let backing = Arc::new(backing);
-                    {
-                        let mut state = self.state.write().unwrap_or_else(|err| err.into_inner());
-                        if let Some(open_file) = state.files.get_mut(&fh) {
-                            open_file._backing = Some(Arc::clone(&backing));
-                        }
-                    }
                     reply.created_passthrough(
                         &ATTR_TTL,
                         &attr,
@@ -1514,8 +1596,16 @@ impl Filesystem for FuseRedirectFs {
             }
         };
         let create_mode = mode & !libc::S_IFMT & !umask;
+        let staged = match StagedEntry::new(&backend.path) {
+            Ok(staged) => staged,
+            Err(errno) => {
+                Self::log_unexpected_open_errno(&policy, &backend.rel, errno);
+                reply.error(errno);
+                return;
+            }
+        };
         let file = match Self::open_backend_file(
-            &backend.path,
+            staged.path(),
             libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL,
             create_mode,
         ) {
@@ -1526,7 +1616,6 @@ impl Filesystem for FuseRedirectFs {
                 return;
             }
         };
-        drop(file);
         let metadata = create_metadata(
             req.uid(),
             req.gid(),
@@ -1536,7 +1625,12 @@ impl Filesystem for FuseRedirectFs {
             backend.is_app_private_backend,
             false,
         );
-        if let Err(errno) = apply_create_metadata(&backend.path, metadata) {
+        if let Err(errno) = apply_create_metadata(staged.path(), metadata) {
+            reply.error(errno);
+            return;
+        }
+        drop(file);
+        if let Err(errno) = staged.publish(&backend.path) {
             reply.error(errno);
             return;
         }
@@ -1587,26 +1681,33 @@ impl Filesystem for FuseRedirectFs {
             }
         };
         let mode = mode & !umask;
-        match std::fs::create_dir(&backend.path) {
-            Ok(()) => {
-                let metadata = create_metadata(
-                    req.uid(),
-                    req.gid(),
-                    policy.uid as u32,
-                    mode,
-                    backend.is_shared_public_backend,
-                    backend.is_app_private_backend,
-                    true,
-                );
-                if let Err(errno) = apply_create_metadata(&backend.path, metadata) {
-                    reply.error(errno);
-                    return;
-                }
-            }
-            Err(error) => {
-                reply.error(errno_from_io(error));
+        let staged = match StagedEntry::new(&backend.path) {
+            Ok(staged) => staged,
+            Err(errno) => {
+                reply.error(errno);
                 return;
             }
+        };
+        if let Err(error) = std::fs::create_dir(staged.path()) {
+            reply.error(errno_from_io(error));
+            return;
+        }
+        let metadata = create_metadata(
+            req.uid(),
+            req.gid(),
+            policy.uid as u32,
+            mode,
+            backend.is_shared_public_backend,
+            backend.is_app_private_backend,
+            true,
+        );
+        if let Err(errno) = apply_create_metadata(staged.path(), metadata) {
+            reply.error(errno);
+            return;
+        }
+        if let Err(errno) = staged.publish(&backend.path) {
+            reply.error(errno);
+            return;
         }
         self.invalidate_dir_candidate_cache();
         policy.emit_monitor_create(&backend, self.requester_attribution(req, &policy).as_ref());
@@ -1704,6 +1805,7 @@ impl Filesystem for FuseRedirectFs {
                 record_backend,
                 Some(&old_backend),
                 libc::EROFS,
+                self.requester_attribution(req, &policy).as_ref(),
             );
             reply.error(Errno::EROFS);
             return;
@@ -1764,7 +1866,7 @@ impl Filesystem for FuseRedirectFs {
         atime: Option<TimeOrNow>,
         mtime: Option<TimeOrNow>,
         _ctime: Option<SystemTime>,
-        _fh: Option<FileHandle>,
+        fh: Option<FileHandle>,
         _crtime: Option<SystemTime>,
         _chgtime: Option<SystemTime>,
         _bkuptime: Option<SystemTime>,
@@ -1778,7 +1880,21 @@ impl Filesystem for FuseRedirectFs {
         if let Some(owner_policy) = self.inode_owner_policy_for_fd_stat(ino, req.uid()) {
             policy = owner_policy;
         }
-        let backend = match self.backend_for_ino(&policy, ino) {
+        let open_file = if fh.is_some() || self.path_for_ino(ino).is_none() {
+            self.open_file_for_inode(ino, fh)
+        } else {
+            None
+        };
+        let backend = match self.backend_for_ino(&policy, ino).or_else(|errno| {
+            if errno.code() == libc::ENOENT {
+                open_file
+                    .as_ref()
+                    .map(|file| Arc::clone(&file.backend))
+                    .ok_or(errno)
+            } else {
+                Err(errno)
+            }
+        }) {
             Ok(backend) => backend,
             Err(errno) => {
                 let rel = self.path_for_ino(ino);
@@ -1805,19 +1921,25 @@ impl Filesystem for FuseRedirectFs {
                     mtime.is_some(),
                 ),
                 &backend,
+                self.requester_attribution(req, &policy).as_ref(),
             );
             reply.error(Errno::EROFS);
             return;
         }
 
+        // 经 proc fd 跟随已打开的 inode，避免覆盖/删除后误改同名新文件。
+        let fd_path = open_file.as_ref().map(|file| {
+            std::path::PathBuf::from(format!("/proc/self/fd/{}", file.file.as_raw_fd()))
+        });
+        let path = fd_path.as_deref().unwrap_or(&backend.path);
         if let Some(mode) = mode {
             let mode = adjust_metadata_mode(
                 mode,
                 backend.is_shared_public_backend,
                 backend.is_app_private_backend,
-                backend.path.is_dir(),
+                path.is_dir(),
             );
-            if let Err(errno) = chmod_path(&backend.path, mode) {
+            if let Err(errno) = chmod_path(path, mode) {
                 reply.error(errno);
                 return;
             }
@@ -1833,7 +1955,7 @@ impl Filesystem for FuseRedirectFs {
             } else {
                 gid.unwrap_or(u32::MAX)
             };
-            if let Err(errno) = chown_path(&backend.path, uid, gid) {
+            if let Err(errno) = chown_path(path, uid, gid) {
                 reply.error(errno);
                 return;
             }
@@ -1850,19 +1972,23 @@ impl Filesystem for FuseRedirectFs {
             }
         });
         if let Some(size) = size
-            && let Err(errno) = truncate_path(&backend.path, size)
+            && let Err(errno) = truncate_path(path, size)
         {
             reply.error(errno);
             return;
         }
         if (atime.is_some() || mtime.is_some())
-            && let Err(errno) = utimens_path(&backend.path, atime, mtime)
+            && let Err(errno) = utimens_path(path, atime, mtime)
         {
             reply.error(errno);
             return;
         }
 
-        match self.attr_for_backend(&policy, ino, &backend) {
+        match open_file
+            .as_ref()
+            .map(OpenFile::attr)
+            .unwrap_or_else(|| self.attr_for_backend(&policy, ino, &backend))
+        {
             Ok(attr) => reply.attr(&ATTR_TTL, &attr),
             Err(errno) => reply.error(errno),
         }
@@ -1889,7 +2015,12 @@ impl Filesystem for FuseRedirectFs {
             }
         };
         if backend.is_read_only && mask.contains(AccessFlags::W_OK) {
-            policy.emit_monitor_read_only_deny_with_errno("access:write", &backend, libc::EACCES);
+            policy.emit_monitor_read_only_deny_with_errno(
+                "access:write",
+                &backend,
+                libc::EACCES,
+                self.requester_attribution(req, &policy).as_ref(),
+            );
             reply.error(Errno::EACCES);
             return;
         }
@@ -1974,7 +2105,6 @@ fn collect_dir_entry_candidates(
     policy: &super::policy::RedirectPolicy,
     rel: &str,
 ) -> (Vec<DirEntryCandidate>, Vec<DirectorySourceSignature>) {
-    use crate::platform::paths;
     let mut entries = Vec::new();
     let mut seen = HashMap::<String, usize>::new();
     let mut sources = Vec::new();
@@ -2004,23 +2134,21 @@ fn collect_dir_entry_candidates(
         &mut seen,
         &mut sources,
     );
-    // 目录的存储路径与映射规则无关：循环内逐条重算会给每个映射多拼一次字符串。
-    let storage_path = policy.storage_path_for_rel(rel);
-    for mapping in &policy.path_mappings {
-        if paths::matches(&mapping.request_path, &storage_path, true)
-            && let Some(target_rel) =
-                paths::relative_child_path(&mapping.final_path, &policy.storage_root)
-        {
-            append_backend_dir_entries(
-                policy,
-                rel,
-                &policy.real_backend_for_storage_rel(target_rel),
-                uniform_backend.as_ref(),
-                &mut entries,
-                &mut seen,
-                &mut sources,
-            );
-        }
+    // 枚举最终路由目录，保留映射子目录的后缀及连续映射结果。
+    if let Some(backend) = policy.backend_for_relative(rel, OperationKind::Read)
+        && !sources
+            .iter()
+            .any(|source| paths_eq(&source.path, &backend.path))
+    {
+        append_backend_dir_entries(
+            policy,
+            rel,
+            &backend.path,
+            uniform_backend.as_ref(),
+            &mut entries,
+            &mut seen,
+            &mut sources,
+        );
     }
     append_rule_prefix_entries(policy, rel, &mut entries, &mut seen);
     (entries, sources)
@@ -2031,6 +2159,40 @@ fn append_directory_source(path: &Path, sources: &mut Vec<DirectorySourceSignatu
         return;
     }
     sources.push(DirectorySourceSignature::capture(path));
+}
+
+/// 直通子树的原始目录枚举：不做任何策略过滤，条目原样进入候选。
+fn append_raw_dir_entries(
+    parent_rel: &str,
+    backend: &Path,
+    entries: &mut Vec<DirEntryCandidate>,
+    seen: &mut HashMap<String, usize>,
+    sources: &mut Vec<DirectorySourceSignature>,
+) {
+    use crate::platform::paths;
+    append_directory_source(backend, sources);
+    let Ok(read_dir) = std::fs::read_dir(backend) else {
+        return;
+    };
+    for item in read_dir.flatten() {
+        let name = item.file_name().to_string_lossy().to_string();
+        if name.is_empty() {
+            continue;
+        }
+        let child_rel = paths::join(parent_rel, &name);
+        if seen.insert(child_rel.clone(), entries.len()).is_none() {
+            let kind = if item.path().is_dir() {
+                FileType::Directory
+            } else {
+                FileType::RegularFile
+            };
+            entries.push(DirEntryCandidate {
+                rel: child_rel,
+                kind,
+                name,
+            });
+        }
+    }
 }
 
 fn append_backend_dir_entries(
@@ -2048,6 +2210,9 @@ fn append_backend_dir_entries(
     let Ok(read_dir) = std::fs::read_dir(backend) else {
         return;
     };
+    // 根级判定只与 parent_rel 有关，循环外算一次：归一化要拼字符串，逐条目重算会让
+    // 大目录枚举多出 O(entries) 次分配。
+    let is_storage_root = policy.is_storage_root_view_rel(parent_rel);
     for item in read_dir.flatten() {
         let name = item.file_name().to_string_lossy().to_string();
         if name.is_empty() {
@@ -2063,11 +2228,14 @@ fn append_backend_dir_entries(
         // 刻意收窄——宿主自身与 media 视图会话仍需按路径访问这些目录。
         // .srx_passthrough_probe 是 passthrough 端到端探针在真实后端根的临时落点
         //（探测窗口毫秒级、事后删除），同样在根级对应用隐藏，避免枚举闪现。
-        if parent_rel.is_empty()
-            && matches!(
-                name.as_str(),
-                ".transforms" | ".picker_transcoded" | ".srx_passthrough_probe"
-            )
+        // 判据必须按归一后的存储相对路径判空（`is_storage_root_view_rel`）：视图根上提后
+        // 用户根在视图里是 `<user>` 这一级，`parent_rel.is_empty()` 只在未上提会话成立，
+        // 上提会话会整条跳过隐藏、把这两个目录暴露回根列表（2026-11-14 实测）。
+        if name.starts_with(STAGING_DIR_PREFIX)
+            || (is_storage_root
+                && (crate::platform::paths_safety::MEDIA_PROVIDER_INTERNAL_DIR_NAMES
+                    .contains(&name.as_str())
+                    || name == ".srx_passthrough_probe"))
         {
             continue;
         }
@@ -2152,43 +2320,62 @@ fn insert_dir_entry_candidate(
     seen.insert(key, index);
 }
 
+/// 上提视图根的条目名：直接照抄系统视图根的目录项（`0`、`999`、`obb`…）。
+///
+/// 不能用 `/data/media` 的目录名代替：那是 f2fs 后端，多用户目录在系统视图里可能是独立
+/// 挂载而不在 `/data/media` 下（真机 2026-11-02 实测 `/data/media/999` 不存在，但基线
+/// `/storage/emulated` 里能看到 `999`）。隐藏的前提是"与基线逐项一致"，条目集合只能来自
+/// 基线本身。
+///
+/// 读取发生在会话进程自己的命名空间：那里 `/storage/emulated` 仍是系统 MediaProvider
+/// FUSE，不会回到本会话（自环）。
+fn lifted_root_names(user_id: i32) -> Vec<String> {
+    let system_root = paths::parent(&paths::storage_user_root_for_user(user_id));
+    let mut names: Vec<String> = Vec::new();
+    if let Ok(entries) = std::fs::read_dir(&system_root) {
+        for entry in entries.flatten() {
+            let name = entry.file_name().to_string_lossy().to_string();
+            if name.is_empty() || names.contains(&name) {
+                continue;
+            }
+            let is_user_dir = name.chars().all(|ch| ch.is_ascii_digit());
+            if is_user_dir || name == "obb" {
+                names.push(name);
+            }
+        }
+    }
+    // 读不到系统视图时至少保证本用户存在：宁可少列兄弟用户，也不能把用户根内容错列成
+    // 视图根条目。
+    let self_name = user_id.to_string();
+    if !names.iter().any(|name| name == &self_name) {
+        names.insert(0, self_name);
+    }
+    if !names.iter().any(|name| name == "obb") {
+        names.push("obb".to_string());
+    }
+    names
+}
+
+/// 把候选条目物化为带 inode 的目录项列表。
+///
+/// 不合成 `.` 与 `..`：系统 MediaProvider 的 FUSE 视图在 readdir 里不返回这两个条目
+/// （真机/A17 模拟器 `ls -a` 实测：基线根与子目录都没有点条目），模块视图若返回，
+/// 应用只要比对 `getdents` 结果就能分辨存储被接管。VFS 的路径解析自行处理 `.`/`..`，
+/// 不依赖文件系统在 readdir 里给出它们。
 fn materialize_dir_entries(
     state: &mut FuseState,
-    ino: INodeNo,
-    rel: &str,
     candidates: Vec<DirEntryCandidate>,
 ) -> Vec<DirEntry> {
-    let parent_rel = paths::parent(rel);
-    let parent_ino = if rel.is_empty() {
-        ROOT_INO
-    } else {
-        // quality-allow(chinese-language): ROOT_INO 是 FUSE 根 inode 的固定技术标识。
-        *state
-            .inodes
-            .get(&state.inode_key(&parent_rel))
-            .unwrap_or(&ROOT_INO)
-    };
-    let mut entries = Vec::with_capacity(candidates.len().saturating_add(2));
-    entries.push(DirEntry {
-        ino,
-        kind: FileType::Directory,
-        name: ".".to_string(),
-        rel: rel.to_string(),
-    });
-    entries.push(DirEntry {
-        ino: INodeNo(parent_ino),
-        kind: FileType::Directory,
-        name: "..".to_string(),
-        rel: parent_rel.clone(),
-    });
-    entries.extend(candidates.into_iter().map(|candidate| {
-        let ino = FuseRedirectFs::ino_for_path_locked(state, &candidate.rel);
-        DirEntry {
-            ino,
-            kind: candidate.kind,
-            name: candidate.name,
-            rel: candidate.rel,
-        }
-    }));
-    entries
+    candidates
+        .into_iter()
+        .map(|candidate| {
+            let ino = FuseRedirectFs::ino_for_path_locked(state, &candidate.rel);
+            DirEntry {
+                ino,
+                kind: candidate.kind,
+                name: candidate.name,
+                rel: candidate.rel,
+            }
+        })
+        .collect()
 }

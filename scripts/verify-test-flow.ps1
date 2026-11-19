@@ -2,6 +2,8 @@
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
+[Console]::OutputEncoding = [Text.UTF8Encoding]::new($false)
+$OutputEncoding = [Console]::OutputEncoding
 
 $RepoRoot = (Resolve-Path -LiteralPath (Join-Path $PSScriptRoot "..")).Path
 $RunDeviceScenarios = if ([string]::IsNullOrWhiteSpace($env:RUN_DEVICE_SCENARIOS)) { "1" } else { $env:RUN_DEVICE_SCENARIOS }
@@ -11,6 +13,14 @@ $ModuleAbi = if ([string]::IsNullOrWhiteSpace($env:SRX_TEST_MODULE_ABI)) { "arm6
 $BuildDir = if ([string]::IsNullOrWhiteSpace($env:SRX_TEST_BUILD_DIR)) { "build/test-flow" } else { $env:SRX_TEST_BUILD_DIR }
 $TestAppApkDir = Join-Path $RepoRoot "tests/storage-redirect-test/app/build/outputs/apk/debug"
 $Utf8NoBom = New-Object System.Text.UTF8Encoding($false)
+$script:AdbSuMode = $null
+
+if ($TargetTriple -notin @("aarch64-linux-android", "x86_64-linux-android")) {
+    throw "不支持的 Android target：$TargetTriple"
+}
+if ($ModuleAbi -notin @("arm64-v8a", "x86_64")) {
+    throw "不支持的模块 ABI：$ModuleAbi"
+}
 
 function Write-Step {
     param([string]$Message)
@@ -34,17 +44,6 @@ function Invoke-Checked {
     }
 }
 
-function Get-CargoTargetDirectory {
-    $metadataJson = & cargo metadata --format-version 1 --no-deps
-    if ($LASTEXITCODE -ne 0) { Fail "无法解析 Cargo 目标目录。" }
-
-    $metadata = $metadataJson | ConvertFrom-Json
-    if ([string]::IsNullOrWhiteSpace([string]$metadata.target_directory)) {
-        Fail "Cargo metadata 未提供目标目录。"
-    }
-    return [System.IO.Path]::GetFullPath([string]$metadata.target_directory)
-}
-
 function Resolve-BuildPath {
     param([string]$Path)
     if ([System.IO.Path]::IsPathRooted($Path)) {
@@ -53,37 +52,10 @@ function Resolve-BuildPath {
     return [System.IO.Path]::GetFullPath((Join-Path $RepoRoot $Path))
 }
 
-function Assert-UnderPath {
-    param([string]$Path, [string]$Parent)
-
-    $parentFull = [System.IO.Path]::GetFullPath($Parent).TrimEnd([System.IO.Path]::DirectorySeparatorChar, [System.IO.Path]::AltDirectorySeparatorChar)
-    $pathFull = [System.IO.Path]::GetFullPath($Path).TrimEnd([System.IO.Path]::DirectorySeparatorChar, [System.IO.Path]::AltDirectorySeparatorChar)
-    if (-not $pathFull.StartsWith($parentFull + [System.IO.Path]::DirectorySeparatorChar, [System.StringComparison]::OrdinalIgnoreCase)) {
-        Fail "拒绝操作预期目录以外的路径：$pathFull"
-    }
-}
-
-function Remove-BuildPath {
-    param([string]$Path, [string]$ExpectedParent)
-    if (-not (Test-Path -LiteralPath $Path)) { return }
-    Assert-UnderPath -Path $Path -Parent $ExpectedParent
-    Remove-Item -LiteralPath $Path -Recurse -Force
-}
-
 function Write-Utf8LfFile {
     param([string]$Path, [string]$Content)
     $lf = $Content.Replace("`r`n", "`n").Replace("`r", "`n")
     [System.IO.File]::WriteAllText($Path, $lf, $Utf8NoBom)
-}
-
-function Normalize-TextFile {
-    param([string]$Path)
-    [byte[]]$bytes = [System.IO.File]::ReadAllBytes($Path)
-    if ($bytes.Length -ge 3 -and $bytes[0] -eq 0xEF -and $bytes[1] -eq 0xBB -and $bytes[2] -eq 0xBF) {
-        if ($bytes.Length -eq 3) { $bytes = [byte[]]::new(0) } else { $bytes = $bytes[3..($bytes.Length - 1)] }
-    }
-    $content = [System.Text.Encoding]::UTF8.GetString($bytes).Replace("`r`n", "`n").Replace("`r", "`n")
-    [System.IO.File]::WriteAllText($Path, $content, $Utf8NoBom)
 }
 
 function Get-PythonCommand {
@@ -119,111 +91,45 @@ function Get-ResolvedVersionData {
     return $data
 }
 
-function New-ModulePackage {
-    param(
-        [string]$Version,
-        [string]$VersionCode,
-        [string]$SoFile,
-        [string]$DaemonFile,
-        [string]$OutputZip,
-        [string]$Abi,
-        [string]$WorkDir
-    )
-
-    if ($Abi -notin @("arm64-v8a", "x86_64")) { Fail "不支持的模块 ABI：$Abi" }
-    if (-not (Test-Path -LiteralPath $SoFile)) { Fail "缺少模块库：$SoFile" }
-    if (-not (Test-Path -LiteralPath $DaemonFile)) { Fail "缺少 daemon 二进制文件：$DaemonFile" }
-
-    $packageDir = Join-Path $WorkDir "module-package"
-    Remove-BuildPath -Path $packageDir -ExpectedParent $WorkDir
-    Remove-BuildPath -Path $OutputZip -ExpectedParent $WorkDir
-    New-Item -ItemType Directory -Path $packageDir -Force | Out-Null
-
-    Copy-Item -LiteralPath (Join-Path $RepoRoot "assets/zygisk_module") -Destination $packageDir -Recurse -Force
-    $templateRoot = Join-Path $packageDir "zygisk_module"
-    if (Test-Path -LiteralPath $templateRoot) {
-        Get-ChildItem -LiteralPath $templateRoot -Force | ForEach-Object {
-            Move-Item -LiteralPath $_.FullName -Destination $packageDir -Force
-        }
-        Remove-Item -LiteralPath $templateRoot -Force
-    }
-
-    Remove-Item -LiteralPath (Join-Path $packageDir "action.sh") -Force -ErrorAction SilentlyContinue
-    Copy-Item -LiteralPath (Join-Path $RepoRoot "LICENSE") -Destination (Join-Path $packageDir "LICENSE") -Force
-    Copy-Item -LiteralPath (Join-Path $RepoRoot "COPYING") -Destination (Join-Path $packageDir "COPYING") -Force
-
-    New-Item -ItemType Directory -Path (Join-Path $packageDir "zygisk") -Force | Out-Null
-    Copy-Item -LiteralPath $SoFile -Destination (Join-Path $packageDir "zygisk/$Abi.so") -Force
-    New-Item -ItemType Directory -Path (Join-Path $packageDir "bin") -Force | Out-Null
-    Copy-Item -LiteralPath $DaemonFile -Destination (Join-Path $packageDir "bin/srx_daemon") -Force
-
-    $moduleProp = @(
-        "id=storage.redirect.x",
-        "name=Storage Redirect X",
-        "version=v$Version",
-        "versionCode=$VersionCode",
-        "author=Kindness-Kismet",
-        "description=Storage Redirect X Core Module",
-        "webui=1"
-    ) -join "`n"
-    Write-Utf8LfFile -Path (Join-Path $packageDir "module.prop") -Content ($moduleProp + "`n")
-
-    $srxctlPath = (Join-Path $packageDir "bin/srxctl")
-    $separator = [System.IO.Path]::DirectorySeparatorChar
-    Get-ChildItem -LiteralPath $packageDir -Recurse -File | Where-Object {
-        $_.Extension -in @(".sh", ".prop", ".rule") -or
-        $_.FullName.Contains("${separator}META-INF${separator}") -or
-        $_.FullName -eq $srxctlPath
-    } | ForEach-Object { Normalize-TextFile -Path $_.FullName }
-
-    Add-Type -AssemblyName System.IO.Compression
-    Add-Type -AssemblyName System.IO.Compression.FileSystem
-    $zip = [System.IO.Compression.ZipFile]::Open($OutputZip, [System.IO.Compression.ZipArchiveMode]::Create)
-    try {
-        $root = (Resolve-Path -LiteralPath $packageDir).Path
-        Get-ChildItem -LiteralPath $packageDir -Recurse -File | ForEach-Object {
-            $relativePath = $_.FullName.Substring($root.Length).TrimStart([char]92, [char]47).Replace([char]92, [char]47)
-            $keepUncompressed =
-                $_.Extension -in @(".sh", ".prop", ".rule") -or
-                $relativePath.StartsWith("META-INF/", [System.StringComparison]::Ordinal) -or
-                $relativePath -eq "bin/srxctl"
-            $compression = if ($keepUncompressed) {
-                [System.IO.Compression.CompressionLevel]::NoCompression
-            } else {
-                [System.IO.Compression.CompressionLevel]::Optimal
-            }
-            $entry = $zip.CreateEntry($relativePath, $compression)
-            $entryStream = $entry.Open()
-            $fileStream = [System.IO.File]::OpenRead($_.FullName)
-            try { $fileStream.CopyTo($entryStream) } finally { $fileStream.Dispose(); $entryStream.Dispose() }
-        }
-    } finally {
-        $zip.Dispose()
-    }
-}
-
 function Get-TestAppApk {
     if (-not (Test-Path -LiteralPath $TestAppApkDir)) { return $null }
     Get-ChildItem -LiteralPath $TestAppApkDir -Filter "*-debug.apk" | Select-Object -First 1 -ExpandProperty FullName
 }
 
+function Resolve-AdbSuMode {
+    if ($script:AdbSuMode) { return $script:AdbSuMode }
+
+    foreach ($mode in @("su0", "su")) {
+        $probe = if ($mode -eq "su0") { "su 0 sh -c 'id -u'" } else { "su -c 'id -u'" }
+        $output = & adb shell $probe 2>$null
+        $exitCode = $LASTEXITCODE
+        if ($exitCode -eq 0 -and (($output -join "`n").Trim() -eq "0")) {
+            $script:AdbSuMode = $mode
+            return $mode
+        }
+    }
+    Fail "设备没有可用的 adb su shell。"
+}
+
 function Invoke-AdbSu {
     param([string]$Command)
     $escaped = $Command.Replace("'", "'\''")
-    & adb shell "su 0 sh -c '$escaped'"
-    if ($LASTEXITCODE -eq 0) { return }
-    & adb shell "su -c '$escaped'"
-    if ($LASTEXITCODE -ne 0) { Fail "adb su 命令执行失败：$Command" }
+    $mode = Resolve-AdbSuMode
+    $remoteCommand = if ($mode -eq "su0") { "su 0 sh -c '$escaped'" } else { "su -c '$escaped'" }
+    $output = & adb shell $remoteCommand
+    $exitCode = $LASTEXITCODE
+    if ($exitCode -ne 0) { Fail "adb su 命令执行失败：$Command" }
+    $output
 }
 
 function Wait-DeviceBootCompleted {
     Invoke-Checked -FilePath "adb" -Arguments @("wait-for-device")
-    for ($attempt = 1; $attempt -le 90; $attempt++) {
+    for ($attempt = 1; $attempt -le 450; $attempt++) {
         $bootCompleted = (& adb shell getprop sys.boot_completed | Out-String).Trim()
         if ($LASTEXITCODE -eq 0 -and $bootCompleted -eq "1") { return }
         Start-Sleep -Seconds 2
     }
-    Fail "设备在 180 秒内未完成启动。"
+    Fail "设备在 900 秒内未完成启动。"
 }
 
 function Assert-ModuleRuntimeState {
@@ -235,43 +141,27 @@ id; module_dir=/data/adb/modules/storage.redirect.x; logs_dir="$module_dir/logs"
 
 Push-Location $RepoRoot
 try {
-    $versionData = Get-ResolvedVersionData
-    $version = [string]$versionData.version
-    $versionCode = [string]$versionData.version_code
-
-    $buildRoot = Resolve-BuildPath $BuildDir
-    New-Item -ItemType Directory -Path (Join-Path $buildRoot "module-bin") -Force | Out-Null
-    New-Item -ItemType Directory -Path (Join-Path $buildRoot "assets") -Force | Out-Null
-
-    Write-Step "为 $TargetTriple 构建 Rust 测试二进制文件"
-    Invoke-Checked -FilePath "cargo" -Arguments @("test", "--target", $TargetTriple, "--no-run")
-
-    Write-Step "为 $TargetTriple 构建 SRX 模块二进制文件"
-    Invoke-Checked -FilePath "cargo" -Arguments @("build", "--target", $TargetTriple, "--release")
-
-    $moduleBinDir = Join-Path $buildRoot "module-bin"
-    $releaseDir = Join-Path (Join-Path (Get-CargoTargetDirectory) $TargetTriple) "release"
-    $libSource = Join-Path $releaseDir "libsrx_core.so"
-    $daemonSource = Join-Path $releaseDir "srx_daemon"
-    $libDest = Join-Path $moduleBinDir "libsrx_core.so"
-    $daemonDest = Join-Path $moduleBinDir "srx_daemon"
-    Copy-Item -LiteralPath $libSource -Destination $libDest -Force
-    Copy-Item -LiteralPath $daemonSource -Destination $daemonDest -Force
-
-    Write-Step "打包测试流模块 zip"
-    $moduleZip = Join-Path $buildRoot "assets/storage.redirect.x-v$version-$ModuleAbi.zip"
-    New-ModulePackage -Version $version -VersionCode $versionCode -SoFile $libDest -DaemonFile $daemonDest -OutputZip $moduleZip -Abi $ModuleAbi -WorkDir $buildRoot
-
-    Write-Step "运行 Android 单元测试并构建测试 APK"
-    $gradle = if (Test-Path -LiteralPath (Join-Path $RepoRoot "gradlew.bat")) { Join-Path $RepoRoot "gradlew.bat" } else { "gradle" }
-    Invoke-Checked -FilePath $gradle -Arguments @(
-        "--no-daemon", "--console=plain", "--stacktrace",
-        ":app:testDebugUnitTest",
-        ":storageRedirectTestApp:testDebugUnitTest",
-        ":storageRedirectTestMediaFileApi:testDebugUnitTest",
-        ":storageRedirectTestApp:assembleDebug"
+    Write-Step "在 WSL 中构建并测试 Rust/Android 产物"
+    $wsl = Get-Command wsl.exe -ErrorAction Stop
+    Invoke-Checked -FilePath $wsl.Source -Arguments @(
+        "--cd", $RepoRoot, "--exec", "bash", "-lc",
+        'build_dir=$(wslpath -a "$1") || exit; shift; exec env SRX_TEST_BUILD_DIR="$build_dir" "$@"',
+        "_", (Resolve-BuildPath $BuildDir),
+        "RUN_DEVICE_SCENARIOS=0",
+        "SRX_TEST_TARGET_TRIPLE=$TargetTriple",
+        "SRX_TEST_MODULE_ABI=$ModuleAbi",
+        "CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER=aarch64-linux-android29-clang",
+        "CARGO_TARGET_X86_64_LINUX_ANDROID_LINKER=x86_64-linux-android29-clang",
+        "bash", "scripts/verify-test-flow.sh"
     )
 
+    $versionData = Get-ResolvedVersionData
+    $version = [string]$versionData.version
+    $buildRoot = Resolve-BuildPath $BuildDir
+    $moduleZip = Join-Path $buildRoot "assets/storage.redirect.x-v$version-$ModuleAbi.zip"
+    if (-not (Test-Path -LiteralPath $moduleZip -PathType Leaf)) {
+        Fail "WSL 未生成测试模块 zip：$moduleZip"
+    }
     $testAppApk = Get-TestAppApk
     if ([string]::IsNullOrWhiteSpace($testAppApk)) { Fail "在 $TestAppApkDir 下找不到测试应用 debug APK。" }
 
@@ -317,6 +207,19 @@ try {
     Write-Step "安装测试 APK"
     Invoke-Checked -FilePath "adb" -Arguments @("install", "-r", $testAppApk)
 
+    Write-Step "运行 native 单元与 ZN 回调测试"
+    $nativeRemote = (& adb shell mktemp -d /data/local/tmp/srx-native-tests.XXXXXX | Out-String).Trim()
+    if ($LASTEXITCODE -ne 0 -or $nativeRemote -notmatch '^/data/local/tmp/srx-native-tests\.[A-Za-z0-9]+$') {
+        Fail "无法创建设备 native 测试目录。"
+    }
+    try {
+        Invoke-Checked -FilePath "adb" -Arguments @("push", "$(Join-Path $buildRoot 'native')/.", "$nativeRemote/")
+        Invoke-Checked -FilePath "adb" -Arguments @("push", ".github/tests/run-zn-runtime-fixture.sh", ".github/tests/grant-storage-test-permissions.sh", "$nativeRemote/")
+        Invoke-AdbSu "sh '$nativeRemote/run-zn-runtime-fixture.sh' '$nativeRemote/zn-runtime-fixture' '/data/adb/modules/storage.redirect.x/zygisk/$ModuleAbi.so' '$nativeRemote/grant-storage-test-permissions.sh' '$nativeRemote/srx_core-tests' '$nativeRemote/srx_daemon-tests'"
+    } finally {
+        Invoke-Checked -FilePath "adb" -Arguments @("shell", "rm", "-rf", $nativeRemote)
+    }
+
     Write-Step "运行设备场景套件"
     $env:MODULE_ZIP = $moduleZip
     $env:APP_APK = $testAppApk
@@ -346,11 +249,14 @@ try {
             "`$env:Path = '$escapedPath'",
             "`$env:SRT_FAIL_FAST = '0'"
         )
+        # 场景脚本从 ANDROID_SERIAL 选定设备；WMI 子进程需要显式接收该变量。
+        if (-not [string]::IsNullOrWhiteSpace($env:ANDROID_SERIAL)) {
+            $wrapperLines += "`$env:ANDROID_SERIAL = '$($env:ANDROID_SERIAL -replace "'", "''")'"
+        }
         if (-not [string]::IsNullOrWhiteSpace($env:SRT_SCENARIOS)) {
             $wrapperLines += "`$env:SRT_SCENARIOS = '$($env:SRT_SCENARIOS -replace "'", "''")'"
         }
-        # 版本级场景排除与 CI 矩阵同语义（如 A17 排除依赖外网的场景 39）：本地复现
-        # 该类形态时必须一起透传，否则默认全量会跑出与 CI 不一致的范围。
+        # 显式透传调用方指定的场景排除项。
         if (-not [string]::IsNullOrWhiteSpace($env:SRT_VERSION_SCENARIO_EXCLUDE)) {
             $wrapperLines += "`$env:SRT_VERSION_SCENARIO_EXCLUDE = '$($env:SRT_VERSION_SCENARIO_EXCLUDE -replace "'", "''")'"
         }

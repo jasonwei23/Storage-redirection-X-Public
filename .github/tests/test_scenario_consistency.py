@@ -1,3 +1,4 @@
+from collections import Counter
 import json
 import os
 import re
@@ -61,11 +62,14 @@ def section(source: str, start: str, end: str) -> str:
 def bash_path(path: Path) -> str:
     """把路径转成子进程 `bash` 认得的相对形式。
 
-    Windows MSYS 下驱动器挂在 `/mnt/<盘符>/...`（不是 `/e/...`），传 `E:/...` 或
-    `/e/...` 都会被当成"脚本不存在"而以 127 假失败；子进程继承当前工作目录，
-    用相对路径在 Windows 与 Linux 上都成立。
+    子进程继承当前工作目录，用相对路径在 Windows 与 Linux 上都成立；跨盘符时
+    `os.path.relpath` 无解（Windows 会抛 ValueError），此时退回绝对路径，由调用方
+    保证该路径在目标 bash 中可见。
     """
-    return Path(os.path.relpath(Path(path), Path.cwd())).as_posix()
+    try:
+        return Path(os.path.relpath(Path(path), Path.cwd())).as_posix()
+    except ValueError:
+        return Path(path).resolve().as_posix()
 
 
 def load_workflow(path: str) -> dict:
@@ -89,20 +93,18 @@ def _assert_android17_unified(jobs: dict, label: str) -> dict:
     entry = android17_matrix_entry(jobs)
     if entry["api_level"] != "37.0":
         raise AssertionError(f"{label}: api_level 应为 37.0，实际 {entry['api_level']}")
-    if entry.get("root_method") != "ksu":
-        raise AssertionError(f"{label}: 17 的 root_method 应为 ksu")
-    if entry.get("adb_root_mode") != "su0":
-        raise AssertionError(f"{label}: 17 的 adb_root_mode 应为 su0")
+    if jobs["test-flow"]["env"].get("ADB_ROOT_MODE") != "su0":
+        raise AssertionError(f"{label}: 统一 KernelSU root shell 应为 su0")
     if entry.get("fresh_app_scenarios") != "1,2,29,32,33":
         raise AssertionError(f"{label}: 17 的 fresh_app_scenarios 应为 1,2,29,32,33")
-    if "magisk_url" in entry:
-        raise AssertionError(f"{label}: 17 不应保留 magisk_url")
     if entry["gpu_mode"] != "swiftshader_indirect":
         raise AssertionError(f"{label}: gpu_mode 应为 swiftshader_indirect")
     if entry["fresh_app_per_case"] != 1:
         raise AssertionError(f"{label}: 17 的 fresh_app_per_case 应为 1")
-    if entry["timeout_minutes"] != 50:
-        raise AssertionError(f"{label}: 17 的 timeout_minutes 应为 50")
+    if "timeout_minutes" in entry:
+        raise AssertionError(
+            f"{label}: 17 不应在矩阵写死 timeout_minutes——job 级预算由 prepare 按场景数自适应产出"
+        )
     if entry["boot_timeout"] != 1800:
         raise AssertionError(f"{label}: 17 的 boot_timeout 应为 1800")
     if entry["disable_animations"] is not False:
@@ -110,21 +112,21 @@ def _assert_android17_unified(jobs: dict, label: str) -> dict:
     if entry["disable_linux_hw"] is not False:
         raise AssertionError(f"{label}: 17 的 disable_linux_hw 应为 false")
     others = [e for e in jobs["test-flow"]["strategy"]["matrix"]["android"] if e["version"] != 17]
-    if len(others) != 4:
-        raise AssertionError(f"{label}: 其余版本应为 4 个，实际 {len(others)}")
+    if sorted(e["version"] for e in others) != [15, 16]:
+        raise AssertionError(f"{label}: 矩阵应仅覆盖 A15-A17")
     for e in others:
         if e["fresh_app_per_case"] != 0:
             raise AssertionError(f"{label}: 其余版本 fresh_app_per_case 应为 0")
-        if e["timeout_minutes"] != 45:
-            raise AssertionError(f"{label}: 其余版本 timeout_minutes 应为 45")
+        if "timeout_minutes" in e:
+            raise AssertionError(
+                f"{label}: 其余版本不应在矩阵写死 timeout_minutes——job 级预算由 prepare 自适应产出"
+            )
         if e["boot_timeout"] != 1500:
             raise AssertionError(f"{label}: 其余版本 boot_timeout 应为 1500")
         if e["disable_animations"] is not True:
             raise AssertionError(f"{label}: 其余版本 disable_animations 应为 true")
         if e["disable_linux_hw"] != "auto":
             raise AssertionError(f"{label}: 其余版本 disable_linux_hw 应保持上游默认 auto")
-        if e.get("magisk_url", "") != "":
-            raise AssertionError(f"{label}: 其余版本不应设置 magisk_url")
     if jobs["test-flow"]["strategy"]["fail-fast"] is not True:
         raise AssertionError(f"{label}: 矩阵必须跨版本 fail-fast")
     required_needs = jobs["test-flow-required"]["needs"]
@@ -310,13 +312,93 @@ class ScenarioConsistencyTest(unittest.TestCase):
         self.assertIn("let removed_storage = unlink_path(storage_path)", media)
         self.assertIn("let removed_backend =", media)
 
-    def test_kernelsu_zygisk_next_default_uses_existing_release_tag(self) -> None:
-        # KernelSU 实验 workflow 已于 2026-10-16 移除，Zygisk Next 的默认地址只剩
-        # 安装脚本一处；A17 分片在正式矩阵里仍按 root_method=ksu 调用该脚本。
-        installer = read(".github/tests/install-storage-redirect-module-ksu.sh")
-        expected = "https://github.com/LSPosed/ZygiskNext/releases/download/v1.5.0/Zygisk-Next-1.5.0-843-5217106-release.zip"
-        self.assertIn(expected, installer)
-        self.assertNotIn("releases/download/1.5.0/", installer)
+    def test_ksu_emulator_death_is_detected_and_retried(self) -> None:
+        """开机等待须检测模拟器提前退出，并只对此类失败重试一次。"""
+        script = read(".github/tests/install-storage-redirect-module.sh")
+        start = section(script, "start_emulator()", "start_emulator_and_boot()")
+        self.assertIn("EMULATOR_PID=$!", start, "必须记下自启模拟器的 pid")
+        boot = section(script, "wait_for_boot()", "wait_for_emulator_shutdown()")
+        self.assertIn('kill -0 "$EMULATOR_PID"', boot, "等待开机时要检查进程是否还活着")
+        self.assertIn("return 2", boot, "进程死亡要用独立返回码区别于普通超时")
+        retry = section(script, "start_emulator_and_boot()", "detect_root_su_form()")
+        self.assertIn("for attempt in 1 2; do", retry, "启动失败要重试一次")
+        self.assertIn("wait_for_boot 300", retry)
+        # 调用点必须走带重试的入口，不能再裸调 start_emulator + wait_for_boot。
+        self.assertNotIn("start_emulator\nwait_for_boot 300", script)
+
+    @unittest.skipUnless(shutil.which("bash"), "需要 Bash 验证模拟器重启恢复")
+    def test_ksu_reboot_requires_new_stable_boot_and_recovers_emulator_death(self) -> None:
+        script = read(".github/tests/install-storage-redirect-module.sh")
+        reboot = section(script, "wait_for_reboot() {", "# 先固定可用的 su 形式")
+        root_wait = section(script, "wait_for_root_shell() {", "dump_root_diagnostics() {")
+        self.assertIn("previous_boot_id", reboot)
+        self.assertIn('current_boot_id" != "$previous_boot_id"', reboot)
+        self.assertIn("stable_attempts", reboot)
+        self.assertIn("start_emulator_and_boot", reboot)
+        self.assertIn("start_emulator_and_boot", root_wait)
+        self.assertEqual(3, script.count("wait_for_reboot 420"))
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            boot_id = root / "boot-id"
+            boot_id.write_text("old\n", encoding="utf-8")
+            adb = root / "adb"
+            adb.write_text(
+                "#!/bin/sh\n"
+                "case \"$*\" in\n"
+                "  reboot) kill -TERM \"$EMULATOR_PID\" 2>/dev/null || true ;;\n"
+                "  'shell cat /proc/sys/kernel/random/boot_id') cat \"$MOCK_BOOT_ID\" ;;\n"
+                "  'shell getprop sys.boot_completed') printf '1\\n' ;;\n"
+                "  'kill-server') : ;;\n"
+                "  *) echo \"unexpected adb call: $*\" >&2; exit 2 ;;\n"
+                "esac\n",
+                encoding="utf-8",
+            )
+            adb.chmod(0o755)
+            harness = (
+                f"export PATH={root}:$PATH MOCK_BOOT_ID={boot_id}\n"
+                "export CURRENT_BOOT=old\n"
+                "sleep() { command sleep 0.01; }\n"
+                "wait_for_emulator_shutdown() { wait \"$EMULATOR_PID\" 2>/dev/null || true; }\n"
+                "start_emulator_and_boot() {\n"
+                "  (command sleep 30) & EMULATOR_PID=$!\n"
+                "  export EMULATOR_PID\n"
+                "  CURRENT_BOOT=new; export CURRENT_BOOT\n"
+                "  printf 'new\\n' > \"$MOCK_BOOT_ID\"\n"
+                "}\n"
+                "(command sleep 30) & EMULATOR_PID=$!; export EMULATOR_PID\n"
+                + reboot
+                + "\nwait_for_reboot 20\n"
+                "kill \"$EMULATOR_PID\" 2>/dev/null || true\n"
+                "wait \"$EMULATOR_PID\" 2>/dev/null || true\n"
+            )
+            result = subprocess.run(
+                [shutil.which("bash"), "-eu", "-c", harness],
+                text=True, capture_output=True, timeout=15,
+            )
+            self.assertEqual(0, result.returncode, result.stderr)
+            self.assertIn("重新启动已打补丁的 AVD", result.stderr)
+            self.assertIn("boot_id=new", result.stdout)
+
+    def test_module_verify_skips_wait_when_post_fs_data_missed(self) -> None:
+        script = read(".github/tests/install-storage-redirect-module.sh")
+        marker = section(script, "module_boot_marker_state()", "verify_storage_redirect_module_loaded()")
+        self.assertIn(".boot_pending", marker)
+        self.assertIn("ran | missed", marker)
+        verify = section(script, "verify_storage_redirect_module_loaded()", "verify_storage_redirect_module_loaded_with_reboot_retry()")
+        self.assertIn('"$(module_boot_marker_state)" = "missed"', verify)
+        self.assertIn("本次开机未执行 post-fs-data", verify)
+        self.assertLess(verify.index("module_boot_marker_state"), verify.index("sleep 2"))
+
+    def test_installer_asset_urls_match_release_tags(self) -> None:
+        installer = read(".github/tests/install-storage-redirect-module.sh")
+        for variable, pattern in (
+            ("KERNELSU_APK_URL", r"/download/(v[\d.]+)/(KernelSU_(v[\d.]+)_\d+-release\.apk)"),
+            ("ZYGISK_NEXT_URL", r"/download/(v[\d.]+)/(Zygisk-Next-([\d.]+)-\d+-[0-9a-f]+-release\.zip)"),
+        ):
+            match = re.search(variable + "=.*?" + pattern, installer)
+            self.assertIsNotNone(match, variable)
+            self.assertEqual(match.group(1).removeprefix("v"), match.group(3).removeprefix("v"))
 
     def test_shared_host_precedes_namespace_redirect(self) -> None:
         daemon = read("src/daemon_mount.rs")
@@ -338,7 +420,8 @@ class ScenarioConsistencyTest(unittest.TestCase):
             self.assertIn("match preattached_host {", source)
             self.assertIn("Ok(state) => (vec![state], ScopedMountAttempt::Ready", source)
             # 已服务判定必须只认**当前**宿主会话：旧代际的层已经失效，仍需重新挂。
-            self.assertIn("Some(view.mount_source.as_str())", source)
+            # 判据是超级块身份（dev）——挂载源已原生化，源文本不再能区分代际。
+            self.assertIn("Some(view.dev.as_str())", source)
             monitor_only = source.index("else if request.is_monitor_only")
             redirect = source.index("apply_sdcard_redirect(", source.index("preattach_shared_host("))
             self.assertLess(monitor_only, redirect, label)
@@ -471,6 +554,31 @@ class ScenarioConsistencyTest(unittest.TestCase):
         ps_targets = section(self.powershell, "function Clear-Targets", "function Remove-TestTargetArtifacts")
         self.assertIn("Fix-OwnPrivateFixturePermissions", ps_targets)
 
+    def test_shared_fixture_ownership_normalized(self) -> None:
+        # root shell 创建的公共目录必须保留 media_rw 属主，应用的 emulated-storage 视图才能遍历。
+        bash_fix = section(self.bash, "fix_shared_fixture_permissions() {", "adb_root() {")
+        self.assertIn("chown -R 1023:1023", bash_fix)
+        self.assertIn("BACKEND_ROOT}/Download'/Srt*", bash_fix)
+        bash_targets = self.bash.split("clean_targets() {", 1)[1].split("\n}", 1)[0]
+        self.assertIn("fix_shared_fixture_permissions", bash_targets)
+        ps_fix = section(self.powershell, "function Fix-SharedFixturePermissions", "function Assert-FixtureRootsEmpty")
+        self.assertIn("chown -R 1023:1023", ps_fix)
+        self.assertIn("'$BackendRoot/Download'/Srt*", ps_fix)
+        self.assertIn("'$RealRoot/Download'/Srt*", ps_fix)
+        self.assertIn("'$RealRoot/SrtRuleSandbox'", ps_fix)
+        self.assertIn("'$RealRoot/DCIM/SrtRuleSibling'", ps_fix)
+        ps_targets = section(self.powershell, "function Clear-Targets", "function Remove-TestTargetArtifacts")
+        self.assertIn("Fix-SharedFixturePermissions", ps_targets)
+        self.assertIn("Fix-SharedFixturePermissions", self.powershell[self.powershell.index("function Invoke-Scenario"):])
+
+    def test_backend_view_invalidation_covers_rule_fixture_aliases(self) -> None:
+        bash_invalidation = section(self.bash, "invalidate_backend_fixture_view() {", "clean_targets() {")
+        self.assertIn("${BACKEND_ROOT}/SrtRuleSandbox", bash_invalidation)
+        self.assertIn("${BACKEND_ROOT}/DCIM/SrtRuleSibling", bash_invalidation)
+        ps_fix = section(self.powershell, "function Fix-SharedFixturePermissions", "function Assert-FixtureRootsEmpty")
+        self.assertIn("'$RealRoot/SrtRuleSandbox'", ps_fix)
+        self.assertIn("'$RealRoot/DCIM/SrtRuleSibling'", ps_fix)
+
     def test_fixture_operations_bypass_app_visible_view(self) -> None:
         # /storage/emulated/0 是应用视图，刚应用的只读/映射配置会覆盖夹具父目录，root shell
         # 从该视图 mkdir 会被 EPERM 拒绝（Android 17 场景 17）。clean_targets 内的夹具操作
@@ -496,24 +604,50 @@ class ScenarioConsistencyTest(unittest.TestCase):
         return ""
 
     def test_run_scenario_calls_only_exported_functions(self) -> None:
-        """run_scenario 在独立子 shell 中执行，它调用的脚本函数都必须先 export -f。
+        """场景进程会触达的脚本函数都必须先 export -f。
 
-        子 shell 只继承显式导出的函数；漏掉一个就会在设备上以 `command not found`
-        让每个场景失败。实测漏导出 wait_scenario_app_view 时，五个平台 × 37 个场景
-        全红，而 quality 侧完全看不出来，只有跑完整矩阵才会暴露，代价很高。
+        子 shell 只继承显式导出的函数；漏掉一个会使对应路径调用失败，而且**症状极其隐蔽**：
+        调用点被当成外部命令，shell 打一行 `command not found` 就继续往下跑，断言从未真正
+        执行过（真机 2026-11-12：新加的 `require_own_private_system_view_identity` 漏了导出，
+        场景 34 在 A15 上以 `environment: line 23: ...: command not found` 失败）。
+
+        判据取**传递闭包**而非只扫 `run_scenario` 那一段：场景主体在 `run_scenario` 里，
+        但它调用到的场景函数（如 `run_own_private_directories_scenario`）定义在别处、也会
+        在子 shell 里执行，它们的调用同样受导出约束。此前的实现只扫 `run_scenario` 段与
+        `clean_targets`，段外函数的漏导出检不出来。
         """
-        body = self.bash[self.bash.index("run_scenario() {") : self.bash.index("# 与 PowerShell 共用设备端锁")]
-        defined = set(re.findall(r"(?m)^([a-z_][a-z0-9_]*)\(\) \{", self.bash))
+        # 函数体表：名字 -> 源码片段（以顶层 `名字() {` 起，到下一个顶层定义前止）。
+        definitions = list(re.finditer(r"(?m)^([a-z_][a-z0-9_]*)\(\) \{", self.bash))
+        bodies: dict[str, str] = {}
+        for index, match in enumerate(definitions):
+            start = match.end()
+            end = definitions[index + 1].start() if index + 1 < len(definitions) else len(self.bash)
+            bodies[match.group(1)] = self.bash[start:end]
+        defined = set(bodies)
+
         exported: set[str] = set()
         for line in self.bash.splitlines():
             if line.startswith("export -f "):
                 exported.update(line[len("export -f ") :].split())
-        missing = sorted(
-            name
-            for name in defined
-            if name not in exported and re.search(rf"(?<![\w-]){re.escape(name)}(?![\w-])", body)
-        )
-        self.assertEqual([], missing, f"run_scenario 会调用但未 export -f 的函数：{missing}")
+
+        # 从场景入口出发做可达性遍历：只沿**已导出**函数继续下钻（未导出的函数在子 shell 里
+        # 根本不存在，其内部调用无从谈起，必须先把自身报出来）。
+        reachable = {"run_scenario", "clean_targets"}
+        pending = list(reachable)
+        while pending:
+            current = pending.pop()
+            body = bodies.get(current)
+            if body is None:
+                continue
+            for name in defined:
+                if name in reachable:
+                    continue
+                if re.search(rf"(?<![\w-]){re.escape(name)}(?![\w-])", body):
+                    reachable.add(name)
+                    pending.append(name)
+
+        missing = sorted(name for name in reachable if name != "run_scenario" and name not in exported)
+        self.assertEqual([], missing, f"场景进程会调用但未 export -f 的函数：{missing}")
 
     def test_shared_probe_invalidation_precedes_backend_cleanup(self) -> None:
         # 前序场景已查询过的文件应经系统 FUSE 删除，不能仅修改底层文件系统。
@@ -631,19 +765,60 @@ class ScenarioConsistencyTest(unittest.TestCase):
         self.assertIn(lock_path, self.bash)
         ps_start = self.powershell[self.powershell.index("$script:ExitCode = 0") :]
         self.assertLess(ps_start.index("Enter-DeviceRunLock"),
+                        ps_start.index("Grant-TestAppStoragePermissions"))
+        self.assertLess(ps_start.index("Grant-TestAppStoragePermissions"),
                         ps_start.index("Backup-GlobalConfig"))
         self.assertIn("try { Invoke-TestArtifactCleanup } finally { Exit-DeviceRunLock }", ps_start)
         bash_start = self.bash[self.bash.index("trap finish_test_run EXIT") :]
         self.assertLess(bash_start.index("acquire_device_run_lock"),
+                        bash_start.index("/grant-storage-test-permissions.sh"))
+        self.assertLess(bash_start.index("/grant-storage-test-permissions.sh"),
                         bash_start.index("backup_global_config"))
         finish = section(self.bash, "finish_test_run() {", "cleanup_done=0")
         self.assertIn('if [ "$device_run_lock_held" -eq 1 ]', finish)
         self.assertLess(finish.index("cleanup_test_artifacts"), finish.index("release_device_run_lock"))
-        self.assertIn('return "$status"', finish)
+        self.assertIn('exit "$status"', finish)
 
     def test_manifest_is_contiguous_and_unique(self) -> None:
         self.assertEqual(list(range(1, max(self.ids) + 1)), self.ids)
         self.assertEqual(len(self.ids), len(set(self.ids)))
+
+    def test_powershell_function_names_are_unique(self) -> None:
+        names = re.findall(r"(?m)^function\s+([a-z_]\w*)\b", self.powershell)
+        duplicates = sorted(name for name, count in Counter(n.casefold() for n in names).items() if count > 1)
+        self.assertEqual([], duplicates, "PowerShell later definitions silently shadow earlier functions")
+
+    def test_powershell_device_probes_keep_the_selected_serial(self) -> None:
+        """后台/直接 ADB 探针不得绕过 runner 的显式设备选择。"""
+        self.assertIn(
+            'Start-Process -FilePath "adb" -ArgumentList @("-s", $Serial, "shell",',
+            self.powershell,
+        )
+        self.assertIn(
+            'Invoke-Adb @("shell", "sleep $delay; exec mkdir',
+            self.powershell,
+        )
+        self.assertNotIn(
+            'Start-Process -FilePath "adb" -ArgumentList @("shell",',
+            self.powershell,
+        )
+        self.assertNotIn(
+            '& adb shell "sleep $delay; exec mkdir',
+            self.powershell,
+        )
+
+    def test_powershell_backend_config_uses_requested_mode(self) -> None:
+        body = section(
+            self.powershell,
+            "function Get-TestGlobalConfig",
+            "function Set-BackendConfig",
+        )
+        self.assertIn('"storage_backend_mode":"\' + $StorageBackendMode + \'"', body)
+        self.assertNotIn('"storage_backend_mode":"auto"', body)
+
+        bash_body = section(self.bash, "test_global_config() {", "set_backend_config() {")
+        self.assertIn('"storage_backend_mode":"%s"', bash_body)
+        self.assertNotIn('"storage_backend_mode":"auto"', bash_body)
 
     def test_both_runners_cover_every_config_and_title(self) -> None:
         bash_config = section(self.bash, "apply_config()", "target_path()")
@@ -710,7 +885,7 @@ class ScenarioConsistencyTest(unittest.TestCase):
             self.assertNotIn("Use-MountNamespaceFallbackConfig", ps_text)
             if mode.startswith("monitor_"):
                 self.assertIn("FileMonitorEnabled $true", ps_text)
-                self.assertIn('storage_backend_mode":"auto', self.bash)
+                self.assertIn("set_backend_config auto", self.bash)
 
     def test_workflows_run_manifest_scenarios(self) -> None:
         # Release 始终全量：硬编码 SRT_SCENARIOS: "all"，不得被单场景标记收窄。
@@ -807,34 +982,369 @@ class ScenarioConsistencyTest(unittest.TestCase):
 
     def test_ci_test_flow_step_timeout_follows_scenario_scope(self) -> None:
         # 模拟器异常时编排脚本可能停在场景脚本之前的准备阶段，脚本内看门狗覆盖
-        # 不到；job 级 45/50 分钟又太宽（run 40272962460 五个版本同时被拖住 33
-        # 分钟、取消请求也不立即生效）。步骤级超时必须按 prepare 解析出的场景数
-        # 自适应：窄跑十几分钟即失败，全量仍留足预算。
+        # 不到；写死的 job 级 45/50 分钟又比 40 场景的看门狗（75 分钟）还小，
+        # 结果看门狗永不触发、永远被 job 硬杀（run 40272962460 五个版本同时被
+        # 拖住 33 分钟、取消请求也不立即生效）。步骤级与 job 级超时必须都由
+        # prepare 按场景数自适应产出，且 job 严格大于 step，场景增加时自动跟上。
         ci = read(".github/workflows/ci.yml")
+        release = read(".github/workflows/release.yml")
+        for workflow in (".github/workflows/ci.yml", ".github/workflows/release.yml"):
+            source = read(workflow)
+            self.assertIn(
+                "timeout-minutes: ${{ fromJSON(needs.prepare.outputs.test_flow_timeout_minutes) }}",
+                source,
+                workflow,
+            )
+            self.assertIn(
+                "timeout-minutes: ${{ fromJSON(needs.prepare.outputs.test_flow_job_timeout_minutes) }}",
+                source,
+                workflow,
+            )
+            # 矩阵不得再写死 job 级超时，否则会盖住自适应预算。
+            parsed = yaml.safe_load(source)["jobs"]
+            for entry in parsed["test-flow"]["strategy"]["matrix"]["android"]:
+                self.assertNotIn("timeout_minutes", entry, workflow)
         prepare = section(ci, "  prepare:", "  init-ci-release:")
         self.assertIn(
             "test_flow_timeout_minutes: ${{ steps.scope.outputs.test_flow_timeout_minutes }}",
             prepare,
         )
         self.assertIn(
-            "timeout-minutes: ${{ fromJSON(needs.prepare.outputs.test_flow_timeout_minutes) }}",
-            ci,
+            "test_flow_job_timeout_minutes: ${{ steps.scope.outputs.test_flow_job_timeout_minutes }}",
+            prepare,
         )
+        self.assertIn("test_flow_job_timeout_minutes", release)
         scope = read(".github/scripts/parse_scenario_scope.py")
         self.assertIn("test_flow_timeout_minutes", scope)
         self.assertIn("_test_flow_timeout_minutes", scope)
+        self.assertIn("_test_flow_job_timeout_minutes", scope)
+
+    def test_setup_phase_budget_covers_pre_scenario_hangs(self) -> None:
+        # 「还没开跑就卡住」发生在场景循环之前（设备健康检查、模块安装、包服务
+        # 恢复），层叠的场景看门狗覆盖不到，只能靠独立的基础设置预算兜底；
+        # 没有这道预算就只能等 step/job 级超时硬杀，拿不到 preflight 快照。
+        flow = read(".github/tests/run-android-test-flow.sh")
+        self.assertIn("SETUP_BUDGET_SECONDS=", flow)
+        self.assertIn("run_setup_phase()", flow)
+        # 非整数（如 15m）会让算术展开报 "arithmetic expression" 这种看不出根因的
+        # 错误，必须有显式校验并给出可读信息。
+        self.assertIn("*[!0-9]*)", flow)
+        self.assertIn("SETUP_BUDGET_SECONDS 必须是非负整数秒", flow)
+        # 模块安装必须以基础设置预算包裹，它是这段里最容易无限阻塞的一步。
+        self.assertIn('run_setup_phase "模块安装"', flow)
+        # timeout 超时回 124，--kill-after 升级 SIGKILL 时回 137（实测确认）；
+        # 只认 124 会把「卡死」误报成「阶段失败」，两个码都必须判成超时。
+        self.assertIn('[ "$code" -eq 124 ] || [ "$code" -eq 137 ]', flow)
+        # 各等待函数自己的固定上限必须被压到基础设置预算内，否则预算只是「边界处
+        # 检查」，wait_for_adb_ready(300s)/wait_for_emulated_storage(180s) 仍能在
+        # 预算用尽后继续跑，把「15 分钟内判定」拖成 20 分钟。
+        self.assertIn("setup_bounded_seconds()", flow)
+        self.assertIn("$(setup_bounded_seconds 300)", flow)
+        self.assertIn('setup_bounded_seconds "${1:-120}"', flow)
+        # 预算把等待裁到 0 秒 ≠ 设备真不可用：三处设备等待的失败归因必须区分，
+        # 否则排查会照着设备方向走错路（实测预算归零时原本只报「设备未进入可用状态」）。
+        self.assertIn("report_device_wait_failure()", flow)
+        self.assertIn("期间已用尽 ${SETUP_BUDGET_SECONDS}s 预算", flow)
+        # A17 分片有意不上传诊断资产（ci.yml 的 `matrix.android.version != 17`），
+        # preflight 快照必须同时打到 step 日志，否则那一版失败时看不到任何现场。
+        self.assertIn('cat "$PREFLIGHT_DIAGNOSTICS" >&2', flow)
+        for call in (
+            'report_device_wait_failure "等待设备就绪"',
+            'report_device_wait_failure "模拟器重启恢复"',
+            'report_device_wait_failure "模块重启后等待设备恢复"',
+        ):
+            self.assertIn(call, flow)
+        # 预算耗尽的判定必须在场景脚本启动之前。
+        self.assertLess(
+            flow.index("基础设置超时：场景循环开始前已用尽"),
+            flow.index('"${scenario_watchdog}s" bash'),
+        )
+        # 基础设置区间内的 adb 调用必须**全部**带超时：设备半死时 adb 客户端自身
+        # 就可能无限阻塞，而等待函数只在两轮之间检查 deadline——单次调用被挂住，
+        # 15 分钟预算就永远走不到判定点，「预算权威」只是名义上的。
+        region = flow[flow.index("setup_started=") : flow.index("scenario_watchdog=$((")]
+        unbounded = [
+            line.strip()
+            for line in region.splitlines()
+            if not line.lstrip().startswith("#")
+            and re.search(r"\badb\b", line)
+            and "timeout" not in line
+            and "adb_bounded" not in line
+        ]
+        self.assertEqual(unbounded, [], "基础设置区间存在无超时的 adb 调用")
+        self.assertIn("adb_bounded()", flow)
+        self.assertIn('timeout "${SETUP_ADB_TIMEOUT_SECONDS}s" adb "$@"', flow)
+        # 包枚举三条（普通/root/cmd）也各带上限，且必须被剩余预算裁剪。裁剪不能
+        # 直接用 setup_bounded_seconds：GNU `timeout 0` 表示「不设超时」，预算耗尽时会
+        # 把「立即失败」变成「无限等待」，正好反过来——所以要走下限 1 秒的包装。
+        self.assertIn("setup_bounded_timeout()", flow)
+        self.assertIn('[ "$left" -ge 1 ] || left=1', flow)
+        self.assertEqual(
+            flow.count('timeout "$(setup_bounded_timeout 60)" adb shell'),
+            3,
+            "包枚举三条都要被预算裁剪",
+        )
+        # 包服务等待同样要被预算裁剪：否则预算耗尽后它还能再跑满 120 秒，
+        # 把「15 分钟内判定」拖成 17 分钟，并吃掉留给 step 的收尾余量。
+        self.assertIn(
+            'setup_bounded_seconds "${PACKAGE_SERVICE_TIMEOUT_SECONDS:-120}"', flow
+        )
+        for workflow in (".github/workflows/ci.yml", ".github/workflows/release.yml"):
+            # 用解析后的值断言，避免「注释里写了同样的字」也算通过。
+            env = yaml.safe_load(read(workflow))["jobs"]["test-flow"]["env"]
+            self.assertEqual(env["SETUP_BUDGET_SECONDS"], 900, workflow)
+
+    def test_release_test_flow_mirrors_ci_test_flow(self) -> None:
+        """发布测试流必须与 CI 测试流共用同一套执行环境。
+
+        两条链路跑的是同一份编排脚本，任何一侧参数漂移都会造成「CI 全绿、发布
+        失败」或反向的假阳性。历史上 release 曾缺 `-dns-server`（A17 镜像网络
+        验证）与步骤级超时，CI 早已修好却传不过去；这里把两侧钉死，避免再次漂移。
+        """
+        ci = yaml.safe_load(read(".github/workflows/ci.yml"))["jobs"]
+        release = yaml.safe_load(read(".github/workflows/release.yml"))["jobs"]
+
+        def emulator_step(jobs: dict) -> dict:
+            return next(
+                step
+                for step in jobs["test-flow"]["steps"]
+                if step.get("uses") == "./.github/actions/run-android-emulator"
+            )
+
+        ci_emulator = emulator_step(ci)
+        release_emulator = emulator_step(release)
+        # 用解析后的值断言，避免「注释里写了同样的表达式」也算通过。
+        self.assertEqual(
+            ci_emulator.get("timeout-minutes"),
+            "${{ fromJSON(needs.prepare.outputs.test_flow_timeout_minutes) }}",
+        )
+        self.assertEqual(
+            ci["test-flow"]["timeout-minutes"],
+            "${{ fromJSON(needs.prepare.outputs.test_flow_job_timeout_minutes) }}",
+        )
+        self.assertEqual(ci_emulator.get("with"), release_emulator.get("with"))
+        self.assertEqual(
+            ci_emulator.get("timeout-minutes"),
+            release_emulator.get("timeout-minutes"),
+        )
+        self.assertEqual(
+            ci["test-flow"]["timeout-minutes"],
+            release["test-flow"]["timeout-minutes"],
+        )
+        self.assertEqual(
+            ci["test-flow"]["env"]["SETUP_BUDGET_SECONDS"],
+            release["test-flow"]["env"]["SETUP_BUDGET_SECONDS"],
+        )
+        # 发布侧 job 级预算引用 prepare 输出，必须显式要求 prepare 成功，
+        # 否则 prepare 未成功时表达式拿到空值会直接解析失败。
+        self.assertIn("needs.prepare.result == 'success'", release["test-flow"]["if"])
+
+    def test_only_ci_uses_concurrency_group(self) -> None:
+        # 两侧并发策略相反且都是有意的：
+        # - CI：新 push 取代旧验证，用并发组取消挂起的旧 run，避免新旧各自占满
+        #   3 个模拟器 runner。
+        # - 发布：tag 触发的一次性发布必须完整跑完，取消会留下资产不全的半成品
+        #   Release 与未更新的 update.json。
+        # 这条断言把「有意不设」固化下来，避免后人当成遗漏顺手补上。
+        self.assertIn("concurrency", yaml.safe_load(read(".github/workflows/ci.yml")))
+        self.assertNotIn(
+            "concurrency", yaml.safe_load(read(".github/workflows/release.yml"))
+        )
+
+    def test_scenario_timeout_kills_whole_process_group(self) -> None:
+        """单场景超时必须整组终止，否则 adb 孙进程成孤儿并占住 stdout。
+
+        `timeout --foreground` 不建新进程组、只终止直接子进程；场景内拉起的 adb
+        会变成孤儿并继续持有 stdout 写端，GitHub runner 判定 step 未结束、job
+        静默挂到步骤超时（run 40286639350：11 分 44 秒零输出）。宿主侧同形命令
+        实测：--foreground 下管道要等孙进程结束才关（15s vs 2s）。
+        """
+        script = read(".github/tests/run-storage-redirect-scenarios.sh")
+        self.assertIn(
+            'timeout --kill-after=30s "${SRT_SCENARIO_TIMEOUT_SECONDS}s" bash -e -o pipefail',
+            script,
+        )
+        self.assertNotIn(
+            'timeout --foreground "${SRT_SCENARIO_TIMEOUT_SECONDS}s"', script
+        )
+        # 唯一允许保留 --foreground 的是 adb_su_timeout：包的是单个 adb 客户端进程
+        # （自身不派生子进程），且处于 happy path；其余超时一律整组终止。
+        foreground = [
+            line.strip()
+            for line in script.splitlines()
+            if "timeout --foreground" in line and not line.lstrip().startswith("#")
+        ]
+        self.assertEqual(len(foreground), 1, foreground)
+        self.assertIn("ADB_ROOT_TIMEOUT_SECONDS", foreground[0])
+
+    def test_download_server_killed_even_on_early_return(self) -> None:
+        """取数服务必须在早退时也被关闭，否则 python 孤儿占住 stdout。
+
+        从 `exec python3 -m http.server` 启动点到线性 kill 之间还有
+        `restart_media_provider_with_hook_ready` / `start_app_and_confirm_mount` /
+        `wait_storage_ready` 三处 `|| return 1`；任何一处失败都会跳过 kill，python
+        继续监听并持有 step 的 stdout 写端 —— 表现为「场景脚本早就失败、action
+        收尾也打完日志，job 却静默挂到步骤超时」。
+
+        2026-10-26 run 40272962460 就是这个形态：五版本同时挂 45-50 分钟，取消时
+        清理出 adb / bash / python3 三个孤儿，而场景在 68 秒时就已经失败了。
+
+        **trap 引用的变量不能是函数 local**：`dl_server_pid` 是
+        `run_download_owner_attribution_scenario` 的 local，`return 1` 之后作用域
+        立即弹出，而 EXIT trap 是在子 shell 退出时才求值——那时取到空值，trap 成了
+        空壳（本地实测：这种写法的后台进程存活、换全局镜像变量后被正常收掉）。
+        这类「写了但没生效」只能靠真跑一遍发现，所以下面既断言结构、也实际执行。
+        """
+        script = read(".github/tests/run-storage-redirect-scenarios.sh")
+        trap_match = re.search(r"trap '([^']*kill[^']*)' EXIT", script)
+        self.assertIsNotNone(trap_match, "取数服务的 EXIT trap 已缺失")
+        assert trap_match is not None
+        body = trap_match.group(1)
+        self.assertIn("SRT_DL_SERVER_PID", body, "trap 必须引用非 local 的镜像变量")
+        self.assertNotIn(
+            "dl_server_pid", body, "trap 不得引用函数 local——早退后它已不在作用域"
+        )
+        # 镜像变量必须真的被赋值，并在正常收尾后清空（避免对已回收的 PID 再 kill）。
+        self.assertIn('SRT_DL_SERVER_PID="$dl_server_pid"', script)
+        self.assertIn('SRT_DL_SERVER_PID=""', script)
+        self.assertLess(
+            script.index('SRT_DL_SERVER_PID="$dl_server_pid"'),
+            script.index(trap_match.group(0)),
+            "镜像变量必须在使用它的 trap 之前赋值",
+        )
+        # 该 trap 只在场景子进程里生效（run_scenario 由 `bash -c` 拉起、trap 不继承），
+        # 不会顶掉父进程的 cleanup_frozen_daemon / finish_test_run。
+        self.assertIn("'run_scenario \"$1\"' _ \"$scenario\"", script)
+        self.assertIn("trap cleanup_frozen_daemon EXIT", script)
+        self.assertIn("trap finish_test_run EXIT", script)
+        # 行为验证：用与脚本同形的结构（函数 local + export -f + bash -c）实际跑一遍。
+        self.assertIn("CLEANED", self._run_exit_trap_probe(body))
+
+    def _run_exit_trap_probe(self, trap_body: str) -> str:
+        """在真实 bash 里复现「函数 local + EXIT trap + 早退」，返回 CLEANED/LEAKED。
+
+        结构必须与脚本一致：函数内 `local dl_server_pid`、装 trap、设镜像变量、
+        `return 1`，再由 `bash -c` 调用——只有这样 trap 才会在函数作用域弹出之后
+        求值，才测得出「变量取不到值」这类空壳 trap。
+        """
+        bash = shutil.which("bash")
+        if bash is None:
+            self.skipTest("bash 不可用：本次仅做结构断言")
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
+            pid_file = Path(tmp) / "pid.txt"
+            probe = Path(tmp) / "probe.sh"
+            # 子进程以临时目录为工作目录，脚本内全部使用相对文件名，避免 Windows
+            # 跨盘符路径在 bash 里出现 127 假失败。
+            pid_path = pid_file.name
+            probe_path = probe.name
+            probe.write_text(
+                "#!/usr/bin/env bash\n"
+                "set -euo pipefail\n"
+                "set_download_test_network() { :; }\n"
+                "probe() {\n"
+                '  local dl_server_pid=""\n'
+                "  ( exec sleep 300 </dev/null >/dev/null 2>&1 ) &\n"
+                "  dl_server_pid=$!\n"
+                '  SRT_DL_SERVER_PID="$dl_server_pid"\n'
+                f"  trap '{trap_body}' EXIT\n"
+                f'  echo "$dl_server_pid" > "{pid_path}"\n'
+                "  return 1\n"
+                "}\n"
+                "export -f probe set_download_test_network\n"
+                "bash -e -o pipefail -c 'probe' || true\n"
+                "sleep 1\n"
+                f'pid=$(cat "{pid_path}")\n'
+                'if kill -0 "$pid" 2>/dev/null; then\n'
+                "  echo LEAKED\n"
+                '  kill -9 "$pid" 2>/dev/null || true\n'
+                "else\n"
+                "  echo CLEANED\n"
+                "fi\n",
+                encoding="utf-8",
+                newline="\n",
+            )
+            proc = subprocess.run(
+                [bash, probe_path],
+                cwd=tmp,
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=60,
+            )
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            return proc.stdout
+
+    def test_exit_path_adb_calls_are_bounded(self) -> None:
+        """退出路径上的 adb 调用必须带超时，否则脚本结束时卡住、只能等看门狗硬杀。
+
+        `cleanup_frozen_daemon` 与 `release_device_run_lock` 都由 EXIT trap 触发。
+        设备半死时 `adb shell` 客户端会无限阻塞：trap 卡住 = 脚本不退出 = job 干等到
+        看门狗（全量 75 分钟）才被杀——正是本批要消灭的「脚本早该结束、job 却干等」
+        形态。两处都必须走 `adb_su_timeout <秒>`，不能用裸 `adb_su`。
+        """
+        script = read(".github/tests/run-storage-redirect-scenarios.sh")
+        self.assertIn("adb_su_timeout() {", script)
+        for name in ("cleanup_frozen_daemon", "release_device_run_lock"):
+            start = script.index(f"{name}() {{")
+            body = script[start : script.index("\n}\n", start)]
+            self.assertIn(
+                "adb_su_timeout 20", body, f"{name} 的 adb 调用必须带超时"
+            )
+            self.assertNotIn(
+                'adb_su "', body, f"{name} 不允许无超时的裸 adb_su（会阻塞 EXIT trap）"
+            )
+
+
+    def test_ci_concurrency_isolates_self_pushed_commits(self) -> None:
+        """并发组必须把 workflow 自己 push 的维护提交隔离出去。
+
+        `update-manifest` 会 push `CI：更新更新清单`，发布链路会 push
+        `发布：更新更新清单`——这两个提交都会再触发一次 CI。它们触发的 run 所有
+        job 都被 if 守卫跳过（纯空跑），若与产出它们的上一轮同组，空跑会把上一轮
+        取消，而上一轮此刻可能正在 create-ci-release / cleanup-build-artifacts。
+        调用方必须确保这类提交走独立分组。
+        """
+        ci = yaml.safe_load(read(".github/workflows/ci.yml"))
+        group = ci["concurrency"]["group"]
+        self.assertTrue(ci["concurrency"]["cancel-in-progress"])
+        for prefix in ("CI：更新更新清单", "Releases:", "发布：更新更新清单"):
+            self.assertIn(prefix, group, prefix)
+        # 分组必须真的按前缀分叉，而不是只把前缀写进注释/常量里。
+        self.assertIn("maintenance", group)
+        self.assertIn("build", group)
 
     def test_download_scenario_avoids_local_network_on_api37(self) -> None:
-        # Android 17（API 37）起应用默认禁止「本地网络访问」：下载提供器在该镜像
-        # targetSdk=37，它连模拟器宿主别名 10.0.2.2（10.0.2.0/24 局域网段）的 TCP
-        # 连接被静默丢弃（connect 超时 + 服务端零请求），回环 127.0.0.1 与公网正常。
-        # 场景 39 因此必须在 API >= 37 走 adb reverse + 回环取数。
+        # 两种运行器在 API 37+ 模拟器上通过 adb reverse 使用回环地址；真机保留内置 URL。
         script = read(".github/tests/run-storage-redirect-scenarios.sh")
+        powershell = read(".github/tests/run-storage-redirect-scenarios.ps1")
         self.assertIn('adb reverse "tcp:$dl_port" "tcp:$dl_port"', script)
         self.assertIn('dl_url="http://127.0.0.1:$dl_port/srt_download.bin"', script)
         self.assertIn('if [ "${dl_api:-0}" -ge 37 ] 2>/dev/null', script)
-        # 低版本与真机通路保持不变：A13-A16 仍用 10.0.2.2，真机仍走 APK 内置 URL。
+        self.assertIn('if (-not $dlUrl -and $isEmulator)', powershell)
+        self.assertIn('if ($deviceSdk -ge 37)', powershell)
+        self.assertNotIn('or -not $isEmulator', powershell)
+        self.assertIn('$dlUrl = "http://127.0.0.1:$dlPort/srt_download.bin"', powershell)
+        self.assertIn('using the test app default download URL', powershell)
+        self.assertIn('if (-not [string]::IsNullOrWhiteSpace($dlUrl)) { $extras.url = $dlUrl }', powershell)
+        ps_download = section(
+            powershell,
+            "function Invoke-DownloadOwnerAttributionScenario {",
+            "function Invoke-SystemUidAttributionScenario",
+        )
+        self.assertIn("Confirm-MediaProviderHookReady", ps_download)
+        # 较旧的模拟器继续使用宿主机别名路由。
         self.assertIn('dl_url="http://10.0.2.2:$dl_port/srt_download.bin"', script)
+        self.assertIn('$dlUrl = "http://10.0.2.2:$dlPort/srt_download.bin"', powershell)
+
+    def test_powershell_media_provider_restart_preserves_api37_storage(self) -> None:
+        powershell = read(".github/tests/run-storage-redirect-scenarios.ps1")
+        restart = section(
+            powershell,
+            "function Restart-MediaProvider {",
+            "function Ensure-MonitorCollector",
+        )
+        self.assertIn("$sdk -le 34 -or $sdk -ge 37", restart)
 
 
     def test_download_scenario_cleans_before_mount_restart(self) -> None:
@@ -918,6 +1428,64 @@ class ScenarioConsistencyTest(unittest.TestCase):
         self.assertIn("policy_registration_failed", body)
         self.assertIn("fuse redirect mount start pkg=${PROVIDER_PACKAGE}", body)
 
+        ps_body = section(
+            self.powershell,
+            "function Invoke-ProviderSandboxScenario {",
+            "\nfunction Invoke-DownloadOwnerAttributionScenario",
+        )
+        self.assertIn("perf companion mount pkg=$ProviderPackage", ps_body)
+        self.assertIn("hook refresh start profile=system-writer pkg=$ProviderPackage", ps_body)
+        self.assertIn("if ($mountOk -or $hookOk)", ps_body)
+        self.assertIn("sandbox=0", ps_body)
+        self.assertIn("policy_registration_failed", ps_body)
+        self.assertIn("fuse redirect mount start pkg=$ProviderPackage", ps_body)
+
+    def test_scenario_40_runs_all_attribution_checks_in_both_runners(self) -> None:
+        bash_runner = section(self.bash, "run_scenario() {", "\n# 与 PowerShell 共用设备端锁")
+        ps_runner = section(self.powershell, "function Invoke-Scenario {", "\nfunction Invoke-BasicAll {")
+        for name in (
+            "run_system_uid_attribution_scenario",
+            "run_app_caller_media_provider_attribution_scenario",
+            "run_shell_executor_boundary_scenario",
+        ):
+            self.assertIn(name, bash_runner)
+        for name in (
+            "Invoke-SystemUidAttributionScenario",
+            "Invoke-AppCallerMediaProviderAttributionScenario",
+            "Invoke-ShellExecutorBoundaryScenario",
+        ):
+            self.assertIn(name, ps_runner)
+        self.assertIn("if ($Scenario -in @(38, 40))", ps_runner)
+        ps_app_caller = section(
+            self.powershell,
+            "function Invoke-AppCallerMediaProviderAttributionScenario {",
+            "\nfunction Invoke-ShellExecutorBoundaryScenario",
+        )
+        self.assertIn("mediastore_create_download", ps_app_caller)
+        self.assertIn("identify_method=caller|identify_reliability=high", ps_app_caller)
+        ps_prepare = section(
+            self.powershell, "function Prepare-ServiceCase {", "\nfunction Test-FileExists"
+        )
+        self.assertIn("if (Test-LabelExpectsMount $Label)", ps_prepare)
+        ps_recovery = section(
+            self.powershell, "function Invoke-ServiceCase {", "\nfunction Test-FileExists"
+        )
+        self.assertIn('if (Test-LabelExpectsMount "$Scenario/$Label-recover")', ps_recovery)
+
+    def test_mediastore_monitor_scenarios_match_camera_mapping_coverage(self) -> None:
+        ps_config = section(
+            self.powershell, "function Apply-ScenarioConfig", "function Clear-Results"
+        )
+        self.assertIn('"DCIM/Camera":"Pictures/SrtMonitorDing"', ps_config)
+        ps_monitor = section(
+            self.powershell,
+            "function Invoke-MediaStoreMonitorScenario {",
+            "\nfunction Get-AppPid",
+        )
+        self.assertIn("media-ding-camera-map", ps_monitor)
+        self.assertIn("DCIM/Camera", ps_monitor)
+        self.assertIn("Pictures/SrtMonitorDing", ps_monitor)
+
     def test_shared_fuse_host_b2a_contract(self) -> None:
         # B2-a 先建立独立宿主会话骨架：它必须在 daemon 的私有 namespace 中创建，
         # 使用 srx_fuse_host 前缀并设为 shared propagation；应用接入仍由后续 B2-b 完成。
@@ -929,14 +1497,21 @@ class ScenarioConsistencyTest(unittest.TestCase):
         self.assertIn("libc::MS_REC | libc::MS_PRIVATE", host)
         self.assertIn("mount_host_fuse(", host)
         self.assertIn("libc::MS_SHARED", config)
-        self.assertIn('"srx_fuse_host"', config)
         self.assertIn("if !crate::fuse_host::ensure_global()", daemon)
         self.assertIn("crate::fuse_host::ensure_global()", daemon)
         # 宿主不可用时应用照常拿到 namespace bind 视图（scoped 会话已退役）。
         self.assertIn("namespace bind remains active", daemon)
-        # scoped 会话退役后，`srx_fuse_redirect` 前缀仍必须保留：它用于识别并清理旧版本
-        # 遗留的 scoped 挂载层，删掉会让历史死层失去归属判据。
-        self.assertIn('"srx_fuse_redirect"', config)
+        # 挂载源必须与系统 MediaProvider 的 FUSE 同形：任何会话标识前缀都会让应用一读
+        # 挂载表就认出本模块。归属改由超级块身份（dev + mount_id）承担，见账本的
+        # known_module_fuse_devs 与宿主快照的 dev 字段。
+        self.assertIn('pub const NATIVE_FUSE_SOURCE: &str = "/dev/fuse";', config)
+        self.assertNotIn('"srx_fuse_host"', config)
+        self.assertNotIn('"srx_fuse_redirect"', config)
+        self.assertIn("pub fn known_module_fuse_devs(", read("src/mount_ledger.rs"))
+        # 旧版本留下的 scoped/宿主死层仍要能识别并清理：机读判据保留在
+        # module_mount_source 的固定前缀里（只用于识别历史层，不再用于生成）。
+        self.assertIn('"srx_fuse_redirect"', read("src/module_mount_source.rs"))
+        self.assertIn('"srx_fuse_host"', read("src/module_mount_source.rs"))
 
     def test_shared_fuse_host_registers_app_policy_before_attach(self) -> None:
         # 共享宿主会话只持有一份「直通」策略。按 uid 策略必须由 daemon 经控制通道登记进会话，
@@ -1143,7 +1718,7 @@ class ScenarioConsistencyTest(unittest.TestCase):
         self.assertIn('const HOST_ATTACH_ENV: &str = "SRT_FUSE_HOST_ATTACH";', host)
         self.assertIn("fn host_attach_enabled() -> bool", host)
         gate = "".join(
-            section(host, "pub fn can_attach_app(", "pub fn is_current_host_source(").split()
+            section(host, "pub fn can_attach_app(", "pub fn is_current_host_mount(").split()
         )
         self.assertIn("if!host_attach_enabled(){", gate)
         # 开关方向必须与目标形态一致：只有显式写成关闭取值才关闭，未设置即接入。
@@ -1163,9 +1738,11 @@ class ScenarioConsistencyTest(unittest.TestCase):
             host, "pub fn spawn_external_abort_monitor()", "fn external_abort_monitor_main("
         )
         self.assertIn("if!host_attach_enabled(){", "".join(monitor.split()))
-        self.assertIn(
-            "paths::normalize_syntax(mount_root)==paths::normalize_syntax(&view_root)", gate
-        )
+        # P5-c：接入目标上提一层后有两种合法形态（用户根 / 视图根），闸门必须同时放行；
+        # 只认其中一种会让整族接入被判"根不允许接入"并静默回退 scoped。
+        self.assertIn("normalized==paths::normalize_syntax(&view_root)", gate)
+        self.assertIn("normalized==paths::normalize_syntax(&lifted_root)", gate)
+        self.assertIn("host_attach_root_for_user(user_id)", gate)
 
         # 别名覆盖函数（attach_host_view_to_storage_aliases）使用同命名空间 MS_BIND，
         # 不属于「跨命名空间 bind 回退」禁令范围，因此 MS_BIND 检查只圈定 child_main 本体。
@@ -1184,7 +1761,10 @@ class ScenarioConsistencyTest(unittest.TestCase):
         self.assertLess(host_ns_at, clone_at, "克隆游离挂载必须在宿主命名空间内完成")
         self.assertLess(clone_at, app_ns_at, "克隆之后要切回应用命名空间")
         self.assertLess(app_ns_at, move_at, "附着必须发生在应用命名空间内")
-        self.assertIn("live.source != view.mount_source", attach)
+        # 复核判据是超级块身份（dev），不是挂载源文本：源原生化之后文本与系统
+        # MediaProvider 的 FUSE 完全同形，按源比较会把"挂在别处"判成接入成功。
+        self.assertIn("live.dev != view.dev", attach)
+        self.assertNotIn("live.source != view.mount_source", attach)
         # 跨命名空间搬运只能用 open_tree + move_mount：`mount(MS_BIND)` 的源挂载必须属于
         # 调用方当前命名空间，跨命名空间时直接 EINVAL（真机实测），退回 bind 会让接入静默失效。
         self.assertIn("libc::SYS_open_tree", host)
@@ -1290,7 +1870,9 @@ class ScenarioConsistencyTest(unittest.TestCase):
             "fn should_keep_reload_redirect_root(",
             "fn sandbox_root_matches_redirect_target(",
         )
-        self.assertIn("crate::fuse_host::is_stale_host_source(source)", keep)
+        # 判据按超级块身份（`is_stale_host_at` 读该路径当前服务层的 dev），不按挂载源
+        # 文本：源原生化之后文本不再带会话标识，按源比较会把"上一代会话的层"判成健康。
+        self.assertIn("crate::fuse_host::is_stale_host_at(target)", keep)
 
     def test_fuse_policy_resolution_is_per_request_uid(self) -> None:
         # 共享宿主 FUSE 会话要让同一个挂载点服务多个应用，策略解析就必须从「会话级常量」
@@ -1370,6 +1952,20 @@ class ScenarioConsistencyTest(unittest.TestCase):
         # 本地全量验证会漏跑 38-40）。
         self.assertIn(f"@(1..{expected_max})", self.powershell)
 
+    @unittest.skipUnless(shutil.which("bash"), "需要 Bash 校验场景选择")
+    def test_default_and_explicit_all_execute_same_complete_scope(self) -> None:
+        functions = section(
+            self.bash, "prune_version_scenario_excludes() {", "remove_test_target_artifacts() {"
+        )
+        for selector in ("", "all"):
+            with self.subTest(selector=selector):
+                result = subprocess.run(
+                    ["bash", "-eu", "-c", functions + '\nSRT_SCENARIOS=$1\n'
+                     'SRT_VERSION_SCENARIO_EXCLUDE=\nbuild_scenario_list\nprintf "%s\\n" "${scenarios[@]}"',
+                     "test-scope", selector], text=True, capture_output=True, check=True, timeout=10,
+                )
+                self.assertEqual(self.ids, [int(value) for value in result.stdout.splitlines()])
+
     def test_version_scenario_exclude_prunes_instead_of_replacing_scope(self) -> None:
         # 版本级限制只能从已确定的范围里剔除，不能替换范围本身：旧实现直接用它
         # 覆盖 SRT_SCENARIOS，既让默认范围退化成窄场景，也吞掉了 dispatch 输入与
@@ -1445,7 +2041,7 @@ class ScenarioConsistencyTest(unittest.TestCase):
             self.assertIn("fresh_app_per_case: 0", test_flow)
             self.assertIn("fresh_app_per_case: 1", test_flow)
             self.assertIn('api_level: "37.0"', test_flow)
-            for version in (13, 14, 15, 16):
+            for version in (15, 16):
                 self.assertIn(f"version: {version}", test_flow)
             self.assertIn("version: 17", test_flow)
             # 统一门禁：校验 quality + 统一矩阵（已含 17），不再单列 android17 job。
@@ -1460,42 +2056,15 @@ class ScenarioConsistencyTest(unittest.TestCase):
         # Android 17 已并入统一矩阵，不再有独立 job；门禁改用统一矩阵覆盖 17。
         self.assertNotIn("  test-flow-android17:", source)
         jobs = load_workflow(".github/workflows/ci.yml")
-        entry = android17_matrix_entry(jobs)
-        # 17 特有执行环境必须保留在矩阵条目中。
-        self.assertEqual("37.0", entry["api_level"])
-        self.assertEqual("ksu", entry["root_method"])
-        self.assertEqual("su0", entry["adb_root_mode"])
-        self.assertEqual("1,2,29,32,33", entry["fresh_app_scenarios"])
-        self.assertEqual("swiftshader_indirect", entry["gpu_mode"])
-        self.assertEqual(1, entry["fresh_app_per_case"])
-        self.assertEqual(50, entry["timeout_minutes"])
-        self.assertEqual(1800, entry["boot_timeout"])
-        self.assertFalse(entry["disable_animations"])
-        self.assertFalse(entry["disable_linux_hw"])
-        # 其余版本保持原值：不设置 Magisk、复用进程、较短超时、关闭动画。
-        others = [e for e in jobs["test-flow"]["strategy"]["matrix"]["android"] if e["version"] != 17]
-        self.assertEqual(4, len(others))
-        for e in others:
-            self.assertEqual(0, e["fresh_app_per_case"])
-            self.assertEqual(45, e["timeout_minutes"])
-            self.assertEqual(1500, e["boot_timeout"])
-            self.assertTrue(e["disable_animations"])
-            self.assertEqual("auto", e["disable_linux_hw"])
-            self.assertEqual("", e.get("magisk_url", ""))
-        self.assertTrue(jobs["test-flow"]["strategy"]["fail-fast"])
+        _assert_android17_unified(jobs, "A15-A17")
         # 17 并入矩阵后，统一 job 通过 17 特有参数承载差异；env 通过矩阵字段引用。
         test_flow = section(source, "  test-flow:", "  test-flow-required:")
-        self.assertIn("MAGISK_URL: ${{ matrix.android.magisk_url }}", test_flow)
+        self.assertNotIn("MAGISK_URL", test_flow)
         self.assertIn("EMULATOR_GPU_MODE: ${{ matrix.android.gpu_mode }}", test_flow)
         self.assertIn('ANDROID_API_LEVEL: ${{ matrix.android.api_level }}', test_flow)
         self.assertIn("SRT_FRESH_APP_PER_CASE: ${{ matrix.android.fresh_app_per_case }}", test_flow)
-        self.assertIn(
-            "MODULE_INSTALL_SCRIPT: ${{ matrix.android.root_method == 'ksu'"
-            " && '.github/tests/install-storage-redirect-module-ksu.sh'"
-            " || '.github/tests/install-storage-redirect-module.sh' }}",
-            test_flow,
-        )
-        self.assertIn("ADB_ROOT_MODE: ${{ matrix.android.adb_root_mode || '' }}", test_flow)
+        self.assertNotIn("MODULE_INSTALL_SCRIPT", test_flow)
+        self.assertIn("ADB_ROOT_MODE: su0", test_flow)
         self.assertIn("SRT_FRESH_APP_SCENARIOS: ${{ matrix.android.fresh_app_scenarios || '' }}", test_flow)
         self.assertIn("Download test-flow runtime", test_flow)
         self.assertIn("emulator-options: -no-window -gpu swiftshader_indirect", test_flow)
@@ -1519,42 +2088,15 @@ class ScenarioConsistencyTest(unittest.TestCase):
         source = read(".github/workflows/release.yml")
         self.assertNotIn("  test-flow-android17:", source)
         jobs = load_workflow(".github/workflows/release.yml")
-        entry = android17_matrix_entry(jobs)
-        # 17 特有执行环境必须保留在矩阵条目中。
-        self.assertEqual("37.0", entry["api_level"])
-        self.assertEqual("ksu", entry["root_method"])
-        self.assertEqual("su0", entry["adb_root_mode"])
-        self.assertEqual("1,2,29,32,33", entry["fresh_app_scenarios"])
-        self.assertEqual("swiftshader_indirect", entry["gpu_mode"])
-        self.assertEqual(1, entry["fresh_app_per_case"])
-        self.assertEqual(50, entry["timeout_minutes"])
-        self.assertEqual(1800, entry["boot_timeout"])
-        self.assertFalse(entry["disable_animations"])
-        self.assertFalse(entry["disable_linux_hw"])
-        # 其余版本保持原值：不设置 Magisk、复用进程、较短超时、关闭动画。
-        others = [e for e in jobs["test-flow"]["strategy"]["matrix"]["android"] if e["version"] != 17]
-        self.assertEqual(4, len(others))
-        for e in others:
-            self.assertEqual(0, e["fresh_app_per_case"])
-            self.assertEqual(45, e["timeout_minutes"])
-            self.assertEqual(1500, e["boot_timeout"])
-            self.assertTrue(e["disable_animations"])
-            self.assertEqual("auto", e["disable_linux_hw"])
-            self.assertEqual("", e.get("magisk_url", ""))
-        self.assertTrue(jobs["test-flow"]["strategy"]["fail-fast"])
+        _assert_android17_unified(jobs, "A15-A17")
         # 17 并入矩阵后，统一 job 通过 17 特有参数承载差异；env 通过矩阵字段引用。
         test_flow = section(source, "  test-flow:", "  test-flow-required:")
-        self.assertIn("MAGISK_URL: ${{ matrix.android.magisk_url }}", test_flow)
+        self.assertNotIn("MAGISK_URL", test_flow)
         self.assertIn("EMULATOR_GPU_MODE: ${{ matrix.android.gpu_mode }}", test_flow)
         self.assertIn('ANDROID_API_LEVEL: ${{ matrix.android.api_level }}', test_flow)
         self.assertIn("SRT_FRESH_APP_PER_CASE: ${{ matrix.android.fresh_app_per_case }}", test_flow)
-        self.assertIn(
-            "MODULE_INSTALL_SCRIPT: ${{ matrix.android.root_method == 'ksu'"
-            " && '.github/tests/install-storage-redirect-module-ksu.sh'"
-            " || '.github/tests/install-storage-redirect-module.sh' }}",
-            test_flow,
-        )
-        self.assertIn("ADB_ROOT_MODE: ${{ matrix.android.adb_root_mode || '' }}", test_flow)
+        self.assertNotIn("MODULE_INSTALL_SCRIPT", test_flow)
+        self.assertIn("ADB_ROOT_MODE: su0", test_flow)
         self.assertIn("SRT_FRESH_APP_SCENARIOS: ${{ matrix.android.fresh_app_scenarios || '' }}", test_flow)
         self.assertIn("Download release test-flow runtime", test_flow)
         self.assertIn("emulator-options: -no-window -gpu swiftshader_indirect", test_flow)
@@ -1579,8 +2121,6 @@ class ScenarioConsistencyTest(unittest.TestCase):
             jobs = load_workflow(workflow)
             entry = _assert_android17_unified(jobs, workflow)
             self.assertEqual("swiftshader_indirect", entry["gpu_mode"])
-            self.assertEqual("ksu", entry["root_method"])
-            self.assertEqual("su0", entry["adb_root_mode"])
 
     def test_matrix_gate_rejects_dropped_android17(self) -> None:
         # 反向验证：若 17 被错误地移出统一矩阵（回到旧的跨 job 缺口），
@@ -1650,11 +2190,23 @@ class ScenarioConsistencyTest(unittest.TestCase):
         }
         for workflow in (".github/workflows/ci.yml", ".github/workflows/release.yml"):
             source = read(workflow)
+            test_flow_build = section(source, "  test-flow-build:", "  test-flow:")
+            rust_toolchain = section(
+                test_flow_build,
+                "      - name: Install pinned Rust toolchain",
+                "      - name: Configure Cargo for Android NDK",
+            )
             build = section(source, "      - name: Build x86_64 module zip and test app", "      - name: Upload")
             test_flow = section(source, "  test-flow:", "  test-flow-required:")
             artifact = test_flow[test_flow.index("          path: |") :]
 
+            self.assertIn("components: clippy", rust_toolchain)
+            self.assertIn(
+                "cargo clippy --target x86_64-linux-android --release --all-targets --locked",
+                test_flow_build,
+            )
             self.assertIn("bash .github/scripts/build_test_flow_runtime.sh", build)
+            self.assertIn("build/test-flow/native/*", source)
             self.assertIn("SRT_FAIL_FAST: 1", test_flow)
             self.assertIn("SRT_SKIP_FINAL_CLEANUP: 1", test_flow)
             self.assertIn("SRT_SCENARIO_TIMEOUT_SECONDS: 300", test_flow)
@@ -1662,9 +2214,17 @@ class ScenarioConsistencyTest(unittest.TestCase):
                 self.assertIn(path, artifact)
 
         script = read(".github/scripts/build_test_flow_runtime.sh")
-        self.assertIn('cargo test --target "$TARGET_TRIPLE" --no-run', script)
+        self.assertIn('bash .github/scripts/build_native_tests.sh "$TARGET_TRIPLE" build/test-flow/native', script)
         self.assertIn('cargo build --target "$TARGET_TRIPLE" --release', script)
+        self.assertIn('cargo metadata --format-version 1 --no-deps --locked', script)
+        self.assertIn('${CARGO_TARGET_DIR_RESOLVED}/${TARGET_TRIPLE}/release/libsrx_core.so', script)
         self.assertIn(":storageRedirectTestApp:assembleDebug", script)
+        native_build = read(".github/scripts/build_native_tests.sh")
+        self.assertIn('cargo test -p srx_core --target "$target" --no-run --message-format=json', native_build)
+        self.assertIn('item.get("executable")', native_build)
+        self.assertIn('bash .github/tests/run-native-tests.sh build/test-flow/native "$MODULE_ABI"', read(".github/tests/run-android-test-flow.sh"))
+        self.assertIn("run-zn-runtime-fixture.sh", read("scripts/verify-test-flow.ps1"))
+        self.assertIn('bash .github/tests/run-native-tests.sh "$BUILD_DIR/native" "$MODULE_ABI"', read("scripts/verify-test-flow.sh"))
 
     def test_every_job_is_bounded_and_build_jobs_wait_for_quality(self) -> None:
         # 缺少 timeout-minutes 的 job 会用 GitHub 的 6 小时默认值，一次挂起就吃满额度
@@ -1691,9 +2251,22 @@ class ScenarioConsistencyTest(unittest.TestCase):
             source = read(workflow)
             self.assertEqual(1, source.count(version), workflow)
             self.assertIn('SRX_NDK_VERSION: "%s"' % version, source)
-            self.assertIn('"ndk;$SRX_NDK_VERSION"', source)
+            self.assertIn("./.github/actions/setup-native-cache", source)
+        self.assertIn('"ndk;$SRX_NDK_VERSION"', read(".github/actions/setup-native-cache/action.yml"))
         script = read("scripts/build-local-module.ps1")
         self.assertIn('Get-GradleProperty -Name "srx.ndkVersion"', script)
+
+    def test_windows_build_helpers_keep_native_builds_in_wsl(self) -> None:
+        module = read("scripts/build-local-module.ps1")
+        app = read("scripts/build-local-app.ps1")
+        self.assertIn("function Invoke-WslCargoBuild", module)
+        self.assertIn("CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER=", module)
+        self.assertIn('"cargo", "build"', module)
+        self.assertIn('"build", "--locked"', module)
+        self.assertNotIn('Invoke-Checked -FilePath "cargo"', module)
+        self.assertIn("function Invoke-WslGradle", app)
+        self.assertIn('exec ./gradlew "$@"', app)
+        self.assertNotIn("gradlew.bat", app)
 
     def test_cargo_cache_key_excludes_sources(self) -> None:
         # key 含 src/** 会让每次源码改动都生成新缓存条目，只能靠 restore-keys 只读
@@ -1731,14 +2304,14 @@ class ScenarioConsistencyTest(unittest.TestCase):
         self.assertIn("adb reboot", recovery)
         self.assertIn('wait_storage_ready "initial-reboot" 120', recovery)
         self.assertLess(recovery.index("wait_storage_ready"), recovery.index("adb reboot"))
-        startup = self.bash[self.bash.index("wait_boot_completed\nacquire_device_run_lock\nbackup_global_config") :]
+        startup = self.bash[self.bash.index("wait_boot_completed\nacquire_device_run_lock\n") :]
         self.assertIn("ensure_initial_storage_ready", startup)
         self.assertLess(startup.index("backup_global_config"), startup.index("ensure_initial_storage_ready"))
 
     def test_windows_test_flow_keeps_python_command_as_object(self) -> None:
         script = read("scripts/verify-test-flow.ps1")
         resolver = section(script, "function Get-PythonCommand", "function Get-ResolvedVersionData")
-        version = section(script, "function Get-ResolvedVersionData", "function New-ModulePackage")
+        version = section(script, "function Get-ResolvedVersionData", "function Get-TestAppApk")
         self.assertIn("[pscustomobject]", resolver)
         self.assertIn("$candidate.FilePath", resolver)
         self.assertIn("@($candidate.Arguments)", resolver)
@@ -1746,12 +2319,43 @@ class ScenarioConsistencyTest(unittest.TestCase):
         self.assertIn("$python.FilePath", version)
         self.assertIn("@($python.Arguments)", version)
 
+    def test_windows_test_flow_builds_in_wsl_and_runs_device_steps_on_windows(self) -> None:
+        script = read("scripts/verify-test-flow.ps1")
+        self.assertIn('"--exec", "bash", "-lc"', script)
+        self.assertIn("CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER=aarch64-linux-android29-clang", script)
+        self.assertIn('"RUN_DEVICE_SCENARIOS=0"', script)
+        self.assertIn('"bash", "scripts/verify-test-flow.sh"', script)
+        self.assertIn('Invoke-Checked -FilePath "adb"', script)
+        self.assertIn('".github/tests/run-storage-redirect-scenarios.ps1"', script)
+        self.assertNotIn('Invoke-Checked -FilePath "cargo"', script)
+        self.assertNotIn("gradlew.bat", script)
+
+    def test_test_flow_selects_su_syntax_before_running_remote_commands(self) -> None:
+        script = read("scripts/verify-test-flow.ps1")
+        resolve = section(script, "function Resolve-AdbSuMode", "function Invoke-AdbSu")
+        invoke = section(script, "function Invoke-AdbSu", "function Wait-DeviceBootCompleted")
+        self.assertIn("su 0 sh -c 'id -u'", resolve)
+        self.assertIn("su -c 'id -u'", resolve)
+        self.assertIn("$script:AdbSuMode = $mode", resolve)
+        self.assertEqual(1, invoke.count("& adb shell"))
+        self.assertNotIn("if ($LASTEXITCODE -eq 0)", invoke)
+
+        shell = read("scripts/verify-test-flow.sh")
+        resolve_shell = section(shell, "resolve_adb_su_mode()", "adb_su()")
+        invoke_shell = section(shell, "adb_su()", "verify_module_runtime_state()")
+        self.assertIn("su 0 sh -c 'id -u'", resolve_shell)
+        self.assertIn("su -c 'id -u'", resolve_shell)
+        self.assertIn("ADB_SU_MODE", resolve_shell)
+        self.assertNotRegex(invoke_shell, r"adb shell .*\|\|\s*adb shell")
+
     def test_windows_test_flow_polls_boot_property_without_remote_shell_expression(self) -> None:
         script = read("scripts/verify-test-flow.ps1")
         wait = section(script, "function Wait-DeviceBootCompleted", "function Assert-ModuleRuntimeState")
         self.assertIn('Invoke-Checked -FilePath "adb" -Arguments @("wait-for-device")', wait)
         self.assertIn("adb shell getprop sys.boot_completed", wait)
         self.assertIn('$bootCompleted -eq "1"', wait)
+        self.assertIn("$attempt -le 450", wait)
+        self.assertIn("设备在 900 秒内未完成启动", wait)
         self.assertNotIn("while [", script)
         self.assertEqual(2, script.count("Wait-DeviceBootCompleted\n"))
 
@@ -1779,7 +2383,7 @@ class ScenarioConsistencyTest(unittest.TestCase):
         self.assertIn('",${APP_ID},"', self.bash)
         self.assertIn("original_app_inactive", self.bash)
 
-        ps_start = self.powershell[self.powershell.index("try {\n    Backup-GlobalConfig") :]
+        ps_start = self.powershell[self.powershell.index("try {\n    Grant-TestAppStoragePermissions") :]
         self.assertLess(
             ps_start.index("Backup-DeviceExecutionState"),
             ps_start.index("Prepare-DeviceExecutionState"),
@@ -1794,7 +2398,7 @@ class ScenarioConsistencyTest(unittest.TestCase):
             ps_cleanup.index("Restore-DeviceExecutionState"),
         )
 
-        bash_start = self.bash[self.bash.index("wait_boot_completed\nacquire_device_run_lock\nbackup_global_config") :]
+        bash_start = self.bash[self.bash.index("wait_boot_completed\nacquire_device_run_lock\n") :]
         self.assertLess(
             bash_start.index("backup_device_execution_state"),
             bash_start.index("prepare_device_execution_state"),
@@ -1831,6 +2435,19 @@ class ScenarioConsistencyTest(unittest.TestCase):
                 source.index("fuse redirect mount start"),
                 source.index("fuse redirect mount failed"),
             )
+
+    def test_external_abort_file_heartbeat_survives_eventfd_failure(self) -> None:
+        host = read("src/fuse_host.rs")
+        monitor = section(host, "fn external_abort_monitor_main(", "/// 判定一次心跳")
+        self.assertIn("let install_wake_fd = crate::platform::host_beat::ensure_wake_fd();", monitor)
+        self.assertNotIn("wait_ms = -1;", monitor)
+        # 不论共享页是否可用都读取心跳，文件降级需由陈旧/冷却截止点驱动。
+        self.assertIn("let now = paths::monotonic_ms();", monitor)
+        self.assertIn("read_beat_preferring_shared()", monitor)
+        self.assertIn("read_beat_preferring_shared()", monitor)
+        wait = section(host, "fn wait_for_host_beat_signal(", "/// 读取并解析宿主心跳文件")
+        self.assertIn("if fd < 0", wait)
+        self.assertIn("timeout_ms.clamp(1_000, 60_000)", wait)
 
     def test_media_monitor_waits_for_restarted_provider_hook(self) -> None:
         bash_wait = section(
@@ -1888,14 +2505,33 @@ class ScenarioConsistencyTest(unittest.TestCase):
         self.assertIn('ensure_media_provider_hook_ready "scenario-${scenario}-before-mediastore"', bash_standard)
         self.assertIn('Confirm-MediaProviderHookReady "initial"', self.powershell)
         self.assertIn('Confirm-MediaProviderHookReady "scenario-$Scenario-before-mediastore"', ps_standard)
+        self.assertIn('Wait-MediaProviderReady "$Label-provider" 60', self.powershell)
+        self.assertIn('wait_media_provider_ready "${label}-provider" 60', self.bash)
+        self.assertNotIn("MediaProvider hook readiness deferred until first app access", self.powershell)
+        self.assertNotIn("MediaProvider hook readiness deferred until first app access", self.bash)
         self.assertLess(
             bash_standard.index("ensure_media_provider_hook_ready"),
-            bash_standard.index('run_service_case "$scenario" "mediastore-sandbox-only"'),
+            bash_standard.index('run_mediastore_create_case "$scenario" "mediastore-sandbox-only"'),
         )
         self.assertLess(
             ps_standard.index("Confirm-MediaProviderHookReady"),
-            ps_standard.index('Invoke-ServiceCase "scenario-$Scenario" "mediastore-sandbox-only"'),
+            ps_standard.index("Invoke-MediaStoreCreateCase $Scenario"),
         )
+
+    def test_mediastore_create_case_retries_volume_attach_race(self) -> None:
+        """MediaStore 创建重试次数有界，并输出可检索的重试与最终失败标记。"""
+        for name, text, case_fn in (
+            ("bash", self.bash, "run_mediastore_create_case() {"),
+            ("ps", self.powershell, "function Invoke-MediaStoreCreateCase {"),
+        ):
+            self.assertIn(case_fn, text, name)
+            wrapper = text[text.index(case_fn) :]
+            wrapper = wrapper[: wrapper.index("\n}")]
+            self.assertIn("mediastore_create_retry", wrapper, name)
+            self.assertIn("SRT_MEDIASTORE_CREATE_ATTEMPTS", wrapper, name)
+            self.assertIn("create_media_failed", wrapper, name)
+        # Bash 包装在重试耗尽后输出最终失败标记。
+        self.assertIn("mediastore_create_failed", self.bash)
 
     def test_backend_endpoint_recovery_keeps_app_pid(self) -> None:
         bash_scenario = section(
@@ -2006,7 +2642,8 @@ class ScenarioConsistencyTest(unittest.TestCase):
         self.assertIn('quick-initial-app', bash_start)
         self.assertIn("app_pid", bash_wait)
         self.assertIn("Wait-AppProcessStopped", ps_stop)
-        self.assertIn('quick-initial-app', ps_stop)
+        self.assertNotIn('RequireStateCleanup', ps_stop)
+        self.assertNotIn('test ! -e', ps_stop)
 
         quick_bash = section(self.bash, "run_quick_media_provider_restart_recovery_scenario()", "check_health()")
         quick_ps = section(self.powershell, "function Invoke-QuickMediaProviderRestartRecoveryScenario", "function Get-TargetPath")
@@ -2100,15 +2737,15 @@ class ScenarioConsistencyTest(unittest.TestCase):
         self.assertIn("stage=init_ok pid=${pid} boot_id=${boot_id}", wait)
         self.assertIn('wait_media_provider_hook_ready "module-boot" 60', recovery)
         self.assertIn('wait_media_provider_hook_ready "module-restart" 60', recovery)
-        self.assertIn("adb reboot", recovery)
+        self.assertIn("wait_for_reboot 420", recovery)
         self.assertIn('wait_media_provider_hook_ready "module-clean-boot" 120', recovery)
-        self.assertEqual(1, recovery.count("adb reboot"))
+        self.assertEqual(1, recovery.count("wait_for_reboot 420"))
         self.assertLess(
             recovery.index('wait_media_provider_hook_ready "module-boot"'),
-            recovery.index("adb reboot"),
+            recovery.index("wait_for_reboot 420"),
         )
         self.assertLess(
-            recovery.index("adb reboot"),
+            recovery.index("wait_for_reboot 420"),
             recovery.index('wait_media_provider_hook_ready "module-clean-boot"'),
         )
         # 进程级自愈必须先于整机重启：先重启 MediaProvider 进程重新走 specialize，
@@ -2124,7 +2761,7 @@ class ScenarioConsistencyTest(unittest.TestCase):
         )
         self.assertLess(
             recovery.index('wait_media_provider_hook_ready "module-restart"'),
-            recovery.index("adb reboot"),
+            recovery.index("wait_for_reboot 420"),
         )
         self.assertLess(
             install.index("restart_media_provider_process() {"),
@@ -2151,31 +2788,60 @@ class ScenarioConsistencyTest(unittest.TestCase):
     def test_package_event_wait_never_blocks_on_fifo_open(self) -> None:
         # FIFO 的 open(O_RDONLY) 在对端缺失时会无限期阻塞，而 `read -t` 的超时只约束
         # 读取、管不到 open：收集器一旦卡在这里就再也不会消费 package_events.log，
-        # 新装应用自动开启、卸载清理与基线更新会全部静默失效（duchamp 实测收集器
+        # 新装应用自动开启、卸载清理与基线更新会全部静默失效（真机实测收集器
         # wchan=wait_for_partner、offset 恒为 0，而事件已堆积在日志里）。
         # 因此等待必须自持读写两端（fd 3）+ 监听进程存活检查，不得回到裸输入重定向。
         events = read("assets/zygisk_module/service.d/config_events.sh")
-        wait = section(
+        collector = section(
             events,
-            "wait_for_package_event_notification() {",
-            "\nstart_package_event_collector() {",
+            "start_package_event_collector() {",
+            "\nstart_config_event_collector() {",
         )
-        self.assertIn('exec 3<>"$notification_fifo"', wait)
-        self.assertIn('read -t 1 -r event_line <&3', wait)
-        self.assertNotIn('< "$notification_fifo"', wait)
-        self.assertIn('kill -0 "$notification_pid"', wait)
-        self.assertIn("exec 3>&-", wait)
+        # 自持读写两端：裸输入重定向（`< "$notification_fifo"`）会在对端缺失时阻塞在
+        # wait_for_partner，收集器从此不再消费事件日志。
+        self.assertIn('exec 3<>"$notification_fifo"', collector)
+        self.assertIn('read -t "$event_wait_seconds" -r event_line <&3', collector)
+        self.assertNotIn('< "$notification_fifo"', collector)
+        # 监听进程存活检查：它退出时要能跳出内层循环重新拉起，而不是继续空等到下个
+        # 自愈周期。
+        self.assertIn('kill -0 "$watcher_pid"', collector)
+        # 监听进程整个生命周期只建一次：每轮自愈都重建一次 inotifyd + FIFO，等于把
+        # 「事件驱动」退化成每 5 秒一轮的 fork/exec 风暴（空闲期最大的常驻开销）。
+        self.assertIn("watcher_ready", collector)
+        self.assertIn("mkfifo", collector)
+        self.assertEqual(collector.count('mkfifo "$notification_fifo"'), 1)
+        # 没有 mkfifo 的极旧系统必须仍有降级路径，功能不降级。
+        self.assertIn("legacy polling path", collector)
+
+    def test_package_event_deadline_ignores_unrelated_log_events(self) -> None:
+        events = read("assets/zygisk_module/service.d/config_events.sh")
+        collector = section(
+            events,
+            "start_package_event_collector() {",
+            "\nstart_config_event_collector() {",
+        )
+        self.assertIn('inotifyd - "$LOGS_DIR":wcmdn', collector)
+        self.assertIn("event_wait_deadline=$((deadline_now + event_wait_budget))", events)
+        self.assertIn("event_wait_seconds=$((event_wait_deadline - deadline_now))", collector)
+        self.assertIn('*)', collector)
+        self.assertIn('package_event_slow_path', collector)
+        self.assertIn('while [ "$debounce_rounds" -lt 16 ]', collector)
+        self.assertIn("compute_package_event_wait_budget", collector)
+        self.assertNotIn('event_wait_seconds="${PACKAGE_EVENT_IDLE_WAIT_SECONDS:-1800}"', collector)
+        self.assertNotIn('event_wait_seconds="${PACKAGE_EVENT_FALLBACK_WAIT_SECONDS:-10}"', collector)
 
     def test_test_app_install_waits_for_package_service(self) -> None:
         install = read(".github/tests/install-storage-redirect-module.sh")
-        section_text = section(install, "install_test_app_before_module_boot()", "seed_storage_redirect_test_environment()")
+        section_text = section(install, "install_test_app_before_module_boot()", "ensure_test_app_available()")
         self.assertIn("cmd package list packages", section_text)
         self.assertIn("APP_INSTALL_ATTEMPTS", section_text)
         self.assertIn("adb reconnect", section_text)
 
     def test_test_flow_waits_for_services_after_module_reboot(self) -> None:
         flow = read(".github/tests/run-android-test-flow.sh")
-        post_install = section(flow, 'bash "${MODULE_INSTALL_SCRIPT', "adb shell appops set")
+        post_install = section(
+            flow, 'bash .github/tests/install-storage-redirect-module.sh', "appops set me.fakerqu.test.storageredirect"
+        )
         self.assertIn("wait_for_adb_ready", post_install)
         self.assertIn("package_service_deadline", post_install)
         self.assertIn("cmd package list packages", post_install)
@@ -2187,7 +2853,9 @@ class ScenarioConsistencyTest(unittest.TestCase):
             "android17_disable_graphics_readback()",
             "prepare_device_health\n",
         )
-        post_install = section(flow, 'bash "${MODULE_INSTALL_SCRIPT', "adb shell appops set")
+        post_install = section(
+            flow, 'bash .github/tests/install-storage-redirect-module.sh', "appops set me.fakerqu.test.storageredirect"
+        )
 
         self.assertIn("service call window 137 i32 0", workaround)
         self.assertIn("service call window 135", workaround)
@@ -2230,14 +2898,109 @@ class ScenarioConsistencyTest(unittest.TestCase):
         self.assertIn('adb_su_timeout "$host_timeout_seconds"', section(flow, "wait_service_result()", "scenario_from_label()"))
         self.assertIn('adb_su_timeout "$host_timeout_seconds"', section(flow, "wait_config_applied()", "service_case_timeout_seconds()"))
 
+    def test_service_result_remains_authoritative_after_nonzero_adb_start(self) -> None:
+        flow = read(".github/tests/run-storage-redirect-scenarios.sh")
+        service = section(flow, "run_service_case()", "run_write_case()")
+        start = service.index('start_output="$(timeout 90 adb shell am start-foreground-service')
+        nonzero = service.index('if [ "$start_status" -ne 0 ]; then', start)
+        nonzero_end = service.index('\n    fi\n    if [ "$start_status" -eq 0 ]', nonzero)
+        result = service.index(
+            'if wait_service_result "$timeout_seconds" "$freshness_marker" "$test_case" >"$output_file"; then',
+            nonzero_end,
+        )
+
+        self.assertLess(start, nonzero)
+        self.assertLess(nonzero, result)
+        self.assertIn("service_start_status_nonzero", service[nonzero:nonzero_end])
+        self.assertNotIn("return", service[nonzero:nonzero_end])
+
+    def test_powershell_service_start_is_bounded_and_result_remains_authoritative(self) -> None:
+        flow = read(".github/tests/run-storage-redirect-scenarios.ps1")
+        service = section(flow, "function Invoke-ServiceCase {", "function Test-FreshAppEnabled")
+        helper = section(flow, "function Invoke-AdbWithTimeout {", "function Invoke-Su {")
+        start = service.index('Invoke-AdbWithTimeout -Arguments $args -TimeoutSeconds 90')
+        nonzero = service.index('if ($startResult.ExitCode -ne 0)', start)
+        result = service.index('$result = Wait-ServiceResult $timeoutSeconds $freshnessMarker $TestCase', nonzero)
+
+        self.assertIn("WaitForExit($TimeoutSeconds * 1000)", helper)
+        self.assertIn("$process.Kill($true)", helper)
+        self.assertIn("service_start_status_nonzero", service[nonzero:result])
+        self.assertNotIn("return", service[nonzero:result])
+        self.assertLess(start, nonzero)
+        self.assertLess(nonzero, result)
+
+    def test_download_owner_wait_is_bounded_and_cleans_host_resources(self) -> None:
+        bash = read(".github/tests/run-storage-redirect-scenarios.sh")
+        bash_scenario = section(
+            bash,
+            "run_download_owner_attribution_scenario() {",
+            "\nrun_system_uid_attribution_scenario()",
+        )
+        flow = read(".github/tests/run-storage-redirect-scenarios.ps1")
+        scenario = section(
+            flow,
+            "function Invoke-DownloadOwnerAttributionScenario {",
+            "function Invoke-SystemUidAttributionScenario",
+        )
+        code = "\n".join(
+            line for line in scenario.splitlines() if not line.strip().startswith("#")
+        )
+        cleanup = code.index("rm -rf '$BackendRoot/$DlOwnerRequestRel'")
+        restart = code.index('Restart-App "scenario-$Scenario/dlowner-apprestart"')
+        service = code.index("Invoke-ServiceCase", restart)
+        finally_block = code.index("} finally {", service)
+
+        self.assertLess(cleanup, restart)
+        self.assertLess(restart, service)
+        self.assertIn("AddSeconds(30)", code)
+        self.assertIn("Invoke-AdbWithTimeout", code[restart:service])
+        self.assertIn("Set-DownloadTestNetwork prepare", code)
+        self.assertIn("Set-DownloadTestNetwork restore", code[finally_block:])
+        self.assertIn("$isEmulator", code)
+        self.assertIn("$dlServer.Kill()", code[finally_block:])
+        self.assertIn("$dlServer.WaitForExit(5000)", code[finally_block:])
+        self.assertIn('"reverse", "--remove", "tcp:$dlPort"', code[finally_block:])
+        self.assertIn('Remove-Item -LiteralPath $dlDir -Recurse -Force', code[finally_block:])
+        self.assertIn("$serverStart.ArgumentList.Add([string]$argument)", code)
+        self.assertIn('adb_su_timeout 10 "test -d', bash_scenario)
+        self.assertIn('echo "error: 映射目标 30s 内未出现', bash_scenario)
+        self.assertIn("SRT_DL_REVERSE_PORT=\"$dl_reverse_port\"", bash_scenario)
+        self.assertIn("timeout 15 adb reverse --remove", bash_scenario)
+        self.assertIn('SRT_DL_TMP_DIR="$dl_dir"', bash_scenario)
+        self.assertIn("set_download_test_network prepare || return 1", bash_scenario)
+        self.assertIn("set_download_test_network restore", bash_scenario)
+
+    def test_sandbox_rebuild_prepares_parent_group_before_module_start(self) -> None:
+        bash_case = section(
+            self.bash, "    41)\n      # 沙盒根", "      ;;"
+        )
+        ps_case = section(
+            self.powershell, "    if ($Scenario -eq 41) {", "    # 未自行预置夹具"
+        )
+        for fixture in (bash_case, ps_case):
+            self.assertIn("parent_gid=", fixture)
+            self.assertIn("stat -c %g", fixture)
+            self.assertLess(fixture.index("chgrp"), fixture.index("rm -rf"))
+            self.assertNotIn("chown -R", fixture)
+        bash_check = section(
+            self.bash, "run_sandbox_root_metadata_scenario() {", "run_scenario() {"
+        )
+        ps_check = section(
+            self.powershell, "function Invoke-SandboxRootMetadataScenario {",
+            "function Invoke-Scenario {",
+        )
+        for checks in (bash_check, ps_check):
+            self.assertNotIn("chgrp", checks)
+        self.assertIn('check_private_tree_native_metadata "${label}-rebuild"', bash_check)
+        self.assertIn('check_private_tree_native_metadata "${label}-post-write"', bash_check)
+        self.assertIn('Test-PrivateTreeMetadata $Scenario "private-tree-rebuild"', ps_check)
+        self.assertIn('Test-PrivateTreeMetadata $Scenario "private-tree-post-write"', ps_check)
+
     def test_android17_diagnostics_do_not_report_expected_missing_files(self) -> None:
         flow = read(".github/tests/run-storage-redirect-scenarios.sh")
         storage = section(flow, "print_storage_state()", "run_service_case()")
-        rootavd = read(".github/vendor/rootAVD/rootAVD.sh")
 
         self.assertIn("optional_storage_alias_absent path=", storage)
-        self.assertIn('if ! $BB wget -q --no-check-certificate $SRCURL$JSON || [ ! -s "$JSON" ]', rootavd)
-        self.assertLess(rootavd.index('[ ! -s "$JSON" ]'), rootavd.index('VER=$(json_value "version" < $JSON)'))
 
     def test_media_provider_readiness_rejects_query_errors_and_uses_ps_fallback(self) -> None:
         flow = read(".github/tests/run-storage-redirect-scenarios.sh")
@@ -2247,9 +3010,14 @@ class ScenarioConsistencyTest(unittest.TestCase):
         readiness = section(flow, "wait_media_provider_ready()", "media_provider_pid()")
         self.assertIn("local uris=(\"content://media/external_primary/file\")", readiness)
         hook = section(flow, "ensure_media_provider_hook_ready()", "restart_media_provider_with_hook_ready()")
-        self.assertIn("if media_provider_is_lazy; then", hook)
-        self.assertIn("timeout --foreground 120s bash -c 'check_health'", flow)
-        self.assertIn("timeout --foreground 180s bash -c 'capture_test_flow_artifacts'", flow)
+        self.assertIn('wait_media_provider_ready "${label}-provider" 60', hook)
+        self.assertNotIn("if media_provider_is_lazy; then", hook)
+        # 这两个兜底调用必须带超时（防止模拟器半死后无限挂起），且用整组终止而不是
+        # --foreground：后者只杀直接子进程，adb 孙进程会占住 stdout 让 job 静默挂住。
+        self.assertIn("timeout --kill-after=30s 120s bash -c 'check_health'", flow)
+        self.assertIn(
+            "timeout --kill-after=30s 180s bash -c 'capture_test_flow_artifacts'", flow
+        )
         pid = section(flow, "media_provider_pid()", "wait_media_provider_hook_ready()")
         self.assertIn("ps -A -o PID,NAME,ARGS", pid)
 
@@ -2350,25 +3118,78 @@ class ScenarioConsistencyTest(unittest.TestCase):
         for forbidden in ("O_CREAT", "fs::write", "File::create", "OpenOptions"):
             self.assertNotIn(forbidden, legacy)
 
-    def test_mount_readiness_is_decided_from_mountinfo(self) -> None:
-        """挂载是否生效必须由应用自己读 mountinfo 判定，而不是等 daemon 写状态文件。
+    def test_mount_readiness_is_observed_not_awaited(self) -> None:
+        """应用侧的就位判定必须是**一次观测**：不等回执、不轮询、不睡眠、不把 fd 带过域边界。
 
-        守卫锁定四件事，缺一条都会让应用在启动阶段被拖死或让判定失真：
+        历史教训三条，方向各不相同，必须同时守住：
 
-        1. 应用侧轮询本模块挂载并等到集合稳定；
-        2. 轮询判据覆盖两条后端——FUSE 后端源带 `srx_fuse_*` 前缀，命名空间后端源是模块私有的
-           临时锚点（`tmp/real_storage/`）；只认前缀会让命名空间后端的应用永远等不到确认；
-        3. 轮询预算必须远低于 AMS 的进程启动超时（约 10 秒）——这个等待跑在应用主线程上，
-           预算接近它就会让应用被判 `start timeout` 杀掉，真机上微信等应用都会 `failed to attach`；
-        4. daemon 侧不再写标记，测试流的挂载确认只认两条日志。
+        1. 早期靠 daemon 写状态文件，文件写失败或进程被杀就让应用永远等不到确认；
+        2. 之后改成应用自己读 mountinfo 认领挂载，但判据挂在模块标识（`srx_fuse_*` 源、
+           `tmp/real_storage` 锚点）上，标识一旦被隐藏/原生化，判据就**静默失效**；
+        3. 再之后改成「应用发请求时保留连接、执行方回 4 字节回执」。这条通道在本项目里
+           **不可能成立**：socket 由 zygote 域创建，应用 specialize 之后属于 untrusted_app
+           域，`read` 被 SELinux 直接拒绝（真机 AVC：`denied { read } ... dev="sockfs"
+           tcontext=u:r:zygote:s0 tclass=unix_stream_socket`）。应用侧拿到 `-EACCES`，而
+           执行方在同一毫秒写成功——每次启动白等 50~60ms，还留下一条可观测的审计行。
+
+        现在的判据只依赖「挂载表里能不能看见自己的视图」（沙箱根 / 本会话的 fuse 视图根），
+        与模块标识无关，且判定不做任何等待。
         """
         post = read("src/lifecycle/specialize_post.rs")
-        wait = section(post, "fn wait_for_module_mount(", "\nfn log_post_perf(")
+        wait = section(post, "fn conclude_mount_readiness(", "\nfn log_post_perf(")
         self.assertIn("app_redirect_mounts_in(0, package_name)", wait)
-        self.assertIn("MOUNT_SETTLE_POLLS", wait)
-        self.assertNotIn(".srx_mount_status_", wait)
-        # 测试流按这一行确认挂载，措辞不能静默改掉。
+        # 判定不得引入任何形式的等待/轮询。
+        for forbidden in ("poll(", "usleep", "thread::sleep", "await_mount_ack", "budget_ms"):
+            self.assertNotIn(forbidden, wait)
+        # 结论只有「观测到」与「没结论」两级：应用侧没有执行方回执，"失败"无从判定，
+        # 执行方的结论由它自己记（`perf companion mount ... ok=`）。
         self.assertIn('"app mount confirmed pid={}', post)
+        self.assertIn('"app mount unconcluded pid={}', post)
+        self.assertNotIn('"app mount failed pid={}', post)
+        for prefix in ('"app mount confirmed pid={}', '"app mount unconcluded pid={}'):
+            start = post.index(prefix)
+            end = post.index(');', start)
+            self.assertIn('pkg={}', post[start:end])
+        # 旧的混淆措辞不得回归。
+        self.assertNotIn("mount unknown/failed", post)
+
+        # 回执通道整套机制必须保持删除状态：留一个 fd 跨域边界既是泄漏面，也是可观测痕迹。
+        self.assertFalse(
+            (ROOT / "src/lifecycle/companion_ack.rs").exists(),
+            "回执通道在 SELinux 域迁移下不可能成立，不得复活",
+        )
+        flow = read("src/lifecycle.rs")
+        self.assertNotIn("mount_reply_fd", flow)
+        pre = read("src/lifecycle/specialize_pre.rs")
+        self.assertIn("send_mount_request(", pre)
+        for removed in (
+            "send_mount_request_retaining",
+            "retain_mount_reply",
+            "take_mount_reply_fd",
+            "release_mount_reply",
+            "take_latest_reply",
+            "discard_mount_reply",
+        ):
+            self.assertNotIn(removed, pre)
+            self.assertNotIn(removed, post)
+        # 发完即关；证据写进代码注释，避免后来者把这条通道"修好"。
+        request = read("src/lifecycle/mount_request.rs")
+        self.assertIn("libc::close(fd)", request)
+        self.assertIn("unix_stream_socket", request)
+        self.assertNotIn("SYS_read", request)
+        # 视图根判据必须**比对设备号**：只判「这一层是 fuse」会把 vold 自己的媒体 FUSE
+        # 误判成我们的会话（真机实证：回落 namespace_bind 的应用也被判 `confirmed`）。
+        view_rule = section(
+            read("src/module_mount_source.rs"),
+            "pub fn storage_view_root_is_module_session(",
+            "\n/// 判断挂载源是否指向模块自己的临时锚点目录。",
+        )
+        self.assertIn("view != system", view_rule)
+        self.assertIn("/mnt/user/", view_rule)
+        # 执行方仍按协议在 'M' 请求上写 4 字节结论（'F' fchown 通道有真实消费者）。
+        self.assertIn("write_status(", read("src/lifecycle/companion.rs"))
+        for path in ("src/lifecycle/companion_mount.rs", "src/daemon_mount.rs"):
+            self.assertIn("send_mount_result(", read(path))
 
         source = read("src/module_mount_source.rs")
         self.assertIn("pub fn is_module_anchor_mount_source(", source)
@@ -2667,29 +3488,29 @@ class ScenarioConsistencyTest(unittest.TestCase):
         for line in system_mounts:
             self.assertFalse(is_module_layer(line), f"系统挂载被误判为本模块的层: {line}")
 
-    def test_mount_wait_budget_stays_under_process_start_timeout(self) -> None:
-        """应用主线程上的挂载等待预算必须远低于 AMS 的进程启动超时。
+    def test_no_mount_wait_on_app_main_thread(self) -> None:
+        """应用主线程上不得有任何挂载等待：不等待就不可能拖过 AMS 的启动超时。
 
-        这个等待发生在 zygisk specialize 之后、应用主线程上；AMS 对进程启动的超时约 10 秒，
-        预算一旦接近它，任何「判据没能立刻给出肯定答案」的情况都会让应用被判 `start timeout`
-        并杀掉——真机上微信与测试应用都出现过 `failed to attach` + `start timeout`，所有依赖
-        文件系统的用例随之超时。这里把上限锁在 2 秒：既留出足够余量覆盖落定确认，又保证即使
-        判据完全不成立也不会把应用拖死。
+        历史上有两版等待，都被真机打回过：
+
+        1. 220 × 50ms = 11 秒的轮询，单独就越过 AMS 约 10 秒的进程启动超时（真机上微信与
+           测试应用出现 `failed to attach` + `start timeout`）；
+        2. 600ms 阻塞读回执。SELinux 域迁移下那条连接永远读不到（见
+           `test_mount_readiness_is_observed_not_awaited`），白等 50~60ms，还在 dmesg 里
+           留下一条 `avc: denied { read } ... unix_stream_socket` 审计行。
+
+        守卫锁定：预算常量不得复活，判定函数里不得出现任何阻塞原语。
         """
         timing = read("src/lifecycle/mount_timing.rs")
-        # 常量可能是 `30` 这样的字面量，也可能是 `20 * 1000` 这样的算式，两种都要能读。
-        count = _const_product(timing, "POST_MOUNT_STATUS_POLL_COUNT")
-        delay_us = _const_product(timing, "POST_MOUNT_STATUS_POLL_DELAY_US")
-        budget_ms = count * delay_us // 1000
-        self.assertLessEqual(
-            budget_ms,
-            2000,
-            f"挂载等待预算 {budget_ms}ms 过高，会把应用拖过 AMS 启动超时（约 10s）",
+        self.assertNotIn("POST_MOUNT_ACK_WAIT_MS", timing)
+        self.assertNotIn("post_mount_ack_wait_budget_ms", timing)
+        wait = section(
+            read("src/lifecycle/specialize_post.rs"),
+            "fn conclude_mount_readiness(",
+            "\nfn log_post_perf(",
         )
-        self.assertGreaterEqual(budget_ms, 200, "预算过短会让正常的落定确认来不及完成")
-        # 等待必须由短轮询实现，不得改成单次长睡眠（那样无法在挂载就绪后立刻返回）。
-        wait = section(read("src/lifecycle/specialize_post.rs"), "fn wait_for_module_mount(", "\nfn log_post_perf(")
-        self.assertIn("POST_MOUNT_STATUS_POLL_DELAY_US", wait)
+        for forbidden in ("poll(", "usleep", "thread::sleep", "nanosleep"):
+            self.assertNotIn(forbidden, wait)
 
     def test_fixture_residue_is_rejected_before_each_scenario(self) -> None:
         """清理后夹具根必须为空，否则跨场景残留会在离现场很远的断言上爆掉。
@@ -2707,8 +3528,9 @@ class ScenarioConsistencyTest(unittest.TestCase):
         self.assertIn("fixture_residue label=", helper)
         runner = section(self.bash, "run_scenario() {", "\n# 与 PowerShell 共用设备端锁")
         self.assertIn('assert_fixture_roots_empty "scenario-${scenario}" || return 1', runner)
-        # 场景 38 自行清理并预置探测目录（下载提供器沙盒夹具），与 9/20/21/22/28/31 同为豁免场景。
-        self.assertRegex(runner, r"9\|20\|21\|22\|28\|31\|38\) ;;")
+        # 场景 38 自行清理并预置探测目录（下载提供器沙盒夹具），场景 43/44 自行预置根级
+        # 对照目录，与 9/20/21/22/28/31 同为豁免场景。
+        self.assertRegex(runner, r"9\|20\|21\|22\|28\|31\|38\|43\|44\) ;;")
         # 容忍式清理必须留下统一前缀，便于在日志里统计与定位，不能只写一句自由文本。
         self.assertIn("cleanup_tolerated reason=probe_fuse_edom", self.bash)
         self.assertIn("cleanup_tolerated reason=own_dir_fuse", self.bash)
@@ -2913,13 +3735,15 @@ class ScenarioConsistencyTest(unittest.TestCase):
             "app_mountinfo_has_expected_paths() {",
             "\nensure_current_app_mount_confirmed() {",
         )
-        self.assertIn("srx_fuse_host", bash_recheck, "`.sh` 场景 4 复核缺少共享宿主布局分支")
+        self.assertIn("form=shared-host", bash_recheck, "`.sh` 场景 4 复核缺少共享宿主布局分支")
+        self.assertIn("form=bind-layout", bash_recheck, "`.sh` 场景 4 复核缺少 bind 布局分支")
         ps_recheck = section(
             self.powershell,
             "function Assert-AppMountinfoHasExpectedPaths {",
             "\nfunction Ensure-CurrentAppMountConfirmed",
         )
-        self.assertIn("srx_fuse_host", ps_recheck, "`.ps1` 场景 4 复核缺少共享宿主布局分支")
+        self.assertIn("layout_shared_host", ps_recheck, "`.ps1` 场景 4 复核缺少共享宿主布局分支")
+        self.assertIn("layout_bind", ps_recheck, "`.ps1` 场景 4 复核缺少 bind 布局分支")
 
     def test_fuse_mount_checks_accept_shared_host_prefix(self) -> None:
         """FUSE 接管与 scoped 启动判定必须识别共享宿主前缀 srx_fuse_host。
@@ -3098,6 +3922,58 @@ class ScenarioConsistencyTest(unittest.TestCase):
                 'scenario_exit" -eq 124', window,
                 "adb emu kill 必须只出现在看门狗超时分支内",
             )
+        # --kill-after 升级 SIGKILL 时 timeout 回 137（实测确认），仍属看门狗触发：
+        # 只认 124 会让「忽略 TERM 的挂死」走正常失败路径，少做一次清场与快照。
+        self.assertIn(
+            '[ "$scenario_exit" -eq 124 ] || [ "$scenario_exit" -eq 137 ]', script
+        )
+        # 看门狗自身也必须有界，否则被 TERM 后不退的 adb 子进程会把它拖成无限等待。
+        self.assertIn('timeout --kill-after=60s "${scenario_watchdog}s"', script)
+
+    def test_owner_drift_form_detection_requires_private_bind_guard(self) -> None:
+        # 属主漂移场景的读写期望取决于数据面形态，而「视图根 dev 与 init 不同」不足以下结论：
+        # 热重载降级成 namespace bind 时，上一轮宿主层可能仍留在同一命名空间的
+        # `/storage/emulated` 上（dev 依旧不同），但 `Android/data/<pkg>` 已被 bind 回系统
+        # 视图，读写按系统侧 DAC 判定。run 42617148478（Android 14 腿）实证：期望被抬成
+        # PASS，实际 EACCES，场景直接失败。因此判据必须叠加「私有树没有被单独 bind」。
+        body = section(
+            self.bash,
+            "run_owner_drift_own_dir_scenario() {",
+            "run_scenario() {",
+        )
+        self.assertIn("private_bind_present", body)
+        self.assertIn("/proc/${drift_pid}/mountinfo", body)
+        self.assertIn('[ "$private_bind_present" -eq 0 ]', body)
+        ps = section(self.powershell, "function Invoke-OwnerDriftOwnDirScenario {", "function Set-ReadOnlySeed {")
+        self.assertIn("$privateBind = Test-Su", ps)
+        self.assertIn("-not $privateBind -and", ps)
+        self.assertIn("/proc/$driftPid/mountinfo", ps)
+
+    def test_host_view_coverage_uses_live_session_fact(self) -> None:
+        # 「宿主是否盖住视图根」不能只看本轮接入是否成功：接入因预算/应答失败而回退时，
+        # 既有宿主层可能仍在服务，此时再恢复 `Android/data|media|obb` 的系统视图 bind
+        # 会叠出混合视图（同一次实证里应用读自己私有树得到 EACCES）。
+        mount = read_daemon_mount_module()
+        self.assertIn("fn host_session_serves_view_root(", mount)
+        self.assertIn(
+            "preattached_host.is_ok() || host_session_serves_view_root(request.uid);",
+            mount,
+        )
+
+    def test_policy_ack_uses_remaining_budget(self) -> None:
+        # 应答等待不能因为「剩余预算不足一整轮超时」就直接判失败：预接入的预算算法
+        # 在剩余 4–6 秒时正好落进这个分支，让本该由宿主服务的视图降级成 bind。
+        control = read_fuse_host_module()
+        ack = section(
+            control,
+            "fn await_policy_ack(",
+            "/// 把某个应用的策略登记到共享宿主会话",
+        )
+        self.assertIn(
+            "set_socket_recv_timeout_ms(fd, remaining_ms.min(HOST_POLICY_ACK_TIMEOUT_MS));",
+            ack,
+        )
+        self.assertNotIn("if remaining_ms < HOST_POLICY_ACK_TIMEOUT_MS {", ack)
 
 
 if __name__ == "__main__":

@@ -6,10 +6,9 @@ mod route;
 mod writer_state;
 
 use super::RuntimeFlow;
+use super::mount_request::send_mount_request;
 use identity::ProcessIdentity;
-use payload::{
-    CompanionMountRequest, build_companion_request_payload, send_companion_request_payload,
-};
+use payload::{CompanionMountRequest, build_companion_request_payload};
 use perf::{SpecializePerf, SpecializePerfStages, log_specialize_perf};
 use route::RouteConfigSnapshot;
 use writer_state::{
@@ -613,7 +612,7 @@ impl RuntimeFlow {
         // 预挂载路径与兜底路径的发送动作完全一致，只有额外日志和退出原因不同
         let is_pre_mount_request = !is_system_writer && !is_shared_uid_writer && !is_monitor_bridge;
         let send_started_ms = monotonic_ms();
-        self.is_mount_request_sent = send_companion_request_payload(self.api.as_ref(), &payload);
+        self.is_mount_request_sent = send_mount_request(self.api.as_ref(), &payload);
         perf_stages.send_ms = monotonic_ms().saturating_sub(send_started_ms);
         if is_pre_mount_request {
             log::info!(
@@ -642,7 +641,9 @@ impl RuntimeFlow {
         }
 
         let payload = std::mem::take(&mut self.deferred_mount_payload);
-        self.is_mount_request_sent = send_companion_request_payload(self.api.as_ref(), &payload);
+        if send_mount_request(self.api.as_ref(), &payload) {
+            self.is_mount_request_sent = true;
+        }
         log::info!(
             "post mount request sent pkg={} sent={} payload={}",
             self.package_name,
@@ -671,7 +672,10 @@ impl RuntimeFlow {
             return;
         }
         if !api.exempt_fd(fd) {
-            log::warn!("module dir fd exempt failed fd={}", fd);
+            // info 而非 warn：zygisk 未导出 `exempt_fd`（或本机 ABI 不提供）时这里恒为假，
+            // 而 fd 只在 pre 阶段用于读配置，不豁免不影响功能——它只影响该 fd 能否活到
+            // specialize 之后。真机每个应用启动固定刷一条 warn，是纯噪音。
+            log::info!("module dir fd exempt unavailable fd={}", fd);
         }
         log::info!("module dir fd open fd={}", fd);
         self.module_dir_fd = fd;
@@ -726,7 +730,7 @@ impl RuntimeFlow {
             if api.exempt_fd(monitor_fd) {
                 log::info!("monitor log fd exempt fd={}", monitor_fd);
             } else {
-                log::warn!("monitor log fd exempt failed fd={}", monitor_fd);
+                log::info!("monitor log fd exempt unavailable fd={}", monitor_fd);
             }
         }
 
@@ -756,7 +760,7 @@ impl RuntimeFlow {
             if api.exempt_fd(inotify_fd) {
                 log::info!("config watch fd exempt fd={}", inotify_fd);
             } else {
-                log::warn!("config watch fd exempt failed fd={}", inotify_fd);
+                log::info!("config watch fd exempt unavailable fd={}", inotify_fd);
             }
         }
     }
@@ -901,7 +905,10 @@ fn resolve_config_package_for_uid(package_name: &str, uid: i32) -> Option<String
     }
 
     if package_name == "android.process.media"
-        && policy::get_uid_for_package("com.android.providers.downloads") == uid
+        && policy::get_uid_for_package_in_user(
+            "com.android.providers.downloads",
+            platform::user_id_from_uid(uid),
+        ) == uid
     {
         return Some("com.android.providers.downloads".to_string());
     }

@@ -13,6 +13,15 @@ use libc::{
     send, setsockopt,
 };
 use std::ffi::CString;
+use std::sync::atomic::{AtomicU64, Ordering};
+
+static MOUNT_STATE_TEMP_ID: AtomicU64 = AtomicU64::new(0);
+
+pub(crate) fn mount_state_temp_path(state_path: &str) -> String {
+    // daemon 与 companion 可能同时写同一应用的挂载状态。
+    let sequence = MOUNT_STATE_TEMP_ID.fetch_add(1, Ordering::Relaxed);
+    format!("{state_path}.tmp.{}.{}", std::process::id(), sequence)
+}
 
 /// 一次 scoped FUSE 挂载的会话记录。
 #[derive(Clone)]
@@ -98,20 +107,23 @@ pub(crate) fn detach_round_mount_targets(targets: &[String]) -> usize {
 ///
 /// 栈顶才是应用当前看到的层：被残留只读屏障盖住的旧层不能算数（那会把「屏障裸奔」
 /// 误判成会话存活）。调用方据此判断是否已有本模块的层在服务该路径。
-pub(crate) fn storage_view_top_source(mount_root: &str) -> Option<String> {
-    let mounts = std::fs::read_to_string("/proc/self/mounts").ok()?;
+/// 读取存储视图根上最顶层挂载的超级块设备号。
+///
+/// 判定"视图根是否已由某个会话服务"必须用超级块身份：挂载源已原生化成 `/dev/fuse`，
+/// 用源文本比对会把系统 MediaProvider 的挂载当成"已经挂好了"。
+pub(crate) fn storage_view_top_dev(mount_root: &str) -> Option<String> {
+    // 必须读 mountinfo：`/proc/self/mounts` 只有源与挂载点，没有超级块设备号，
+    // 而源现在与系统 MediaProvider 的 FUSE 同形，无法再用于归属判定。
+    let content = std::fs::read_to_string("/proc/self/mountinfo").ok()?;
     let root = mount_root.trim_end_matches('/');
-    let last = mounts.lines().rev().find(|line| {
-        let mut fields = line.split_whitespace();
-        fields.next().unwrap_or("");
-        fields
-            .next()
-            .unwrap_or("")
-            .replace("\\040", " ")
-            .trim_end_matches('/')
-            == root
-    })?;
-    Some(last.split_whitespace().next().unwrap_or("").to_string())
+    content
+        .lines()
+        .rev()
+        .filter_map(crate::platform::mountinfo::parse_entry)
+        .find(|entry| {
+            crate::platform::mountinfo::unescape_field(entry.target).trim_end_matches('/') == root
+        })
+        .map(|entry| entry.dev.to_string())
 }
 
 /// 把本次挂载写入状态文件（原子写：临时文件 + fsync + rename）。
@@ -224,13 +236,17 @@ pub(crate) fn write_mount_state(
         let _ = libc::chmod(c_temp_path.as_ptr(), 0o600);
     }
     if ok {
-        ok = std::fs::rename(temp_path, state_path).is_ok();
-        if !ok {
-            log::warn!(
-                "mount state rename failed temp={} path={}",
-                temp_path,
-                state_path
-            );
+        match std::fs::rename(temp_path, state_path) {
+            Ok(()) => {}
+            Err(error) => {
+                log::warn!(
+                    "mount state rename failed temp={} path={} error={}",
+                    temp_path,
+                    state_path,
+                    error
+                );
+                ok = false;
+            }
         }
     }
     if ok {
@@ -261,6 +277,15 @@ pub(crate) enum HostSessionSkip {
     PolicyRegistrationFailed,
     /// 请求没有任何策略规则，接入宿主只会得到 deny_all 空视图。
     NoPolicyRules,
+    /// 请求是「全隔离」配置（enabled 且非 mapping_mode_only / monitor_only），但
+    /// `allowed_real_paths` / `excluded_real_paths` / `path_mappings` /
+    /// `sandboxed_paths` / `read_only_paths` 全为空。
+    ///
+    /// 这是一种**有意义的**策略（整棵存储都应落进沙盒），但当前闸门按「显式规则
+    /// 数组是否非空」判定，因此这类应用一律走 namespace bind。单独列出这个原因，
+    /// 是为了不再把它混进 `attach_gate_closed`——后者读起来像「挂载根不允许接入」，
+    /// 与实际原因完全不同，现场排查会被带偏（真机 2026-11-09 复现）。
+    NoExplicitRules,
     /// 登记与闸门都通过，但实际接入失败（超时、errno、后端不可读）。
     AttachFailed,
 }
@@ -283,6 +308,7 @@ impl HostSessionSkip {
             Self::AttachGateClosed => "attach_gate_closed",
             Self::PolicyRegistrationFailed => "policy_registration_failed",
             Self::NoPolicyRules => "no_policy_rules",
+            Self::NoExplicitRules => "no_explicit_rules",
             Self::AttachFailed => "host_attach_failed",
         }
     }
@@ -378,3 +404,7 @@ pub(crate) fn send_mount_result(sock: c_int, result: i32) -> bool {
     log::debug!("send result sock={} ret={}", sock, result);
     true
 }
+
+#[cfg(test)]
+#[path = "../tests/native-unit/mount_state.rs"]
+mod tests;

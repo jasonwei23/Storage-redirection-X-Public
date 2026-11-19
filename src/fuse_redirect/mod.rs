@@ -31,26 +31,22 @@ use fuser::{
 };
 use inode::{remove_inode_path, remove_unreferenced_inode};
 use metadata::{
-    apply_create_metadata, create_metadata, cstring_path, errno_from_code, errno_from_io,
-    last_errno,
+    STAGING_DIR_PREFIX, StagedEntry, apply_create_metadata, create_metadata, cstring_path,
+    errno_from_code, errno_from_io, last_errno,
 };
 use perf::FusePerfStats;
-use policy::{
-    ANDROID_APP_UID_START, BackendPath, OperationKind, PolicyRegistry, RedirectPolicy,
-    RequesterIdentity,
-};
+use policy::{BackendPath, OperationKind, PolicyRegistry, RedirectPolicy, RequesterIdentity};
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::ffi::OsStr;
 use std::fs::File;
 use std::os::fd::{AsRawFd, FromRawFd};
 use std::os::unix::ffi::OsStrExt;
+use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{Arc, LazyLock, Mutex, RwLock};
 use std::time::{Duration, Instant, SystemTime};
-
-use once_cell::sync::Lazy;
 
 /// attr 有效期：与原生 MP FuseDaemon 对齐（10s）。writeback 回写模式下内核在
 /// 本地维护 inode 的 i_size，应用轮询 stat 命中未过期的内核缓存时拿到的是
@@ -62,16 +58,12 @@ const ENTRY_TTL: Duration = Duration::ZERO;
 const ROOT_INO: u64 = 1;
 const MAX_READ_SIZE: usize = 256 * 1024;
 
-/// 系统 uid 请求者身份缓存 TTL：pid 的 /proc 身份极少变化（进程退出即失效，
-/// 重用窗口内 cmdline+uid 双校验兜底），5 秒足够吸收 write 等高频路径的重复解析。
+/// 包解析缓存只在原任务的 UID、启动时间、命令名、域与边界均未变化时复用。
 const SYSTEM_REQUESTER_CACHE_TTL_MS: i64 = 5_000;
-/// 缓存容量上限：系统 uid 进程数量级远小于该值，超限整表清空（简单防膨胀）。
 const SYSTEM_REQUESTER_CACHE_CAP: usize = 256;
-/// 系统 uid 请求者身份缓存条目：(解析时刻单调毫秒，身份；None 表示 pid 当时
-/// 不可归因——缓存失败结果避免 miss 风暴)。
-type SystemRequesterCacheEntry = (i64, Option<RequesterIdentity>);
-static SYSTEM_REQUESTER_CACHE: Lazy<Mutex<HashMap<i32, SystemRequesterCacheEntry>>> =
-    Lazy::new(|| Mutex::new(HashMap::new()));
+type SystemRequesterCacheEntry = (i64, RequesterIdentity);
+static SYSTEM_REQUESTER_CACHE: LazyLock<Mutex<HashMap<i32, SystemRequesterCacheEntry>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
 /// 目录候选缓存的存活时间。
 ///
 /// 命中前会逐源校验目录 mtime（`DirectorySourceSignature`），文件增删都会改变父目录
@@ -93,16 +85,6 @@ pub(super) const MEDIA_RW_GID: u32 = 1023;
 // 目录模式只在 `platform::fs` 定义一次，避免多处副本各自漂移。
 pub(super) use crate::platform::fs::MAPPED_DIR_MODE;
 const SHARED_PUBLIC_DIR_MODE: u32 = crate::platform::fs::SHARED_PUBLIC_DIR_MODE;
-/// 一级压缩（去重、剔除被父根覆盖的子路径）后的软目标根数。
-///
-/// 优先保持"只在通配规则命中的最小具体父目录上挂 FUSE"的设计前提，能不收敛就不收敛。
-pub(super) const TARGET_SCOPED_FUSE_ROOTS: usize = 4;
-/// 多 scoped 会话模式允许保留的根数上限。
-///
-/// 这个上限不是规则能力或内核约束，而是资源预算：每个根对应一个 `srx_fuse` 子进程和
-/// 一次会话，父进程的挂载等待预算也按根数线性增长。顶层根超过该预算时改用单个共享
-/// 存储根 FUSE 会话，仍由原始规则逐路径匹配，不再因为根数退回精度较弱的 namespace。
-pub(super) const MAX_SCOPED_FUSE_ROOTS: usize = 16;
 const INITIAL_DIR_CANDIDATE_CACHE_BYTES: usize = 256 * 1024;
 
 thread_local! {
@@ -147,6 +129,7 @@ struct FuseState {
     lookup_counts: HashMap<u64, u64>,
     dir_entry_refs: HashMap<u64, u64>,
     files: HashMap<u64, OpenFile>,
+    backings: HashMap<(u64, u64), RegisteredBacking>,
     dirs: HashMap<u64, Arc<[DirEntry]>>,
     dir_candidate_cache: HashMap<String, CachedDirCandidates>,
     dir_candidate_cache_bytes: usize,
@@ -163,6 +146,10 @@ struct FuseState {
 struct InodeBackendCacheEntry {
     owner_uid: u32,
     backend: Arc<BackendPath>,
+    /// 解析时覆盖表的代次。覆盖挂载可能在会话运行中途出现或消失，代次不一致时这条
+    /// 缓存按陈旧处理、就地重解析——否则首次解析落在 1 秒快照窗口内会把「bind 遮蔽前
+    /// 的后端」钉死到 inode 生命周期结束（2026-11-17 A16 偶发视图不一致即此）。
+    overlay_generation: u64,
 }
 
 /// 条目上限：`ls -lR` 一万条目的遍历会把 inode 全部带进来，每条目两段路径字符串
@@ -244,14 +231,30 @@ fn dir_candidate_cache_capacity_limits() -> (usize, usize, usize) {
     )
 }
 
+#[derive(Clone)]
 struct OpenFile {
-    // quality-allow(lint-suppression): rel字段保留供调试和诊断输出使用，当前未被读取但不应删除。
-    #[allow(dead_code)]
-    rel: String,
-    file: Option<Arc<File>>,
-    // backing 注册必须覆盖整个打开句柄生命周期；提前注销会让内核 passthrough 返回 EIO。
-    _backing: Option<Arc<fuser::BackingId>>,
-    is_read_only: bool,
+    ino: INodeNo,
+    public_uid: Option<u32>,
+    backend: Arc<BackendPath>,
+    file: Arc<File>,
+    backing_key: Option<(u64, u64)>,
+}
+
+impl OpenFile {
+    fn attr(&self) -> Result<FileAttr, Errno> {
+        let mut attr =
+            file_attr_from_metadata(self.ino, self.file.metadata().map_err(errno_from_io)?);
+        if let Some(uid) = self.public_uid {
+            attr.uid = uid;
+            attr.gid = MEDIA_RW_GID;
+        }
+        Ok(attr)
+    }
+}
+
+struct RegisteredBacking {
+    id: Arc<fuser::BackingId>,
+    handles: usize,
 }
 
 #[derive(Clone)]
@@ -348,34 +351,22 @@ struct NewEntryRoute {
     backend: BackendPath,
 }
 
-/// MediaProvider 应用 uid：宿主 daemon 以 root 运行，直接解析 packages.list
-/// （系统维护的权威映射；不同设备/用户 profile 的分配值不构成契约），
-/// 解析失败回退 A16/A17 观测值。
-fn media_provider_uid() -> u32 {
-    static MEDIA_PROVIDER_UID: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
-    *MEDIA_PROVIDER_UID.get_or_init(|| {
-        let parsed = std::fs::read_to_string("/data/system/packages.list")
-            .ok()
-            .and_then(|content| {
-                content.lines().find_map(|line| {
-                    let mut fields = line.split_whitespace();
-                    if fields.next() == Some("com.android.providers.media.module") {
-                        fields.next().and_then(|value| value.parse::<i32>().ok())
-                    } else {
-                        None
-                    }
-                })
-            })
-            .filter(|uid| *uid >= 10000);
-        parsed.map(|uid| uid as u32).unwrap_or(10217)
-    })
-}
-
 /// 宿主共享会话的「系统读取者」白名单：MediaProvider 应用 uid 与 media/media_rw
 /// 系统身份。这些调用方按路径访问应用重定向树是系统扫描/元数据协商的正常路径，
 /// 不属于 scoped storage 越权；其余应用 uid 一律维持 deny_all。
 fn is_system_reader_uid(uid: u32) -> bool {
-    uid == media_provider_uid() || uid == 1013 || uid == 1023
+    uid == 1013
+        || uid == 1023
+        || [
+            "com.android.providers.media.module",
+            "com.google.android.providers.media.module",
+            "com.android.providers.media",
+        ]
+        .iter()
+        .any(|package| {
+            policy::package_uid(package)
+                .is_some_and(|app_id| app_id >= 10000 && uid % 100000 == app_id as u32 % 100000)
+        })
 }
 
 impl FuseRedirectFs {
@@ -483,6 +474,7 @@ impl FuseRedirectFs {
                 lookup_counts: HashMap::new(),
                 dir_entry_refs: HashMap::new(),
                 files: HashMap::new(),
+                backings: HashMap::new(),
                 dirs: HashMap::new(),
                 dir_candidate_cache: HashMap::new(),
                 dir_candidate_cache_bytes: 0,
@@ -506,55 +498,81 @@ impl FuseRedirectFs {
         }
     }
 
+    // 同一后端 inode 的并存句柄复用注册，直到最后一个 release 才注销。
+    fn backing_for_open_file(
+        &self,
+        fh: u64,
+        file: &File,
+        register: impl FnOnce() -> std::io::Result<fuser::BackingId>,
+    ) -> std::io::Result<Arc<fuser::BackingId>> {
+        let metadata = file.metadata()?;
+        let key = (metadata.dev(), metadata.ino());
+        let mut state = self.state.write().unwrap_or_else(|err| err.into_inner());
+        if !state.files.contains_key(&fh) {
+            return Err(std::io::Error::from_raw_os_error(libc::EBADF));
+        }
+        let backing = match state.backings.entry(key) {
+            std::collections::hash_map::Entry::Occupied(entry) => entry.into_mut(),
+            std::collections::hash_map::Entry::Vacant(entry) => entry.insert(RegisteredBacking {
+                id: Arc::new(register()?),
+                handles: 0,
+            }),
+        };
+        backing.handles += 1;
+        let id = Arc::clone(&backing.id);
+        if let Some(open_file) = state.files.get_mut(&fh) {
+            open_file.backing_key = Some(key);
+        }
+        Ok(id)
+    }
+
+    // rename 覆盖或 unlink 后路径已失效，fd 属性仍从打开的后端文件读取。
+    fn open_file_for_inode(&self, ino: INodeNo, fh: Option<fuser::FileHandle>) -> Option<OpenFile> {
+        let state = self.state.read().unwrap_or_else(|err| err.into_inner());
+        if let Some(fh) = fh {
+            state.files.get(&fh.0).filter(|file| file.ino == ino)
+        } else {
+            state.files.values().find(|file| file.ino == ino)
+        }
+        .cloned()
+    }
+
     fn policy_for_request(&self, req: &Request) -> Arc<RedirectPolicy> {
         self.policy.for_request(req.uid(), req.pid())
     }
 
-    /// 系统 uid 请求者的监视归因（仅监视开启且走系统回退策略时解析）。
-    ///
-    /// daemon 以 root 运行，直接读 `/proc/<pid>` 反查发起者（MP 域的 SELinux 限制
-    /// 不存在），身份可信度由 status 的 Uid 行裁决；pid 是发起任务的强信号，短
-    /// TTL 缓存吸收 write 等高频路径的重复解析。非系统 uid 或未走系统回退策略
-    /// （应用 uid 命中自身策略）时返回 None，记录维持会话默认形态。
+    /// 保留每次 FUSE 请求的执行者；缓存命中前重新核验任务，root 也记录但不追溯 App。
     fn requester_attribution(
         &self,
         req: &Request,
         policy: &RedirectPolicy,
     ) -> Option<RequesterIdentity> {
-        if !policy.is_file_monitor_enabled || !policy.is_system_fallback {
+        if !policy.is_file_monitor_enabled {
             return None;
         }
         let uid = req.uid() as i32;
-        if uid <= 0 || uid >= ANDROID_APP_UID_START {
-            return None;
-        }
         let pid = req.pid() as i32;
-        if pid <= 0 {
-            return None;
-        }
-        let now_ms = crate::platform::paths::monotonic_ms();
+        let task = crate::platform::proc_identity::read_request_task(pid, uid);
+        let Some(task) = task else {
+            return Some(RequesterIdentity::unresolved(uid, pid));
+        };
+        let now_ms = paths::monotonic_ms();
         if let Ok(cache) = SYSTEM_REQUESTER_CACHE.lock()
-            && let Some((at_ms, identity)) = cache.get(&pid)
+            && let Some((at_ms, cached)) = cache.get(&pid)
             && now_ms.saturating_sub(*at_ms) <= SYSTEM_REQUESTER_CACHE_TTL_MS
+            && cached.same_task(&task)
         {
-            return match identity {
-                Some(cached) if cached.uid == uid => Some(cached.clone()),
-                _ => None,
-            };
+            return Some(cached.clone());
         }
-        let identity = crate::platform::proc_identity::read_proc_identity(pid)
-            .filter(|(proc_uid, _)| *proc_uid == uid)
-            .map(|(proc_uid, package)| RequesterIdentity {
-                package,
-                uid: proc_uid,
-            });
+        let identity = crate::platform::proc_identity::read_proc_identity_for_request(pid, uid)
+            .unwrap_or_else(|| RequesterIdentity::unresolved(uid, pid));
         if let Ok(mut cache) = SYSTEM_REQUESTER_CACHE.lock() {
             if cache.len() >= SYSTEM_REQUESTER_CACHE_CAP {
                 cache.clear();
             }
             cache.insert(pid, (now_ms, identity.clone()));
         }
-        identity
+        Some(identity)
     }
 
     fn policy_for_read_request(
@@ -681,6 +699,7 @@ impl FuseRedirectFs {
             InodeBackendCacheEntry {
                 owner_uid: policy.uid as u32,
                 backend,
+                overlay_generation: backend_overlay::snapshot_generation(),
             },
         );
     }
@@ -717,11 +736,15 @@ impl FuseRedirectFs {
         ino: INodeNo,
     ) -> Result<Arc<BackendPath>, Errno> {
         let rel = self.path_for_ino(ino).ok_or(Errno::ENOENT)?;
+        // 代次在取 state 锁之前读取（`snapshot_generation` 会短暂持有快照锁，避免与
+        // state 锁形成反向嵌套）；它最多滞后一次快照刷新，陈旧时只多做一次解析。
+        let overlay_generation = backend_overlay::snapshot_generation();
         {
             let state = self.state.read().unwrap_or_else(|err| err.into_inner());
             if let Some(entry) = state.inode_backends.get(&ino.0)
                 && entry.owner_uid == policy.uid as u32
                 && entry.backend.rel == rel
+                && entry.overlay_generation == overlay_generation
             {
                 let count = INODE_BACKEND_CACHE_HITS.fetch_add(1, Ordering::Relaxed) + 1;
                 if count == 1 || count.is_multiple_of(8192) {
@@ -782,6 +805,9 @@ impl FuseRedirectFs {
         {
             return Err(Errno::EINVAL);
         }
+        if name_bytes.starts_with(STAGING_DIR_PREFIX.as_bytes()) {
+            return Err(Errno::EPERM);
+        }
         let name_text = String::from_utf8_lossy(name_bytes).to_string();
         if parent_rel.is_empty() {
             Ok(name_text)
@@ -809,11 +835,17 @@ impl FuseRedirectFs {
         // HyperOS 下载 bind 在任务入队瞬间创建，快照 TTL 可能刚好错过；新建入口
         // 强制重读 init mountinfo，避免首次 CREATE 与 bind 创建竞态时落到被遮蔽的
         // 真实目录（真机 2026-10-19：商店增量下载校验 error=3 的直接成因）。
-        if let Some(resolved) = backend_overlay::overlay_backend_path_fresh(&backend.path) {
+        if let Some(resolved) =
+            backend_overlay::overlay_backend_path_fresh(&backend.path, policy.user_id)
+        {
             backend.path = resolved;
         }
         if backend.is_read_only {
-            policy.emit_monitor_read_only_deny(operation_name, &backend);
+            policy.emit_monitor_read_only_deny(
+                operation_name,
+                &backend,
+                self.requester_attribution(req, &policy).as_ref(),
+            );
             return Err(Errno::EROFS);
         }
         self.ensure_parent_for_backend(&policy, &backend)?;
@@ -822,6 +854,45 @@ impl FuseRedirectFs {
             rel,
             backend,
         })
+    }
+
+    /// 视图根节点（挂载点本身）的展示属性对齐。
+    ///
+    /// 视图根上提后，根节点在基线里就是 `/storage/emulated`（`0550 media_rw:media_rw`），
+    /// 而它的后端是「用户存储根」（`2770`）。应用只要 `stat("/storage/emulated")` 就能看出
+    /// mode 差异，所以根的展示属性直接取系统视图根的真实值。
+    ///
+    /// 与 `attr_for_backend` 的边界：那里一律透传后端事实（**不得**把既有目录归一成模块
+    /// 常量，否则公共目录的 02773/02771 会被压平）；这里只处理"根节点本身"，且取值来自
+    /// 系统视图而非模块常量。`dev`/`ino` 是内核事实，保持我方值。
+    fn apply_view_root_attr(&self, policy: &RedirectPolicy, ino: INodeNo, attr: &mut FileAttr) {
+        if !policy.view_lifted || ino.0 != 1 {
+            return;
+        }
+        let Some(system_root) = self.lifted_root_attr(policy) else {
+            // 读不到系统视图根时保持后端属性：宁可少一次对齐，也不能让 getattr 失败。
+            return;
+        };
+        attr.perm = system_root.perm;
+        attr.uid = system_root.uid;
+        attr.gid = system_root.gid;
+        attr.nlink = system_root.nlink;
+        attr.size = system_root.size;
+        attr.blocks = system_root.blocks;
+        attr.blksize = system_root.blksize;
+    }
+
+    /// 系统视图根（`/storage/emulated`）的真实属性，用于视图根节点的展示对齐。
+    ///
+    /// 读取发生在会话进程自己的命名空间：那里 `/storage/emulated` 仍是系统
+    /// MediaProvider 视图，不会回到本会话（本会话挂在 `FUSE_HOST_MOUNT_POINT`）。
+    /// 读不到时返回 `None`，调用方保持后端属性——宁可少一次对齐，也不能让 getattr 失败。
+    fn lifted_root_attr(&self, policy: &RedirectPolicy) -> Option<FileAttr> {
+        let system_root = crate::platform::paths::parent(
+            &crate::platform::paths::storage_user_root_for_user(policy.user_id),
+        );
+        let metadata = std::fs::symlink_metadata(&system_root).ok()?;
+        Some(file_attr_from_metadata(INodeNo(1), metadata))
     }
 
     fn attr_for_backend(
@@ -836,9 +907,14 @@ impl FuseRedirectFs {
         if backend.is_shared_public_backend {
             attr.uid = policy.uid as u32;
             attr.gid = MEDIA_RW_GID;
-            if attr.kind == FileType::Directory {
-                attr.perm = SHARED_PUBLIC_DIR_MODE as u16;
-            }
+            // **不改写目录 mode**：这里曾经无条件把目录权限压成 `SHARED_PUBLIC_DIR_MODE`
+            // (02770)，但该常量是「我们新建目录时落盘的权限」，用它覆盖**已存在**节点的
+            // 展示值会让原生形态暴露。真机 2026-11-02 应用域实测（应用进程内 stat）：
+            // `/storage/emulated/0/DCIM` 原生 `1023:1023 02773`、`Android` 原生 `02771`，
+            // 改写后统一变成 `02770` —— 只要 stat 一次公共目录就能看出来。
+            //
+            // 展示层只负责「属主归一」（见下方注释），mode/nlink/size 一律透传后端事实：
+            // 本模块新建目录落盘就是 02770，与原生新建一致；系统既有目录保持 02773/02771。
         }
         Ok(attr)
     }
@@ -850,7 +926,10 @@ impl FuseRedirectFs {
         backend: &BackendPath,
     ) -> Result<FileAttr, Errno> {
         match self.attr_for_backend(policy, ino, backend) {
-            Ok(attr) => Ok(attr),
+            Ok(mut attr) => {
+                self.apply_view_root_attr(policy, ino, &mut attr);
+                Ok(attr)
+            }
             Err(errno) if errno.code() == libc::ENOENT && policy.is_virtual_dir(&backend.rel) => {
                 Ok(synthetic_dir_attr(ino, policy.uid as u32, MEDIA_RW_GID))
             }
@@ -1090,6 +1169,39 @@ impl FuseRedirectFs {
         }
     }
 
+    fn open_backend_file_for_create(
+        path: &Path,
+        flags: i32,
+        mode: u32,
+        metadata: metadata::CreateMetadata,
+    ) -> Result<File, Errno> {
+        if flags & libc::O_EXCL == 0 {
+            match Self::open_backend_file(path, flags & !libc::O_CREAT, mode) {
+                Ok(file) => {
+                    apply_create_metadata(path, metadata)?;
+                    return Ok(file);
+                }
+                Err(errno) if i32::from(errno) == libc::ENOENT => {}
+                Err(errno) => return Err(errno),
+            }
+        }
+
+        let staged = StagedEntry::new(path)?;
+        let file =
+            Self::open_backend_file(staged.path(), flags | libc::O_CREAT | libc::O_EXCL, mode)?;
+        apply_create_metadata(staged.path(), metadata)?;
+        match staged.publish(path) {
+            Ok(()) => Ok(file),
+            Err(errno) if flags & libc::O_EXCL == 0 && i32::from(errno) == libc::EEXIST => {
+                drop(file);
+                let file = Self::open_backend_file(path, flags, mode)?;
+                apply_create_metadata(path, metadata)?;
+                Ok(file)
+            }
+            Err(errno) => Err(errno),
+        }
+    }
+
     fn remove_child(
         &self,
         policy: &RedirectPolicy,
@@ -1115,7 +1227,11 @@ impl FuseRedirectFs {
             return;
         };
         if backend.is_read_only {
-            policy.emit_monitor_read_only_deny(if is_dir { "rmdir" } else { "unlink" }, &backend);
+            policy.emit_monitor_read_only_deny(
+                if is_dir { "rmdir" } else { "unlink" },
+                &backend,
+                caller,
+            );
             reply.error(Errno::EROFS);
             return;
         }
@@ -1141,3 +1257,7 @@ impl FuseRedirectFs {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "../../tests/native-unit/fuse_staging.rs"]
+mod tests;

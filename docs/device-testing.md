@@ -19,38 +19,44 @@ me.fakerqu.test.storageredirection.TEST_CASE
 
 ## 总体流程
 
-普通本地排障可以只针对设备当前已安装的 Storage Redirect X 模块运行测试 APP 和场景脚本；需要在本地预检或复现 GitHub Actions 失败时，再使用完整验证脚本验证当前工作区产物。
+本地 Rust 编译、Rust 测试和 Gradle APK 构建/测试在 WSL 中执行；设备侧场景在 Windows PowerShell 中通过 Windows ADB 直接运行。两个阶段共享仓库里的构建产物，不需要把 Windows ADB 转发给 WSL。普通排障也可以只针对设备当前已安装的模块运行 Windows 设备脚本。
 
-完整验证脚本有可用 Bash 时使用：
+在 WSL 中构建模块、编译 Android 测试二进制、运行 Gradle 单元测试并打包模块 zip：
 
 ```bash
-bash scripts/verify-test-flow.sh
+RUN_DEVICE_SCENARIOS=0 bash scripts/verify-test-flow.sh
 ```
 
-Windows PowerShell 环境可以使用同等入口：
+也可以从 Windows PowerShell 启动完整本地流程：
 
 ```powershell
-pwsh -NoProfile -ExecutionPolicy Bypass -File .\scripts\verify-test-flow.ps1
+.\scripts\verify-test-flow.ps1
 ```
 
-该脚本默认会：
+该入口先在 WSL 中执行同一构建和测试阶段，并强制关闭设备场景；成功后由 Windows PowerShell 使用本机 ADB 安装产物，依次执行 native 测试和设备场景。默认会安装模块并重启设备；设置 `$env:SRX_TEST_INSTALL_MODULE = "0"` 可跳过模块安装和重启。ADB 不会转发到 WSL。
 
-1. 解析当前本地测试版本号。
-2. 构建 Android 目标 Rust 测试二进制和 release 模块二进制。
-3. 打包测试用模块 zip。
-4. 运行管理 APP 单元测试、测试 APP 单元测试，并构建测试 APP debug APK。
-5. 将刚构建的模块 zip 刷入在线 root 测试设备，重启并确认模块启用、启动脚本完成、`srx_daemon` 存活。
-6. 安装本仓库内置测试 APP。
-7. 运行 `.github/tests/run-storage-redirect-scenarios.sh` 或 PowerShell 等价脚本。
+另行运行可在主机执行的 Rust fixture 测试：
 
-公开仓库 PR、CI Build 和 Release workflow 会强制执行测试流门禁。CI/Release 会先构建一次 x86_64 测试模块 zip 和测试 APK，再把 Android 13/14/15/16/17 模拟器组成并行矩阵运行，每个 Android 版本各自执行完整 scenario 1-40。Android 17（API 37.0）已经并入同一测试矩阵，不再是独立 job；`Test-flow required gate` 统一校验五个平台，任一失败都会拦住 CI 资产发布与正式 Release。CI/Release 只有在全部测试流场景通过后才会继续发布 CI 资产、更新 `update.json` 或创建正式 Release。测试流失败时保留 GitHub Actions 失败记录、日志和已上传的排障 artifact，由后续提交修复。
+```bash
+cargo test -p native-config-fixtures --locked
+```
+
+CI/Release 仍由 Linux runner 在 Android 模拟器上运行完整 shell 测试流。
+
+公开仓库 PR、CI Build 和 Release workflow 会强制执行测试流门禁。CI/Release 会先构建一次 x86_64 测试模块 zip 和测试 APK，再把 Android 15/16/17 模拟器组成并行矩阵运行，每个 Android 版本各自执行完整 scenario 1-44。Android 17（API 37.0）已经并入同一测试矩阵，不再是独立 job；`Test-flow required gate` 统一校验三个平台，任一失败都会拦住 CI 资产发布与正式 Release。CI/Release 只有在全部测试流场景通过后才会继续发布 CI 资产、更新 `update.json` 或创建正式 Release。测试流失败时保留 GitHub Actions 失败记录、日志和已上传的排障 artifact，由后续提交修复。
 
 完整设备侧通过标准是：
 
 - `basic/all` 通过。
-- 当前模块跑完 scenario 1-40。场景脚本不按 FUSE 支持能力跳过任何场景，全部使用 `auto` 后端，实际后端由运行时日志和 mountinfo 记录。
+- native Rust 单元测试与 ZN 回调夹具通过，输出 `ZN_FIXTURE_SUMMARY` 且 `failed=0`。
+- 当前模块跑完 scenario 1-44。场景脚本不按 FUSE 支持能力跳过场景，后端按各场景配置选择，实际后端由运行时日志和 mountinfo 记录。
 - 脚本最后输出 `ALL_SCENARIOS_PASSED`。
-- 本地完整回归退出前执行白名单清理，恢复原全局配置和测试 APP 配置，并重启 MediaProvider；CI/Release 使用临时模拟器，设置 `SRT_SKIP_FINAL_CLEANUP=1` 跳过最终清理，避免清理耗时或清理阶段误报影响测试结论。
+- PowerShell 入口在应用停止后确认进程退出及旧独占 FUSE 子进程回收；死进程的状态账本由 daemon 按五分钟节流异步清理，不以账本文件立即消失作为退出判据。
+- 本地完整回归退出前执行白名单清理，恢复原全局配置和测试 APP 配置，并重启 MediaProvider；CI/Release 使用临时模拟器，设置 `SRT_SKIP_FINAL_CLEANUP=1` 跳过最终清理。
+
+场景 40 分别验证 shell 执行者、应用经 MediaProvider 中转的来源，以及 shell 不套用应用沙盒规则。场景 42 以未重定向的链接操作作对照，再比较各路由的链接结果；平台原生拒绝不等同于模块失败。未开启 fail-fast 时，组合场景会保留失败并继续执行其他独立子项；冻结 daemon 的探测在退出时执行恢复。
+
+PowerShell 的测试应用活动启动命令设置 90 秒超时。准备阶段异常也会保留场景终态与汇总；关闭 fail-fast 后继续后续场景，异常清理失败不会覆盖原始错误。
 
 本项目不使用参考实现中的 `/dev/srx_config` 共享挂载作为模块加载信号。配置目录固定为 `/data/adb/modules/storage.redirect.x/config`，运行期通过 inotify 和指纹轮询热更新；安装阶段只验证模块目录未禁用、关键文件存在、当前 boot 的 `.boot_ok` 或 `logs/boot_<boot_id>.marker` 已写入，以及 `srx_daemon` 正在运行。具体重定向、挂载和配置热更新是否生效由后续场景，尤其是 scenario 29，进行端到端验证。
 
@@ -60,54 +66,24 @@ pwsh -NoProfile -ExecutionPolicy Bypass -File .\scripts\verify-test-flow.ps1
 
 ```powershell
 adb devices
-pwsh -NoProfile -ExecutionPolicy Bypass -File .\scripts\verify-test-flow.ps1
+$Serial = "<Windows ADB serial>"  # 换成实际设备序列号
 ```
 
-Bash 可用时也可以直接运行 `bash scripts/verify-test-flow.sh`。
-
-如果测试设备是 x86_64 模拟器，可切换目标：
-
-```powershell
-$env:SRX_TEST_TARGET_TRIPLE = "x86_64-linux-android"
-$env:SRX_TEST_MODULE_ABI = "x86_64"
-pwsh -NoProfile -ExecutionPolicy Bypass -File .\scripts\verify-test-flow.ps1
-Remove-Item Env:SRX_TEST_TARGET_TRIPLE
-Remove-Item Env:SRX_TEST_MODULE_ABI
-```
-
-完整验证脚本默认会刷入当前构建模块并重启设备。只在本地定位测试 APP 或脚本问题时，才临时跳过模块刷入或设备场景：
-
-```powershell
-# 只验证构建和测试 APK，不跑设备场景。
-$env:RUN_DEVICE_SCENARIOS = "0"
-pwsh -NoProfile -ExecutionPolicy Bypass -File .\scripts\verify-test-flow.ps1
-Remove-Item Env:RUN_DEVICE_SCENARIOS
-
-# 使用设备上已安装模块跑场景。
-$env:SRX_TEST_INSTALL_MODULE = "0"
-pwsh -NoProfile -ExecutionPolicy Bypass -File .\scripts\verify-test-flow.ps1
-Remove-Item Env:SRX_TEST_INSTALL_MODULE
-```
+完整设备套件的顺序是：安装并重启 WSL 构建的模块、安装 WSL 构建的测试 APP、再按“运行完整回归”一节从 Windows PowerShell 启动设备场景。只针对当前已安装模块复测时，可以跳过构建和模块安装。
 
 ## 构建并刷入模块
 
-单独构建模块 zip 时，Windows PowerShell 下推荐在本仓库根目录使用脚本。脚本会编译 Android release 目标、生成可刷入 zip、校验 zip 条目和 LF 换行；如不传 `-NoAdb`，还会询问是否通过 `ksud module install` 刷入并重启。
+模块二进制和测试流 zip 由 WSL 构建入口生成。需要在 Windows 单独打包已有 Android target 产物时，使用 `-SkipBuild`，避免在 Windows 调用 Cargo；如不传 `-NoAdb`，脚本会询问是否通过 `ksud module install` 刷入并重启。
 
 ```powershell
-# 构建模块 zip，可按提示刷入设备
-.\scripts\build-local-module.ps1
-
-# 只构建 zip，不执行 ADB 安装
-.\scripts\build-local-module.ps1 -NoAdb
-
-# 只打包已有 target 产物，不执行 cargo build，也不检查 adb
+# 只打包 WSL 已生成的 target 产物，不执行 cargo build，也不访问设备
 .\scripts\build-local-module.ps1 -SkipBuild -NoAdb
 ```
 
 手动刷入 zip 时，必须推送完整 zip，不要直接覆盖 `/data/adb/modules/storage.redirect.x` 下的 `.so` 或 daemon：
 
 ```powershell
-adb -s $Serial push build\storage.redirect.x-v<version>.zip /data/local/tmp/storage.redirect.x-local.zip
+adb -s $Serial push build\test-flow\assets\storage.redirect.x-v<version>-arm64-v8a.zip /data/local/tmp/storage.redirect.x-local.zip
 adb -s $Serial shell "su -c 'rm -rf /data/adb/modules_update/storage.redirect.x'"
 adb -s $Serial shell "su -c '/data/adb/ksu/bin/ksud module install /data/local/tmp/storage.redirect.x-local.zip'"
 adb -s $Serial reboot
@@ -120,28 +96,43 @@ adb -s $Serial shell "su -c 'cat /data/adb/modules/storage.redirect.x/module.pro
 
 ## 构建并安装测试 APP
 
-测试 APP 已作为主 Gradle build 的独立模块接入。Windows 下在本仓库根目录执行：
+测试 APP 已作为主 Gradle build 的独立模块接入。在 WSL 仓库根目录构建并运行单元测试：
+
+```bash
+./gradlew --no-daemon --console=plain --stacktrace :storageRedirectTestApp:testDebugUnitTest :storageRedirectTestMediaFileApi:testDebugUnitTest :storageRedirectTestApp:assembleDebug
+```
+
+在 Windows 中用 ADB 安装 WSL 生成的 APK：
 
 ```powershell
-.\gradlew.bat --no-daemon --console=plain --stacktrace :storageRedirectTestApp:testDebugUnitTest :storageRedirectTestMediaFileApi:testDebugUnitTest :storageRedirectTestApp:assembleDebug
 adb -s $Serial install -r tests\storage-redirect-test\app\build\outputs\apk\debug\storageRedirectTestApp-debug.apk
 ```
 
-授予测试 APP 必要权限：
+两个场景入口在获取设备锁后，首先通过 `grant-storage-test-permissions.sh` 准备测试 APP 权限：按 Android 版本授予 APK 已声明的存储读写、照片、视频、音频、选定照片和通知权限，Android 17 还处理本地网络权限；同时允许媒体读写、所有文件访问和媒体管理 AppOps，覆盖应用与 UID 两层。
 
-```powershell
-adb -s $Serial shell pm grant me.fakerqu.test.storageredirect android.permission.READ_EXTERNAL_STORAGE
-adb -s $Serial shell pm grant me.fakerqu.test.storageredirect android.permission.WRITE_EXTERNAL_STORAGE
-adb -s $Serial shell pm grant me.fakerqu.test.storageredirect android.permission.READ_MEDIA_IMAGES
-adb -s $Serial shell pm grant me.fakerqu.test.storageredirect android.permission.READ_MEDIA_VIDEO
-adb -s $Serial shell pm grant me.fakerqu.test.storageredirect android.permission.READ_MEDIA_AUDIO
-adb -s $Serial shell pm grant me.fakerqu.test.storageredirect android.permission.POST_NOTIFICATIONS
-adb -s $Serial shell appops set me.fakerqu.test.storageredirect MANAGE_EXTERNAL_STORAGE allow
-```
-
-部分 Android 版本会拒绝旧权限或通知权限，脚本会容忍这类失败；手动执行时以不阻断测试为准。
+脚本回读权限及 AppOps 状态；授权失败时在修改测试配置和运行场景前终止，并释放设备锁。系统特权权限不通过 `pm grant` 补入。PowerShell 下载服务会验证 Python 解释器可运行且版本至少为 3.7，避免误用未安装解释器的 Windows 应用执行别名。
 
 ## 运行完整回归
+
+### Native 单元测试与 ZN 回调夹具
+
+构建入口通过 `.github/scripts/build_native_tests.sh` 将 Cargo 本次报告的 `srx_core`、`srx_daemon` 测试可执行文件和 `zn-runtime-fixture` 放入 `build/test-flow/native/`。本地完整入口与 CI/Release 在场景开始前将它们推送到设备；Android Rust 测试在设备上执行，不仅检查能否编译。
+
+`run-zn-runtime-fixture.sh` 使用与场景套件相同的设备锁，先准备测试 APP 存储权限，再备份配置、运行 Rust 测试和回调用例。夹具加载已安装模块的 `.so`，调用实际导出的 `zn_module` 和 `zn_companion_module`，以测试 APP UID 执行特化回调，验证直通、映射物理落点、空映射、全隔离、共享 namespace 拒绝、未知包拒绝、连接失败、注册后运行时禁用、禁用配置、运行中配置重载与监视记录。结束时恢复配置并清理本次目录；预期拒绝会按预期退出码记为通过。
+
+该夹具用模拟 API 表调用真实模块回调，在 root 测试进程中建立 namespace 后降 UID/GID；它不验证 Hyos 加载器本身、应用 SELinux 域或设备是否提供独立 namespace。配置隔离视图要求目标进程独占挂载 namespace；无法满足时回调以 126 退出，避免在共享 spawner 视图中挂载。未配置且未启用监视时允许直通；仅监视时共享 namespace 会跳过挂载，挂载失败也不终止进程，身份核验失败仍拒绝。
+
+Hyos 客户端先在五秒内读取 companion 回复。需要挂载时，companion 先回复本次规划的等待预算，再执行挂载并返回最终状态；预算覆盖进程就绪、宿主登记、屏障和挂载子进程等待。协议回归验证延迟超过原五秒窗口仍能收到成功、预算不能重复延长，以及失败或不完整回复不会被视为成功。
+
+模块在 `system_server` 中始终安装包事件接收器与查询端，自动配置新应用仍由模板设置控制。Android 13 及更新版本按 PackageManager 状态版本使包查询缓存失效；Android 12 仅在包快照有效时按快照对象身份缓存，失效或重建期间直接查询。包事件也会使缓存失效；下次请求时再取当前 PM 状态。用户清单 `T` 与全用户包清单 `L` 始终实时查询，因为增删用户不保证推进 PM 包代次或触发包广播。companion 身份校验与 daemon 进程扫描不依赖 shell 异步生成的 UID 文件。连接验证 UID 与 SELinux 域，请求受两秒截止点和回复大小上限约束；服务未就绪或查询失败时不使用旧版本缓存身份。
+
+`srx_daemon package-query` 输出完整用户 UID；`package-query P <user> <package>` 查询单包，`package-query U <uid>` 查询共享 UID 的全部包，`package-query S <uid>` 查询该完整 UID 的真实共享用户标签（无法确定时输出为空）。shell 保留完整 UID，原子更新 hook 使用的 `system_writer_uids.list`，避免不同用户的安装记录混用。FUSE 热路径读取该快照；它不是 companion 的授权依据。系统服务重启后随注入重建查询端。
+
+身份回归覆盖普通应用与非特权 native 子进程、root/应用 fsuid、shell、已知特权域、非特权域变化、UID/PID 不匹配、PID 复用、嵌套作用域与 Binder 身份恢复。日志回归检查终止边界及共享组标签不会经命令行、UID、路径提示或 UI 回退成为具体应用，失败操作与低可信度记录不派生高可信度公共路径提示。设备场景结束后可对照原始 `file_monitor.log` 的请求字段与管理 App 解析结果；文件落点仍以实际后端文件为准。
+
+异步目录回归需区分宿主内部调用与外部 Binder 请求，并检查提示冲突、过期、任务退出和凭据变化；原始 UID/PID、启动时钟及域不能被宿主身份替代。共享 UID 的只读回归分别检查显式成员、无具体成员及另一成员的近期路径提示。管理 App 与 WebUI 同时验证不同请求保留、重复请求去重及请求/观察关联，日志字段往返后 `unverified` 必须仍为未知来源。套接字队列满时，身份查询与日志回复都应有界返回。
+
+### 应用场景
 
 完整回归优先使用本仓库内置脚本。bash 版是 CI 使用的主入口：
 
@@ -178,8 +169,8 @@ Remove-Item Env:SRT_SCENARIOS
 | 变量或参数 | 用途 |
 | --- | --- |
 | `-SkipBasicAll` | 跳过 `basic/all`，只跑场景脚本。 |
-| `-Scenarios 9,17` / `SRT_SCENARIOS=9,17` | 只跑指定场景，范围为 1-40。 |
-| `SRT_SCENARIOS=all` | 按当前场景清单执行全部场景；当前等价于 1-40。与其它场景号混用会报错。不设置时默认也是全场景。 |
+| `-Scenarios 9,17` / `SRT_SCENARIOS=9,17` | 只跑指定场景，范围为 1-44。 |
+| `SRT_SCENARIOS=all` | 按当前场景清单执行全部场景；当前等价于 1-44。与其它场景号混用会报错。不设置时默认也是全场景。 |
 | `SRT_VERSION_SCENARIO_EXCLUDE=39` | 版本级场景排除：从已确定的范围里剔除指定场景（默认仍是全场景）。它是剔除而不是替换，因此不会收窄 `SRT_SCENARIOS` 或 dispatch 输入的范围；仅用于某个版本确实无法验证的场景，当前矩阵未使用。 |
 | `-FreshAppPerCase` / `SRT_FRESH_APP_PER_CASE=1` | 每个服务用例前都冷启动测试 APP，这是默认行为，用于避免跨用例进程状态污染。需要调试复用进程时可设 `SRT_FRESH_APP_PER_CASE=0`；scenario 29 会临时保持同一进程以验证配置热更新。 |
 | `SRT_FAIL_FAST=1` | 某个场景失败后立即停止当前 Android 测试 job。CI/Release 默认开启，便于尽快暴露首个失败点。 |
@@ -188,13 +179,31 @@ Remove-Item Env:SRT_SCENARIOS
 | `SRT_FILE_MONITOR_ENABLED=1` | 调试非监控场景时也开启全局文件监控；正式回归通常保持默认。 |
 | `SRT_RESULT_POLL_MS`、`SRT_APP_LAUNCH_SETTLE_MS`、`SRT_SERVICE_CASE_SETTLE_MS`、`SRT_MOUNT_CONFIRM_TIMEOUT_MS` | 调整结果轮询、启动缓冲、用例间缓冲和等待 mount 日志的时间。 |
 
+### 超时预算（四层嵌套）
+
+测试流的超时是四层，必须严格满足 `job > step > (基础设置 + 场景看门狗) > 单场景`。顺序一旦颠倒，先触发的
+那一层会直接硬杀进程，脚本自己的模拟器清场与残留进程快照就跑不到，只剩一条「超时」结论。
+
+| 层 | 预算 | 来源 | 作用 |
+| --- | --- | --- | --- |
+| 单场景 | CI/Release 300 秒，本地默认 600 秒 | `SRT_SCENARIO_TIMEOUT_SECONDS` | 单个场景卡死时按退出码 124 失败并留下现场 |
+| 基础设置 | 900 秒（15 分钟） | `SETUP_BUDGET_SECONDS`（`run-android-test-flow.sh`） | 场景循环之前的一切准备：设备健康检查、模块安装、包服务恢复。各等待函数自身的上限会被压进该预算，预算耗尽立即失败，而不是再等一整个默认上限 |
+| 场景看门狗 | `900 + 90 × 场景数` 秒（15 + 1.5n 分钟） | `run-android-test-flow.sh` | 覆盖场景脚本本体。场景失败后 adb 调用可能无限阻塞，超时以 124 退出并标注场景范围，交给重跑而不是占满 runner |
+| 步骤级 | `33 + 1.5n` 分钟，上限 345 分钟 | `.github/scripts/parse_scenario_scope.py` | 兜住编排脚本之外的挂起（runner 卡在设备等待或安装阶段），由 `prepare` 按本次实际场景数产出 |
+| job 级 | 步骤级 + 15 分钟作业开销，上限 360 分钟 | 同上 | 保证 job 严格大于 step；360 分钟是 GitHub 的硬上限，抬不动 |
+
+- 场景数按场景清单条目数取，**不能**数字面 token：全量时 `SRT_SCENARIOS` 的值是 `all`，按 token 数只能算出 1，看门狗会被压到 990 秒而把全量跑腰斩。
+- 步骤级与 job 级由 `prepare` 的 `Resolve scenario scope` 步骤按同一次范围产出，CI 与 Release 共用同一份解析脚本，所以场景数增长时两边一起自适应，不必手工同步数字。
+- 步骤预算在基础设置与场景看门狗之外预留 3 分钟；模拟器启动也占用步骤预算，单独的 `emulator-boot-timeout`（A15/A16 1500 秒、A17 1800 秒）不扩大步骤预算。
+- 嵌套关系在约 209 个场景时失效（step 已触顶 345 分钟，看门狗仍在按 1.5n 增长）。当前 44 个场景远未到边界，但场景加到 200 个之前必须把矩阵拆成多个 test-flow job 分片，而不是继续抬高上限。
+
 ### 场景范围的触发条件
 
 范围只由运行参数决定，仓库里不写死场景清单（矩阵字段只用于「某版本确实无法验证」的剔除，且当前未使用）：
 
 | 触发入口 | 写法 | 实际范围 |
 | --- | --- | --- |
-| 默认（push、未传参） | — | 全场景 1-40 |
+| 默认（push、未传参） | — | 全场景 1-44 |
 | 手动触发 workflow | `workflow_dispatch` 的 `scenarios` 输入：`29`、`29,34`、`all` | 指定场景；`all` 表示全量 |
 | 提交信息标记 | 标题或正文写「单场景 29」「单场景 29,34」 | 只跑指定场景 |
 | 本地运行 | `SRT_SCENARIOS=29`（sh）或 `-Scenarios 29`（PowerShell） | 同上 |
@@ -222,16 +231,18 @@ SRT_SCENARIOS=24 bash .github/tests/run-storage-redirect-scenarios.sh
 ```
 
 - 一次验证只选一种入口，禁止「带标记推送 + 手动派发」同时进行；出现两轮 run 时先确认事件来源，不要用取消第二轮掩盖范围错误。
-- 窄场景验证不产生可发布资产（`publish_ci=false`），不能作为发布门禁通过的依据；合并或发布前必须有一次全量 1-40 通过记录。
+- 窄场景验证不产生可发布资产（`publish_ci=false`），不能作为发布门禁通过的依据；合并或发布前必须有一次全量 1-44 通过记录。
 
-矩阵当前不含任何版本级排除项：Android 13/14/15/16/17 都执行全量 1-40，包含依赖下载的场景 39。
+CI/Release 在 Android 15/16/17 x86_64 模拟器上各自执行完整场景 1-44，无版本级排除项；任一版本失败即取消其余版本，单个版本内按场景顺序快速失败。测试流全部通过后才发布资产。
 
-CI/Release 以 Android 版本为矩阵维度运行测试流：Android 13/14/15/16/17 x86_64 模拟器各自执行完整 scenario 1-40，矩阵跨版本 fail-fast（任一版本失败即取消其余版本），并在单个 Android 版本内按场景顺序快速失败。这只改变执行调度，不减少覆盖范围；scenario 1-40 必须在 Android 13/14/15/16/17 x86_64 模拟器上全部通过。
+CI/Release 统一由 KernelSU-AVD 打 ramdisk 补丁，使用 ksud 依次安装 Zygisk Next 与 SRX，root shell 走 `su 0 sh -c`（`ADB_ROOT_MODE=su0`）。Zygisk Next 与 KernelSU 在恢复缓存前查询 GitHub 最新稳定版，按版本和上游 SHA-256 选择缓存；缓存和下载文件均校验摘要与归档内容，校验通过后才交给安装器。
 
-Android 17（API 37.0）已并入上面的矩阵（不再是独立 job），与主矩阵一同被 `Test-flow required gate` 校验并执行同一套 scenario 1-40（包含场景 39；该版本曾因镜像网络验证失败被临时排除，现已恢复）。它与其他版本还有三处执行环境差异：
+Android Emulator 在恢复缓存前查询 Google 稳定渠道 revision，安装后核对 `source.properties`。系统镜像使用 [PuerNya/AvdLite 的 images release](https://github.com/PuerNya/AvdLite/releases/tag/images) 中 API 35、36、37.0 的 `AvdLiteWithoutKsu` 4K ZIP；每轮先查询资产 SHA-256，再选择缓存，资产被替换时自动使用新缓存键。导入前核对 API、架构、4K 页大小和上游启动报告，资产内导入器验证文件摘要并创建独立 AVD；开机后再次要求 `PAGE_SIZE=4096`。CI/Release 共用本仓库启动器，避免 SDK 安装步骤覆盖 AvdLite。只缓存原始 ZIP，不缓存打过 KernelSU 补丁的镜像或 AVD 数据。版本查询或校验失败时停止准备，不回退到旧版。项目依赖、Rust/Gradle 与 NDK/libcxx 仍使用仓库锁定版本。
+
+Android 17（API 37.0）有三处执行环境差异：
 
 - **设备侧图形读回保护**：Android 17 系统镜像的 `mapper.ranchu` gralloc 未实现 DMA 颜色缓冲读回，而 emulator 的 gfxstream 后端仍会广播 `ReadColorBufferDMA` 特性。SystemUI 的 `RegionSampling` 与 system_server 的 `TaskSnapshotPersister` 触发读回后会命中 `Assertion failed: !rcEnc->featureInfo()->hasReadColorBufferDma`，并连带重启 framework。测试脚本在设备 SDK 版本为 37 时先执行 `service call window 137 i32 0` 关闭 task snapshot，再 `pm disable-user com.android.systemui` 关闭 SystemUI，并在模块安装重启 framework 后重新应用，直到确认 task snapshot 已关闭且 SystemUI 处于 disabled 状态才继续。该缺陷与 GPU 模式无关，保护逻辑仅在检测到 `ro.build.version.sdk = 37` 时生效。保护过程写入设备侧 `test-flow-graphics-state.txt`（该文件目前不在任何 job 的 artifact 上传清单内，排障需结合 job 日志中的 `android17:` 行）。
-- **注入方案与启动参数**：Android 17 矩阵条目使用 KernelSU 方案（`root_method: ksu`，AVD 镜像打 KernelSU 补丁，ksud 负责安装模块与 Zygisk Next），root shell 走 `su 0 sh -c`（`ADB_ROOT_MODE=su0`）；其余版本仍由安装脚本按 Magisk 探测完成注入。模拟器启动超时放宽到 1800 秒并保留系统动画（其余版本为 1500 秒、关闭动画），GPU 模式固定 `swiftshader_indirect`。
+- **启动参数**：Android 17 的模拟器启动超时放宽到 1800 秒并保留系统动画（其余版本为 1500 秒、关闭动画），GPU 模式固定 `swiftshader_indirect`。
 - **用例粒度**：Android 17 矩阵条目覆盖 `SRT_FRESH_APP_PER_CASE=1`（每个服务用例前冷启动应用），并经 `SRT_FRESH_APP_SCENARIOS` 收窄到配置切换与生命周期场景（1,2,29,32,33）；其余版本显式设为 0。
 
 完整脚本覆盖以下场景：
@@ -244,10 +255,10 @@ Android 17（API 37.0）已并入上面的矩阵（不再是独立 job），与�
 | 3 | `path_mappings` 将 `Download/SrtProbe` 映射到 `Download/Test`。 |
 | 4 | 路径映射叠加真实路径放行时，映射优先。 |
 | 5 | `allowed_real_paths=["Download"]` 时保持真实路径写入。 |
-| 6 | `mapping_mode_only=true` 且未命中映射时保持真实路径写入。 |
+| 6 | `mapping_mode_only=true` 且未命中映射时保持真实路径写入；后端属主必须仍是注入的 1023，被静默修好即按回归失败。属主漂移的可见性按数据面形态判定：bind 布局由内核按应用凭据做 DAC，期望拒绝；FUSE 布局由会话服务，期望放行（与原生 MediaProvider 服务 emulated 视图同理），并输出 `owner_drift_layout form=` 便于事后判断走的是哪条（2026-11-07 FUSE 优先后：属主漂移不再必然 EACCES）。形态判据必须同时满足「视图根 dev 与 init 不同」且「`Android/data/<pkg>` 没有被单独 bind 回来」（`private_bind=`），只看 dev 会在「根 FUSE + 私有树系统视图 bind」的混合视图上误判（2026-11-09 A14 CI 腿实证）。 |
 | 7 | `mapping_mode_only=true` 且命中映射时写入映射目标。 |
 | 8 | `mapping_mode_only` 加 `sandboxed_paths=[".xlDownload"]` 时验证 `.xlDownload`/`.xldownload` 沙盒化。 |
-| 9 | `read_only_paths` 允许读取、`stat`、`access`，但拒绝写入、truncate、ftruncate、chmod、fchmod、link、symlink、删除、mkdir、rename。 |
+| 9 | `read_only_paths` 允许读取、`stat`、`access`，但拒绝写入、truncate、ftruncate、chmod、fchmod、link、symlink、删除、mkdir、rename；拒绝操作后回读原文件，校验内容未变。 |
 | 10 | 映射目标为只读路径时，映射请求写入被拒绝。 |
 | 11 | `allowed_real_paths` 内联排除和通配符排除：放行路径保持真实写入，排除目录和 `*.part` 写入应用私有空间。 |
 | 12 | `excluded_real_paths` 旧字段兼容：并入真实路径放行的排除规则。 |
@@ -261,7 +272,7 @@ Android 17（API 37.0）已并入上面的矩阵（不再是独立 job），与�
 | 20 | 自动模式下，`allowed_real_paths` 的 `*`/`?` 通配规则执行动态匹配或 namespace 回退，命中路径保持真实路径，并记录最终后端。 |
 | 21 | namespace 数据面下，`read_only_paths` 通配规则执行具体路径回退，并保持读取允许、写入拒绝语义。 |
 | 22 | namespace 数据面下，路径映射和只读规则共同存在时仍由映射最终目标决定写权限。 |
-| 23 | 启用 `file_monitor_enabled` 且测试 APP 配置 `enabled=false` 时，普通公共路径写入和 MediaStore 系统代写成功后仍应记录成功监控日志。 |
+| 23 | 启用 `file_monitor_enabled` 且测试 APP 配置 `enabled=false` 时，普通公共路径写入和 MediaStore 系统代写成功后仍应记录成功监控日志；同时断言该形态**不会**被接入模块视图（`st_dev` 与系统视图一致、根列表无 `.transforms`/`.picker_transcoded`）——monitor-only 只对完全没有配置的应用成立，停用配置走的是 `Disable`。 |
 | 24 | 启用文件监控且使用 namespace 数据面时，普通应用映射成功、最终只读失败、只读排除成功。 |
 | 25 | 启用文件监控且使用 FUSE 数据面时，普通应用直写覆盖放行成功、映射成功、最终只读失败、只读排除成功。 |
 | 26 | 启用文件监控且使用 namespace 数据面时，MediaStore 系统代写覆盖放行成功、映射成功、最终只读失败、只读排除成功。 |
@@ -273,13 +284,35 @@ Android 17（API 37.0）已并入上面的矩阵（不再是独立 job），与�
 | 32 | 真实后端端点短暂恢复后，应用重启仍能完成挂载，不要求重启 MediaProvider。 |
 | 33 | MediaProvider 热重启后保留应用挂载，并继续完成图片保存。 |
 | 34 | 启用重定向时，当前应用自己的 `Android/data|media|obb/<包名>` 子树保持真实路径，不再次套入应用沙盒。 |
-| 35 | 任意路径映射矩阵：验证公共存储、`Android/data|media|obb/<包名>`、`/data/user`、`/data/data` 及公共路径之间的相对/绝对映射。 |
+| 35 | 任意路径映射矩阵：验证公共存储、`Android/data|media|obb/<包名>`、`/data/user`、`/data/data` 及公共路径之间的相对/绝对映射；公共到应用私有目录从空沙盒开始，目标文件必须存在，公共源和沙盒不得残留文件。 |
 | 36 | 映射应用私有别名后，仍可写入 MediaProvider 已创建的现有文件。 |
-| 37 | 父路径先映射到中间目录后，中间目录下的子路径继续命中下一条映射并落到最终目录。 |
-| 38 | 下载提供器（com.android.providers.downloads）自身配置 `sandboxed_paths` 后必须由模块接管原生写入，两种拓扑都算通过：companion mount 成功（`perf companion mount pkg=... ok=true`）或进程内 per-caller hook（`hook refresh start profile=system-writer pkg=...`，此时 pre 阶段直接跳过 companion mount）。出现 `attach skipped ... policy_registration_failed`、`sandbox=0` 挂载请求，或下载提供器自己起模块 FUSE 会话即回归（2026-10-21 真机侧漏回归；2026-10-26 场景 39 让提供器改走 system-writer hook 后同步放宽判据）。 |
+| 37 | 父路径先映射到中间目录后，中间目录下的子路径继续命中下一条映射并落到最终目录；应用通过请求路径枚举目录时必须看到最终目标中的文件。 |
+| 38 | 下载提供器自身 `sandboxed_paths` 接管标记：companion mount 成功（`perf companion mount pkg=... ok=true`）或进程内 system-writer hook（`hook refresh start profile=system-writer pkg=...`）其一即可；`sandbox=0` 请求、`attach skipped ... policy_registration_failed` 或提供器自建模块 FUSE 会话判为回归。该场景脚本只检查接管拓扑，不提交提供器原生写入；实际沙盒落点需由单独设备用例验证，CI 模拟器不含所需 XL 引擎。 |
 | 39 | 下载提供器（共享 uid 代写者）经 DownloadManager 异步下载公共路径时，按发起者（测试 APP）的 `path_mappings` 把目标改写到映射目标落盘，真实请求路径零穿透；文件出现在真实请求路径或下载失败即按源归因回归（2026-10-24 真机：误归因组内成员、行数据反查未触发）。 |
+| 40 | 系统 uid 的 FUSE 写入按发起服务归因；应用经 MediaProvider 中转创建的文件归因到源头应用；系统 uid 的沙盒目标缺失时零穿透，不得落到真实路径。 |
+| 41 | 沙盒根（重定向根 `Android/data/<包名>/sdcard`）在应用重启时由模块重建：属主必须是应用、**组不得是应用自己的 uid**，只能取父目录的组（setgid 继承）或 `media_rw`(1023)/`ext_data_rw`(1078)；other 位不得可写，mode 只允许 `02770`/`02771`。随后应用自己写一个文件、再由 MediaProvider 代写一条 `Documents/SrtSandboxRootProbe`，两者都必须落在沙盒内，真实公共路径不得出现该目录或文件（2026-11-09 真机：沙盒根 gid 被写成应用 uid，系统代写 EACCES 后回退到真实公共路径，公共存储凭空长出 `Documents/ringtone/...`）。 |
+| 42 | 在沙盒、真实路径放行、映射和前缀相邻路径验证文件与目录变更、打开描述符、权限及链接边界，并检查物理落点与零穿透。 |
+| 43 | 存储视图根的条目集合必须与系统视图逐项一致：根级不出现 MediaProvider 内部目录（`.transforms`、`.picker_transcoded`）与模块探针残留，readdir 不返回 `.`/`..`，名字级的对照点目录仍可见，深层同名目录仍可见；配置变更触发 reconcile 后内容保持不变。 |
+| 44 | 监视接管链路：应用没有任何配置、只开文件监视，冷启动停在系统视图；改「另一个应用」的规则触发 reconcile 后它被接入模块视图，此时根条目集合仍须与系统视图逐项一致（无内部目录、无点条目、单层挂载）。接管后还会在应用私有树里造一次覆盖挂载（源目录 bind 到 `/data/media/<user>/Android/data/<包名>/files/SrtOverlayBacked`，等价系统把下载暂存目录 bind 到 `.siexternal`），该目录经可见路径 `/storage/emulated/<user>/...` 的模块视图必须与 init 侧 `/data/media/<user>` 的视图逐项一致。 |
+
+场景 44 复刻「没开重定向的应用在别人改规则后突然看见内部目录」的现场。它与场景 43 互补而不是重复：43 的应用**有配置**（通配放行整根），启动即被模块会话接管；44 的应用**没有任何配置**，应用侧只在 `should_redirect` 时为真才发挂载请求，因此冷启动一定停在系统视图，接管发生在 daemon 因**别的应用**规则变化而做全量 reconcile 的那一刻——这正是 MT 的现象链。断言先用 `st_dev` 锁定基线（必须仍等于系统视图，否则说明上一轮会话没清干净、断言会失去意义），再用一份与目标应用无关的配置（`com.srx.test.monitor.trigger.json`）触发 reconcile，随后复用 43 的逐项一致性断言；结束时删除触发器配置。接管后追加一条覆盖挂载断言：在应用私有树里把源目录 bind 到 `/data/media/<user>/Android/data/<包名>/files/SrtOverlayBacked`（形状等价 HyperOS 每次下载把 `/data/apk-tmp/<pkg>/download` bind 到 `/data/media/<user>/Android/data/<pkg>/files/.siexternal`），要求经可见路径 `/storage/emulated/<user>/...` 读到的模块视图与 init 侧 `/data/media/<user>` 的视图逐项一致。bind 必须**建在 `/data/media/<user>` 写法上**：覆盖挂载表按该写法登记挂载点，建在 `/storage/emulated/<user>` 上只会遮蔽那个 FUSE 挂载自己的视图，f2fs 侧与覆盖表都看不到，断言就退化成验证不了改写。bind 还必须**在接入之后**才建——宿主会话的数据面是 `/data/media/<user>` 的非递归 bind 锚点，建会话那一刻定型，事后新增的覆盖挂载只能靠后端路径改写补偿；这条断言就是该补偿链的回归护栏（2026-11-17 真机：改写用的查询串丢了 `<user>` 段，覆盖表恒不命中，商店校验读不到刚下载的包，安装不发起）。
+
+场景 43 用「通配放行整根」（`allowed_real_paths=["*"]`）让视图根由模块 FUSE 接管，同时根目录枚举逐条落到真实后端——只有走真实后端枚举，根级隐藏判据才会被触发（`.transforms` 泄漏的现场路径）。断言先用 `/storage/emulated/0` 的 `st_dev` 确认应用确实被模块会话接管（未接管时两侧天然一致，断言会空转），再要求视图根 `/storage/emulated` 上**只有一层**挂载（接入按「替换而非叠加」实现，叠加与基线不一致且让上层归属不可判定），然后逐项比对应用命名空间与系统视图的 `ls -a` 结果；`.SrtRootDotVisible` 是反向对照，防止把根级过滤写成「藏掉所有点条目」。视图根上提后用户根在视图里是 `<user>` 这一级，根级判据必须按归一后的存储相对路径判空，否则整条隐藏会被跳过（2026-11-14 回归）。配置变更触发 reconcile 后会再断言一次，保证内容与挂载层数都不随重挂变化。
+
+场景 42 验证独占创建、二进制读写、追加、截断与零扩展、文件和非空目录改名、子孙路径与打开描述符在改名后的读写、旧路径重用、前缀相邻目录隔离、原子覆盖、覆盖/删除后的描述符读回及同名文件重建隔离。覆盖非空目录、移入自身子目录和删除非空目录必须被拒绝；`chmod`/`fchmod` 分别校验 `0440`/`0220` 的后端模式。
+
+场景 42 先关闭测试应用的重定向，在原生共享存储上记录链接创建或拒绝结果，再启用场景配置。符号链接成功时校验 `readlink`、跟随读取和物理落点；只有未重定向对照与真实路径放行对照都返回 `EACCES` 时，其余路径才接受相同拒绝，且不得创建或泄漏链接。硬链接成功时校验后端落点、同一 inode 和内容；`EPERM` 必须由未重定向对照复现，`EACCES` 必须由两个对照复现，且均不得创建目标；其它错误均失败。各目标最终只保留 `complete.txt`、`metadata.txt`、`link-target.txt` 和创建成功的链接，由 root 校验物理落点及其余路径零残留。
+
+服务用例以 `OBSERVED [...] app_status=PASS/FAIL` 保留 APP 的实际结果和错误细节，并将原始文本保存在产物目录的 `scenario-*-result.txt` 中。`PASS/FAIL [...] assertion=app_result` 表示该项 APP 结果是否符合断言；由调用方继续校验的结果先输出 `PENDING`。链接操作完成全部路由、对照和物理断言后，才输出 `PASS [file_symlink_boundary]` / `PASS [file_link_boundary]`，并以 `outcome=created` 或 `outcome=denied` 区分实际创建与拒绝边界通过；后者不代表验证过成功创建。`PASS/FAIL [scenario] id=N` 是整个场景的最终判定，错误、超时、残留或对照不符均不得通过。最终清理失败会输出 `FAIL [cleanup]` 并返回非零退出码；PowerShell 入口仅在场景和清理全部成功后输出 `ALL_SCENARIOS_PASSED`。
+
+PowerShell 入口固定使用 UTF-8 输出，重定向到文件时不依赖宿主控制台代码页。场景 40 的 shell 执行者探针经同一 FUSE 可见路径删除、重建目录，避免直删后端留下正目录项缓存；判定同时检查命令退出码、真实落点与沙箱落点，缺少真实目录不会被描述为已经路由到沙箱。
+
+APP 将消息和元数据中的控制字符转义为 `\uXXXX`，避免诊断内容伪造结果行；每份结果以 `__SRT_RESULT_END__=N` 记录条数，随后以 `__SRT_RESULT_TOKEN__` 回传本次调用的 `result_token`，并在写入临时文件后原子重命名发布。采集器只接受严格晚于本次标记文件、调用令牌与用例标识匹配、条数相符且没有重复或额外行的完整结果；`all` 正常执行时必须包含全部 25 个独立用例，任一失败均使聚合断言失败。服务启动或聚合执行异常产生的单条 `FAIL [all]` 直接判失败，不等待超时；单条 `PASS [all]` 和混入聚合结果的致命错误记录均不接受。更新采集器时必须同步安装测试 APP。
+
+文件列举失败不得按空目录处理。拒绝类文件用例捕获到异常时，只接受明确的访问拒绝；MediaStore 创建异常向调用方传播，单独返回 `null` 不能证明权限拒绝。`EIO`、`ENOENT` 和 `ENOSPC` 等错误均不能冒充拒绝成功。
 
 场景脚本会同时检查测试 APP 视角和 root 视角的物理落点或拒绝结果；文件监控场景还会检查 `/data/adb/modules/storage.redirect.x/logs/file_monitor.log` 中的成功或失败记录。默认情况下，非文件监控场景会关闭 `file_monitor_enabled`，文件监控场景会显式开启它。
+
 ## 手动运行用例
 
 最小配置表示为测试 APP 开启完整隔离：
@@ -416,7 +449,7 @@ adb -s $Serial shell am start-foreground-service -n me.fakerqu.test.storageredir
 - 每次运行（完整回归、窄场景、单场景）各自创建一个独立的时间戳目录，同一天的多次运行互不覆盖；
 - `run-android-test-flow.sh` 在启动时创建目录并通过 `SRT_ARTIFACT_DIR` 环境变量注入子脚本，场景脚本与诊断脚本共用同一目录；直接运行 `run-storage-redirect-scenarios.sh` 或 `run-storage-redirect-scenarios.ps1` 时由脚本自行创建；
 - CI 的 `Upload test-flow artifacts` 步骤按 `temp/test-flow/**` 收集上传；
-- 不得向仓库根目录或脚本当前目录新增产物落盘点（规范见 `AGENTS.md`「测试流产物落盘」）；`temp/` 已被 git 忽略，无需提交。
+- 不得向仓库根目录或脚本当前目录新增产物落盘点（产物一律写入 `temp/test-flow/<时间戳>/`，`temp/` 已被 git 忽略，无需提交）。
 
 设备侧结果文件可能出现在以下位置，场景脚本会自动查找：
 
@@ -531,6 +564,15 @@ adb -s $Serial pull /data/anr/trace_XX trace_storage_redirect.txt
 
 3. 如果卡在 MediaStore 用例，抓 MediaProvider 栈并查看 FUSE 线程是否卡在 native `read`。
 
+4. 全量场景**每个**用例都 `result_timeout`、但手动 `am start-foreground-service` 立刻能写出结果时，先怀疑设备上装的是旧测试 APP：结果校验要求文件里带 `__SRT_RESULT_TOKEN__` / `__SRT_RESULT_END__` 行（token 协议加入后才是这个格式），旧 APK 只写 `PASS`/`FAIL` 行，脚本会判成超时。核对办法：
+
+   ```powershell
+   adb -s $Serial shell "su -c 'cat /sdcard/Android/data/me.fakerqu.test.storageredirect/files/test_case_result/result_current.txt'"
+   adb -s $Serial shell dumpsys package me.fakerqu.test.storageredirect | Select-String lastUpdateTime
+   ```
+
+   结果文件没有 token 行就重装：`.\gradlew.bat :storageRedirectTestApp:assembleDebug` → `adb install -r -g tests/storage-redirect-test/app/build/outputs/apk/debug/storageRedirectTestApp-debug.apk`（签名变更被拒时先 `adb uninstall`）。
+
 ### 模块目录出现重复
 
 **现象**：`ls /data/adb/modules/` 显示两个 `storage.redirect.x` 目录，其中一个实际名称带 `\r`。
@@ -551,7 +593,7 @@ adb -s $Serial shell "su -c 'find /data/adb/modules -maxdepth 1 -inum <inode> -e
 不要用目录安装模块，也不要用 PowerShell `Compress-Archive` 直接打包。应使用 `scripts/build-local-module.ps1` 生成 store/no compression zip，再安装，避免设备侧安装器在部分环境中把脚本条目解成 0 字节：
 
 ```powershell
-adb -s $Serial push build\storage.redirect.x-v<version>.zip /data/local/tmp/storage.redirect.x-local.zip
+adb -s $Serial push build\test-flow\assets\storage.redirect.x-v<version>-arm64-v8a.zip /data/local/tmp/storage.redirect.x-local.zip
 adb -s $Serial shell "su -c 'rm -rf /data/adb/modules_update/storage.redirect.x'"
 adb -s $Serial shell "su -c '/data/adb/ksu/bin/ksud module install /data/local/tmp/storage.redirect.x-local.zip'"
 ```

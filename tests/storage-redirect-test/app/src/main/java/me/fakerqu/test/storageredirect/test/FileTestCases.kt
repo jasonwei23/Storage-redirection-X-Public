@@ -4,6 +4,7 @@ import android.app.DownloadManager
 import android.content.Context
 import android.net.Uri
 import android.os.SystemClock
+import android.system.Os
 import android.system.OsConstants
 import java.io.File
 import java.io.RandomAccessFile
@@ -42,7 +43,7 @@ class FileTestCases(
               metadata = mapOf("path" to dirPath),
           )
         }
-        val listed = dir.listFiles()?.toList().orEmpty()
+        val listed = dir.listFilesOrFail().toList()
         val entries =
             listed.map { file -> file.name.ifBlank { "." } }.sorted().take(MAX_LISTED_ENTRIES)
         TestCase.FILE_LIST_DIR.pass(
@@ -72,9 +73,9 @@ class FileTestCases(
               metadata = mapOf("path" to dirPath),
           )
         }
-        val children = root.listFiles()?.filter(File::isDirectory).orEmpty()
+        val children = root.listFilesOrFail().filter(File::isDirectory)
         var listedEntries = 0
-        children.forEach { child -> listedEntries += child.listFiles()?.size ?: 0 }
+        children.forEach { child -> listedEntries += child.listFilesOrFail().size }
         TestCase.FILE_LIST_DIR_TREE.pass(
             message = "directory tree listed",
             metadata =
@@ -110,13 +111,6 @@ class FileTestCases(
         val targetPath =
             args.requireFilePath(TestCase.FILE_READ)
                 ?: return@measure args.missingPathResult(TestCase.FILE_READ)
-        val target = File(targetPath)
-        if (!target.isFile) {
-          return@measure TestCase.FILE_READ.fail(
-              message = "file does not exist [" + mountInfoSnapshot().take(1200) + "]",
-              metadata = mapOf("path" to targetPath),
-          )
-        }
         val readBack = api.readFile(targetPath).use { it.readBytes() }
         val expected = args.expectedPayload
         if (expected != null && !readBack.contentEquals(expected)) {
@@ -283,6 +277,7 @@ class FileTestCases(
             it.flush()
           }
         } catch (e: Exception) {
+          if (!isAccessDenied(e)) throw e
           return@measure TestCase.FILE_WRITE_DENIED.pass(
               message = "write denied as expected",
               metadata = pathMetadata(targetPath) + exceptionMetadata(e),
@@ -329,21 +324,16 @@ class FileTestCases(
           )
         }
         try {
-          val deleted = api.deleteFile(targetPath)
-          if (deleted || !target.exists()) {
-            return@measure TestCase.FILE_DELETE_DENIED.fail(
-                message = "delete unexpectedly succeeded",
-                metadata = pathMetadata(targetPath),
-            )
-          }
+          Os.remove(targetPath)
         } catch (e: Exception) {
+          if (!isAccessDenied(e)) throw e
           return@measure TestCase.FILE_DELETE_DENIED.pass(
               message = "delete denied as expected",
               metadata = pathMetadata(targetPath) + exceptionMetadata(e),
           )
         }
-        TestCase.FILE_DELETE_DENIED.pass(
-            message = "delete denied as expected",
+        TestCase.FILE_DELETE_DENIED.fail(
+            message = "delete unexpectedly succeeded",
             metadata = pathMetadata(targetPath),
         )
       }
@@ -387,22 +377,29 @@ class FileTestCases(
           )
         }
         try {
-          val created = api.mkdir(dirPath)
-          if (created || dir.exists()) {
-            return@measure TestCase.FILE_MKDIR_DENIED.fail(
-                message = "mkdir unexpectedly succeeded",
-                metadata = pathMetadata(dirPath),
-            )
-          }
+          Os.mkdir(dirPath, OsConstants.S_IRWXU)
         } catch (e: Exception) {
+          if (!isAccessDenied(e)) throw e
           return@measure TestCase.FILE_MKDIR_DENIED.pass(
               message = "mkdir denied as expected",
               metadata = pathMetadata(dirPath) + exceptionMetadata(e),
           )
         }
-        TestCase.FILE_MKDIR_DENIED.pass(
-            message = "mkdir denied as expected",
+        TestCase.FILE_MKDIR_DENIED.fail(
+            message = "mkdir unexpectedly succeeded",
             metadata = pathMetadata(dirPath),
+        )
+      }
+
+  fun mutationLifecycle(args: TestCaseArgs): TestResult =
+      TestCase.FILE_MUTATION_LIFECYCLE.measure {
+        val root =
+            args.requireFileDirOrPath(TestCase.FILE_MUTATION_LIFECYCLE)
+                ?: return@measure args.missingDirOrPathResult(TestCase.FILE_MUTATION_LIFECYCLE)
+        runFileMutationLifecycle(File(root))
+        TestCase.FILE_MUTATION_LIFECYCLE.pass(
+            message = "mutation lifecycle completed",
+            metadata = pathMetadata(root),
         )
       }
 
@@ -502,21 +499,16 @@ class FileTestCases(
           )
         }
         try {
-          val renamed = api.renameFile(fromPath, toPath)
-          if (renamed || !source.exists() || target.exists()) {
-            return@measure TestCase.FILE_RENAME_DENIED.fail(
-                message = "rename unexpectedly succeeded",
-                metadata = renameMetadata(fromPath, toPath),
-            )
-          }
+          Os.rename(fromPath, toPath)
         } catch (e: Exception) {
+          if (!isAccessDenied(e)) throw e
           return@measure TestCase.FILE_RENAME_DENIED.pass(
               message = "rename denied as expected",
               metadata = renameMetadata(fromPath, toPath) + exceptionMetadata(e),
           )
         }
-        TestCase.FILE_RENAME_DENIED.pass(
-            message = "rename denied as expected",
+        TestCase.FILE_RENAME_DENIED.fail(
+            message = "rename unexpectedly succeeded",
             metadata = renameMetadata(fromPath, toPath),
         )
       }
@@ -620,10 +612,9 @@ class FileTestCases(
   }
 
   /**
-   * 通过 DownloadManager 入队一个下载任务，由下载提供器（com.android.providers.downloads， 监视桥接进程）在自己的进程内创建目标文件。
+   * 通过 DownloadManager 入队下载，由下载提供器在自己的进程内创建目标文件。
    *
-   * 这是验证「桥接进程自身配置了 sandboxed_paths」时写入必须进沙盒的触发器： 测试应用未被配置重定向，仅负责预建真实父目录并驱动入队；目标文件由提供器创建，
-   * 实际落点（真实公共路径 vs 提供器沙盒后端）由场景脚本断言。
+   * 测试 APP 负责准备目标父目录并轮询下载状态；文件落点由场景脚本断言。
    */
   fun downloadManagerEnqueue(args: TestCaseArgs): TestResult =
       TestCase.DOWNLOADMANAGER_ENQUEUE.measure {
@@ -774,7 +765,7 @@ class FileTestCases(
             api.truncateFile(targetPath, length)
           }
         } catch (e: Exception) {
-          return@measure if (expectDenied) {
+          return@measure if (expectDenied && isAccessDenied(e)) {
             testCase.pass(
                 message = "truncate denied as expected",
                 metadata = pathMetadata(targetPath) + exceptionMetadata(e),
@@ -839,7 +830,7 @@ class FileTestCases(
             api.chmodFile(targetPath, mode)
           }
         } catch (e: Exception) {
-          return@measure if (expectDenied) {
+          return@measure if (expectDenied && isAccessDenied(e)) {
             testCase.pass(
                 message = "chmod denied as expected",
                 metadata = pathMetadata(targetPath) + exceptionMetadata(e),
@@ -890,7 +881,7 @@ class FileTestCases(
             api.linkFile(fromPath, toPath)
           }
         } catch (e: Exception) {
-          return@measure if (expectDenied) {
+          return@measure if (expectDenied && isAccessDenied(e)) {
             testCase.pass(
                 message = "link denied as expected",
                 metadata = renameMetadata(fromPath, toPath) + exceptionMetadata(e),

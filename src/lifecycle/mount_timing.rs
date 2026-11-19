@@ -1,16 +1,5 @@
-// 应用侧等待「重定向挂载是否落定」的轮询预算。
-//
-// 这个等待跑在应用主线程上（zygisk specialize 之后），而 AMS 的进程启动超时约 10 秒。
-// 旧值 220 × 50ms = 11 秒，单独就超过了启动超时线：只要挂载判据没能立刻给出肯定答案
-// （命名空间后端的 bind 挂载就属于这类），应用会在等待里被 AMS 判 start timeout 杀掉，
-// 表现为所有依赖文件系统的用例超时。
-//
-// 实测挂载通常在请求发出后 ~200ms 内就已落定，这个等待实际只是「确认集合稳定」而非
-// 「等待挂载建立」——companion 路径的父进程在此之前已经等过子进程的挂载结果。因此把预算
-// 收到 600ms（20ms × 30 轮）：足够覆盖正常波动与落定确认，又远低于启动超时线，即使判据
-// 完全不成立也不会把应用拖死。
-pub(crate) const POST_MOUNT_STATUS_POLL_COUNT: i32 = 30;
-pub(crate) const POST_MOUNT_STATUS_POLL_DELAY_US: u32 = 20 * 1000;
+// Zygisk 应用主线程只观测挂载就绪，不阻塞等待；Hyos 同步请求使用 companion 给出的预算。
+
 pub(crate) const POST_SPECIALIZE_SLOW_MS: i64 = 20;
 
 // 父进程等待挂载结果的超时。之前的 2s 在高负载/FUSE 异常场景下
@@ -22,10 +11,18 @@ pub(crate) const COMPANION_PARENT_RECV_GRACE_TIMEOUT_SEC: i64 = 1;
 pub(crate) const COMPANION_PROCESS_READY_TIMEOUT_MS: i32 = 5000;
 pub(crate) const COMPANION_MOUNT_SLOW_MS: i64 = 20;
 pub(crate) const FUSE_READY_TIMEOUT_SEC: i64 = 4;
+pub(crate) const BARRIER_WAIT_TIMEOUT_MS: i64 = 2_000;
 
-pub(crate) fn post_mount_status_wait_budget_ms() -> i64 {
-    (POST_MOUNT_STATUS_POLL_COUNT as i64).saturating_mul(POST_MOUNT_STATUS_POLL_DELAY_US as i64)
-        / 1000
+/// Hyos 的同步等待覆盖就绪、宿主登记、两轮屏障与挂载子进程预算，另留两秒收尾。
+pub(crate) fn hyos_mount_timeout_ms(roots: usize, host_wait_ms: u64) -> Option<i32> {
+    let roots = i64::try_from(roots).ok()?;
+    let barriers = roots.checked_mul(BARRIER_WAIT_TIMEOUT_MS)?.checked_mul(2)?;
+    let total = i64::from(COMPANION_PROCESS_READY_TIMEOUT_MS)
+        .checked_add(i64::try_from(host_wait_ms).ok()?)?
+        .checked_add(companion_parent_recv_budget_sec(roots as usize).checked_mul(1000)?)?
+        .checked_add(barriers)?
+        .checked_add(2_000)?;
+    i32::try_from(total).ok()
 }
 
 pub(crate) fn companion_parent_recv_budget_sec(scoped_fuse_root_count: usize) -> i64 {
@@ -37,3 +34,7 @@ pub(crate) fn companion_parent_recv_primary_timeout_sec(scoped_fuse_root_count: 
     COMPANION_PARENT_RECV_PRIMARY_TIMEOUT_SEC
         .saturating_add(FUSE_READY_TIMEOUT_SEC.saturating_mul(scoped_fuse_root_count as i64))
 }
+
+#[cfg(test)]
+#[path = "../../tests/native-unit/mount_timing.rs"]
+mod tests;

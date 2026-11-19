@@ -1,4 +1,4 @@
-﻿param(
+param(
     [string]$Serial = $env:ANDROID_SERIAL,
     [string]$AppId = "me.fakerqu.test.storageredirect",
     [switch]$SkipBasicAll,
@@ -7,6 +7,8 @@
 )
 
 $ErrorActionPreference = "Stop"
+[Console]::OutputEncoding = [Text.UTF8Encoding]::new($false)
+$OutputEncoding = [Console]::OutputEncoding
 
 if ([string]::IsNullOrWhiteSpace($Serial)) {
     $devices = @(& adb devices | Select-Object -Skip 1 | Where-Object { $_ -match "`tdevice" })
@@ -20,6 +22,10 @@ if ([string]::IsNullOrWhiteSpace($Serial)) {
 $Action = "me.fakerqu.test.storageredirection.TEST_CASE"
 $Config = "/data/adb/modules/storage.redirect.x/config/apps/$AppId.json"
 $ReadOnlyOwnerConfig = "/data/adb/modules/storage.redirect.x/config/apps/com.android.settings.json"
+# 场景 44 的「另一个应用」配置。必须落在**已安装**包的配置路径上：daemon 只统计能解析
+# 出包名的配置（给不存在的包写配置时 `app configs found n=0`，指纹不变、不会 reconcile）。
+# 这里借用跨应用只读夹具的包，但两份载荷都是 enabled:false，不会给它建立挂载。
+$MonitorTriggerConfig = "/data/adb/modules/storage.redirect.x/config/apps/com.android.settings.json"
 $GlobalConfig = "/data/adb/modules/storage.redirect.x/config/global.json"
 $LogPath = "/data/adb/modules/storage.redirect.x/logs/running.log"
 $FileMonitorLogPath = "/data/adb/modules/storage.redirect.x/logs/file_monitor.log"
@@ -28,7 +34,7 @@ $ResultDir = "/sdcard/Android/data/$AppId/files/test_case_result"
 $InternalResultDir = "/data/data/$AppId/files/test_case_result"
 $RealRoot = "/storage/emulated/0"
 
-# 测试流产物统一落盘目录（AGENTS.md「临时文件管理」规范）：temp/test-flow/<启动时间戳>/。
+# 测试流产物统一落盘目录（仓库规范「临时文件管理」）：temp/test-flow/<启动时间戳>/。
 # 诊断文件一律写到这里，不得散落在仓库根目录；同一天多轮测试互不覆盖。
 if ($env:SRT_ARTIFACT_DIR) {
     $script:ArtifactDir = $env:SRT_ARTIFACT_DIR
@@ -125,16 +131,12 @@ $PrivateMediaStoreRoutingProbeRoot = "$PrivateRoot/Documents/SrtMediaRoutingProb
 $RuleSandboxRoot = "$RealRoot/SrtRuleSandbox"
 $BackendRuleSandboxRoot = "$BackendRoot/SrtRuleSandbox"
 $PrivateRuleSandboxRoot = "$BackendPrivateRoot/SrtRuleSandbox"
-# 场景 38：下载提供器（监视桥接进程）自身配置 sandboxed_paths 的回归夹具。
-# 真实父目录由测试应用预建，目标文件由提供器在自己的进程内创建，实际落点是断言对象。
+# 场景 38：下载提供器自身 sandboxed_paths 接管拓扑夹具目录。
 $ProviderPackage = "com.android.providers.downloads"
 $ProviderConfig = "/data/adb/modules/storage.redirect.x/config/apps/$ProviderPackage.json"
 $ProviderProbeRel = "Download/SrtDlProbe"
-$ProviderProbeFile = "srx_probe_download.txt"
 $ProviderRealDir = "$RealRoot/$ProviderProbeRel"
 $ProviderBackendDir = "$BackendRoot/Android/data/$ProviderPackage/sdcard/$ProviderProbeRel"
-$ProviderBackendFile = "$ProviderBackendDir/$ProviderProbeFile"
-$ProviderRealFile = "$BackendRoot/$ProviderProbeRel/$ProviderProbeFile"
 # 场景 39：下载提供器（共享 uid 代写者）按发起者规则重定向的归因夹具。
 # 测试应用作为下载发起者配置 path_mappings；下载提供器引擎写的公共路径必须
 # 按发起者的映射落到映射目标，真实请求路径零穿透。
@@ -144,18 +146,23 @@ $DlOwnerProbeFile = "srt_dl_owner_probe.bin"
 $DlOwnerRequestFile = "$RealRoot/$DlOwnerRequestRel/$DlOwnerProbeFile"
 $DlOwnerRequestBackendFile = "$BackendRoot/$DlOwnerRequestRel/$DlOwnerProbeFile"
 $DlOwnerMappedBackendFile = "$BackendRoot/$DlOwnerMappedRel/$DlOwnerProbeFile"
-# 下载用例的取数 URL 覆盖：默认空 = 场景内启动本地回环 HTTP 服务。
+# 下载用例的取数 URL 覆盖：默认空 = 模拟器使用本地服务，真机使用测试 APP 内置 URL。
 $SrtDownloadUrl = if ($env:SRT_DOWNLOAD_URL) { $env:SRT_DOWNLOAD_URL } else { "" }
 # 场景 40：系统 uid 的 FUSE 写入按发起服务归因夹具。
 $UidAttribRel = "Download/SrtUidAttrib"
 $UidAttribProbeRel = "Download/SrtUidAttrib/srt_uid_probe_dir"
-# 场景 40 第三段：系统 uid（shell 2000）自身配置沙盒、真实目标缺失、经 MediaProvider
-# 建目录，请求路径零穿透（与 .sh 同名夹具一致）。
+# 场景 40 第三段：shell 执行者不借用 com.android.shell 的应用沙盒规则。
 $ShellPackage = "com.android.shell"
 $ShellConfig = "/data/adb/modules/storage.redirect.x/config/apps/$ShellPackage.json"
 $ShellSandboxRel = "Download/SrtShellSandbox"
 $ShellSandboxRealDir = "$BackendRoot/$ShellSandboxRel"
 $ShellSandboxBackendDir = "$BackendRoot/Android/data/$ShellPackage/sdcard/$ShellSandboxRel"
+# 场景 41：模块自建沙盒根（重定向根 `Android/data/<pkg>/sdcard`）的原生元数据与系统代写
+# 零穿透夹具。沙盒根由模块在 FUSE 会话初始化时创建，组必须来自父目录 setgid 继承；否则
+# 系统代写进程（MediaProvider，附加组 media_rw/ext_data_rw）遍历时 EACCES，写入回退到
+# 真实公共路径——真机 2026-11-09 的 `Documents/ringtone/gamefree/...` 即此形态。
+$SandboxRootMetadataRel = "Documents/SrtSandboxRootProbe"
+$SandboxRootMetadataFile = "srt_sandbox_root_probe.txt"
 $RuleSiblingRoot = "$RealRoot/DCIM/SrtRuleSibling"
 $BackendRuleSiblingRoot = "$BackendRoot/DCIM/SrtRuleSibling"
 $PrivateRuleSiblingRoot = "$BackendPrivateRoot/DCIM/SrtRuleSibling"
@@ -220,6 +227,50 @@ function Invoke-Adb {
     & adb -s $Serial @Arguments | ForEach-Object { $_ -replace "`r", "" }
 }
 
+function Invoke-AdbWithTimeout {
+    param([string[]]$Arguments, [int]$TimeoutSeconds)
+
+    $startInfo = [System.Diagnostics.ProcessStartInfo]::new()
+    $startInfo.FileName = (Get-Command adb -ErrorAction Stop).Source
+    $startInfo.UseShellExecute = $false
+    $startInfo.RedirectStandardOutput = $true
+    $startInfo.RedirectStandardError = $true
+    $startInfo.CreateNoWindow = $true
+    foreach ($argument in (@("-s", $Serial) + $Arguments)) {
+        [void]$startInfo.ArgumentList.Add([string]$argument)
+    }
+
+    $process = [System.Diagnostics.Process]::new()
+    $process.StartInfo = $startInfo
+    try {
+        if (-not $process.Start()) { throw "无法启动 adb。" }
+        $stdout = $process.StandardOutput.ReadToEndAsync()
+        $stderr = $process.StandardError.ReadToEndAsync()
+        $timedOut = -not $process.WaitForExit($TimeoutSeconds * 1000)
+        if ($timedOut) {
+            try { $process.Kill($true) } catch {
+                if (-not $process.HasExited) { $process.Kill() }
+            }
+            $process.WaitForExit()
+        }
+        $output = @($stdout.GetAwaiter().GetResult(), $stderr.GetAwaiter().GetResult()) -join "`n"
+        [pscustomobject]@{
+            ExitCode = if ($timedOut) { 124 } else { $process.ExitCode }
+            Output = $output.Replace("`r", "").TrimEnd()
+        }
+    } finally {
+        $process.Dispose()
+    }
+}
+
+function Start-TestApp {
+    param([switch]$Wait)
+    $arguments = @("shell", "am", "start")
+    if ($Wait) { $arguments += "-W" }
+    $result = Invoke-AdbWithTimeout -Arguments ($arguments + @("-n", "$AppId/.MainActivity")) -TimeoutSeconds 90
+    if ($result.ExitCode -ne 0) { throw "测试应用启动失败 exit=$($result.ExitCode)：$($result.Output)" }
+}
+
 function Invoke-Su {
     param([string]$Command)
     $normalized = $Command.Replace("`r", "")
@@ -233,6 +284,24 @@ function Test-Su {
     $escaped = $normalized.Replace("'", "'\''")
     & adb -s $Serial shell "su -c '$escaped'" | Out-Null
     $LASTEXITCODE -eq 0
+}
+
+function Grant-TestAppStoragePermissions {
+    $helper = Get-Content -LiteralPath (Join-Path $PSScriptRoot "grant-storage-test-permissions.sh") -Raw
+    $encoded = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($helper.Replace("`r", "")))
+    $escapedAppId = $AppId.Replace("'", "'\''")
+    Invoke-Adb @("shell", "printf '%s' '$encoded' | base64 -d | sh -s -- '$escapedAppId'") | Write-Host
+    if ($LASTEXITCODE -ne 0) { throw "测试应用存储权限准备失败：$AppId" }
+}
+
+function Set-DownloadTestNetwork {
+    param([ValidateSet("prepare", "restore")][string]$Action)
+    $helper = Get-Content -LiteralPath (Join-Path $PSScriptRoot "prepare-download-test-network.sh") -Raw
+    $encoded = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($helper.Replace("`r", "")))
+    $command = "printf %s $encoded | base64 -d | sh -s -- $Action"
+    $result = Invoke-AdbWithTimeout -Arguments @("shell", "su -c '$command'") -TimeoutSeconds 60
+    $result.Output | Write-Host
+    if ($result.ExitCode -ne 0) { throw "下载测试网络 $Action 失败：$($result.Output)" }
 }
 
 # 两种运行器共用设备端原子目录锁；先持锁再备份，清理完成后才释放。
@@ -254,7 +323,9 @@ function Enter-DeviceRunLock {
 function Exit-DeviceRunLock {
     if (-not $script:DeviceRunLockHeld) { return }
     if (-not (Test-Su "test `"`$(cat '$script:DeviceRunLockPath/owner' 2>/dev/null)`" = '$script:DeviceRunLockToken' && rm '$script:DeviceRunLockPath/owner' && rmdir '$script:DeviceRunLockPath'")) {
-        Write-Warning "设备测试锁释放失败或归属已变更，保留现场：$script:DeviceRunLockPath"
+        $script:ExitCode = 1
+        $script:Failures.Add("cleanup/device_lock: 设备测试锁释放失败或归属已变更")
+        Write-Host "FAIL [cleanup] step=device_lock path=$script:DeviceRunLockPath"
     }
     $script:DeviceRunLockHeld = $false
 }
@@ -278,6 +349,20 @@ function Clear-CrossAppReadOnlyConfig {
     Invoke-Su "rm -f '$ReadOnlyOwnerConfig'" | Out-Null
 }
 
+function Write-MonitorTriggerConfig {
+    # 与目标应用无关的一份配置：配置指纹变化 → daemon 走全量 reconcile，
+    # 未配置规则的应用在那一轮被 monitor-only 会话接管（应用侧只在 should_redirect
+    # 时才发挂载请求，冷启动不会自己接管）。
+    # 默认载荷只用于让 step 1 的配置生效等待拿到 apps≥1 的信号；触发接管时要换成
+    # 另一份载荷，内容不同才会真正改变指纹。
+    param([string]$Json = '{"users":{"0":{"enabled":false}}}')
+    $encoded = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($Json))
+    Invoke-Su "mkdir -p /data/adb/modules/storage.redirect.x/config/apps; printf '%s' '$encoded' | base64 -d > '$MonitorTriggerConfig.tmp.$PID'; mv -f '$MonitorTriggerConfig.tmp.$PID' '$MonitorTriggerConfig'; chmod 644 '$MonitorTriggerConfig'" | Out-Null
+}
+function Clear-MonitorTriggerConfig {
+    Invoke-Su "rm -f '$MonitorTriggerConfig'" | Out-Null
+}
+
 function Clear-ProviderSandboxConfig {
     # 场景 38 使用的下载提供器专属配置；其余场景不得残留，避免桥接进程
     # 在后续场景重启时带上意外的沙盒规则。
@@ -298,7 +383,7 @@ function Get-TestGlobalConfig {
     )
     $fileMonitorEnabledValue = if ($null -ne $FileMonitorEnabled) { [bool]$FileMonitorEnabled } else { $script:FileMonitorEnabled }
     $fileMonitor = if ($fileMonitorEnabledValue) { "true" } else { "false" }
-    '{"file_monitor_enabled":' + $fileMonitor + ',"fuse_fix_enabled":true,"storage_backend_mode":"auto","verbose_logging_enabled":true,"auto_enable_redirect_for_new_apps":false,"auto_enable_new_apps_template_id":"","app_config_auto_save":false}'
+    '{"file_monitor_enabled":' + $fileMonitor + ',"fuse_fix_enabled":true,"storage_backend_mode":"' + $StorageBackendMode + '","verbose_logging_enabled":true,"auto_enable_redirect_for_new_apps":false,"auto_enable_new_apps_template_id":"","app_config_auto_save":false}'
 }
 
 function Set-BackendConfig {
@@ -325,7 +410,7 @@ function Backup-GlobalConfig {
 function Restore-GlobalConfig {
     if (-not $script:GlobalConfigBackupReady) { return }
     if ($script:OriginalGlobalConfigExists -and -not [string]::IsNullOrWhiteSpace($script:OriginalGlobalConfigBase64)) {
-        Invoke-Su "printf '%s' '$script:OriginalGlobalConfigBase64' | base64 -d > '$GlobalConfig'; chmod 644 '$GlobalConfig'" | Out-Null
+        Invoke-Su "printf '%s' '$script:OriginalGlobalConfigBase64' | base64 -d > '$GlobalConfig' && chmod 644 '$GlobalConfig'" | Out-Null
     } else {
         Invoke-Su "rm -f '$GlobalConfig'" | Out-Null
     }
@@ -346,7 +431,7 @@ function Backup-AppConfig {
 function Restore-AppConfig {
     if (-not $script:AppConfigBackupReady) { return }
     if ($script:OriginalAppConfigExists -and -not [string]::IsNullOrWhiteSpace($script:OriginalAppConfigBase64)) {
-        Invoke-Su "mkdir -p /data/adb/modules/storage.redirect.x/config/apps; printf '%s' '$script:OriginalAppConfigBase64' | base64 -d > '$Config'; chmod 644 '$Config'" | Out-Null
+        Invoke-Su "mkdir -p /data/adb/modules/storage.redirect.x/config/apps && printf '%s' '$script:OriginalAppConfigBase64' | base64 -d > '$Config' && chmod 644 '$Config'" | Out-Null
     } else {
         Invoke-Su "rm -f '$Config'" | Out-Null
     }
@@ -367,7 +452,7 @@ function Backup-CrossAppConfig {
 function Restore-CrossAppConfig {
     if (-not $script:CrossAppConfigBackupReady) { return }
     if ($script:OriginalCrossAppConfigExists -and -not [string]::IsNullOrWhiteSpace($script:OriginalCrossAppConfigBase64)) {
-        Invoke-Su "mkdir -p /data/adb/modules/storage.redirect.x/config/apps; printf '%s' '$script:OriginalCrossAppConfigBase64' | base64 -d > '$ReadOnlyOwnerConfig'; chmod 644 '$ReadOnlyOwnerConfig'" | Out-Null
+        Invoke-Su "mkdir -p /data/adb/modules/storage.redirect.x/config/apps && printf '%s' '$script:OriginalCrossAppConfigBase64' | base64 -d > '$ReadOnlyOwnerConfig' && chmod 644 '$ReadOnlyOwnerConfig'" | Out-Null
     } else {
         Clear-CrossAppReadOnlyConfig
     }
@@ -393,33 +478,35 @@ function Prepare-DeviceExecutionState {
 
 function Restore-DeviceExecutionState {
     if (-not $script:DeviceExecutionStateBackupReady) { return }
+    $ok = $true
     if (-not $script:OriginalDeviceIdleWhitelist) {
         Invoke-Adb @("shell", "cmd", "deviceidle", "whitelist", "-$AppId") | Out-Null
+        $ok = ($LASTEXITCODE -eq 0) -and $ok
     }
     Invoke-Adb @("shell", "am", "set-inactive", $AppId, $script:OriginalAppInactive.ToString().ToLowerInvariant()) | Out-Null
+    $ok = ($LASTEXITCODE -eq 0) -and $ok
     if ([string]::IsNullOrWhiteSpace($script:OriginalStayOnWhilePluggedIn) -or $script:OriginalStayOnWhilePluggedIn -eq "null") {
         Invoke-Adb @("shell", "settings", "delete", "global", "stay_on_while_plugged_in") | Out-Null
     } else {
         Invoke-Adb @("shell", "settings", "put", "global", "stay_on_while_plugged_in", $script:OriginalStayOnWhilePluggedIn) | Out-Null
     }
+    if ($LASTEXITCODE -ne 0 -or -not $ok) { throw "设备执行状态恢复失败" }
 }
 
 function Test-FuseBackendScenarioSupport {
-    # 所有场景都使用 auto；是否实际启用 FUSE 由运行时日志和 mountinfo 记录。
+    # 不按 FUSE 能力预先跳过场景；实际后端以运行时日志和 mountinfo 为准。
     return $true
 }
 
 function Remove-ExcludedScenarios {
-    # 版本级场景排除（语义与 sh 版的 prune_version_scenario_excludes 一致）：只剔除、
-    # 不替换，默认范围保持全场景。CI 用 sh 版，本地 pwsh 验证需要同一套排除能力，
-    # 否则模拟 A17 这类「无外网不能验证下载场景」的形态只能靠手改矩阵。
+    # 与 sh 版一致：只剔除调用方指定的场景，不替换默认范围。
     param([int[]]$ScenarioList)
     $excludeRaw = $env:SRT_VERSION_SCENARIO_EXCLUDE
     if ([string]::IsNullOrWhiteSpace($excludeRaw)) { return $ScenarioList }
     $excluded = New-Object System.Collections.Generic.List[int]
     foreach ($part in @($excludeRaw -split "[,\s;]+" | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })) {
         $value = 0
-        if (-not [int]::TryParse($part, [ref]$value) -or $value -lt 1 -or $value -gt 40) {
+        if (-not [int]::TryParse($part, [ref]$value) -or $value -lt 1 -or $value -gt 44) {
             throw "无效排除场景：$part"
         }
         $excluded.Add($value) | Out-Null
@@ -432,20 +519,20 @@ function Remove-ExcludedScenarios {
 function Get-ScenarioList {
     $requested = New-Object System.Collections.Generic.List[int]
     foreach ($scenario in $Scenarios) {
-        if ($scenario -lt 1 -or $scenario -gt 40) { throw "无效场景：$scenario" }
+        if ($scenario -lt 1 -or $scenario -gt 44) { throw "无效场景：$scenario" }
         $requested.Add($scenario) | Out-Null
     }
     if ($requested.Count -eq 0 -and -not [string]::IsNullOrWhiteSpace($env:SRT_SCENARIOS)) {
         $parts = @($env:SRT_SCENARIOS -split "[,\s;]+" | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
         if ($parts.Count -eq 1 -and $parts[0] -eq "all") {
-            return @(Remove-ExcludedScenarios -ScenarioList @(1..40))
+            return @(Remove-ExcludedScenarios -ScenarioList @(1..44))
         }
         if ($parts -contains "all") {
             throw "all 选择器不能与其它场景号混用"
         }
         foreach ($part in $parts) {
             $scenario = [int]$part
-            if ($scenario -lt 1 -or $scenario -gt 40) { throw "无效场景：$scenario" }
+            if ($scenario -lt 1 -or $scenario -gt 44) { throw "无效场景：$scenario" }
             $requested.Add($scenario) | Out-Null
         }
     }
@@ -453,9 +540,8 @@ function Get-ScenarioList {
         return @(Remove-ExcludedScenarios -ScenarioList @($requested | Select-Object -Unique))
     }
 
-    # 默认范围即全场景 1-40：旧实现维护了一份手写清单且停在 37，本地全量验证实际
-    # 漏跑 38-40，与 CI 的 seq 1 40 不一致。
-    @(Remove-ExcludedScenarios -ScenarioList @(1..40))
+    # 默认范围与显式 all 使用同一完整范围，避免手写清单漏掉新增场景。
+    @(Remove-ExcludedScenarios -ScenarioList @(1..44))
 }
 
 function Apply-ScenarioConfig {
@@ -520,7 +606,7 @@ function Apply-ScenarioConfig {
         }
         { $_ -in @(26, 27) } {
             Set-BackendConfig -Mode "auto" -FileMonitorEnabled $true
-            Write-DeviceConfig '{"users":{"0":{"enabled":true,"allowed_real_paths":["Download/SrtMonitor","DCIM","Pictures"],"read_only_paths":["Download/SrtMonitorLocked","!Download/SrtMonitorLocked/Writable"],"path_mappings":{"Download/SrtMonitorMap":"Download/SrtMonitorMapped"}}}}'
+            Write-DeviceConfig '{"users":{"0":{"enabled":true,"allowed_real_paths":["Download/SrtMonitor","DCIM","Pictures"],"read_only_paths":["Download/SrtMonitorLocked","!Download/SrtMonitorLocked/Writable"],"path_mappings":{"Download/SrtMonitorMap":"Download/SrtMonitorMapped","DCIM/Camera":"Pictures/SrtMonitorDing"}}}}'
             Write-CrossAppReadOnlyConfig
         }
         28 { Write-DeviceConfig '{"users":{"0":{"enabled":true,"read_only_paths":["Pictures/SrtReadOnlyMedia"]}}}' }
@@ -559,6 +645,28 @@ function Apply-ScenarioConfig {
             Write-GlobalConfig '{"file_monitor_enabled":true,"fuse_fix_enabled":true,"storage_backend_mode":"auto","verbose_logging_enabled":true,"auto_enable_redirect_for_new_apps":false,"auto_enable_new_apps_template_id":"","app_config_auto_save":false}'
             Write-DeviceConfig '{"users":{"0":{"enabled":false}}}'
         }
+        41 {
+            # 与场景 2 同一条默认重定向（沙盒根就是重定向根），差别在于本场景在重启应用
+            # 之前把沙盒根删掉，让模块按原生语义重建它，再验证系统代写链路。
+            Write-DeviceConfig '{"users":{"0":{"enabled":true}}}'
+        }
+        42 {
+            Write-DeviceConfig '{"users":{"0":{"enabled":true,"allowed_real_paths":["Download/SrtMutationAllowed"],"path_mappings":{"Download/SrtMutationRequest":"Download/SrtMutationMapped"}}}}'
+        }
+        43 {
+            # 通配放行整根：视图根由模块 FUSE 接管，且根目录枚举逐条落到真实后端，
+            # 正是根级隐藏判据被触发的那条路径。
+            Write-DeviceConfig '{"users":{"0":{"enabled":true,"allowed_real_paths":["*"]}}}'
+        }
+        44 {
+            # 现场链路：应用没有配置文件（不是 enabled:false——那种被判为 Disable，
+            # 设计上就停在系统视图），只靠全局文件监视被 daemon 以 monitor-only 会话接管。
+            # 触发器必须在 step 1 就存在：配置生效等待只认 `apps=[1-9]`，而本场景的
+            # 目标应用刻意没有配置。
+            Write-GlobalConfig (Get-TestGlobalConfig 'auto' $true)
+            Invoke-Su "rm -f '$Config'" | Out-Null
+            Write-MonitorTriggerConfig
+        }
         default { throw "未知场景 $Scenario" }
     }
 }
@@ -577,22 +685,39 @@ function Wait-ServiceResult {
 
     $pollSeconds = [Math]::Max(0.05, $script:ResultPollMilliseconds / 1000.0).ToString("0.###", [Globalization.CultureInfo]::InvariantCulture)
     $command = @"
-marker_mtime=`$(stat -c %Y '$FreshnessMarker' 2>/dev/null || echo 0)
+test -f '$FreshnessMarker' || exit 1
 deadline=`$(date +%s); deadline=`$((deadline + $TimeoutSeconds));
 while [ `$(date +%s) -lt `$deadline ]; do
   for file in '$ResultDir/result_current.txt' '$InternalResultDir/result_current.txt' '$BackendResultDir/result_current.txt' '$SandboxResultDir/result_current.txt' `$(find '$BackendRoot/Android/data/$AppId' '/data/data/$AppId' -path '*/files/test_case_result/result_current.txt' -type f 2>/dev/null); do
-    if [ -s "`$file" ]; then
-      file_mtime=`$(stat -c %Y "`$file" 2>/dev/null || echo 0)
-      [ "`$file_mtime" -ge "`$marker_mtime" ] || continue
-      if [ '$ExpectedTestCase' != 'all' ]; then
-        line_count=`$(grep -cve '^[[:space:]]*`$' "`$file" 2>/dev/null || true)
-        grep -Eq '^(PASS|FAIL) \[$ExpectedTestCase\]' "`$file" || continue
-        [ "`$line_count" -eq 1 ] || continue
-      fi
-      printf '%s\n' "__SRT_RESULT_PATH__=`$file"
-      cat "`$file"
-      exit 0
-    fi
+    [ -s "`$file" ] && [ "`$file" -nt '$FreshnessMarker' ] || continue
+    result=`$(awk -v expected='$ExpectedTestCase' -v expected_token='$FreshnessMarker' '
+      { text=text `$0 "\n" }
+      /^__SRT_RESULT_TOKEN__=/ {
+        if (token++ || complete != 1 || `$0 != "__SRT_RESULT_TOKEN__=" expected_token) invalid=1
+        next
+      }
+      /^__SRT_RESULT_END__=[0-9]+`$/ {
+        if (complete++ || `$0 != "__SRT_RESULT_END__=" count || count < 1) invalid=1
+        next
+      }
+      {
+        if (`$0 ~ /[[:cntrl:]]/) invalid=1
+        if (complete || `$0 !~ /^(PASS|FAIL) \[[a-z_]+\] / || seen[`$2]++) invalid=1
+        if (expected != "all" && `$2 != "[" expected "]") invalid=1
+        if (expected == "all") {
+          if (`$1 == "FAIL" && `$2 == "[all]") fatal=1
+          else if (`$2 !~ /^\[(mediastore_(create|read|write)_(image|video|audio|file|download)|file_(list_dir|create|read|write|write_then_overwrite|overwrite|stat|access|truncate|ftruncate))\]$/) invalid=1
+        }
+        count++
+      }
+      END {
+        if (invalid || complete != 1 || token != 1 || count != (expected == "all" && !fatal ? 25 : 1)) exit 1
+        printf "%s", text
+      }
+    ' "`$file") || continue
+    printf '%s\n' "__SRT_RESULT_PATH__=`$file"
+    printf '%s\n' "`$result"
+    exit 0
   done
   sleep $pollSeconds
 done
@@ -604,6 +729,9 @@ exit 1
         return [pscustomobject]@{ Found = $false; Path = ""; Text = "" }
     }
     $pathLine = $lines | Where-Object { $_ -like "__SRT_RESULT_PATH__=*" } | Select-Object -First 1
+    if (-not $pathLine -or $pathLine.Length -le "__SRT_RESULT_PATH__=".Length) {
+        return [pscustomobject]@{ Found = $false; Path = ""; Text = "" }
+    }
     $path = if ($pathLine) { $pathLine.Substring("__SRT_RESULT_PATH__=".Length) } else { "" }
     $text = ($lines | Where-Object { $_ -notlike "__SRT_RESULT_PATH__=*" }) -join "`n"
     [pscustomobject]@{ Found = $true; Path = $path; Text = $text }
@@ -619,9 +747,7 @@ function Wait-AppMountConfirmed {
     # 但标记文件机制已废弃（按 PID 命名、在应用数据目录里无限累积），不要把它加回来。
     # 只认应用侧那一条会让「仅由 daemon 重挂」的场景（例如热更新后的 reconcile）在这里空等超时。
     #
-    # 与 .sh 仍有一处已知差异：`.sh` 在确认到 PID 后还会用 app_mountinfo_has_expected_paths
-    # 独立复核挂载点，本文件尚无该函数，日志命中即视为通过。补它需要一并移植 label→期望路径的
-    # 映射表，属独立改动。
+    # 日志只用于确认当前 PID 已完成挂载流程；命中后仍通过 mountinfo 复核期望挂载点。
     if ($script:MountConfirmTimeoutMilliseconds -le 0) { return $false }
 
     $timeoutSeconds = [Math]::Max(1, [Math]::Ceiling($script:MountConfirmTimeoutMilliseconds / 1000.0))
@@ -687,7 +813,9 @@ function Test-LabelExpectsMount {
     param([string]$Label)
 
     $scenario = Get-ScenarioFromLabel $Label
-    return -not ($scenario -in @(-1, 1, 23, 31, 38, 40))
+    # 44 是监视链路：无配置应用冷启动一定停在系统视图，接管要等 reconcile 触发，
+    # 不能按「启动即挂载」等待。
+    return -not ($scenario -in @(-1, 1, 23, 31, 38, 40, 44))
 }
 
 function Get-ExpectedMountPathsForLabel {
@@ -732,10 +860,15 @@ function Assert-AppMountinfoHasExpectedPaths {
         # 应用视图已被模块接管。
         # 注意：命令必须先在赋值表达式里拼好再传给 Invoke-Su——直接在参数位置用
         # `"a" + "b"` 拼接是参数模式语义，会产出一个带字面加号的字符串传到设备端。
-        $scenario4Command = "pid='$AppProcessId'; " +
-            "grep -Fq ' $RealRoot/Download ' `"/proc/`$pid/mountinfo`" && { echo layout_scoped; exit 0; }; " +
-            "grep -F ' $RealRoot ' `"/proc/`$pid/mountinfo`" | grep -Fq srx_fuse_host && { echo layout_fuse_host; exit 0; }; " +
-            "echo missing=$RealRoot/Download-or-fuse-host-root"
+        # 挂载源已原生化（NATIVE_FUSE_SOURCE=/dev/fuse，见 config.rs），srx_fuse_host
+        # 源名判定失效。接管证明改为拓扑事实：① bind 布局——用户根本身是挂载点；
+        # ② 共享宿主布局——应用视图根 dev 与 init 命名空间的系统 FUSE 不同
+        # （内容由 FUSE 策略层服务，挂载点不落用户根）。pid 由本地插值。
+        $scenario4Command = "grep -Fq ' $RealRoot ' `"/proc/$AppProcessId/mountinfo`" && { echo layout_bind; exit 0; }; " +
+            "a=`"`$(grep -m1 ' /storage/emulated ' `"/proc/$AppProcessId/mountinfo`" | cut -d' ' -f3)`"; " +
+            "b=`"`$(grep -m1 ' /storage/emulated ' /proc/1/mountinfo | cut -d' ' -f3)`"; " +
+            "[ -n `"`$a`" ] && [ -n `"`$b`" ] && [ `"`$a`" != `"`$b`" ] && { echo layout_shared_host; exit 0; }; " +
+            "echo missing=app_dev=`$a init_dev=`$b"
         $output = @(Invoke-Su $scenario4Command)
         foreach ($line in $output) {
             if ($line -like "layout_*") { return [bool]$true }
@@ -755,7 +888,33 @@ function Assert-AppMountinfoHasExpectedPaths {
     $command += "echo all_present"
 
     $output = @(Invoke-Su $command)
-    if ($output -contains "all_present") { return [bool]$true }
+    if ($output -contains "all_present") {
+        Write-Host "  takeover_proven ${Label} form=bind-layout"
+        return [bool]$true
+    }
+
+    # 共享宿主布局：auto 的语义是 FUSE 优先，整棵存储视图根由会话接管，规则落点只存在于
+    # FUSE 策略层，mountinfo 里不再出现路径级挂载点（设计目标而非缺陷）。此时改用与场景 4
+    # 相同的拓扑事实作为接管证明：应用视图根 dev ≠ init 命名空间的系统 FUSE dev。
+    # 命令同样先拼好再传参（参数模式下 `+` 会变成字面量）。
+    $devCommand = "a=`"`$(grep -m1 ' /storage/emulated ' `"/proc/$AppProcessId/mountinfo`" | cut -d' ' -f3)`"; " +
+        "b=`"`$(grep -m1 ' /storage/emulated ' /proc/1/mountinfo | cut -d' ' -f3)`"; " +
+        "echo app_dev=`$a init_dev=`$b"
+    $devOutput = @(Invoke-Su $devCommand)
+    foreach ($line in $devOutput) {
+        if ($line -notlike "app_dev=*") { continue }
+        $pair = $line -replace '^app_dev=', "" -split ' init_dev='
+        if (
+            $pair.Count -eq 2 -and
+            -not [string]::IsNullOrWhiteSpace($pair[0]) -and
+            -not [string]::IsNullOrWhiteSpace($pair[1]) -and
+            $pair[0] -ne $pair[1]
+        ) {
+            Write-Host "  takeover_proven ${Label} form=shared-host $line"
+            return [bool]$true
+        }
+        Write-Host "  mountinfo_check ${Label}: $line"
+    }
     foreach ($line in $output) {
         if ($line -like "missing=*") { Write-Host "  mountinfo_check ${Label}: $line" }
     }
@@ -814,6 +973,23 @@ function Get-ServiceCaseTimeoutSeconds {
     75
 }
 
+# MediaStore 创建失败时有界重试，并保留各次断言结果。
+function Invoke-MediaStoreCreateCase {
+    param([int]$Scenario, [string]$Label, [hashtable]$Extras)
+    $max = 3
+    if ($env:SRT_MEDIASTORE_CREATE_ATTEMPTS) { $max = [int]$env:SRT_MEDIASTORE_CREATE_ATTEMPTS }
+    for ($attempt = 1; $attempt -le $max; $attempt++) {
+        $result = Invoke-ServiceCase "scenario-$Scenario" $Label "mediastore_create_file" $Extras "^PASS \[mediastore_create_file\]"
+        if ($result -and $result.Ok) { return $result }
+        if ($attempt -ge $max) {
+            Write-Host "mediastore_create_failed scenario=$Scenario label=$Label attempts=$attempt"
+            return $result
+        }
+        Write-Host "mediastore_create_retry scenario=$Scenario label=$Label attempt=$attempt reason=create_media_failed"
+        Start-Sleep -Seconds 2
+    }
+}
+
 function Invoke-ServiceCase {
     param(
         [string]$Scenario,
@@ -824,6 +1000,7 @@ function Invoke-ServiceCase {
     )
 
     Write-Host "  - ${Scenario}/${Label}: $TestCase"
+    $failuresBefore = $script:Failures.Count
     Prepare-ServiceCase "$Scenario/$Label"
 
     # HyperOS 实机（A16/KSU）会随用例启动次数累积把 start-foreground-service 无限期
@@ -834,13 +1011,15 @@ function Invoke-ServiceCase {
     for ($driveAttempt = 1; $driveAttempt -le 2; $driveAttempt++) {
         if ($driveAttempt -gt 1) {
             Write-Host "    RECOVER $Scenario/$Label attempt=$driveAttempt"
-            Stop-AppAndWaitFuseCleanup "$Scenario/$Label/recover" $true | Out-Null
+            Stop-AppAndWaitFuseCleanup "$Scenario/$Label/recover" | Out-Null
             Start-Sleep -Milliseconds 500
             $script:LastMountConfirmedPid = ""
             Invoke-Adb @("logcat", "-c") | Out-Null
             Invoke-Su ": > '$LogPath' 2>/dev/null || true" | Out-Null
-            Invoke-Adb @("shell", "am", "start", "-W", "-n", "$AppId/.MainActivity") | Out-Null
-            Wait-AppMountConfirmed "$Scenario/$Label-recover" | Out-Null
+            Start-TestApp -Wait
+            if (Test-LabelExpectsMount "$Scenario/$Label-recover") {
+                Wait-AppMountConfirmed "$Scenario/$Label-recover" | Out-Null
+            }
             Wait-Storage "$Scenario/$Label-recover" | Out-Null
             Clear-Results
         }
@@ -850,6 +1029,11 @@ function Invoke-ServiceCase {
         Clear-Results
         $freshnessMarker = "/data/local/tmp/srx-result-$([Guid]::NewGuid().ToString('N')).marker"
         Invoke-Su "touch '$freshnessMarker'" | Out-Null
+        if ($LASTEXITCODE -ne 0) {
+            $script:Failures.Add("$Scenario/$Label freshness marker failed")
+            Write-Host "FAIL [$TestCase] scenario=$Scenario label=$Label reason=freshness_marker_failed"
+            return [pscustomobject]@{ Ok = $false; Text = ""; Path = "" }
+        }
         # 直接启动前台服务而非经 receiver 转发广播：HyperOS 实机（A16/KSU）会在用例
         # 启动若干次后按「Background execution not allowed」策略在入队时静默丢弃发往
         # manifest receiver 的广播，表现为用例永远无结果（result_timeout 雪崩）；
@@ -859,10 +1043,15 @@ function Invoke-ServiceCase {
         foreach ($key in $Extras.Keys) {
             $args += @("--es", [string]$key, [string]$Extras[$key])
         }
-        Invoke-Adb $args | Out-Null
+        $args += @("--es", "result_token", $freshnessMarker)
+        # adb 超时或退出非零时，仍以 freshness marker 对应的服务结果确认 intent 是否已执行。
+        $startResult = Invoke-AdbWithTimeout -Arguments $args -TimeoutSeconds 90
+        if ($startResult.ExitCode -ne 0) {
+            Write-Host "service_start_status_nonzero scenario=$Scenario label=$Label test_case=$TestCase status=$($startResult.ExitCode); checking result"
+            $startResult.Output -split "`n" | Where-Object { $_ } | ForEach-Object { Write-Host "service_start: $_" }
+        }
 
-        # 与 .sh 的 run_service_case 一致：确认必须在广播**之后**——广播才会拉起应用进程，
-        # 放在之前会因为进程尚未存在而等不到 PID，把正常的场景判成失败。
+        # 与 .sh 的 run_service_case 一致：确认放在服务启动之后，避免应用进程尚未创建时空等 PID。
         # 场景 1/23/31 断言「不重定向」，由 Test-LabelExpectsMount 排除。
         #
         # 确认失败只在**有期望路径**的场景记失败（即场景 3/4）：那里的挂载点可预知，挂载没建立时
@@ -884,23 +1073,32 @@ function Invoke-ServiceCase {
         $result = Wait-ServiceResult $timeoutSeconds $freshnessMarker $TestCase
         Invoke-Su "rm -f '$freshnessMarker'" | Out-Null
         if ($result.Found) {
-            $ok = if ($PassRegex) { $result.Text -match $PassRegex } else { $true }
+            $rawResult = Join-Path $script:ArtifactDir "$Scenario-$Label-result.txt"
+            Set-Content -LiteralPath $rawResult -Value $result.Text -Encoding utf8
+            $result.Text -split "`n" | ForEach-Object {
+                Write-Host ($_ -replace '^(PASS|FAIL) (\[[^]]*\]) ', 'OBSERVED $2 app_status=$1 ')
+            }
+            $ok = if ($PassRegex) { $result.Text -match "(?m)$PassRegex" } else { $true }
+            if ($TestCase -eq "all" -and $result.Text -match '(?m)^FAIL ') { $ok = $false }
+            $ok = $ok -and $script:Failures.Count -eq $failuresBefore
             if (-not $ok) {
                 $script:Failures.Add("$Scenario/$Label expected $PassRegex, got: $($result.Text -replace "`n", " | ")")
-                Write-Host "    FAIL $Scenario/$Label"
+                Write-Host "FAIL [$TestCase] scenario=$Scenario label=$Label assertion=app_result reason=mismatch expected=$PassRegex raw_result=$rawResult"
                 if ($script:FailFast) {
                     throw "[SRT_FAIL_FAST_ITEM] $Scenario/$Label"
                 }
+            } elseif (-not $PassRegex) {
+                Write-Host "PENDING [$TestCase] scenario=$Scenario label=$Label raw_result=$rawResult"
             } else {
-                Write-Host "    PASS $Scenario/$Label"
+                Write-Host "PASS [$TestCase] scenario=$Scenario label=$Label assertion=app_result raw_result=$rawResult"
             }
             return [pscustomobject]@{ Ok = $ok; Text = $result.Text; Path = $result.Path }
         }
-        Stop-AppAndWaitFuseCleanup "$Scenario/$Label/attempt-$driveAttempt-timeout" $true | Out-Null
+        Stop-AppAndWaitFuseCleanup "$Scenario/$Label/attempt-$driveAttempt-timeout" | Out-Null
     }
 
     $script:Failures.Add("$Scenario/$Label result timeout for $TestCase")
-    Write-Host "    TIMEOUT $Scenario/$Label"
+    Write-Host "FAIL [$TestCase] scenario=$Scenario label=$Label reason=result_timeout"
     if ($script:FailFast) {
         throw "[SRT_FAIL_FAST_ITEM] $Scenario/$Label"
     }
@@ -933,8 +1131,11 @@ function Prepare-ServiceCase {
     $script:LastMountConfirmedPid = ""
     Invoke-Adb @("logcat", "-c") | Out-Null
     Invoke-Su ": > '$LogPath' 2>/dev/null || true" | Out-Null
-    Invoke-Adb @("shell", "am", "start", "-W", "-n", "$AppId/.MainActivity") | Out-Null
-    $confirmed = Wait-AppMountConfirmed $Label
+    Start-TestApp -Wait
+    $confirmed = $true
+    if (Test-LabelExpectsMount $Label) {
+        $confirmed = Wait-AppMountConfirmed $Label
+    }
     if (-not $confirmed -and $script:AppLaunchSettleMilliseconds -gt 0) {
         Start-Sleep -Milliseconds $script:AppLaunchSettleMilliseconds
     }
@@ -948,12 +1149,13 @@ function Test-FileExists {
 
 function Test-PathMissing {
     param([string]$Path)
-    Test-Su "test ! -e '$(Convert-ToBackendPath $Path)'"
+    $backendPath = Convert-ToBackendPath $Path
+    Test-Su "test ! -e '$backendPath' && test ! -L '$backendPath'"
 }
 
 function Convert-ToBackendPath {
     param([string]$Path)
-    if ($Path.StartsWith($RealRoot)) {
+    if ($Path -ceq $RealRoot -or $Path.StartsWith("$RealRoot/", [StringComparison]::Ordinal)) {
         return $BackendRoot + $Path.Substring($RealRoot.Length)
     }
     $Path
@@ -984,6 +1186,83 @@ function Require-OwnPrivateRealLanding {
     $script:Failures.Add("$Scenario/$Label missing file: $VisiblePath")
     @(Invoke-Su "ls -la '$VisiblePath' '$BackendPath' 2>&1 || true") | ForEach-Object { Write-Host "  landing: $_" }
     $false
+}
+
+function Get-SuValue {
+    param([string]$Command)
+    (@(Invoke-Su $Command) | Select-Object -Last 1) -replace '\s', ''
+}
+
+# 回归守卫（2026-11-12 真机事故后的固化断言）：自有私有目录 `Android/{data,media,obb}/<pkg>`
+# 的恢复源必须是**系统存储视图**（MediaProvider 的 FUSE），不能退化成 f2fs 直连后端。
+#
+# 为什么必须单独断言：恢复源错层时目录内容仍落在同一份后端，"文件写进去了/沙盒没有残留"
+# 这类断言**全部照过**——数据不分叉，分叉的是**服务方**与因此失效的 mode 归一。真实伤害是：
+# 应用在该目录新建的 SQLite 边车按自身 umask 落 `0600`，MP 用自身身份（附加组 media_rw /
+# ext_data_rw、`CapEff: 0`）打不开，跨进程读同一份库的一方 `SQLITE_CANTOPEN`（真机
+# 2026-11-12：恢复源误取 `/mnt/pass_through/...`，管理器一次冷启 16 条）。
+#
+# 判据自校准，不写死设备号：
+# - 应用侧 `/proc/<pid>/root<path>` 与 init 命名空间 `/proc/1/root<path>` 的超级块设备号；
+#   模块从不挂载 init 命名空间，那里的同一路径恒为系统视图；
+# - f2fs 后端口令取 `/data/media/0` 的设备号，用来识别"被判据误当成系统视图"的直连 bind。
+# 于是：可见目录**不能**等于 f2fs 后端；而当 init 那边确实是系统视图（≠ f2fs）时，应用侧
+# 必须与它同一个 dev——这正是"恢复源取自系统视图"的机器可判定形式。
+function Require-OwnPrivateSystemViewIdentity {
+    param([string]$Scenario, [string]$Label, [string]$VisiblePath, [string]$CreatedFile)
+    $appPid = Get-AppPid
+    if ([string]::IsNullOrWhiteSpace($appPid)) {
+        $script:Failures.Add("$Scenario/$Label app process missing while checking own private view identity")
+        return $false
+    }
+    $appDev = Get-SuValue "stat -c %d '/proc/$appPid/root$VisiblePath' 2>/dev/null"
+    $systemDev = Get-SuValue "stat -c %d '/proc/1/root$VisiblePath' 2>/dev/null"
+    $backendDev = Get-SuValue "stat -c %d '/data/media/0' 2>/dev/null"
+    if ([string]::IsNullOrWhiteSpace($appDev)) {
+        $script:Failures.Add("$Scenario/$Label own private dir unreadable from app namespace: $VisiblePath")
+        return $false
+    }
+    if ([string]::IsNullOrWhiteSpace($systemDev) -or [string]::IsNullOrWhiteSpace($backendDev)) {
+        # 部分版本自有私有目录是独立卷（Android 13 的 Android/data|obb），init 命名空间里
+        # 没有同名路径，判据在这里取不到数：留一条可检索的跳过标记，不伪造结论。
+        Write-Host "  - own_private_view_identity_skipped label=$Label system='$systemDev' backend='$backendDev' path=$VisiblePath"
+        $systemDev = ""
+    }
+    $ok = $true
+    if ($appDev -eq $backendDev) {
+        # 主判据：可见目录直接落在 f2fs 后端上 = 恢复源退化成直连 bind。这条不受挂载传播影响
+        # （真机自证：在应用命名空间里手工 bind 后端会把 init 侧的参照一起改掉，只有比后端
+        # 设备号才抓得住）。
+        $script:Failures.Add("$Scenario/$Label own private dir served by f2fs backend app_dev=$appDev backend_dev=${backendDev}: $VisiblePath")
+        @(Invoke-Su "grep -E ' $VisiblePath ' /proc/$appPid/mountinfo 2>/dev/null || true") | ForEach-Object { Write-Host "  mount: $_" }
+        $ok = $false
+    } elseif (-not [string]::IsNullOrWhiteSpace($systemDev)) {
+        if ($systemDev -ne $backendDev -and $appDev -ne $systemDev) {
+            $script:Failures.Add("$Scenario/$Label own private dir not on the same system view app_dev=$appDev system_dev=${systemDev}: $VisiblePath")
+            @(Invoke-Su "grep -E ' $VisiblePath ' /proc/$appPid/mountinfo 2>/dev/null || true") | ForEach-Object { Write-Host "  mount: $_" }
+            $ok = $false
+        } else {
+            Write-Host "  - own_private_system_view label=$Label dev=$appDev path=$VisiblePath"
+        }
+    }
+    if (-not [string]::IsNullOrWhiteSpace($CreatedFile)) {
+        $mode = Get-SuValue "stat -c '%a' '$CreatedFile' 2>/dev/null"
+        if ([string]::IsNullOrWhiteSpace($mode) -or $mode -notmatch '^[0-7]{3,4}$') {
+            $script:Failures.Add("$Scenario/$Label own private file mode unreadable '$mode': $CreatedFile")
+            $ok = $false
+        } else {
+            # 系统视图（MP）写入会把 mode 归一到 0664；绕过 MP 的 f2fs 写入按调用方 umask
+            # 落 0600 —— 组位全 0 就是错层签名，也正是跨进程 SQLITE_CANTOPEN 的成因。
+            $perm = [Convert]::ToInt32($mode, 8)
+            if (($perm -band 0x38) -eq 0) {
+                $script:Failures.Add("$Scenario/$Label own private file is owner-only mode=$mode (expected group bits, MP normalises to 0664): $CreatedFile")
+                $ok = $false
+            } else {
+                Write-Host "  - own_private_system_view_mode label=$Label mode=$mode path=$CreatedFile"
+            }
+        }
+    }
+    $ok
 }
 
 function Test-PublicDirectoryOwner {
@@ -1039,10 +1318,6 @@ function Wait-MediaProviderReady {
     param([string]$Label, [int]$TimeoutSeconds = 120)
 
     $deadline = (Get-Date).AddSeconds($TimeoutSeconds)
-    if (Test-MediaProviderIsLazy) {
-        Write-Host "MediaProvider readiness deferred until first app access: $Label"
-        return $true
-    }
     $sdk = (& adb -s $Serial shell getprop ro.build.version.sdk 2>$null | Out-String).Trim()
     $uris = @("content://media/external_primary/file")
     if ([string]::IsNullOrEmpty($sdk) -or [int]$sdk -lt 37) {
@@ -1151,10 +1426,8 @@ function Wait-MediaProviderHookReady {
 function Confirm-MediaProviderHookReady {
     param([string]$Label)
 
-    if (Test-MediaProviderIsLazy) {
-        Write-Host "MediaProvider hook readiness deferred until first app access: $Label"
-        return $true
-    }
+    # API 37+ 的 MediaProvider 采用惰性启动。先通过只读查询拉起进程，再确认新 PID 的 hook 就绪。
+    if (-not (Wait-MediaProviderReady "$Label-provider" 60)) { return $false }
     if (Wait-MediaProviderHookReady "$Label-current" 3) { return $true }
     Write-Host "media_provider_hook_recovery label=$Label"
     Restart-MediaProviderWithHookReady "$Label-recovery"
@@ -1198,15 +1471,28 @@ function Fix-OwnPrivateFixturePermissions {
     }
     # 沙箱内的夹具同样按应用属主修正：$PrivateRoot 就是应用自己的重定向根，root 预置的
     # 目录项会被系统 FUSE 按属主过滤，应用在热重载后重新解析这条路径时报 ENOENT。
+    # 只改属主、**不动组**：`Android/data|media|obb/<包名>` 三支的原生组各不相同
+    # （ext_data_rw 1078 / media_rw 1023 / ext_obb_rw 1079），统一写成 1023 会让夹具
+    # 先把真机形态改成测试形态，后续所有「组是多少」的判断都得先扣掉这层影响。
     $roots = @(
+        "$BackendRoot/Android/data/$AppId", "$BackendRoot/Android/media/$AppId", "$BackendRoot/Android/obb/$AppId",
         $BackendOwnPrivateDataRoot, $BackendOwnPrivateMediaRoot, $BackendOwnPrivateObbRoot,
         $OwnPrivateDataRoot, $OwnPrivateMediaRoot, $OwnPrivateObbRoot,
         "$PrivateRoot/Download", "$PrivateRoot/Pictures", "$PrivateRoot/DCIM", "$PrivateRoot/Documents"
     )
     $rootsArg = ($roots | ForEach-Object { "'$_'" }) -join " "
     $command = 'app_uid=' + "'" + $uid + "'" + '; for root in ' + $rootsArg +
-        '; do [ -e "$root" ] || continue; chown -R $app_uid:1023 $root 2>/dev/null || true; find $root -type d -exec chmod 2771 {} + 2>/dev/null || true; find $root -type f -exec chmod 0664 {} + 2>/dev/null || true; done'
+        '; do [ -e "$root" ] || continue; chown -R $app_uid $root 2>/dev/null || true; find $root -type d -exec chmod 2771 {} + 2>/dev/null || true; find $root -type f -exec chmod 0664 {} + 2>/dev/null || true; done'
     Invoke-Su $command | Out-Null
+}
+
+function Fix-SharedFixturePermissions {
+    # 公共夹具由 root shell 创建；应用的 emulated-storage 视图要求这些条目归 media_rw。
+    # 首次 lookup 前统一属主和权限，否则应用侧会把夹具看成 ENOENT。
+    $command = "for root in '$BackendRoot/Download'/Srt* '$BackendRoot/Pictures'/Srt* '$BackendRoot/DCIM'/Srt* '$BackendRoot/Documents'/Srt* '$BackendRoot/Movies'/Srt* '$BackendRoot/Music'/Srt* '$BackendRoot/Download/Test' '$BackendRoot/.xldownload' '$BackendRoot/.xlDownload' '$BackendRuleSandboxRoot' '$BackendRuleSiblingRoot'; do [ -e `"`$root`" ] || continue; chown -R 1023:1023 `"`$root`" 2>/dev/null || true; find `"`$root`" -type d -exec chmod 2771 {} + 2>/dev/null || true; find `"`$root`" -type f -exec chmod 0664 {} + 2>/dev/null || true; done"
+    Invoke-Su $command | Out-Null
+    # 后端清理绕过应用 FUSE 视图；触碰各可见别名，让后续应用 lookup 重新解析重建目录。
+    Invoke-Su "for path in '$RealRoot/Download'/Srt* '$RealRoot/Pictures'/Srt* '$RealRoot/DCIM'/Srt* '$RealRoot/Documents'/Srt* '$RealRoot/Movies'/Srt* '$RealRoot/Music'/Srt* '$RealRoot/SrtRuleSandbox' '$RealRoot/DCIM/SrtRuleSibling' '$RealRoot/Download/Test' '$RealRoot/.xldownload' '$RealRoot/.xlDownload'; do ls -ld `"`$path`" >/dev/null 2>&1 || true; done" | Out-Null
 }
 
 function Assert-FixtureRootsEmpty {
@@ -1251,6 +1537,7 @@ function Assert-FixtureRootsEmpty {
 }
 
 function Clear-Targets {
+    Invoke-Su "for name in Sandbox Allowed Request RequestSibling Mapped; do rm -rf '$BackendRoot/Download/SrtMutation'`$name '$BackendPrivateRoot/Download/SrtMutation'`$name; done" | Out-Null
     # 先经系统 FUSE 删除共享探针，通知其失效前序场景的 inode 缓存；
     # 仅删除 /data/media 后端会让 lookup 仍命中旧文件，而随后 open 返回 ENOENT。
     Invoke-Su "rm -f '$RealRoot/Download/SrtProbe/$TestFile' '$RealRoot/Download/Test/$TestFile' || echo 'cleanup_tolerated reason=probe_fuse_edom note=单文件删除被模块 FUSE 以 EDOM 拒绝，改由下面的目录级删除覆盖' >&2" | Out-Null
@@ -1289,7 +1576,7 @@ function Clear-Targets {
         throw "monitor_fixture_prepare_failed: 后端监视器映射/只读排除目录不存在"
     }
     Invoke-Su "rm -rf '$BackendRoot/Pictures/SrtReadOnlyMedia' '$BackendPrivateRoot/Pictures/SrtReadOnlyMedia'; mkdir -p '$BackendRoot/Pictures/SrtReadOnlyMedia' '$BackendPrivateRoot/Pictures/SrtReadOnlyMedia'; chmod -R 777 '$BackendRoot/Pictures/SrtReadOnlyMedia' '$BackendPrivateRoot/Pictures/SrtReadOnlyMedia' 2>/dev/null || true" | Out-Null
-    Invoke-Su "rm -rf '$AnyRelativePublicTarget' '$AnyAbsolutePublicTarget' '$AnyPublicToPrivateRequest' '$AnyMediaRequest' '$AnyMediaTarget' '$NestedMappingRequestRoot' '$NestedMappingStageRoot' '$NestedMappingTargetRoot' '$AnyRelativeRequest/srt_any_relative.txt' '$AnyAbsoluteUserRequest/srt_any_absolute.txt' '$AnyUserIdRequest/srt_any_user_id.txt' '$AnyLegacyDataRequest/srt_any_legacy.txt' '$AnyUserPrivateTarget/srt_any_public_private.txt' '$AnyLegacyPrivateTarget/srt_any_legacy.txt'; mkdir -p '$AnyRelativePublicTarget' '$AnyAbsolutePublicTarget' '$AnyPublicToPrivateRequest' '$AnyMediaRequest' '$AnyMediaTarget' '$NestedMappingRequestRoot' '$NestedMappingStageRoot' '$NestedMappingTargetRoot' '$BackendRoot/Android/data/$AppId/cache' '$BackendRoot/Android/data/$AppId/srt_any_relative' '$BackendRoot/Android/media/$AppId/cache' '$AnyAbsoluteUserRequest' '$AnyUserIdRequest' '$AnyLegacyDataRequest' '$AnyUserPrivateTarget'; chmod -R 777 '$AnyRelativePublicTarget' '$AnyAbsolutePublicTarget' '$AnyPublicToPrivateRequest' '$AnyMediaRequest' '$AnyMediaTarget' '$NestedMappingRequestRoot' '$NestedMappingStageRoot' '$NestedMappingTargetRoot' '$BackendRoot/Android/data/$AppId/cache' '$BackendRoot/Android/data/$AppId/srt_any_relative' '$BackendRoot/Android/media/$AppId/cache' '$AnyAbsoluteUserRequest' '$AnyUserIdRequest' '$AnyLegacyDataRequest' '$AnyUserPrivateTarget' 2>/dev/null || true" | Out-Null
+    Invoke-Su "rm -rf '$BackendPrivateRoot/Download/SrtAnyPublicToPrivate' '$AnyRelativePublicTarget' '$AnyAbsolutePublicTarget' '$AnyPublicToPrivateRequest' '$AnyMediaRequest' '$AnyMediaTarget' '$NestedMappingRequestRoot' '$NestedMappingStageRoot' '$NestedMappingTargetRoot' '$AnyRelativeRequest/srt_any_relative.txt' '$AnyAbsoluteUserRequest/srt_any_absolute.txt' '$AnyUserIdRequest/srt_any_user_id.txt' '$AnyLegacyDataRequest/srt_any_legacy.txt' '$AnyUserPrivateTarget/srt_any_public_private.txt' '$AnyLegacyPrivateTarget/srt_any_legacy.txt' '/data/data/$AppId/files/srt_any_absolute_alias.txt' '/data/data/$AppId/cache/srt_any_user_id_alias.txt' '/data/user/0/$AppId/code_cache/srt_any_legacy_alias.txt' '$BackendRoot/Android/data/$AppId/cache/srt_any_user_id_alias.txt' '$AnyLegacyPrivateTarget/srt_any_legacy_alias.txt'; mkdir -p '$AnyRelativePublicTarget' '$AnyAbsolutePublicTarget' '$AnyPublicToPrivateRequest' '$AnyMediaRequest' '$AnyMediaTarget' '$NestedMappingRequestRoot' '$NestedMappingStageRoot' '$NestedMappingTargetRoot' '$BackendRoot/Android/data/$AppId/cache' '$BackendRoot/Android/data/$AppId/srt_any_relative' '$BackendRoot/Android/media/$AppId/cache' '$AnyAbsoluteUserRequest' '$AnyUserIdRequest' '$AnyLegacyDataRequest' '$AnyUserPrivateTarget'; chmod -R 777 '$AnyRelativePublicTarget' '$AnyAbsolutePublicTarget' '$AnyPublicToPrivateRequest' '$AnyMediaRequest' '$AnyMediaTarget' '$NestedMappingRequestRoot' '$NestedMappingStageRoot' '$NestedMappingTargetRoot' '$BackendRoot/Android/data/$AppId/cache' '$BackendRoot/Android/data/$AppId/srt_any_relative' '$BackendRoot/Android/media/$AppId/cache' '$AnyAbsoluteUserRequest' '$AnyUserIdRequest' '$AnyLegacyDataRequest' '$AnyUserPrivateTarget' 2>/dev/null || true" | Out-Null
     # 嵌套映射准备会清理 Tencent 父目录；自有私有目录必须最后准备。
     # 系统 FUSE 可能拒绝 shell 清理可见自有目录，但不一定就是 FUSE 所致：可见路径删除失败时
     # 如实记录，交由真实后端的严格清理覆盖（不声称一定是 FUSE）。
@@ -1313,9 +1600,15 @@ function Clear-Targets {
         Write-Host "自有目录可见路径预置失败，应用视图写入将直接 ENOENT；后端拷贝仍会预置"
     }
     Fix-OwnPrivateFixturePermissions
+    Fix-SharedFixturePermissions
 }
 
 function Remove-TestTargetArtifacts {
+    Invoke-Su "for name in Sandbox Allowed Request RequestSibling Mapped; do rm -rf '$BackendRoot/Download/SrtMutation'`$name '$BackendPrivateRoot/Download/SrtMutation'`$name; done" | Out-Null
+    # 场景 43 的根级对照目录不在任何 Srt* 通配范围内，必须显式清理。
+    Invoke-Su "rm -rf '$RealRoot/.SrtRootDotVisible' '$BackendRoot/.SrtRootDotVisible' '$RealRoot/Download/SrtViewParity' '$BackendRoot/Download/SrtViewParity'" | Out-Null
+    # 场景 44 的 reconcile 触发器：残留会在后续场景的配置指纹里多算一份「别的应用」。
+    Clear-MonitorTriggerConfig
     Invoke-Su "rm -rf '$BackendOwnPrivateDataRoot' '$BackendOwnPrivateMediaRoot' '$BackendOwnPrivateObbRoot' '$SandboxOwnPrivateDataRoot' '$SandboxOwnPrivateMediaRoot' '$SandboxOwnPrivateObbRoot'" | Out-Null
     Invoke-Su "rm -rf '$BackendRuleSandboxRoot' '$PrivateRuleSandboxRoot' '$BackendRuleSiblingRoot' '$PrivateRuleSiblingRoot'" | Out-Null
     # 后端侧也要按通配扫一遍：下面的目录清单同样是手工维护的，漏项会让残留避开清理
@@ -1326,7 +1619,7 @@ function Remove-TestTargetArtifacts {
     Invoke-Su "rm -rf '$BackendRoot/Documents/SrtMediaRoutingProbe' '$BackendPrivateRoot/Documents/SrtMediaRoutingProbe'" | Out-Null
     Invoke-Su "rm -rf '$BackendRoot/Download/SrtProbe' '$BackendRoot/Download/SrtOther' '$BackendRoot/Download/SrtOtherMapped' '$BackendRoot/Download/SrtMapOnlyMapped' '$BackendRoot/Download/SrtReadOnly' '$BackendRoot/Download/SrtMapRO' '$BackendRoot/Download/SrtAllow' '$BackendRoot/Download/SrtLegacy' '$BackendRoot/Download/SrtQMark' '$BackendRoot/Download/SrtLongest' '$BackendRoot/Download/SrtLongestBase' '$BackendRoot/Download/SrtLongestDeep' '$BackendRoot/Download/SrtPriority' '$BackendRoot/Download/SrtPriorityMapped' '$BackendRoot/Download/Test' '$BackendRoot/.xldownload' '$BackendRoot/.xlDownload' '$BackendRoot/Pictures/SrtLocked' '$BackendPrivateRoot/Download/SrtProbe' '$BackendPrivateRoot/Download/SrtOther' '$BackendPrivateRoot/Download/SrtOtherMapped' '$BackendPrivateRoot/Download/SrtMapOnlyMapped' '$BackendPrivateRoot/Download/SrtReadOnly' '$BackendPrivateRoot/Download/SrtMapRO' '$BackendPrivateRoot/Download/SrtAllow' '$BackendPrivateRoot/Download/SrtLegacy' '$BackendPrivateRoot/Download/SrtQMark' '$BackendPrivateRoot/Download/SrtLongest' '$BackendPrivateRoot/Download/SrtLongestBase' '$BackendPrivateRoot/Download/SrtLongestDeep' '$BackendPrivateRoot/Download/SrtPriority' '$BackendPrivateRoot/Download/SrtPriorityMapped' '$BackendPrivateRoot/Download/Test' '$BackendPrivateRoot/.xldownload' '$BackendPrivateRoot/.xlDownload' '$BackendPrivateRoot/Pictures/SrtLocked'; rm -f '$BackendRoot/Download/$AllowPartFile' '$BackendPrivateRoot/Download/$AllowPartFile' '$BackendRoot/Download/$QMarkSingleFile' '$BackendPrivateRoot/Download/$QMarkSingleFile' '$BackendRoot/Download/$QMarkDoubleFile' '$BackendPrivateRoot/Download/$QMarkDoubleFile'" | Out-Null
     Invoke-Su "rm -f '$BackendRoot/Download/$QMarkFileSingleFile' '$BackendPrivateRoot/Download/$QMarkFileSingleFile'" | Out-Null
-    Invoke-Su "rm -rf '$AnyRelativePublicTarget' '$AnyAbsolutePublicTarget' '$AnyPublicToPrivateRequest' '$AnyRelativeRequest/srt_any_relative.txt' '$AnyAbsoluteUserRequest/srt_any_absolute.txt' '$AnyUserIdRequest/srt_any_user_id.txt' '$AnyLegacyDataRequest/srt_any_legacy.txt' '$AnyUserPrivateTarget/srt_any_public_private.txt' '$AnyLegacyPrivateTarget/srt_any_legacy.txt'" | Out-Null
+    Invoke-Su "rm -rf '$AnyRelativePublicTarget' '$AnyAbsolutePublicTarget' '$AnyPublicToPrivateRequest' '$AnyRelativeRequest/srt_any_relative.txt' '$AnyAbsoluteUserRequest/srt_any_absolute.txt' '$AnyUserIdRequest/srt_any_user_id.txt' '$AnyLegacyDataRequest/srt_any_legacy.txt' '$AnyUserPrivateTarget/srt_any_public_private.txt' '$AnyLegacyPrivateTarget/srt_any_legacy.txt' '/data/data/$AppId/files/srt_any_absolute_alias.txt' '/data/data/$AppId/cache/srt_any_user_id_alias.txt' '/data/user/0/$AppId/code_cache/srt_any_legacy_alias.txt' '$BackendRoot/Android/data/$AppId/cache/srt_any_user_id_alias.txt' '$AnyLegacyPrivateTarget/srt_any_legacy_alias.txt'" | Out-Null
     Invoke-Su "rm -rf '$BackendRoot/Download/SrtFusePlain' '$BackendRoot/Download/SrtFuseExclude' '$BackendRoot/Download/SrtFuseMapParent' '$BackendRoot/Download/SrtFuseMapRW' '$BackendRoot/Download/SrtFuseMapRO' '$BackendRoot/Download/SrtFuseMulti' '$BackendRoot/DCIM/SrtFuseQQ' '$BackendPrivateRoot/Download/SrtFusePlain' '$BackendPrivateRoot/Download/SrtFuseExclude' '$BackendPrivateRoot/Download/SrtFuseMapParent' '$BackendPrivateRoot/Download/SrtFuseMapRW' '$BackendPrivateRoot/Download/SrtFuseMapRO' '$BackendPrivateRoot/Download/SrtFuseMulti' '$BackendPrivateRoot/DCIM/SrtFuseQQ'" | Out-Null
     Invoke-Su "rm -rf '$BackendRoot/Download/SrtFuseQa' '$BackendRoot/Download/SrtFuseQab' '$BackendRoot/Download/SrtFuseQb' '$BackendRoot/Download/SrtFuseMediaAlpha' '$BackendPrivateRoot/Download/SrtFuseQa' '$BackendPrivateRoot/Download/SrtFuseQab' '$BackendPrivateRoot/Download/SrtFuseQb' '$BackendPrivateRoot/Download/SrtFuseMediaAlpha'" | Out-Null
     Invoke-Su "rm -rf '$BackendRoot/Download/SrtMountNsAllow' '$BackendRoot/Download/SrtMountNsReadOnly' '$BackendRoot/Download/SrtMountNsMapParent' '$BackendRoot/Download/SrtMountNsMapRW' '$BackendRoot/Download/SrtMountNsMapRO' '$BackendPrivateRoot/Download/SrtMountNsAllow' '$BackendPrivateRoot/Download/SrtMountNsReadOnly' '$BackendPrivateRoot/Download/SrtMountNsMapParent' '$BackendPrivateRoot/Download/SrtMountNsMapRW' '$BackendPrivateRoot/Download/SrtMountNsMapRO'" | Out-Null
@@ -1373,6 +1666,11 @@ function Remove-RandomMediaStoreRows {
     Remove-MediaStoreRowsByPattern "content://media/external/images/media" @("_display_name=(\.pending-\d+-|\.trashed-\d+-)?srt_own_private_mediastore( \(\d+\))?\.jpg(,|$)") @("_data=.*/Android/media/$escapedAppId/Tencent/QQfile_recv/")
     Remove-MediaStoreRowsByPattern "content://media/external/images/media" @("_display_name=(\.pending-\d+-|\.trashed-\d+-)?srt_fuse_dcim_media( \(\d+\))?\.jpg(,|$)") @("relative_path=DCIM/SrtFuseQQ/", "_data=.*/DCIM/SrtFuseQQ/", "_data=.*/Android/data/$escapedAppId/sdcard/DCIM/SrtFuseQQ/")
     Remove-MediaStoreRowsByPattern "content://media/external/images/media" @("_display_name=srt_read_only_media( \(\d+\))?\.jpg(,|$)") @("relative_path=Pictures/SrtReadOnlyMedia/", "_data=.*/Pictures/SrtReadOnlyMedia/", "_data=.*/Android/data/$escapedAppId/sdcard/Pictures/SrtReadOnlyMedia/")
+    # 夹具**根目录**会在 `file` 表留下目录行（`_data=…/Pictures/SrtReadOnlyMedia`，无扩展名），
+    # 与图片行名字不同、上面的模式匹配不到。复用设备上它一旦残留，场景 28 的图片查询就会
+    # `rowCount=1` 命中目录行并判定 `media row not found`（2026-11-12 A17 复用模拟器实测
+    # `_id=1027`；CI 每次新模拟器所以从未暴露）。
+    Remove-MediaStoreRowsByPattern "content://media/external/file" @("_display_name=SrtReadOnlyMedia( \(\d+\))?(,|$)") @("_data=.*/Pictures/SrtReadOnlyMedia(,|$)")
     Remove-MediaStoreRowsByPattern "content://media/external/video/media" @("_display_name=(\.pending-\d+-|\.trashed-\d+-)?srt_video_\d+( \(\d+\))?\.mp4(,|$)") @("relative_path=Movies/", "_data=.*/Movies/", "_data=.*/Android/data/$escapedAppId/sdcard/Movies/")
     Remove-MediaStoreRowsByPattern "content://media/external/audio/media" @("_display_name=(\.pending-\d+-|\.trashed-\d+-)?srt_audio_\d+( \(\d+\))?\.mp3(,|$)") @("relative_path=Music/", "_data=.*/Music/", "_data=.*/Android/data/$escapedAppId/sdcard/Music/")
     Remove-MediaStoreRowsByPattern "content://media/external/file" @("_display_name=(\.pending-\d+-|\.trashed-\d+-)?srt_file_\d+( \(\d+\))?\.txt(,|$)") @("relative_path=Documents/", "_data=.*/Documents/", "_data=.*/Android/data/$escapedAppId/sdcard/Documents/")
@@ -1396,7 +1694,7 @@ function Remove-RandomPhysicalMediaFiles {
 function Restart-MediaProvider {
     $sdkText = (@(Invoke-Adb @("shell", "getprop", "ro.build.version.sdk")) | Select-Object -First 1).Trim()
     $sdk = 0
-    if ([int]::TryParse($sdkText, [ref]$sdk) -and $sdk -le 34) {
+    if ([int]::TryParse($sdkText, [ref]$sdk) -and ($sdk -le 34 -or $sdk -ge 37)) {
         Write-Warning "skip_media_provider_restart sdk=${sdk}: restarting MediaProvider can detach emulated storage on this emulator"
         return
     }
@@ -1704,8 +2002,8 @@ function Invoke-MonitorCaptureFailOpenScenario {
         if ($trimmed -match '^\d+$') { $daemonPid = $trimmed; break }
     }
     if ([string]::IsNullOrWhiteSpace($daemonPid)) {
-        Write-Host "monitor_capture_failopen_skipped scenario=$Scenario reason=daemon_not_running"
-        return $true
+        Write-Host "FAIL [monitor_capture_failopen] scenario=$Scenario reason=daemon_not_running"
+        return $false
     }
     Write-Host "monitor_capture_failopen freeze daemon pid=$daemonPid"
     if (-not (Test-Su "kill -STOP $daemonPid")) {
@@ -1719,7 +2017,7 @@ function Invoke-MonitorCaptureFailOpenScenario {
         # 留下常驻屏障，新语义不落屏障且视图保持原生存活。
         Invoke-Adb @("shell", "am", "force-stop", $AppId) | Out-Null
         Start-Sleep -Milliseconds 500
-        Invoke-Adb @("shell", "am", "start", "-W", "-n", "$AppId/.MainActivity") | Out-Null
+        Start-TestApp -Wait
         $appPid = ""
         for ($attempt = 0; $attempt -lt 20; $attempt++) {
             $appPid = Get-AppPid
@@ -1777,6 +2075,8 @@ function Invoke-MonitorCaptureFailOpenScenario {
 
 function Invoke-DisabledRedirectMonitorScenario {
     param([string]$Scenario)
+    # 先钉住这个形态的视图前提：停用配置不得被监视会话接管（详见函数注释）。
+    if (-not (Assert-DisabledProfileNotCaptured "scenario-$Scenario-disabled-profile-view")) { return $false }
     $fileName = "srt_monitor_${Scenario}_disabled_regular.bin"
     $ok = Invoke-FileMonitorWriteSuccessCase $Scenario "disabled-regular-write" "$MonitorBaseRoot/$fileName" "$MonitorBaseRoot/$fileName" "$PrivateMonitorBaseRoot/$fileName" $true $false
     $ok = (Invoke-FileMonitorMediaStoreSuccessCase $Scenario "disabled-system-writer-create" "Download/SrtMonitor" $MonitorBaseRoot $PrivateMonitorBaseRoot $false "disabled-profile-mediastore-create-result-and-routing-are-authoritative") -and $ok
@@ -1821,6 +2121,7 @@ function Invoke-MediaStoreMonitorScenario {
     $ok = (Invoke-FileMonitorMediaStoreRelativeDataSuccessCase $Scenario "media-relative-data-create" "Pictures/SrtRelativeData" $MonitorRelativeDataRoot $PrivateMonitorRelativeDataRoot) -and $ok
     $ok = (Invoke-FileMonitorMediaStoreRelativeDataSuccessCase $Scenario "media-nnngram-relative-data" "/Pictures/Nnngram" $MonitorNnngramRoot $PrivateMonitorNnngramRoot) -and $ok
     $ok = (Invoke-FileMonitorMediaStoreSuccessCase $Scenario "media-mapped-create" "Download/SrtMonitorMap" $MonitorMapTarget) -and $ok
+    $ok = (Invoke-FileMonitorMediaStoreImageSuccessCase $Scenario "media-ding-camera-map" "DCIM/Camera" "$RealRoot/Pictures/SrtMonitorDing" "" $false "ding-system-writer-map-result-and-routing-are-authoritative") -and $ok
     $ok = (Invoke-FileMonitorMediaStoreDeniedCase $Scenario "media-read-only-denied" "Download/SrtMonitorLocked" $MonitorLockedRoot) -and $ok
     $ok = (Invoke-FileMonitorMediaStoreSuccessCase $Scenario "media-read-only-excluded-create" "Download/SrtMonitorLocked/Writable" $MonitorWritableRoot $PrivateMonitorWritableRoot) -and $ok
     $ok
@@ -1867,7 +2168,7 @@ function Get-ProcessStartTimeTicks {
 }
 
 function Stop-AppAndWaitFuseCleanup {
-    param([string]$Label, [bool]$RequireStateCleanup = $false)
+    param([string]$Label)
     $appPid = Get-AppPid
     if ([string]::IsNullOrWhiteSpace($appPid)) {
         Invoke-Adb @("shell", "am", "force-stop", $AppId) | Out-Null
@@ -1882,7 +2183,7 @@ function Stop-AppAndWaitFuseCleanup {
     Invoke-Adb @("shell", "am", "force-stop", $AppId) | Out-Null
 
     $ok = $true
-    if ($Label -like "*quick-initial-app*" -and -not (Wait-AppProcessStopped)) {
+    if (-not (Wait-AppProcessStopped)) {
         $script:Failures.Add("$Label 应用进程未在启动前退出 app_pid=$appPid")
         $ok = $false
     }
@@ -1904,25 +2205,7 @@ function Stop-AppAndWaitFuseCleanup {
         }
     }
 
-    if ($RequireStateCleanup) {
-        # 状态文件没有应用退出时的同步删除路径，由 daemon 的 reconcile 循环按 30 秒
-        # 节流回收（src/daemon.rs 的 PRUNE_INTERVAL_MS）；常规周期 reconcile 也是 30 秒，
-        # 但配置、宿主和控制事件会立即唤醒主循环，不能把事件驱动路径误写成固定周期。
-        # 清理延迟上限约为 30s 节流余量 + 30s 周期 + 扫描耗时；等待窗口必须覆盖
-        # 整个周期加余量，否则是在赌 prune 相位。文件消失即提前返回，正常路径不付出全额等待。
-        $removed = $false
-        for ($attempt = 0; $attempt -lt 400; $attempt++) {
-            if (Test-Su "test ! -e '$statePath'") {
-                $removed = $true
-                break
-            }
-            Start-Sleep -Milliseconds 100
-        }
-        if (-not $removed) {
-            $script:Failures.Add("$Label 挂载状态未在应用退出后清理 path=$statePath")
-            $ok = $false
-        }
-    }
+    # 死进程的状态账本由 daemon 按 5 分钟节流清理，不作为应用退出或 FUSE 会话存活判据。
     if ($ok -and $identities.Count -gt 0) {
         Write-Host "  - fuse_sessions_cleaned label=$Label app_pid=$appPid count=$($identities.Count)"
     }
@@ -2109,21 +2392,34 @@ function Invoke-QuickMediaProviderRestartRecoveryScenario {
 }
 
 function Invoke-TestArtifactCleanup {
-    if ($script:CleanupDone) { return }
+    if ($script:CleanupDone -or -not $script:GlobalConfigBackupReady) { return }
     $script:CleanupDone = $true
     Write-Host "== 清理测试产物 =="
-    try { Invoke-Adb @("shell", "am", "force-stop", $AppId) | Out-Null } catch { Write-Warning "force-stop 清理失败：$_" }
-    try { Restore-CrossAppConfig } catch { Write-Warning "跨应用只读配置恢复失败：$_" }
-    try { Restore-AppConfig } catch { Write-Warning "应用配置恢复失败：$_" }
-    try { Restore-GlobalConfig } catch { Write-Warning "全局配置恢复失败：$_" }
-    try { Clear-Results } catch { Write-Warning "结果清理失败：$_" }
-    try { Invoke-Su "rm -f /data/local/tmp/srx-result-*.marker" | Out-Null } catch { Write-Warning "结果标记清理失败：$_" }
-    try { Remove-TestTargetArtifacts } catch { Write-Warning "目标产物清理失败：$_" }
-    try { Clear-AliasMediaStoreFixture } catch { Write-Warning "别名测试媒体行清理失败：$_" }
-    try { Remove-RandomMediaStoreRows } catch { Write-Warning "MediaStore 清理失败：$_" }
-    try { Remove-RandomPhysicalMediaFiles } catch { Write-Warning "物理文件清理失败：$_" }
-    try { Restart-MediaProvider } catch { Write-Warning "MediaProvider 重启失败：$_" }
-    try { Restore-DeviceExecutionState } catch { Write-Warning "设备执行状态恢复失败：$_" }
+    $steps = [ordered]@{
+        force_stop = { Invoke-Adb @("shell", "am", "force-stop", $AppId) }
+        cross_app_config = { Restore-CrossAppConfig }
+        app_config = { Restore-AppConfig }
+        global_config = { Restore-GlobalConfig }
+        results = { Clear-Results }
+        result_markers = { Invoke-Su "rm -f /data/local/tmp/srx-result-*.marker" }
+        targets = { Remove-TestTargetArtifacts }
+        alias_media = { Clear-AliasMediaStoreFixture }
+        media_rows = { Remove-RandomMediaStoreRows }
+        media_files = { Remove-RandomPhysicalMediaFiles }
+        media_provider = { Restart-MediaProvider }
+        device_state = { Restore-DeviceExecutionState }
+    }
+    foreach ($step in $steps.GetEnumerator()) {
+        try {
+            $global:LASTEXITCODE = 0
+            & $step.Value | Out-Null
+            if ($LASTEXITCODE -ne 0) { throw "exit=$LASTEXITCODE" }
+        } catch {
+            $script:ExitCode = 1
+            $script:Failures.Add("cleanup/$($step.Key): $_")
+            Write-Host "FAIL [cleanup] step=$($step.Key) error=$_"
+        }
+    }
     if ($script:Failures.Count -eq 0) {
         Remove-Item -LiteralPath (Join-Path $PSScriptRoot "../../temp/scenario-2-mediastore-hook-diag.txt") -Force -ErrorAction SilentlyContinue
     }
@@ -2139,7 +2435,7 @@ function Restart-App {
     $script:LastMountConfirmedPid = ""
     Invoke-Adb @("logcat", "-c") | Out-Null
     Invoke-Su ": > '$LogPath' 2>/dev/null || true" | Out-Null
-    Invoke-Adb @("shell", "am", "start", "-n", "$AppId/.MainActivity") | Out-Null
+    Start-TestApp
     $confirmed = if ($ExpectMount) { Wait-AppMountConfirmed $Label } else { $true }
     if (-not $confirmed -and $script:AppLaunchSettleMilliseconds -gt 0) {
         Start-Sleep -Milliseconds $script:AppLaunchSettleMilliseconds
@@ -2219,9 +2515,13 @@ function Get-ScenarioTitle {
         35 { "arbitrary path mapping matrix across public and private roots" }
         36 { "mapped private alias continues writing an existing file" }
         37 { "nested mapping chain applies parent result to child rule" }
-        38 { "download provider own sandboxed_paths native write into sandbox" }
+        38 { "download provider sandboxed_paths takeover topology markers" }
         39 { "download provider delegated write lands on requester mapping target" }
-        40 { "system uid fuse write attributed to originating service; app-initiated mediaprovider creation attributed to source app; system uid sandbox missing target has zero leak" }
+        40 { "shell fuse write keeps executor; mediaprovider creation keeps source app; shell does not use App sandbox rules" }
+        41 { "sandbox root rebuilt with inherited group; mediaprovider write stays in sandbox with zero public leak" }
+        42 { "file mutation, metadata and symlink semantics across sandbox, allow, mapping and prefix sibling" }
+        43 { "storage root listing matches system view entry by entry; mediaprovider internal dirs hidden and no dot entries" }
+        44 { "monitor-captured app: after another app's rule change the app is attached to the module view and its root listing still matches the system view" }
     }
 }
 
@@ -2248,7 +2548,7 @@ function Invoke-OwnPrivateWriteCase {
         }
         Write-Output "own_private_write_retry scenario=$Scenario label=$Label attempt=$attempt"
         Invoke-Adb @("shell", "am", "force-stop", $AppId) | Out-Null
-        Invoke-Adb @("shell", "am", "start", "-W", "-n", "$AppId/.MainActivity") | Out-Null
+        Start-TestApp -Wait
         Wait-Storage "scenario-$Scenario-$Label-own-private" | Out-Null
         Clear-Targets
         Clear-Results
@@ -2270,6 +2570,13 @@ function Invoke-OwnPrivateDirectoriesScenario {
         $sandboxPath = "$($sandboxRoots[$index])/$fileName"
         $ok = (Invoke-OwnPrivateWriteCase $Scenario "own-$($labels[$index])" $requestPath $requestPath $backendPath $sandboxPath) -and $ok
     }
+    # 服务方守卫（2026-11-12 真机回归）：三类自有私有目录都必须由**系统视图**服务，
+    # 且应用在其中新建的文件不得是 owner-only。写用例本身只能证明"数据落对了地方"，
+    # 而恢复源退化成 f2fs 直连时数据照样落对，坏的是服务方与 mode 归一 —— 必须单独断言。
+    for ($index = 0; $index -lt $labels.Count; $index++) {
+        $createdFile = "$($backendRoots[$index])/srt_qqfile_recv_$($labels[$index]).txt"
+        $ok = (Require-OwnPrivateSystemViewIdentity "scenario-$Scenario" "own-$($labels[$index])-view" $requestRoots[$index] $createdFile) -and $ok
+    }
     # 真机回归（2026-09 报障，修复见提交 23388f01）：直写用例只覆盖应用自身命名空间视图，
     # 补一条经 MediaStore 的 provider 中介链路（insert(DATA=自身 Android/media/<pkg>/...)
     # → provider 侧 pending 创建与发布 → 回读），断言真实落点存在、沙盒无残留。
@@ -2286,9 +2593,12 @@ function Invoke-AnyPathMappingScenario {
     $cases = @(
         @{ Label = "relative-android-data-to-public"; Request = "$AnyRelativeRequest/srt_any_relative.txt"; Expected = "$AnyRelativePublicTarget/srt_any_relative.txt"; Source = "$BackendRoot/Android/data/$AppId/srt_any_relative/srt_any_relative.txt" },
         @{ Label = "absolute-data-user-to-public"; Request = "$AnyAbsoluteUserRequest/srt_any_absolute.txt"; Expected = "$AnyAbsolutePublicTarget/srt_any_absolute.txt"; Source = "$AnyAbsoluteUserRequest/srt_any_absolute.txt" },
+        @{ Label = "absolute-legacy-alias-to-public"; Request = "/data/data/$AppId/files/srt_any_absolute_alias.txt"; Expected = "$AnyAbsolutePublicTarget/srt_any_absolute_alias.txt"; Source = "/data/data/$AppId/files/srt_any_absolute_alias.txt" },
         @{ Label = "user-id-data-user-to-private"; Request = "$AnyUserIdRequest/srt_any_user_id.txt"; Expected = "$BackendRoot/Android/data/$AppId/cache/srt_any_user_id.txt"; Source = "$AnyUserIdRequest/srt_any_user_id.txt" },
+        @{ Label = "user-id-legacy-alias-to-private"; Request = "/data/data/$AppId/cache/srt_any_user_id_alias.txt"; Expected = "$BackendRoot/Android/data/$AppId/cache/srt_any_user_id_alias.txt"; Source = "/data/data/$AppId/cache/srt_any_user_id_alias.txt" },
         @{ Label = "legacy-data-data-to-private"; Request = "$AnyLegacyDataRequest/srt_any_legacy.txt"; Expected = "$BackendRoot/Android/media/$AppId/cache/srt_any_legacy.txt"; Source = "$AnyLegacyDataRequest/srt_any_legacy.txt" },
-        @{ Label = "public-to-absolute-private"; Request = "$AnyPublicToPrivateRequest/srt_any_public_private.txt"; Expected = "$AnyUserPrivateTarget/srt_any_public_private.txt"; Source = "$AnyPublicToPrivateRequest/srt_any_public_private.txt" },
+        @{ Label = "legacy-canonical-alias-to-private"; Request = "/data/user/0/$AppId/code_cache/srt_any_legacy_alias.txt"; Expected = "$BackendRoot/Android/media/$AppId/cache/srt_any_legacy_alias.txt"; Source = "/data/user/0/$AppId/code_cache/srt_any_legacy_alias.txt" },
+        @{ Label = "public-to-absolute-private"; Request = "$AnyPublicToPrivateRequest/srt_any_public_private.txt"; Expected = "$AnyUserPrivateTarget/srt_any_public_private.txt"; Source = "$AnyPublicToPrivateRequest/srt_any_public_private.txt"; Shadow = "$BackendPrivateRoot/Download/SrtAnyPublicToPrivate/srt_any_public_private.txt" },
         @{ Label = "mapped-mediastore-target"; Request = "$AnyMediaRequest/$AnyMediaFile"; Expected = "$AnyMediaTarget/$AnyMediaFile"; Source = "$AnyMediaRequest/$AnyMediaFile"; MediaStore = $true }
     )
     $ok = $true
@@ -2301,6 +2611,9 @@ function Invoke-AnyPathMappingScenario {
         }
         $ok = (Require-File "scenario-$Scenario" "$($case.Label)-target" $case.Expected) -and $ok
         $ok = (Require-Missing "scenario-$Scenario" "$($case.Label)-source" $case.Source) -and $ok
+        if ($case.Shadow) {
+            $ok = (Require-Missing "scenario-$Scenario" "$($case.Label)-shadow" $case.Shadow) -and $ok
+        }
     }
     $ok
 }
@@ -2333,6 +2646,7 @@ function Invoke-NestedMappingChainScenario {
     $target = "$NestedMappingTargetRoot/nested.bin"
     $result = Invoke-WriteCase $Scenario "nested-mapping-chain" $file $Payload
     $ok = $result.Ok
+    $ok = (Invoke-ServiceCase "scenario-$Scenario" "nested-mapping-list" "file_list_dir" @{ file_dir = "$NestedMappingRequestRoot/QQfile_recv" } '^PASS \[file_list_dir\].*entries=nested\.bin$').Ok -and $ok
     $ok = (Require-File "scenario-$Scenario" "nested-mapping-target" $target) -and $ok
     $ok = (Require-Missing "scenario-$Scenario" "nested-mapping-request" $file) -and $ok
     $ok
@@ -2395,15 +2709,29 @@ function Expect-AppEntry {
     param([int]$Scenario, [string]$Label, [string]$Dir, [string]$FileName)
     $result = Invoke-ServiceCase "scenario-$Scenario" $Label "file_list_dir" @{ file_dir = $Dir } "^PASS \[file_list_dir\]"
     if (-not $result.Ok) { return $false }
-    if ($result.Text -match "entries=.*$([regex]::Escape($FileName))") { return $true }
+    if ($result.Text -match '(?m)listedCount=([0-9]+), entries=([^\r\n]*)$') {
+        $entries = if ($Matches[2]) { @($Matches[2] -split '\|') } else { @() }
+        if ($entries -ccontains $FileName) { return $true }
+    }
     $script:Failures.Add("scenario-$Scenario/$Label app view missing $FileName in $Dir :: $($result.Text -replace "`n", " | ")")
     $false
 }
 
 function Expect-NoAppEntry {
     param([int]$Scenario, [string]$Label, [string]$Dir, [string]$FileName)
-    $result = Invoke-ServiceCase "scenario-$Scenario" $Label "file_list_dir" @{ file_dir = $Dir } ""
-    if ($result.Text -match "entries=.*$([regex]::Escape($FileName))") {
+    $result = Invoke-ServiceCase "scenario-$Scenario" $Label "file_list_dir" @{ file_dir = $Dir } '^PASS \[file_list_dir\]'
+    if (-not $result.Ok) { return $false }
+    if ($result.Text -notmatch '(?m)listedCount=([0-9]+), entries=([^\r\n]*)$') {
+        $script:Failures.Add("scenario-$Scenario/$Label missing listing metadata")
+        return $false
+    }
+    $listedCount = $Matches[1]
+    $entries = if ($Matches[2]) { @($Matches[2] -split '\|') } else { @() }
+    if ("$($entries.Count)" -cne $listedCount) {
+        $script:Failures.Add("scenario-$Scenario/$Label incomplete listing")
+        return $false
+    }
+    if ($entries -ccontains $FileName) {
         $script:Failures.Add("scenario-$Scenario/$Label app view unexpectedly sees $FileName in $Dir")
         return $false
     }
@@ -2465,6 +2793,216 @@ grep -aE 'java hook|writer final|writer init|writer boot|boot_lite|specialize' \
     }
 }
 
+function Invoke-FileMutationLifecycleScenario {
+    param([int]$Scenario)
+    $ok = $true
+    foreach ($kind in @("Sandbox", "Allowed", "Request", "RequestSibling")) {
+        $request = "$RealRoot/Download/SrtMutation$kind"
+        $expected = "$BackendPrivateRoot/Download/SrtMutation$kind"
+        $shadow = "$BackendRoot/Download/SrtMutation$kind"
+        if ($kind -eq "Allowed") {
+            $expected = "$BackendRoot/Download/SrtMutationAllowed"
+            $shadow = "$BackendPrivateRoot/Download/SrtMutationAllowed"
+        } elseif ($kind -eq "Request") {
+            $expected = "$BackendRoot/Download/SrtMutationMapped"
+            $shadow = "$BackendPrivateRoot/Download/SrtMutationRequest"
+        }
+        $result = Invoke-ServiceCase "scenario-$Scenario" "mutation-$kind" "file_mutation_lifecycle" @{ file_dir = $request } '^PASS \[file_mutation_lifecycle\]'
+        $ok = $result.Ok -and $ok
+        if (-not (Test-Su "test `"`$(ls -A '$expected')`" = complete.txt && test `"`$(cat '$expected/complete.txt')`" = srx-mutation-lifecycle-v1 && test `"`$(wc -c < '$expected/complete.txt')`" -eq 25")) {
+            $script:Failures.Add("scenario-$Scenario/mutation-$kind physical content mismatch: $expected") | Out-Null
+            $ok = $false
+        }
+        if (-not (Test-Su "test ! -L '$shadow' && { test ! -e '$shadow' || { test -d '$shadow' && entries=`$(ls -A '$shadow') && test -z `"`$entries`"; }; }")) {
+            $script:Failures.Add("scenario-$Scenario/mutation-$kind shadow contains leaked entries: $shadow") | Out-Null
+            $ok = $false
+        }
+    }
+    foreach ($unused in @("$BackendRoot/Download/SrtMutationRequest", "$BackendPrivateRoot/Download/SrtMutationMapped")) {
+        if (-not (Test-Su "entries=`$(ls -A '$unused') && test -z `"`$entries`"")) {
+            $script:Failures.Add("scenario-$Scenario/mutation unused path missing or not empty: $unused") | Out-Null
+            $ok = $false
+        }
+    }
+    return $ok
+}
+
+function Invoke-FileLinkControl {
+    Apply-ScenarioConfig 1
+    Clear-Targets
+    if (-not (Test-Su "mkdir -p '$BackendRoot/Download/SrtMutationAllowed'")) { return $false }
+    Fix-SharedFixturePermissions
+    if (-not (Restart-App "scenario-1-link-control" $false)) { return $false }
+    $controlPid = Get-AppPid
+    if (-not $controlPid -or -not (Test-Su "a=`$(awk '`$5 == `"/storage/emulated`" {print `$3; exit}' /proc/$controlPid/mountinfo); b=`$(awk '`$5 == `"/storage/emulated`" {print `$3; exit}' /proc/1/mountinfo); test -n `"`$a`" && test `"`$a`" = `"`$b`"")) {
+        Write-Host "FAIL [file_link_control] reason=unredirected_view_unconfirmed"
+        return $false
+    }
+    $control = "$RealRoot/Download/SrtMutationAllowed"
+    $result = Invoke-ServiceCase "scenario-1" "link-control-target" "file_create" @{ file_path = "$control/link-target.txt"; payload = $Payload } '^PASS \[file_create\]'
+    if (-not $result.Ok) { return $false }
+    foreach ($operation in @("symlink", "link")) {
+        $from = if ($operation -eq "symlink") { "link-target.txt" } else { "$control/link-target.txt" }
+        $result = Invoke-ServiceCase "scenario-1" "link-control-$operation" "file_$operation" @{ file_path = $from; target_file_path = "$control/native-$operation" } ""
+        if (-not $result.Ok) { return $false }
+        if ($result.Text -match "^PASS \[file_$operation\] link succeeded") {
+            $outcome = "created"
+            if (-not (Test-Su "test -e '$BackendRoot/Download/SrtMutationAllowed/native-$operation'")) { return $false }
+        } elseif ($result.Text -match "(?m)^FAIL \[file_$operation\] link failed .*error=($operation failed: )?EACCES( \([^()]*\))?$") {
+            $outcome = "EACCES"
+        } elseif ($operation -eq "link" -and $result.Text -match '(?m)^FAIL \[file_link\] link failed .*error=(link failed: )?EPERM( \([^()]*\))?$') {
+            $outcome = "EPERM"
+        } else {
+            Write-Host "FAIL [file_link_control] operation=$operation reason=unexpected_result`n$($result.Text)"
+            return $false
+        }
+        if ($outcome -ne "created" -and -not (Test-Su "test ! -e '$BackendRoot/Download/SrtMutationAllowed/native-$operation' && test ! -L '$BackendRoot/Download/SrtMutationAllowed/native-$operation'")) { return $false }
+        if ($operation -eq "symlink") { $script:NativeSymlinkResult = $outcome } else { $script:NativeHardlinkResult = $outcome }
+        Write-Host "OBSERVED [file_link_control] operation=$operation redirect=disabled outcome=$outcome"
+    }
+    return $true
+}
+
+function Invoke-FileMutationMetadataScenario {
+    param([int]$Scenario)
+    $ok = $true
+    $failureCount = $script:Failures.Count
+    $symlinkDeniedRoutes = New-Object System.Collections.Generic.List[string]
+    $hardlinkDeniedRoutes = New-Object System.Collections.Generic.List[string]
+    $linkResults = New-Object System.Collections.Generic.List[string]
+    foreach ($kind in @("Sandbox", "Allowed", "Request", "RequestSibling")) {
+        $request = "$RealRoot/Download/SrtMutation$kind"
+        $expected = "$BackendPrivateRoot/Download/SrtMutation$kind"
+        $shadow = "$BackendRoot/Download/SrtMutation$kind"
+        $chmodMode = "440"
+        $fchmodMode = "220"
+        if ($kind -eq "Allowed") {
+            $expected = "$BackendRoot/Download/SrtMutationAllowed"
+            $shadow = "$BackendPrivateRoot/Download/SrtMutationAllowed"
+        } elseif ($kind -eq "Request") {
+            $expected = "$BackendRoot/Download/SrtMutationMapped"
+            $shadow = "$BackendPrivateRoot/Download/SrtMutationRequest"
+        }
+
+        $file = "$request/metadata.txt"
+        $linkTarget = "$request/link-target.txt"
+        $link = "$request/symbolic-link"
+        $hardlink = "$request/hard-link"
+        $hardlinkCreated = $false
+        $result = Invoke-ServiceCase "scenario-$Scenario" "mutation-$kind-metadata-create" "file_create" @{ file_path = $file; payload = $Payload } '^PASS \[file_create\]'
+        $ok = $result.Ok -and $ok
+        $result = Invoke-ServiceCase "scenario-$Scenario" "mutation-$kind-chmod" "file_chmod" @{ file_path = $file; mode = "0400" } '^PASS \[file_chmod\]'
+        $ok = $result.Ok -and $ok
+        $actualMode = ((Invoke-Su "stat -c %a '$expected/metadata.txt'") -join "").Trim()
+        if ($LASTEXITCODE -ne 0 -or $actualMode -ne $chmodMode) {
+            $script:Failures.Add("scenario-$Scenario/mutation-$kind chmod mode mismatch expected=$chmodMode actual=$actualMode") | Out-Null
+            $ok = $false
+        }
+        $result = Invoke-ServiceCase "scenario-$Scenario" "mutation-$kind-fchmod" "file_fchmod" @{ file_path = $file; mode = "0200" } '^PASS \[file_fchmod\]'
+        $ok = $result.Ok -and $ok
+        $actualMode = ((Invoke-Su "stat -c %a '$expected/metadata.txt'") -join "").Trim()
+        if ($LASTEXITCODE -ne 0 -or $actualMode -ne $fchmodMode) {
+            $script:Failures.Add("scenario-$Scenario/mutation-$kind fchmod mode mismatch expected=$fchmodMode actual=$actualMode") | Out-Null
+            $ok = $false
+        }
+        $result = Invoke-ServiceCase "scenario-$Scenario" "mutation-$kind-chmod-restore" "file_chmod" @{ file_path = $file; mode = "0664" } '^PASS \[file_chmod\]'
+        $ok = $result.Ok -and $ok
+        $result = Invoke-ServiceCase "scenario-$Scenario" "mutation-$kind-link-target-create" "file_create" @{ file_path = $linkTarget; payload = $Payload } '^PASS \[file_create\]'
+        $ok = $result.Ok -and $ok
+        $symlinkCreated = $false
+        $result = Invoke-ServiceCase "scenario-$Scenario" "mutation-$kind-symlink" "file_symlink" @{ file_path = "link-target.txt"; target_file_path = $link } ""
+        $ok = $result.Ok -and $ok
+        if ($result.Text -match 'PASS \[file_symlink\] link succeeded') {
+            $symlinkCreated = $true
+            $result = Invoke-ServiceCase "scenario-$Scenario" "mutation-$kind-readlink" "file_readlink" @{ file_path = $link; expected_path = "link-target.txt" } '^PASS \[file_readlink\]'
+            $ok = $result.Ok -and $ok
+            $result = Invoke-ServiceCase "scenario-$Scenario" "mutation-$kind-symlink-read" "file_read" @{ file_path = $link; expected_payload = $Payload } '^PASS \[file_read\]'
+            $ok = $result.Ok -and $ok
+            $linkResults.Add("[file_symlink_boundary] scenario=$Scenario route=$kind outcome=created")
+        } elseif ($result.Text -match '(?m)^FAIL \[file_symlink\] link failed .*error=(symlink failed: )?EACCES( \([^()]*\))?$') {
+            $symlinkDeniedRoutes.Add($kind) | Out-Null
+            $linkResults.Add("[file_symlink_boundary] scenario=$Scenario route=$kind outcome=denied errno=EACCES control=unredirected,Allowed")
+        } else {
+            $script:Failures.Add("scenario-$Scenario/mutation-$kind symlink boundary changed: $($result.Text -replace "`n", " | ")") | Out-Null
+            Write-Host "FAIL [file_symlink_boundary] scenario=$Scenario route=$kind reason=unexpected_result`n$($result.Text)"
+            $ok = $false
+        }
+
+        $result = Invoke-ServiceCase "scenario-$Scenario" "mutation-$kind-hardlink-boundary" "file_link" @{ file_path = $linkTarget; target_file_path = $hardlink } ""
+        $ok = $result.Ok -and $ok
+        if ($result.Text -match 'PASS \[file_link\] link succeeded') {
+            $hardlinkCreated = $true
+            if (-not (Test-Su "test '$expected/hard-link' -ef '$expected/link-target.txt' && test `"`$(cat '$expected/hard-link')`" = '$Payload'")) {
+                $script:Failures.Add("scenario-$Scenario/mutation-$kind hardlink content mismatch: $expected/hard-link") | Out-Null
+                $ok = $false
+            }
+            $linkResults.Add("[file_link_boundary] scenario=$Scenario route=$kind outcome=created")
+        } elseif ($result.Text -match '(?m)^FAIL \[file_link\] link failed .*error=(link failed: )?EPERM( \([^()]*\))?$') {
+            if ($script:NativeHardlinkResult -ne "EPERM") {
+                $script:Failures.Add("scenario-$Scenario/mutation-$kind EPERM was not reproduced by the unredirected control") | Out-Null
+                $ok = $false
+            }
+            $linkResults.Add("[file_link_boundary] scenario=$Scenario route=$kind outcome=denied errno=EPERM control=unredirected")
+        } elseif ($result.Text -match '(?m)^FAIL \[file_link\] link failed .*error=(link failed: )?EACCES( \([^()]*\))?$') {
+            $hardlinkDeniedRoutes.Add($kind) | Out-Null
+            $linkResults.Add("[file_link_boundary] scenario=$Scenario route=$kind outcome=denied errno=EACCES control=unredirected,Allowed")
+        } else {
+            $script:Failures.Add("scenario-$Scenario/mutation-$kind hardlink boundary changed: $($result.Text -replace "`n", " | ")") | Out-Null
+            Write-Host "FAIL [file_link_boundary] scenario=$Scenario route=$kind reason=unexpected_result`n$($result.Text)"
+            $ok = $false
+        }
+
+        $entries = ((Invoke-Su "entries=`$(ls -A '$expected') || exit 1; if [ -n `"`$entries`" ]; then printf '%s\n' `"`$entries`" | sort | tr '\n' '|'; fi") -join "").TrimEnd("`r", "`n")
+        $expectedEntries = "complete.txt|"
+        if ($hardlinkCreated) { $expectedEntries += "hard-link|" }
+        $expectedEntries += "link-target.txt|metadata.txt|"
+        if ($symlinkCreated) { $expectedEntries += "symbolic-link|" }
+        if ($LASTEXITCODE -ne 0 -or $entries -cne $expectedEntries) {
+            $script:Failures.Add("scenario-$Scenario/mutation-$kind physical entries mismatch path=$expected entries=$entries") | Out-Null
+            $ok = $false
+        }
+        if (-not (Test-Su "test `"`$(cat '$expected/metadata.txt')`" = '$Payload' && test `"`$(cat '$expected/link-target.txt')`" = '$Payload' && test ! -e '$shadow/hard-link' && test ! -L '$shadow/hard-link' && test ! -e '$shadow/metadata.txt' && test ! -e '$shadow/link-target.txt' && test ! -e '$shadow/symbolic-link' && test ! -L '$shadow/symbolic-link'")) {
+            $script:Failures.Add("scenario-$Scenario/mutation-$kind content or shadow path mismatch: $expected") | Out-Null
+            $ok = $false
+        }
+        $symlinkPathValid = if ($symlinkCreated) {
+            if (Test-Su "test -L '$expected/symbolic-link'") {
+                $actualLink = ((Invoke-Su "readlink '$expected/symbolic-link'") -join "").Trim()
+                $LASTEXITCODE -eq 0 -and $actualLink -ceq "link-target.txt"
+            } else { $false }
+        } else {
+            Test-Su "test ! -e '$expected/symbolic-link' && test ! -L '$expected/symbolic-link'"
+        }
+        if (-not $symlinkPathValid) {
+            $script:Failures.Add("scenario-$Scenario/mutation-$kind symlink physical path mismatch: $expected/symbolic-link") | Out-Null
+            $ok = $false
+        }
+        if ($kind -eq "Request" -and -not (Test-Su "test ! -e '$BackendRoot/Download/SrtMutationRequest/hard-link' && test -z `"`$(ls -A '$BackendRoot/Download/SrtMutationRequest' 2>/dev/null)`" && test -z `"`$(ls -A '$BackendPrivateRoot/Download/SrtMutationMapped' 2>/dev/null)`"")) {
+            $script:Failures.Add("scenario-$Scenario/mutation-$kind unexpected hardlink or unused mapped path entry") | Out-Null
+            $ok = $false
+        }
+    }
+    if ($symlinkDeniedRoutes.Count -gt 0 -and ($script:NativeSymlinkResult -ne "EACCES" -or -not $symlinkDeniedRoutes.Contains("Allowed"))) {
+        $script:Failures.Add("scenario-$Scenario/symlink EACCES was not reproduced by both controls") | Out-Null
+        Write-Host "FAIL [file_symlink_boundary] scenario=$Scenario reason=eacces_without_matching_controls"
+        $ok = $false
+    }
+    if ($hardlinkDeniedRoutes.Count -gt 0 -and ($script:NativeHardlinkResult -ne "EACCES" -or -not $hardlinkDeniedRoutes.Contains("Allowed"))) {
+        $script:Failures.Add("scenario-$Scenario/hardlink EACCES was not reproduced by both controls") | Out-Null
+        Write-Host "FAIL [file_link_boundary] scenario=$Scenario reason=eacces_without_matching_controls"
+        $ok = $false
+    }
+    $ok = $ok -and $script:Failures.Count -eq $failureCount
+    if ($ok) {
+        foreach ($result in $linkResults) {
+            Write-Host "PASS $result checks=physical,content,zero_shadow"
+        }
+    } else {
+        Write-Host "FAIL [file_mutation_metadata] scenario=$Scenario reason=verification_failed"
+    }
+    return $ok
+}
+
 function Invoke-StandardScenario {
     param([int]$Scenario)
     $ok = (Invoke-WriteCase $Scenario "write" (Get-TargetPath $Scenario) $Payload).Ok
@@ -2477,7 +3015,7 @@ function Invoke-StandardScenario {
             $ok = (Require-Missing "scenario-$Scenario" "real-request" "$RealRoot/Download/SrtProbe/$TestFile") -and $ok
             $mediaFile = "srt_mediastore_sandbox_only.txt"
             if (-not (Confirm-MediaProviderHookReady "scenario-$Scenario-before-mediastore")) { return $false }
-            $mediaResult = Invoke-ServiceCase "scenario-$Scenario" "mediastore-sandbox-only" "mediastore_create_file" @{ file_name = $mediaFile; relative_path = "Documents/SrtMediaRoutingProbe" } "^PASS \[mediastore_create_file\]"
+            $mediaResult = Invoke-MediaStoreCreateCase $Scenario "mediastore-sandbox-only" @{ file_name = $mediaFile; relative_path = "Documents/SrtMediaRoutingProbe" }
             $ok = $mediaResult.Ok -and $ok
             # 断言前立即采集 hook 证据，此时 logcat buffer 仍覆盖本次 insert。
             Invoke-CaptureScenario2MediastoreHookDiag
@@ -2520,15 +3058,38 @@ function Invoke-OwnerDriftOwnDirScenario {
     $driftVisible = "$RealRoot/Android/data/$AppId/files/SrtDrift"
     $driftBackend = "$BackendRoot/Android/data/$AppId/files/SrtDrift"
     $ok = $true
-    # 漂移目录的读与新建写入都必须被原生 DAC 拒绝：任何 PASS 都说明有链路在
-    # 改写属主或绕过 DAC 放行。
-    $ok = (Invoke-ServiceCase "scenario-$Scenario" "own-drift-read-denied" "file_read" @{ file_path = "$driftVisible/srt_drift_existing.txt" } "^FAIL \[file_read\]").Ok -and $ok
-    $ok = (Invoke-ServiceCase "scenario-$Scenario" "own-drift-write-denied" "file_write" @{ file_path = "$driftVisible/srt_drift_probe.txt"; payload = $Payload; expected_payload = $Payload } "^FAIL \[file_write\]").Ok -and $ok
+    # 与 .sh 同口径：属主漂移私有目录的读写结论取决于数据面形态——bind 布局下内核按应用
+    # 凭据做 DAC 而拒绝；FUSE 布局（auto 默认）由会话服务，与系统 MediaProvider 服务
+    # emulated 视图同理，属于应用自己的私有树故放行。原生 Android 走 FUSE，因此「拒绝」
+    # 不是唯一正确形态。本场景契约是「模块不得改写私有树属主」（见下方 1023 校验）。
+    # 设备端命令先在赋值表达式里拼好再传 Invoke-Su（参数模式下 `+` 会变成字面量）。
+    $readExpect = '^FAIL \[file_read\].*error=.*open failed: EACCES( \([^()]*\))?$'
+    $writeExpect = '^FAIL \[file_write\].*error=.*open failed: EACCES( \([^()]*\))?$'
+    $driftPid = Get-AppPid
+    if ($driftPid) {
+        $devProbe = "a=`"`$(grep -m1 ' /storage/emulated ' `"/proc/$driftPid/mountinfo`" | cut -d' ' -f3)`"; " +
+            "b=`"`$(grep -m1 ' /storage/emulated ' /proc/1/mountinfo | cut -d' ' -f3)`"; " +
+            "[ -n `"`$a`" ] && [ -n `"`$b`" ] && [ `"`$a`" != `"`$b`" ]"
+        $privateBind = Test-Su "grep -Fq ' /storage/emulated/0/Android/data/$AppId ' /proc/$driftPid/mountinfo"
+        if (-not $privateBind -and (Test-Su $devProbe)) {
+            Write-Host "  - scenario-$Scenario/owner-drift-layout form=fuse-served"
+            $readExpect = "^PASS \[file_read\]"
+            $writeExpect = "^PASS \[file_write\]"
+        } else {
+            Write-Host "  - scenario-$Scenario/owner-drift-layout form=bind"
+        }
+    }
+    $ok = (Invoke-ServiceCase "scenario-$Scenario" "own-drift-read" "file_read" @{ file_path = "$driftVisible/srt_drift_existing.txt"; expected_payload = "srt-drift-payload" } $readExpect).Ok -and $ok
+    $ok = (Invoke-ServiceCase "scenario-$Scenario" "own-drift-write" "file_write" @{ file_path = "$driftVisible/srt_drift_probe.txt"; payload = $Payload; expected_payload = $Payload } $writeExpect).Ok -and $ok
     # 后端属主必须保持注入的 1023：守护与应用都不得改写私有树属主（拆除契约）。
-    $ownerIntact = Test-Su "[ `$(stat -c %u '$driftBackend/srt_drift_existing.txt') -eq 1023 ]"
+    $ownerIntact = Test-Su "[ `$(stat -c %u '$driftBackend/srt_drift_existing.txt') -eq 1023 ] && [ `"`$(cat '$driftBackend/srt_drift_existing.txt')`" = srt-drift-payload ]"
     if (-not $ownerIntact) {
         $script:Failures.Add("scenario-$Scenario/owner-drift-repaired-unexpectedly") | Out-Null
         Write-Host "  - scenario-$Scenario/owner-drift-repaired-unexpectedly backend=$driftBackend"
+        return $false
+    }
+    if ($writeExpect.StartsWith('^FAIL ') -and -not (Test-Su "test ! -e '$driftBackend/srt_drift_probe.txt' && test ! -L '$driftBackend/srt_drift_probe.txt'")) {
+        $script:Failures.Add("scenario-$Scenario/owner-drift denied write left a file") | Out-Null
         return $false
     }
     Write-Host "  - scenario-$Scenario/owner-drift-inert"
@@ -2556,6 +3117,7 @@ function Invoke-ReadOnlyScenario {
     $ok = (Invoke-ServiceCase "scenario-$Scenario" "mkdir-denied" "file_mkdir_denied" @{ file_dir = "$ReadOnlyRoot/newdir" } "^PASS \[file_mkdir_denied\]").Ok -and $ok
     $ok = (Invoke-ServiceCase "scenario-$Scenario" "rename-denied" "file_rename_denied" @{ file_path = "$ReadOnlyRoot/$ReadOnlyFile"; target_file_path = "$ReadOnlyRoot/renamed.txt" } "^PASS \[file_rename_denied\]").Ok -and $ok
     $ok = (Invoke-ServiceCase "scenario-$Scenario" "delete-denied" "file_delete_denied" @{ file_path = "$ReadOnlyRoot/$ReadOnlyFile" } "^PASS \[file_delete_denied\]").Ok -and $ok
+    $ok = (Invoke-ServiceCase "scenario-$Scenario" "read-after-denials" "file_read" @{ file_path = "$ReadOnlyRoot/$ReadOnlyFile"; expected_payload = $ReadOnlyPayload } "^PASS \[file_read\]").Ok -and $ok
     $ok = (Require-File "scenario-$Scenario" "seed-still-exists" "$ReadOnlyRoot/$ReadOnlyFile") -and $ok
     $ok = (Require-Missing "scenario-$Scenario" "write-target" "$ReadOnlyRoot/write_denied.txt") -and $ok
     $ok = (Require-Missing "scenario-$Scenario" "hardlink-target" "$ReadOnlyRoot/$ReadOnlyHardlink") -and $ok
@@ -2586,6 +3148,7 @@ function Set-ReadOnlyMediaImage {
     $backendPath = "$backendDir/$ReadOnlyImageFile"
     $privatePath = Convert-ToBackendPath "$PrivateReadOnlyMediaRoot/$ReadOnlyImageFile"
     Remove-MediaStoreRowsByPattern "content://media/external/images/media" @("_display_name=srt_read_only_media( \(\d+\))?\.jpg(,|$)") @("relative_path=Pictures/SrtReadOnlyMedia/", "_data=.*/Pictures/SrtReadOnlyMedia/")
+    Remove-MediaStoreRowsByPattern "content://media/external/file" @("_display_name=SrtReadOnlyMedia( \(\d+\))?(,|$)") @("_data=.*/Pictures/SrtReadOnlyMedia(,|$)")
     Invoke-Su "mkdir -p '$backendDir'; rm -f '$privatePath'; printf '%s' '$ReadOnlyImageBase64' | base64 -d > '$backendPath'; chmod -R 777 '$backendDir' 2>/dev/null || true" | Out-Null
     Invoke-Adb @("shell", "content", "insert", "--uri", "content://media/external/images/media", "--bind", "_data:s:$ReadOnlyMediaRoot/$ReadOnlyImageFile", "--bind", "_display_name:s:$ReadOnlyImageFile", "--bind", "mime_type:s:image/jpeg") | Out-Null
     Invoke-Adb @("shell", "am", "broadcast", "-a", "android.intent.action.MEDIA_SCANNER_SCAN_FILE", "-d", "file://$ReadOnlyMediaRoot/$ReadOnlyImageFile") | Out-Null
@@ -2769,6 +3332,12 @@ function Test-FuseMountActive {
             Write-Host "  - scenario-$Scenario/fuse-mount-active pid=$appPid"
             return $true
         }
+        # 挂载源原生化（/dev/fuse）后源名判据恒落空：应用视图根 dev 与 init 命名空间系统
+        # FUSE 不同即已接管（与 .sh 的 app_view_dev_differs 同一判据）。
+        if ($appPid -and (Test-Su "a=`$(grep -m1 ' /storage/emulated ' /proc/$appPid/mountinfo | cut -d' ' -f3); b=`$(grep -m1 ' /storage/emulated ' /proc/1/mountinfo | cut -d' ' -f3); [ -n `"`$a`" ] && [ -n `"`$b`" ] && [ `"`$a`" != `"`$b`" ]")) {
+            Write-Host "  - scenario-$Scenario/fuse-mount-active pid=$appPid source=app-view-dev"
+            return $true
+        }
         Start-Sleep -Milliseconds $script:ResultPollMilliseconds
     }
 
@@ -2821,6 +3390,13 @@ function Test-ScopedFuseDaemonStarted {
             # 继续真实验证。
             if ($scopedAppPid -and (Test-Su "grep -F -- ' $RealRoot ' `"/proc/$scopedAppPid/mountinfo`" 2>/dev/null | grep -Eq ' - fuse srx_fuse_host(\[| )'")) {
                 Write-Host "  - scoped_fuse_started scenario=$Scenario root=$MountRoot attempt=$attempt source=app-mountinfo-host"
+                return $true
+            }
+            # 判据 4（原生化挂载源）：挂载源已是 /dev/fuse，判据 2/3 的 srx_fuse_* 源名在
+            # 共享宿主布局下恒落空。改用拓扑事实：应用视图根 dev 与 init 命名空间系统 FUSE
+            # 不同即已接管（与场景 4 接管断言同一判据）。
+            if ($scopedAppPid -and (Test-Su "a=`$(grep -m1 ' /storage/emulated ' /proc/$scopedAppPid/mountinfo | cut -d' ' -f3); b=`$(grep -m1 ' /storage/emulated ' /proc/1/mountinfo | cut -d' ' -f3); [ -n `"`$a`" ] && [ -n `"`$b`" ] && [ `"`$a`" != `"`$b`" ]")) {
+                Write-Host "  - scoped_fuse_started scenario=$Scenario root=$MountRoot attempt=$attempt source=app-view-dev"
                 return $true
             }
             # 失败标志只收集不提前终止：这些日志可能出现在挂载协商窗口内，随后宿主
@@ -2882,7 +3458,7 @@ function Recover-ScopedFuseStart {
     Invoke-Adb @("shell", "am", "force-stop", $AppId) | Out-Null
     # 重启后旧 PID 的挂载确认全部失效，与 Restart-App 同口径清空缓存。
     $script:LastMountConfirmedPid = ""
-    Invoke-Adb @("shell", "am", "start", "-W", "-n", "$AppId/.MainActivity") | Out-Null
+    Start-TestApp -Wait
     Wait-Storage "scenario-$Scenario-scoped-fuse-recovery" 30 | Out-Null
     Invoke-Su "sleep 1" | Out-Null
 }
@@ -2914,31 +3490,20 @@ function Invoke-RuleSandboxScenario {
 }
 
 function Invoke-ProviderSandboxScenario {
-    # 触发链：提供器配置（Apply-ScenarioConfig 写入）→ force-stop → root content query
-    # 拉起提供器冷启动（新配置生效）→ 轮询断言挂载请求携带沙盒规则（scoped 会话或宿主接入）。
-    # 回归背景（2026-10-21 真机）：桥接进程的挂载请求被清零规则（req sandbox=0），
-    # 宿主接入被拒（attach skipped reason=policy_registration_failed），退回零规则
-    # scoped 会话后原生写入穿透真实存储。
-    # 判定标记（与提供器由 companion 还是 daemon 路径服务无关）：
-    #   通过：`perf companion mount pkg=... ok=true`（挂载流程成功，hook 兜底拓扑）
-    #   回归：`req op=apply ... sandbox=0`、`attach skipped ... policy_registration_failed`，
-    #         或出现任何 `fuse redirect mount start pkg=下载提供器`（桥接进程不应有模块会话）
-    # 行为级验证（引擎 mkdir 落点）依赖 XL 引擎初始化，CI 模拟器无该引擎，
-    # 由真机复测协议覆盖（见 .workbuddy/memory/2026-10-21.md）。
+    # 检查下载提供器由 companion mount 或 system-writer hook 接管。
+    # 本场景验证接管拓扑，不执行提供器写入或断言其落点。
     param([int]$Scenario)
     Write-Host "  - scenario-$Scenario/provider-sandbox: cleanup and force-stop download provider"
     Invoke-Su "rm -rf '$ProviderRealDir' '$ProviderBackendDir'; am force-stop '$ProviderPackage'" | Out-Null
     Start-Sleep -Seconds 2
+    # 用只读查询触发提供器路径，再轮询进程级挂载或 hook 标记。
     Invoke-Su "content query --uri content://downloads/my_downloads --projection _id >/dev/null 2>&1" | Out-Null
-    $assertionsOk = $false
-    foreach ($attempt in 1..4) {
+    $positiveOk = $false
+    for ($round = 1; $round -le 4 -and -not $positiveOk; $round++) {
         Start-Sleep -Seconds 5
         $mountOk = (Invoke-Su "grep -Eq 'perf companion mount pkg=$ProviderPackage pid=[0-9]+ .*ok=true' '$LogPath' 2>/dev/null; echo exit=`$?" | Select-Object -Last 1) -eq "exit=0"
-        if ($mountOk) {
-            $assertionsOk = $true
-            break
-        }
-        # 本轮请求行/挂载行未出现（companion 限流或启动慢）：重启提供器再试一轮。
+        $hookOk = (Invoke-Su "grep -Eq 'hook refresh start profile=system-writer pkg=$ProviderPackage ' '$LogPath' 2>/dev/null; echo exit=`$?" | Select-Object -Last 1) -eq "exit=0"
+        if ($mountOk -or $hookOk) { $positiveOk = $true; break }
         Invoke-Su "am force-stop '$ProviderPackage'; content query --uri content://downloads/my_downloads --projection _id >/dev/null 2>&1" | Out-Null
     }
     $regressionReq = (Invoke-Su "grep -Eq 'req op=apply pid=[0-9]+ pkg=$ProviderPackage .*sandbox=0' '$LogPath' 2>/dev/null; echo exit=`$?" | Select-Object -Last 1) -eq "exit=0"
@@ -2948,2190 +3513,16 @@ function Invoke-ProviderSandboxScenario {
         Write-Host "  - scenario-$Scenario/provider-sandbox: regression markers found (sandbox=0 request / policy_registration_failed / unexpected fuse session)"
         return $false
     }
-    if (-not $assertionsOk) {
-        Write-Host "  - scenario-$Scenario/provider-sandbox: positive markers not found after retries"
-        return $false
-    }
-    Write-Host "  - scenario-$Scenario/provider-sandbox: sandbox policy markers confirmed"
-    Invoke-Su "grep -hE 'perf companion mount pkg=$ProviderPackage' '$LogPath' 2>/dev/null | tail -3" | Write-Host
-    return $true
-}
-
-
-function Get-ServiceCaseTimeoutSeconds {
-    param([string]$TestCase)
-    if ($TestCase -eq "all") {
-        if (-not [string]::IsNullOrWhiteSpace($env:ALL_TEST_TIMEOUT_SECONDS)) {
-            return [int]$env:ALL_TEST_TIMEOUT_SECONDS
-        }
-        return 240
-    }
-    if (-not [string]::IsNullOrWhiteSpace($env:TEST_CASE_TIMEOUT_SECONDS)) {
-        return [int]$env:TEST_CASE_TIMEOUT_SECONDS
-    }
-    75
-}
-
-function Invoke-ServiceCase {
-    param(
-        [string]$Scenario,
-        [string]$Label,
-        [string]$TestCase,
-        [hashtable]$Extras,
-        [string]$PassRegex
-    )
-
-    Write-Host "  - ${Scenario}/${Label}: $TestCase"
-    Prepare-ServiceCase "$Scenario/$Label"
-
-    # HyperOS 实机（A16/KSU）会随用例启动次数累积把 start-foreground-service 无限期
-    # 延迟（应用重启后还会重投递积压 intent）：被延迟的用例变成僵尸，或表现为本用例
-    # result_timeout，或与后续用例交错执行污染结果文件。第一轮超时后先停止应用清空
-    # 积压 intent，再把应用前台重启一次，然后原地重驱当前用例（与 .sh 的
-    # run_service_case 清态重试同步）。
-    for ($driveAttempt = 1; $driveAttempt -le 2; $driveAttempt++) {
-        if ($driveAttempt -gt 1) {
-            Write-Host "    RECOVER $Scenario/$Label attempt=$driveAttempt"
-            Stop-AppAndWaitFuseCleanup "$Scenario/$Label/recover" $true | Out-Null
-            Start-Sleep -Milliseconds 500
-            $script:LastMountConfirmedPid = ""
-            Invoke-Adb @("logcat", "-c") | Out-Null
-            Invoke-Su ": > '$LogPath' 2>/dev/null || true" | Out-Null
-            Invoke-Adb @("shell", "am", "start", "-W", "-n", "$AppId/.MainActivity") | Out-Null
-            Wait-AppMountConfirmed "$Scenario/$Label-recover" | Out-Null
-            Wait-Storage "$Scenario/$Label-recover" | Out-Null
-            Clear-Results
-        }
-        if ($script:ServiceCaseSettleMilliseconds -gt 0) {
-            Start-Sleep -Milliseconds $script:ServiceCaseSettleMilliseconds
-        }
-        Clear-Results
-        $freshnessMarker = "/data/local/tmp/srx-result-$([Guid]::NewGuid().ToString('N')).marker"
-        Invoke-Su "touch '$freshnessMarker'" | Out-Null
-        # 直接启动前台服务而非经 receiver 转发广播：HyperOS 实机（A16/KSU）会在用例
-        # 启动若干次后按「Background execution not allowed」策略在入队时静默丢弃发往
-        # manifest receiver 的广播，表现为用例永远无结果（result_timeout 雪崩）；
-        # shell 直启 FGS 不受该策略限制，服务端 onStartCommand 按 action+extras 处理，
-        # 与 receiver 转发语义一致（与 .sh 的 run_service_case 同步修改）。
-        $args = @("shell", "am", "start-foreground-service", "-n", "$AppId/.TestService", "-a", $Action, "--es", "test_case", $TestCase)
-        foreach ($key in $Extras.Keys) {
-            $args += @("--es", [string]$key, [string]$Extras[$key])
-        }
-        Invoke-Adb $args | Out-Null
-
-        # 与 .sh 的 run_service_case 一致：确认必须在广播**之后**——广播才会拉起应用进程，
-        # 放在之前会因为进程尚未存在而等不到 PID，把正常的场景判成失败。
-        # 场景 1/23/31 断言「不重定向」，由 Test-LabelExpectsMount 排除。
-        #
-        # 确认失败只在**有期望路径**的场景记失败（即场景 3/4）：那里的挂载点可预知，挂载没建立时
-        # 用例必然失败，在确认点报错更贴近现场。其余场景复核恒真，其返回值只当廉价存活检查用。
-        $serviceLabel = "$Scenario/$Label-service"
-        $mountConfirmed = Ensure-CurrentAppMountConfirmed $serviceLabel
-        if (
-            -not $mountConfirmed -and
-            (Test-LabelExpectsMount $serviceLabel) -and
-            (Get-ExpectedMountPathsForLabel $serviceLabel).Count -gt 0
-        ) {
-            $script:Failures.Add("$Scenario/$Label mount not confirmed before service case")
-            if ($script:FailFast) {
-                throw "[SRT_FAIL_FAST_ITEM] $Scenario/$Label/mount-confirm"
-            }
-        }
-
-        $timeoutSeconds = Get-ServiceCaseTimeoutSeconds $TestCase
-        $result = Wait-ServiceResult $timeoutSeconds $freshnessMarker $TestCase
-        Invoke-Su "rm -f '$freshnessMarker'" | Out-Null
-        if ($result.Found) {
-            $ok = if ($PassRegex) { $result.Text -match $PassRegex } else { $true }
-            if (-not $ok) {
-                $script:Failures.Add("$Scenario/$Label expected $PassRegex, got: $($result.Text -replace "`n", " | ")")
-                Write-Host "    FAIL $Scenario/$Label"
-                if ($script:FailFast) {
-                    throw "[SRT_FAIL_FAST_ITEM] $Scenario/$Label"
-                }
-            } else {
-                Write-Host "    PASS $Scenario/$Label"
-            }
-            return [pscustomobject]@{ Ok = $ok; Text = $result.Text; Path = $result.Path }
-        }
-        Stop-AppAndWaitFuseCleanup "$Scenario/$Label/attempt-$driveAttempt-timeout" $true | Out-Null
-    }
-
-    $script:Failures.Add("$Scenario/$Label result timeout for $TestCase")
-    Write-Host "    TIMEOUT $Scenario/$Label"
-    if ($script:FailFast) {
-        throw "[SRT_FAIL_FAST_ITEM] $Scenario/$Label"
-    }
-    [pscustomobject]@{ Ok = $false; Text = "timeout"; Path = "" }
-}
-
-function Test-FreshAppEnabled {
-    # 与 .sh 的 fresh_app_enabled_for_label 对应：SRT_FRESH_APP_SCENARIOS 非空时
-    # 只有列出的场景保持逐用例冷启动。
-    param([string]$Label)
-
-    if (-not $script:FreshAppPerCase) { return $false }
-    if ($script:FreshAppScenarios.Count -gt 0) {
-        $scenario = Get-ScenarioFromLabel $Label
-        return ($scenario -in $script:FreshAppScenarios)
-    }
-    return $true
-}
-
-function Prepare-ServiceCase {
-    param([string]$Label)
-    if (-not (Test-FreshAppEnabled $Label)) { return }
-    $cleanupOk = Stop-AppAndWaitFuseCleanup "$Label/fresh-app"
-    if (-not $cleanupOk -and $script:FailFast) {
-        throw "[SRT_FAIL_FAST_ITEM] $Label/fresh-app-cleanup"
-    }
-    Start-Sleep -Milliseconds 500
-    # 应用即将重启，之前确认过的 PID 一定失效；不清掉会让 Ensure-CurrentAppMountConfirmed
-    # 在 PID 被复用时空转（与 .sh 在 start_app_and_confirm_mount 循环里重置的含义一致）。
-    $script:LastMountConfirmedPid = ""
-    Invoke-Adb @("logcat", "-c") | Out-Null
-    Invoke-Su ": > '$LogPath' 2>/dev/null || true" | Out-Null
-    Invoke-Adb @("shell", "am", "start", "-W", "-n", "$AppId/.MainActivity") | Out-Null
-    $confirmed = Wait-AppMountConfirmed $Label
-    if (-not $confirmed -and $script:AppLaunchSettleMilliseconds -gt 0) {
-        Start-Sleep -Milliseconds $script:AppLaunchSettleMilliseconds
-    }
-    Wait-Storage $Label | Out-Null
-}
-
-function Test-FileExists {
-    param([string]$Path)
-    Test-Su "test -f '$(Convert-ToBackendPath $Path)'"
-}
-
-function Test-PathMissing {
-    param([string]$Path)
-    Test-Su "test ! -e '$(Convert-ToBackendPath $Path)'"
-}
-
-function Convert-ToBackendPath {
-    param([string]$Path)
-    if ($Path.StartsWith($RealRoot)) {
-        return $BackendRoot + $Path.Substring($RealRoot.Length)
-    }
-    $Path
-}
-
-function Require-File {
-    param([string]$Scenario, [string]$Label, [string]$Path)
-    if (Test-FileExists $Path) { return $true }
-    $script:Failures.Add("$Scenario/$Label missing file: $Path")
-    $false
-}
-
-function Require-Missing {
-    param([string]$Scenario, [string]$Label, [string]$Path)
-    if (Test-PathMissing $Path) { return $true }
-    $script:Failures.Add("$Scenario/$Label unexpected path exists: $Path")
-    $false
-}
-
-# 自有包名私有目录的真实落点随 Android 版本不同：app-specific 存储在部分版本是独立卷
-# （Android 13 的 Android/data|obb 为独立 ext4），此时可见路径与 /data/media/0 下的同名
-# 路径是两份目录。这里只要求真实落点二选一，且沙盒断言必须没有该文件——应用视图被错误
-# 重定向时可见路径（未重定向视角）自然为空，仍会被判失败。
-function Require-OwnPrivateRealLanding {
-    param([string]$Scenario, [string]$Label, [string]$VisiblePath, [string]$BackendPath)
-    if (Test-Su "test -f '$VisiblePath'") { return $true }
-    if (Test-Su "test -f '$BackendPath'") { return $true }
-    $script:Failures.Add("$Scenario/$Label missing file: $VisiblePath")
-    @(Invoke-Su "ls -la '$VisiblePath' '$BackendPath' 2>&1 || true") | ForEach-Object { Write-Host "  landing: $_" }
-    $false
-}
-
-function Test-PublicDirectoryOwner {
-    param([string]$Scenario, [string]$Label, [string]$Path)
-    $actual = ""
-    for ($attempt = 1; $attempt -le 8; $attempt++) {
-        $actualLine = @(Invoke-Su "stat -c '%u:%g' '$Path' 2>/dev/null") | Select-Object -Last 1
-        $actual = if ($null -eq $actualLine) { "" } else { $actualLine.Trim() }
-        if ($actual -eq "1023:1023") {
-            Write-Host "  - public_owner label=$Label path=$Path owner=$actual attempt=$attempt"
-            return $true
-        }
-        Start-Sleep -Milliseconds 250
-    }
-    $script:Failures.Add("$Scenario/$Label public directory owner expected 1023:1023, got ${actual}: $Path")
-    @(Invoke-Su "ls -ldn '$Path' 2>/dev/null || true") | ForEach-Object { Write-Host "  owner: $_" }
-    $false
-}
-
-function Wait-Storage {
-    param([string]$Label, [int]$TimeoutSeconds = 90)
-    $deadline = (Get-Date).AddSeconds($TimeoutSeconds)
-    while ((Get-Date) -lt $deadline) {
-        & adb -s $Serial shell "sm list-volumes all 2>/dev/null | grep -q 'emulated;0 mounted' && test -d '$RealRoot'" | Out-Null
-        if ($LASTEXITCODE -eq 0) { return $true }
-        Start-Sleep -Seconds 2
-    }
-    $script:Failures.Add("$Label storage not ready")
-    $false
-}
-
-function Test-MediaProviderQueryReady {
-    param([string]$Uri)
-
-    $output = @(
-        & adb -s $Serial shell content query --uri $Uri --projection _id --where "_id=-1" 2>&1
-    )
-    $text = ($output -join "`n")
-    if ($LASTEXITCODE -ne 0) {
-        return $false
-    }
-    if ($text -match "Error while accessing provider:media" -or
-        $text -match "Volume [^ ]+ not found" -or
-        $text -match "IllegalArgumentException" -or
-        $text -match "Unknown URL" -or
-        $text -match "Unsupported Uri") {
-        return $false
-    }
-    return $true
-}
-
-function Wait-MediaProviderReady {
-    param([string]$Label, [int]$TimeoutSeconds = 120)
-
-    $deadline = (Get-Date).AddSeconds($TimeoutSeconds)
-    if (Test-MediaProviderIsLazy) {
-        Write-Host "MediaProvider readiness deferred until first app access: $Label"
-        return $true
-    }
-    $sdk = (& adb -s $Serial shell getprop ro.build.version.sdk 2>$null | Out-String).Trim()
-    $uris = @("content://media/external_primary/file")
-    if ([string]::IsNullOrEmpty($sdk) -or [int]$sdk -lt 37) {
-        $uris += @(
-            "content://media/external_primary/images/media",
-            "content://media/external_primary/video/media",
-            "content://media/external_primary/audio/media",
-            "content://media/external_primary/downloads",
-            "content://media/external/images/media",
-            "content://media/external/video/media",
-            "content://media/external/audio/media",
-            "content://media/external/file",
-            "content://media/external/downloads"
-        )
-    }
-
-    while ((Get-Date) -lt $deadline) {
-        $ready = $true
-        foreach ($uri in $uris) {
-            if (-not (Test-MediaProviderQueryReady $uri)) {
-                $ready = $false
-                break
-            }
-        }
-        if ($ready) { return $true }
-        Start-Sleep -Seconds 2
-    }
-    $script:Failures.Add("$Label media provider not ready")
-    $false
-}
-
-function Get-MediaProviderPid {
-    $output = @(
-        Invoke-Su "for package in com.android.providers.media.module com.google.android.providers.media.module com.android.providers.media android.process.media; do pidof `"`$package`" 2>/dev/null || true; done"
-    ) -join "`n"
-    $match = [regex]::Match($output, '(?m)^\s*(\d+)')
-    if ($match.Success) { $match.Groups[1].Value } else { "" }
-}
-
-function Test-MediaProviderIsLazy {
-    $sdk = (& adb -s $Serial shell getprop ro.build.version.sdk 2>$null | Out-String).Trim()
-    return -not [string]::IsNullOrEmpty($sdk) -and [int]$sdk -ge 37
-}
-
-# MediaProvider 就绪缓存：与 .sh 的 media_provider_ready_cached 对等。全量 URI
-# 探测 ~10s，系统代写监视场景（26/27）每个用例前重复探测成为最大耗时项。按
-# provider 进程 PID 缓存就绪结论，PID 变化自动失效；场景 32/33 的进程内热重载
-# 不换 PID，显式绕过缓存直连探测。
-$script:MediaProviderReadyCachePid = ""
-function Wait-MediaProviderReadyCached {
-    param([string]$Label, [int]$TimeoutSeconds = 120)
-    $scenario = Get-ScenarioFromLabel $Label
-    if ($scenario -in @(32, 33)) {
-        return (Wait-MediaProviderReady -Label $Label -TimeoutSeconds $TimeoutSeconds)
-    }
-    $currentPid = Get-MediaProviderPid
-    if (-not [string]::IsNullOrEmpty($currentPid) -and $currentPid -eq $script:MediaProviderReadyCachePid) {
-        return $true
-    }
-    if (Wait-MediaProviderReady -Label $Label -TimeoutSeconds $TimeoutSeconds) {
-        $script:MediaProviderReadyCachePid = $currentPid
-        return $true
-    }
-    return $false
-}
-
-function Wait-MediaProviderHookReady {
-    param(
-        [string]$Label,
-        [int]$TimeoutSeconds = 30
-    )
-
-    $deadline = (Get-Date).AddSeconds($TimeoutSeconds)
-    while ((Get-Date) -lt $deadline) {
-        $mediaPid = Get-MediaProviderPid
-        if ($mediaPid) {
-            $bootId = (@(Invoke-Adb @("shell", "cat", "/proc/sys/kernel/random/boot_id")) | Select-Object -First 1).Trim()
-            $installState = (@(Invoke-Su "cat /data/adb/modules/storage.redirect.x/logs/.media_hook_install_state 2>/dev/null || true") -join "`n").Trim()
-            if ($bootId -and $installState.Contains("stage=init_ok pid=$mediaPid boot_id=$bootId ")) {
-                Write-Host "media_provider_hook_ready label=$Label pid=$mediaPid source=install-state"
-                return $true
-            }
-            $hookLines = @(& adb -s $Serial logcat -d --pid $mediaPid -s SRX:I 2>$null) |
-                Select-String -SimpleMatch "java hook open ok"
-            if ($hookLines.Count -gt 0) {
-                Write-Host "media_provider_hook_ready label=$Label pid=$mediaPid source=logcat"
-                return $true
-            }
-        }
-        Start-Sleep -Milliseconds 200
-    }
-
-    $mediaPid = Get-MediaProviderPid
-    $pidText = if ($mediaPid) { $mediaPid } else { "missing" }
-    Write-Warning "media_provider_hook_timeout label=$Label pid=$pidText"
-    if ($mediaPid) {
-        @(Invoke-Su "grep -E 'storage.redirect.x/zygisk|libsrx_core' '/proc/$mediaPid/maps' 2>/dev/null || true") |
-            ForEach-Object { Write-Host "media_provider_module_map: $_" }
-        @(& adb -s $Serial logcat -d --pid $mediaPid -s SRX:V StorageRedirect:V 2>$null) |
-            Select-Object -Last 80 |
-            ForEach-Object { Write-Host "media_provider_hook_logcat: $_" }
-    }
-    $false
-}
-
-function Confirm-MediaProviderHookReady {
-    param([string]$Label)
-
-    if (Test-MediaProviderIsLazy) {
-        Write-Host "MediaProvider hook readiness deferred until first app access: $Label"
-        return $true
-    }
-    if (Wait-MediaProviderHookReady "$Label-current" 3) { return $true }
-    Write-Host "media_provider_hook_recovery label=$Label"
-    Restart-MediaProviderWithHookReady "$Label-recovery"
-}
-
-function Restart-MediaProviderWithHookReady {
-    param([string]$Label)
-
-    for ($attempt = 1; $attempt -le 2; $attempt++) {
-        Invoke-Adb @("logcat", "-c") | Out-Null
-        Restart-MediaProvider
-        if (-not (Wait-Storage "$Label-storage-attempt-$attempt" 30)) { return $false }
-        if (-not (Wait-MediaProviderReady "$Label-provider-attempt-$attempt" 60)) { return $false }
-        if (Wait-MediaProviderHookReady "$Label-attempt-$attempt" 20) {
-            return $true
-        }
-        if ($attempt -lt 2) {
-            Write-Host "media_provider_hook_retry label=$Label attempt=$attempt"
-        }
-    }
-
-    $script:Failures.Add("$Label media provider hook not ready after restart retries")
-    $false
-}
-
-function Test-AppUid {
-    $uidLine = (& adb -s $Serial shell "cmd package list packages -U '$AppId' 2>/dev/null | sed -n 's/.* uid://p' | head -1" |
-        ForEach-Object { $_ -replace "`r", "" } | Select-Object -First 1)
-    if ($null -eq $uidLine) { "" } else { $uidLine.Trim() }
-}
-
-# 自有私有目录夹具的属主修正：Android 13 上应用的自有私有目录视图经系统 FUSE 锚点
-# 恢复，MediaProvider 按属主过滤目录项——root 预置的夹具对应用不可见，写入直接
-# ENOENT（场景 34 own-data 重试后仍失败，是确定性差异而非时序）。后端拷贝与可见
-# 路径两份夹具都按应用属主修正；模块自身创建包名根时也用应用 uid，语义一致。
-function Fix-OwnPrivateFixturePermissions {
-    $uid = Test-AppUid
-    if ([string]::IsNullOrEmpty($uid)) {
-        Write-Warning "own_private_fixture_permission_fix_skipped: app uid not found for $AppId"
-        return
-    }
-    # 沙箱内的夹具同样按应用属主修正：$PrivateRoot 就是应用自己的重定向根，root 预置的
-    # 目录项会被系统 FUSE 按属主过滤，应用在热重载后重新解析这条路径时报 ENOENT。
-    $roots = @(
-        $BackendOwnPrivateDataRoot, $BackendOwnPrivateMediaRoot, $BackendOwnPrivateObbRoot,
-        $OwnPrivateDataRoot, $OwnPrivateMediaRoot, $OwnPrivateObbRoot,
-        "$PrivateRoot/Download", "$PrivateRoot/Pictures", "$PrivateRoot/DCIM", "$PrivateRoot/Documents"
-    )
-    $rootsArg = ($roots | ForEach-Object { "'$_'" }) -join " "
-    $command = 'app_uid=' + "'" + $uid + "'" + '; for root in ' + $rootsArg +
-        '; do [ -e "$root" ] || continue; chown -R $app_uid:1023 $root 2>/dev/null || true; find $root -type d -exec chmod 2771 {} + 2>/dev/null || true; find $root -type f -exec chmod 0664 {} + 2>/dev/null || true; done'
-    Invoke-Su $command | Out-Null
-}
-
-function Assert-FixtureRootsEmpty {
-    # 场景前置断言：夹具根下不得残留任何文件。
-    #
-    # 场景 20 的 file_unexpected 就是前序场景的探针没被清掉造成的：残留文件 mtime 早于本场景
-    # 十余分钟，却被本场景的「不应存在」断言读到。清理失败过去只打一行提示就继续跑，污染因此
-    # 跨场景传播，最终在离现场很远的断言上爆掉。Clear-Targets 只建目录、不预置文件，所以
-    # 「未自行预置夹具的场景，清理后夹具根下必须没有文件」成立，不成立就当场停下。
-    param([string]$Label)
-    # 夹具目录会随场景演进增长，按 Srt* 通配动态枚举，不写死清单。
-    # 仅扫描原有 Download/Srt* 与 Download/Test 范围，不扩大枚举、不新增删除，避免误伤
-    # 未知预置夹具。扫描失败（adb 中断、find 权限错误）必须传播，不能吞成成功；移除
-    # -maxdepth 限制与 head 管道后，任何层级的残留与 find 错误都不再被掩盖。
-    $command = "for d in '$RealRoot/Download'/Srt* '$RealRoot/Download/Test'; do if [ -d `"`$d`" ]; then find `"`$d`" -type f -printf '%p size=%s owner=%u:%g mtime=%T@\n' || exit 1; fi; done"
-    $lines = @(Invoke-Su $command)
-    if ($LASTEXITCODE -ne 0) {
-        Write-Host "fixture_scan_failed label=$Label"
-        return $false
-    }
-    $residue = @($lines | Where-Object { $_ -and $_.Trim() })
-    if ($residue.Count -gt 0) {
-        Write-Host "fixture_residue label=$Label"
-        $residue | ForEach-Object { Write-Host "  residue: $_" }
-        return $false
-    }
-    # 后端层同样断言：视图与后端必须同时干净。只清视图那一份时，后续场景会从后端读到
-    # 前序场景的残留（与 Clear-Targets 的双层删除口径一致）。
-    $backendCommand = "for d in '$BackendRoot/Download'/Srt* '$BackendRoot/Download/Test'; do if [ -d `"`$d`" ]; then find `"`$d`" -type f -printf '%p size=%s owner=%u:%g mtime=%T@\n' || exit 1; fi; done"
-    $backendLines = @(Invoke-Su $backendCommand)
-    if ($LASTEXITCODE -ne 0) {
-        Write-Host "fixture_scan_failed label=$Label layer=backend"
-        return $false
-    }
-    $backendResidue = @($backendLines | Where-Object { $_ -and $_.Trim() })
-    if ($backendResidue.Count -gt 0) {
-        Write-Host "fixture_residue label=$Label layer=backend"
-        $backendResidue | ForEach-Object { Write-Host "  residue: $_" }
-        return $false
-    }
-    return $true
-}
-
-function Clear-Targets {
-    # 先经系统 FUSE 删除共享探针，通知其失效前序场景的 inode 缓存；
-    # 仅删除 /data/media 后端会让 lookup 仍命中旧文件，而随后 open 返回 ENOENT。
-    Invoke-Su "rm -f '$RealRoot/Download/SrtProbe/$TestFile' '$RealRoot/Download/Test/$TestFile' || echo 'cleanup_tolerated reason=probe_fuse_edom note=单文件删除被模块 FUSE 以 EDOM 拒绝，改由下面的目录级删除覆盖' >&2" | Out-Null
-    # 只删探针文件不够：模块对重定向目录的 unlink 返回 EDOM（Math result not representable），
-    # 该次删除不生效。必须同时删到目录本身，目录级 rm -rf 才会让模块丢弃该目录项，
-    # 后续 lookup 不再命中残留（Android 17 场景 20 的 file_unexpected 即残留所致）。
-    #
-    # 覆盖范围必须按 `Srt*` 通配动态枚举，不能靠维护一份手写清单：清单漏一个目录，那个目录里
-    # 的文件就会跨场景残留，最后在离现场很远的「不应存在」断言上爆掉（场景 29 的
-    # `fixture_residue .../SrtQqAliasMapped/srt_qq_alias_existing.bin` 就是清单漏项所致）。
-    # 枚举口径与场景前置断言 Assert-FixtureRootsEmpty 保持一致，两者互为印证。
-    Invoke-Su "for d in '$RealRoot/Download'/Srt*; do [ -d `"`$d`" ] && rm -rf `"`$d`"; done 2>/dev/null; rm -rf '$RealRoot/Download/Test' 2>/dev/null || true" | Out-Null
-    # 仍保留显式列出的既有目录：通配只在目录名以 Srt 开头时才命中，历史目录名若不含该前缀
-    # （如已废弃的临时目录）需要靠这里兜住。
-    Invoke-Su "rm -rf '$RealRoot/Download/SrtProbe' '$RealRoot/Download/SrtOther' '$RealRoot/Download/SrtOtherMapped' '$RealRoot/Download/SrtMapOnlyMapped' '$RealRoot/Download/SrtReadOnly' '$RealRoot/Download/SrtMapRO' '$RealRoot/Download/SrtAllow' '$RealRoot/Pictures/SrtLocked' '$RealRoot/Pictures/SrtReadOnlyMedia' 2>/dev/null || true" | Out-Null
-
-    Invoke-Su "rm -rf '$BackendRuleSandboxRoot' '$PrivateRuleSandboxRoot' '$BackendRuleSiblingRoot' '$PrivateRuleSiblingRoot'" | Out-Null
-    # 后端侧也要按通配扫一遍：下面的目录清单同样是手工维护的，漏项会让残留避开清理
-    # （可见路径已被扫过，但后端那一份是独立的目录树）。两条路径都要动态枚举才能保证不漏。
-    Invoke-Su "for d in '$BackendRoot/Download'/Srt* '$BackendRoot/Pictures'/Srt* '$BackendRoot/DCIM'/Srt* '$BackendRoot/Documents'/Srt* '$BackendRoot/Movies'/Srt* '$BackendRoot/Music'/Srt*; do [ -d `"`$d`" ] && rm -rf `"`$d`"; done 2>/dev/null || true" | Out-Null
-    # 仅映射模式属主漂移夹具（场景 6）：后端自有目录下的独立夹具，按精确路径清理。
-    Invoke-Su "rm -rf '$BackendRoot/Android/data/$AppId/files/SrtDrift' 2>/dev/null || true" | Out-Null
-    Invoke-Su "rm -rf '$BackendRoot/Documents/SrtMediaRoutingProbe' '$BackendPrivateRoot/Documents/SrtMediaRoutingProbe'" | Out-Null
-    Invoke-Su "rm -rf '$BackendRoot/Download/SrtProbe' '$BackendRoot/Download/SrtOther' '$BackendRoot/Download/SrtOtherMapped' '$BackendRoot/Download/SrtMapOnlyMapped' '$BackendRoot/Download/SrtReadOnly' '$BackendRoot/Download/SrtMapRO' '$BackendRoot/Download/SrtAllow' '$BackendRoot/Download/SrtLegacy' '$BackendRoot/Download/SrtQMark' '$BackendRoot/Download/SrtLongest' '$BackendRoot/Download/SrtLongestBase' '$BackendRoot/Download/SrtLongestDeep' '$BackendRoot/Download/SrtPriority' '$BackendRoot/Download/SrtPriorityMapped' '$BackendRoot/Pictures/SrtLocked' '$BackendPrivateRoot/Download/SrtProbe' '$BackendPrivateRoot/Download/SrtOther' '$BackendPrivateRoot/Download/SrtOtherMapped' '$BackendPrivateRoot/Download/SrtMapOnlyMapped' '$BackendPrivateRoot/Download/SrtReadOnly' '$BackendPrivateRoot/Download/SrtMapRO' '$BackendPrivateRoot/Download/SrtAllow' '$BackendPrivateRoot/Download/SrtLegacy' '$BackendPrivateRoot/Download/SrtQMark' '$BackendPrivateRoot/Download/SrtLongest' '$BackendPrivateRoot/Download/SrtLongestBase' '$BackendPrivateRoot/Download/SrtLongestDeep' '$BackendPrivateRoot/Download/SrtPriority' '$BackendPrivateRoot/Download/SrtPriorityMapped' '$BackendPrivateRoot/Pictures/SrtLocked'; rm -f '$BackendRoot/Download/$AllowPartFile' '$BackendPrivateRoot/Download/$AllowPartFile' '$BackendRoot/Download/$QMarkSingleFile' '$BackendPrivateRoot/Download/$QMarkSingleFile' '$BackendRoot/Download/$QMarkDoubleFile' '$BackendPrivateRoot/Download/$QMarkDoubleFile' '$BackendRoot/Download/Test/$TestFile' '$BackendPrivateRoot/Download/Test/$TestFile' '$BackendRoot/Download/Test/$HotBeforeFile' '$BackendRoot/Download/Test/$HotAfterFile' '$BackendPrivateRoot/Download/Test/$HotBeforeFile' '$BackendPrivateRoot/Download/Test/$HotAfterFile' '$BackendRoot/.xldownload/$TestFile' '$BackendRoot/.xlDownload/$TestFile' '$BackendPrivateRoot/.xldownload/$TestFile' '$BackendPrivateRoot/.xlDownload/$TestFile'" | Out-Null
-    Invoke-Su "mkdir -p '$BackendRoot/Download/SrtProbe' '$BackendRoot/Download/Test' '$BackendRoot/Download/SrtMapOnlyMapped' '$BackendRoot/Download/SrtReadOnly' '$BackendRoot/Download/SrtMapRO' '$BackendRoot/Download/SrtAllow/tmp' '$BackendRoot/Download/SrtLegacy/tmp' '$BackendRoot/Download/SrtQMark/Keep1' '$BackendRoot/Download/SrtQMark/Keep12' '$BackendRoot/Download/SrtLongest/Deep' '$BackendRoot/Download/SrtLongestBase' '$BackendRoot/Download/SrtLongestDeep' '$BackendRoot/Download/SrtPriority' '$BackendRoot/Download/SrtPriorityMapped' '$BackendRoot/Pictures/SrtLocked' '$BackendRoot/.xldownload' '$BackendRoot/.xlDownload' '$BackendPrivateRoot/Download/SrtProbe' '$BackendPrivateRoot/Download/Test' '$BackendPrivateRoot/Download/SrtMapOnlyMapped' '$BackendPrivateRoot/Download/SrtReadOnly' '$BackendPrivateRoot/Download/SrtMapRO' '$BackendPrivateRoot/Download/SrtAllow/tmp' '$BackendPrivateRoot/Download/SrtLegacy/tmp' '$BackendPrivateRoot/Download/SrtQMark/Keep1' '$BackendPrivateRoot/Download/SrtQMark/Keep12' '$BackendPrivateRoot/Download/SrtLongest/Deep' '$BackendPrivateRoot/Download/SrtLongestBase' '$BackendPrivateRoot/Download/SrtLongestDeep' '$BackendPrivateRoot/Download/SrtPriority' '$BackendPrivateRoot/Download/SrtPriorityMapped' '$BackendPrivateRoot/Pictures/SrtLocked' '$BackendPrivateRoot/.xldownload' '$BackendPrivateRoot/.xlDownload'; chmod -R 777 '$BackendRoot/Download/SrtProbe' '$BackendRoot/Download/Test' '$BackendRoot/Download/SrtMapOnlyMapped' '$BackendRoot/Download/SrtReadOnly' '$BackendRoot/Download/SrtMapRO' '$BackendRoot/Download/SrtAllow' '$BackendRoot/Download/SrtLegacy' '$BackendRoot/Download/SrtQMark' '$BackendRoot/Download/SrtLongest' '$BackendRoot/Download/SrtLongestBase' '$BackendRoot/Download/SrtLongestDeep' '$BackendRoot/Download/SrtPriority' '$BackendRoot/Download/SrtPriorityMapped' '$BackendRoot/Pictures/SrtLocked' '$BackendPrivateRoot/Download/SrtProbe' '$BackendPrivateRoot/Download/Test' '$BackendPrivateRoot/Download/SrtMapOnlyMapped' '$BackendPrivateRoot/Download/SrtReadOnly' '$BackendPrivateRoot/Download/SrtMapRO' '$BackendPrivateRoot/Download/SrtAllow' '$BackendPrivateRoot/Download/SrtLegacy' '$BackendPrivateRoot/Download/SrtQMark' '$BackendPrivateRoot/Download/SrtLongest' '$BackendPrivateRoot/Download/SrtLongestBase' '$BackendPrivateRoot/Download/SrtLongestDeep' '$BackendPrivateRoot/Download/SrtPriority' '$BackendPrivateRoot/Download/SrtPriorityMapped' '$BackendPrivateRoot/Pictures/SrtLocked' 2>/dev/null || true; chmod 777 '$BackendRoot/.xldownload' '$BackendRoot/.xlDownload' '$BackendPrivateRoot/.xldownload' '$BackendPrivateRoot/.xlDownload' 2>/dev/null || true" | Out-Null
-    Invoke-Su "rm -f '$BackendRoot/Download/$QMarkFileSingleFile' '$BackendPrivateRoot/Download/$QMarkFileSingleFile'" | Out-Null
-    Invoke-Su "rm -rf '$BackendRoot/Download/SrtFusePlain' '$BackendRoot/Download/SrtFuseExclude' '$BackendRoot/Download/SrtFuseMapParent' '$BackendRoot/Download/SrtFuseMapRW' '$BackendRoot/Download/SrtFuseMapRO' '$BackendRoot/Download/SrtFuseMulti' '$BackendRoot/DCIM/SrtFuseQQ' '$BackendPrivateRoot/Download/SrtFusePlain' '$BackendPrivateRoot/Download/SrtFuseExclude' '$BackendPrivateRoot/Download/SrtFuseMapParent' '$BackendPrivateRoot/Download/SrtFuseMapRW' '$BackendPrivateRoot/Download/SrtFuseMapRO' '$BackendPrivateRoot/Download/SrtFuseMulti' '$BackendPrivateRoot/DCIM/SrtFuseQQ'; mkdir -p '$BackendRoot/Download/SrtFusePlain' '$BackendRoot/Download/SrtFuseExclude/Locked' '$BackendRoot/Download/SrtFuseExclude/Writable' '$BackendRoot/Download/SrtFuseMapParent/WritableTarget' '$BackendRoot/Download/SrtFuseMapParent/LockedTarget' '$BackendRoot/Download/SrtFuseMapRW' '$BackendRoot/Download/SrtFuseMapRO' '$BackendRoot/Download/SrtFuseMulti/QQ' '$BackendRoot/Download/SrtFuseMulti/WeChat' '$BackendRoot/Download/SrtFuseMulti/Locked' '$BackendRoot/Download/SrtFuseMulti/Other' '$FuseDcimAllowedRoot' '$FuseDcimOtherRoot' '$BackendPrivateRoot/Download/SrtFusePlain' '$BackendPrivateRoot/Download/SrtFuseExclude/Locked' '$BackendPrivateRoot/Download/SrtFuseExclude/Writable' '$BackendPrivateRoot/Download/SrtFuseMapParent/WritableTarget' '$BackendPrivateRoot/Download/SrtFuseMapParent/LockedTarget' '$BackendPrivateRoot/Download/SrtFuseMapRW' '$BackendPrivateRoot/Download/SrtFuseMapRO' '$BackendPrivateRoot/Download/SrtFuseMulti/QQ' '$BackendPrivateRoot/Download/SrtFuseMulti/WeChat' '$BackendPrivateRoot/Download/SrtFuseMulti/Locked' '$BackendPrivateRoot/Download/SrtFuseMulti/Other' '$PrivateFuseDcimAllowedRoot' '$PrivateFuseDcimOtherRoot'; chmod -R 777 '$BackendRoot/Download/SrtFusePlain' '$BackendRoot/Download/SrtFuseExclude' '$BackendRoot/Download/SrtFuseMapParent' '$BackendRoot/Download/SrtFuseMapRW' '$BackendRoot/Download/SrtFuseMapRO' '$BackendRoot/Download/SrtFuseMulti' '$BackendRoot/DCIM/SrtFuseQQ' '$BackendPrivateRoot/Download/SrtFusePlain' '$BackendPrivateRoot/Download/SrtFuseExclude' '$BackendPrivateRoot/Download/SrtFuseMapParent' '$BackendPrivateRoot/Download/SrtFuseMapRW' '$BackendPrivateRoot/Download/SrtFuseMapRO' '$BackendPrivateRoot/Download/SrtFuseMulti' '$BackendPrivateRoot/DCIM/SrtFuseQQ' 2>/dev/null || true" | Out-Null
-    Invoke-Su "rm -rf '$BackendRoot/Download/SrtFuseQa' '$BackendRoot/Download/SrtFuseQab' '$BackendRoot/Download/SrtFuseQb' '$BackendRoot/Download/SrtFuseMediaAlpha' '$BackendPrivateRoot/Download/SrtFuseQa' '$BackendPrivateRoot/Download/SrtFuseQab' '$BackendPrivateRoot/Download/SrtFuseQb' '$BackendPrivateRoot/Download/SrtFuseMediaAlpha'; mkdir -p '$BackendRoot/Download/SrtFuseQa/Media' '$BackendRoot/Download/SrtFuseQab/Media' '$BackendRoot/Download/SrtFuseQb/Media' '$BackendRoot/Download/SrtFuseMediaAlpha/Drop' '$BackendRoot/Download/SrtFuseMediaAlpha/Other' '$BackendPrivateRoot/Download/SrtFuseQa/Media' '$BackendPrivateRoot/Download/SrtFuseQab/Media' '$BackendPrivateRoot/Download/SrtFuseQb/Media' '$BackendPrivateRoot/Download/SrtFuseMediaAlpha/Drop' '$BackendPrivateRoot/Download/SrtFuseMediaAlpha/Other'; chmod -R 777 '$BackendRoot/Download/SrtFuseQa' '$BackendRoot/Download/SrtFuseQab' '$BackendRoot/Download/SrtFuseQb' '$BackendRoot/Download/SrtFuseMediaAlpha' '$BackendPrivateRoot/Download/SrtFuseQa' '$BackendPrivateRoot/Download/SrtFuseQab' '$BackendPrivateRoot/Download/SrtFuseQb' '$BackendPrivateRoot/Download/SrtFuseMediaAlpha' 2>/dev/null || true" | Out-Null
-    Invoke-Su "rm -rf '$BackendRoot/Download/SrtMountNsAllow' '$BackendRoot/Download/SrtMountNsReadOnly' '$BackendRoot/Download/SrtMountNsMapParent' '$BackendRoot/Download/SrtMountNsMapRW' '$BackendRoot/Download/SrtMountNsMapRO' '$BackendPrivateRoot/Download/SrtMountNsAllow' '$BackendPrivateRoot/Download/SrtMountNsReadOnly' '$BackendPrivateRoot/Download/SrtMountNsMapParent' '$BackendPrivateRoot/Download/SrtMountNsMapRW' '$BackendPrivateRoot/Download/SrtMountNsMapRO'; mkdir -p '$BackendRoot/Download/SrtMountNsAllow' '$BackendRoot/Download/SrtMountNsReadOnly' '$BackendRoot/Download/SrtMountNsMapParent/WritableTarget' '$BackendRoot/Download/SrtMountNsMapParent/LockedTarget' '$BackendRoot/Download/SrtMountNsMapRW' '$BackendRoot/Download/SrtMountNsMapRO' '$BackendPrivateRoot/Download/SrtMountNsAllow' '$BackendPrivateRoot/Download/SrtMountNsReadOnly' '$BackendPrivateRoot/Download/SrtMountNsMapParent/WritableTarget' '$BackendPrivateRoot/Download/SrtMountNsMapParent/LockedTarget' '$BackendPrivateRoot/Download/SrtMountNsMapRW' '$BackendPrivateRoot/Download/SrtMountNsMapRO'; chmod -R 777 '$BackendRoot/Download/SrtMountNsAllow' '$BackendRoot/Download/SrtMountNsReadOnly' '$BackendRoot/Download/SrtMountNsMapParent' '$BackendRoot/Download/SrtMountNsMapRW' '$BackendRoot/Download/SrtMountNsMapRO' '$BackendPrivateRoot/Download/SrtMountNsAllow' '$BackendPrivateRoot/Download/SrtMountNsReadOnly' '$BackendPrivateRoot/Download/SrtMountNsMapParent' '$BackendPrivateRoot/Download/SrtMountNsMapRW' '$BackendPrivateRoot/Download/SrtMountNsMapRO' 2>/dev/null || true" | Out-Null
-    Invoke-Su "mkdir -p '$BackendRoot/Download/SrtMountNsAllow/TeamAlpha/Deep' '$BackendRoot/Download/SrtMountNsAllow/Qa/Deep' '$BackendPrivateRoot/Download/SrtMountNsAllow/TeamAlpha/Deep' '$BackendPrivateRoot/Download/SrtMountNsAllow/Qa/Deep'; chmod -R 777 '$BackendRoot/Download/SrtMountNsAllow' '$BackendPrivateRoot/Download/SrtMountNsAllow' 2>/dev/null || true" | Out-Null
-    Invoke-Su "rm -rf '$BackendRoot/Download/SrtMonitor' '$BackendRoot/Download/SrtMonitorMap' '$BackendRoot/Download/SrtMonitorMapped' '$BackendRoot/Download/SrtMonitorLocked' '$BackendRoot/Pictures/SrtRelativeData' '$BackendRoot/Pictures/Nnngram' '$BackendPrivateRoot/Download/SrtMonitor' '$BackendPrivateRoot/Download/SrtMonitorMap' '$BackendPrivateRoot/Download/SrtMonitorMapped' '$BackendPrivateRoot/Download/SrtMonitorLocked' '$BackendPrivateRoot/Pictures/SrtRelativeData' '$BackendPrivateRoot/Pictures/Nnngram'; mkdir -p '$BackendRoot/Download/SrtMonitor' '$BackendRoot/Download/SrtMonitorMap' '$BackendRoot/Download/SrtMonitorMapped' '$BackendRoot/Download/SrtMonitorLocked/Writable' '$BackendRoot/Pictures/SrtRelativeData' '$BackendRoot/Pictures/Nnngram' '$BackendPrivateRoot/Download/SrtMonitor' '$BackendPrivateRoot/Download/SrtMonitorMap' '$BackendPrivateRoot/Download/SrtMonitorMapped' '$BackendPrivateRoot/Download/SrtMonitorLocked/Writable' '$BackendPrivateRoot/Pictures/SrtRelativeData' '$BackendPrivateRoot/Pictures/Nnngram'; chmod -R 777 '$BackendRoot/Download/SrtMonitor' '$BackendRoot/Download/SrtMonitorMap' '$BackendRoot/Download/SrtMonitorMapped' '$BackendRoot/Download/SrtMonitorLocked' '$BackendRoot/Pictures/SrtRelativeData' '$BackendRoot/Pictures/Nnngram' '$BackendPrivateRoot/Download/SrtMonitor' '$BackendPrivateRoot/Download/SrtMonitorMap' '$BackendPrivateRoot/Download/SrtMonitorMapped' '$BackendPrivateRoot/Download/SrtMonitorLocked' '$BackendPrivateRoot/Pictures/SrtRelativeData' '$BackendPrivateRoot/Pictures/Nnngram' 2>/dev/null || true" | Out-Null
-    # 监视器矩阵的映射源、映射目标和只读排除目录必须在原始后端真实存在。该组路径单独执行并逐项校验，避免超长 adb 命令在 Windows PowerShell 通道中被截断后静默吞错，最终才以应用侧 ENOENT 暴露。
-    Invoke-Su "mkdir -p '$BackendRoot/Download/SrtMonitor' '$BackendRoot/Download/SrtMonitorMap' '$BackendRoot/Download/SrtMonitorMapped' '$BackendRoot/Download/SrtMonitorLocked/Writable' '$BackendPrivateRoot/Download/SrtMonitor' '$BackendPrivateRoot/Download/SrtMonitorMap' '$BackendPrivateRoot/Download/SrtMonitorMapped' '$BackendPrivateRoot/Download/SrtMonitorLocked/Writable'" | Out-Null
-    Invoke-Su "chmod -R 777 '$BackendRoot/Download/SrtMonitor' '$BackendRoot/Download/SrtMonitorMap' '$BackendRoot/Download/SrtMonitorMapped' '$BackendRoot/Download/SrtMonitorLocked' '$BackendPrivateRoot/Download/SrtMonitor' '$BackendPrivateRoot/Download/SrtMonitorMap' '$BackendPrivateRoot/Download/SrtMonitorMapped' '$BackendPrivateRoot/Download/SrtMonitorLocked'" | Out-Null
-    if (-not (Test-Su "test -d '$BackendRoot/Download/SrtMonitor' -a -d '$BackendRoot/Download/SrtMonitorMap' -a -d '$BackendRoot/Download/SrtMonitorMapped' -a -d '$BackendRoot/Download/SrtMonitorLocked/Writable'")) {
-        throw "monitor_fixture_prepare_failed: 后端监视器映射/只读排除目录不存在"
-    }
-    Invoke-Su "rm -rf '$BackendRoot/Pictures/SrtReadOnlyMedia' '$BackendPrivateRoot/Pictures/SrtReadOnlyMedia'; mkdir -p '$BackendRoot/Pictures/SrtReadOnlyMedia' '$BackendPrivateRoot/Pictures/SrtReadOnlyMedia'; chmod -R 777 '$BackendRoot/Pictures/SrtReadOnlyMedia' '$BackendPrivateRoot/Pictures/SrtReadOnlyMedia' 2>/dev/null || true" | Out-Null
-    Invoke-Su "rm -rf '$AnyRelativePublicTarget' '$AnyAbsolutePublicTarget' '$AnyPublicToPrivateRequest' '$AnyMediaRequest' '$AnyMediaTarget' '$NestedMappingRequestRoot' '$NestedMappingStageRoot' '$NestedMappingTargetRoot' '$AnyRelativeRequest/srt_any_relative.txt' '$AnyAbsoluteUserRequest/srt_any_absolute.txt' '$AnyUserIdRequest/srt_any_user_id.txt' '$AnyLegacyDataRequest/srt_any_legacy.txt' '$AnyUserPrivateTarget/srt_any_public_private.txt' '$AnyLegacyPrivateTarget/srt_any_legacy.txt'; mkdir -p '$AnyRelativePublicTarget' '$AnyAbsolutePublicTarget' '$AnyPublicToPrivateRequest' '$AnyMediaRequest' '$AnyMediaTarget' '$NestedMappingRequestRoot' '$NestedMappingStageRoot' '$NestedMappingTargetRoot' '$BackendRoot/Android/data/$AppId/cache' '$BackendRoot/Android/data/$AppId/srt_any_relative' '$BackendRoot/Android/media/$AppId/cache' '$AnyAbsoluteUserRequest' '$AnyUserIdRequest' '$AnyLegacyDataRequest' '$AnyUserPrivateTarget'; chmod -R 777 '$AnyRelativePublicTarget' '$AnyAbsolutePublicTarget' '$AnyPublicToPrivateRequest' '$AnyMediaRequest' '$AnyMediaTarget' '$NestedMappingRequestRoot' '$NestedMappingStageRoot' '$NestedMappingTargetRoot' '$BackendRoot/Android/data/$AppId/cache' '$BackendRoot/Android/data/$AppId/srt_any_relative' '$BackendRoot/Android/media/$AppId/cache' '$AnyAbsoluteUserRequest' '$AnyUserIdRequest' '$AnyLegacyDataRequest' '$AnyUserPrivateTarget' 2>/dev/null || true" | Out-Null
-    # 嵌套映射准备会清理 Tencent 父目录；自有私有目录必须最后准备。
-    # 系统 FUSE 可能拒绝 shell 清理可见自有目录，但不一定就是 FUSE 所致：可见路径删除失败时
-    # 如实记录，交由真实后端的严格清理覆盖（不声称一定是 FUSE）。
-    if (-not (Test-Su "rm -rf '$OwnPrivateDataRoot' '$OwnPrivateMediaRoot' '$OwnPrivateObbRoot'")) {
-        Write-Host "cleanup_tolerated reason=own_dir_fuse note=可见自有目录删除失败将验证后端清理"
-    }
-    # 删除 6 个 backend/sandbox 自有目录。
-    Invoke-Su "rm -rf '$BackendOwnPrivateDataRoot' '$BackendOwnPrivateMediaRoot' '$BackendOwnPrivateObbRoot' '$SandboxOwnPrivateDataRoot' '$SandboxOwnPrivateMediaRoot' '$SandboxOwnPrivateObbRoot'" | Out-Null
-    # 紧接上面 6 个 backend/sandbox 自有目录删除之后、重建之前，显式确认这 6 个精确目录确实
-    # 已被删除：只做存在性检查、绝不删除其它文件；adb 本身失败也要传播，避免残留被静默掩盖。
-    if ($LASTEXITCODE -ne 0) { throw "own_dir_cleanup_failed note=后端自有目录删除失败" }
-    if (-not (Test-Su "for d in '$BackendOwnPrivateDataRoot' '$BackendOwnPrivateMediaRoot' '$BackendOwnPrivateObbRoot' '$SandboxOwnPrivateDataRoot' '$SandboxOwnPrivateMediaRoot' '$SandboxOwnPrivateObbRoot'; do if [ -e `"`$d`" ] || [ -L `"`$d`" ]; then echo `"own_dir_cleanup_failed path=`$d`" >&2; exit 1; fi; done")) {
-        throw "own_dir_verify_failed note=后端自有目录残留或设备验证失败"
-    }
-    Invoke-Su "mkdir -p '$BackendOwnPrivateDataRoot' '$BackendOwnPrivateMediaRoot' '$BackendOwnPrivateObbRoot' '$SandboxOwnPrivateDataRoot' '$SandboxOwnPrivateMediaRoot' '$SandboxOwnPrivateObbRoot'; chmod -R 777 '$BackendOwnPrivateDataRoot' '$BackendOwnPrivateMediaRoot' '$BackendOwnPrivateObbRoot' '$SandboxOwnPrivateDataRoot' '$SandboxOwnPrivateMediaRoot' '$SandboxOwnPrivateObbRoot' 2>/dev/null || true" | Out-Null
-    # 自有私有目录在应用视图里是模块锚点的 bind，权威落点是可见路径：新版本把
-    # app-specific 存储放在独立卷上（Android 13 的 Android/data|obb 为独立 ext4），
-    # 此时 /data/media/0 下的同名路径是另一份目录，只预置后端拷贝会让应用看到空包名根，
-    # 写入直接 ENOENT（场景 34 own-data）。因此可见路径必须预置成功，且不再吞掉错误。
-    if (-not (Test-Su "mkdir -p '$OwnPrivateDataRoot' '$OwnPrivateMediaRoot' '$OwnPrivateObbRoot'")) {
-        Write-Host "自有目录可见路径预置失败，应用视图写入将直接 ENOENT；后端拷贝仍会预置"
-    }
-    Fix-OwnPrivateFixturePermissions
-}
-
-function Remove-TestTargetArtifacts {
-    Invoke-Su "rm -rf '$BackendOwnPrivateDataRoot' '$BackendOwnPrivateMediaRoot' '$BackendOwnPrivateObbRoot' '$SandboxOwnPrivateDataRoot' '$SandboxOwnPrivateMediaRoot' '$SandboxOwnPrivateObbRoot'" | Out-Null
-    Invoke-Su "rm -rf '$BackendRuleSandboxRoot' '$PrivateRuleSandboxRoot' '$BackendRuleSiblingRoot' '$PrivateRuleSiblingRoot'" | Out-Null
-    # 后端侧也要按通配扫一遍：下面的目录清单同样是手工维护的，漏项会让残留避开清理
-    # （可见路径已被扫过，但后端那一份是独立的目录树）。两条路径都要动态枚举才能保证不漏。
-    Invoke-Su "for d in '$BackendRoot/Download'/Srt* '$BackendRoot/Pictures'/Srt* '$BackendRoot/DCIM'/Srt* '$BackendRoot/Documents'/Srt* '$BackendRoot/Movies'/Srt* '$BackendRoot/Music'/Srt*; do [ -d `"`$d`" ] && rm -rf `"`$d`"; done 2>/dev/null || true" | Out-Null
-    # 仅映射模式属主漂移夹具（场景 6）：后端自有目录下的独立夹具，按精确路径清理。
-    Invoke-Su "rm -rf '$BackendRoot/Android/data/$AppId/files/SrtDrift' 2>/dev/null || true" | Out-Null
-    Invoke-Su "rm -rf '$BackendRoot/Documents/SrtMediaRoutingProbe' '$BackendPrivateRoot/Documents/SrtMediaRoutingProbe'" | Out-Null
-    Invoke-Su "rm -rf '$BackendRoot/Download/SrtProbe' '$BackendRoot/Download/SrtOther' '$BackendRoot/Download/SrtOtherMapped' '$BackendRoot/Download/SrtMapOnlyMapped' '$BackendRoot/Download/SrtReadOnly' '$BackendRoot/Download/SrtMapRO' '$BackendRoot/Download/SrtAllow' '$BackendRoot/Download/SrtLegacy' '$BackendRoot/Download/SrtQMark' '$BackendRoot/Download/SrtLongest' '$BackendRoot/Download/SrtLongestBase' '$BackendRoot/Download/SrtLongestDeep' '$BackendRoot/Download/SrtPriority' '$BackendRoot/Download/SrtPriorityMapped' '$BackendRoot/Download/Test' '$BackendRoot/.xldownload' '$BackendRoot/.xlDownload' '$BackendRoot/Pictures/SrtLocked' '$BackendPrivateRoot/Download/SrtProbe' '$BackendPrivateRoot/Download/SrtOther' '$BackendPrivateRoot/Download/SrtOtherMapped' '$BackendPrivateRoot/Download/SrtMapOnlyMapped' '$BackendPrivateRoot/Download/SrtReadOnly' '$BackendPrivateRoot/Download/SrtMapRO' '$BackendPrivateRoot/Download/SrtAllow' '$BackendPrivateRoot/Download/SrtLegacy' '$BackendPrivateRoot/Download/SrtQMark' '$BackendPrivateRoot/Download/SrtLongest' '$BackendPrivateRoot/Download/SrtLongestBase' '$BackendPrivateRoot/Download/SrtLongestDeep' '$BackendPrivateRoot/Download/SrtPriority' '$BackendPrivateRoot/Download/SrtPriorityMapped' '$BackendPrivateRoot/Download/Test' '$BackendPrivateRoot/.xldownload' '$BackendPrivateRoot/.xlDownload' '$BackendPrivateRoot/Pictures/SrtLocked'; rm -f '$BackendRoot/Download/$AllowPartFile' '$BackendPrivateRoot/Download/$AllowPartFile' '$BackendRoot/Download/$QMarkSingleFile' '$BackendPrivateRoot/Download/$QMarkSingleFile' '$BackendRoot/Download/$QMarkDoubleFile' '$BackendPrivateRoot/Download/$QMarkDoubleFile'" | Out-Null
-    Invoke-Su "rm -f '$BackendRoot/Download/$QMarkFileSingleFile' '$BackendPrivateRoot/Download/$QMarkFileSingleFile'" | Out-Null
-    Invoke-Su "rm -rf '$AnyRelativePublicTarget' '$AnyAbsolutePublicTarget' '$AnyPublicToPrivateRequest' '$AnyRelativeRequest/srt_any_relative.txt' '$AnyAbsoluteUserRequest/srt_any_absolute.txt' '$AnyUserIdRequest/srt_any_user_id.txt' '$AnyLegacyDataRequest/srt_any_legacy.txt' '$AnyUserPrivateTarget/srt_any_public_private.txt' '$AnyLegacyPrivateTarget/srt_any_legacy.txt'" | Out-Null
-    Invoke-Su "rm -rf '$BackendRoot/Download/SrtFusePlain' '$BackendRoot/Download/SrtFuseExclude' '$BackendRoot/Download/SrtFuseMapParent' '$BackendRoot/Download/SrtFuseMapRW' '$BackendRoot/Download/SrtFuseMapRO' '$BackendRoot/Download/SrtFuseMulti' '$BackendRoot/DCIM/SrtFuseQQ' '$BackendPrivateRoot/Download/SrtFusePlain' '$BackendPrivateRoot/Download/SrtFuseExclude' '$BackendPrivateRoot/Download/SrtFuseMapParent' '$BackendPrivateRoot/Download/SrtFuseMapRW' '$BackendPrivateRoot/Download/SrtFuseMapRO' '$BackendPrivateRoot/Download/SrtFuseMulti' '$BackendPrivateRoot/DCIM/SrtFuseQQ'" | Out-Null
-    Invoke-Su "rm -rf '$BackendRoot/Download/SrtFuseQa' '$BackendRoot/Download/SrtFuseQab' '$BackendRoot/Download/SrtFuseQb' '$BackendRoot/Download/SrtFuseMediaAlpha' '$BackendPrivateRoot/Download/SrtFuseQa' '$BackendPrivateRoot/Download/SrtFuseQab' '$BackendPrivateRoot/Download/SrtFuseQb' '$BackendPrivateRoot/Download/SrtFuseMediaAlpha'" | Out-Null
-    Invoke-Su "rm -rf '$BackendRoot/Download/SrtMountNsAllow' '$BackendRoot/Download/SrtMountNsReadOnly' '$BackendRoot/Download/SrtMountNsMapParent' '$BackendRoot/Download/SrtMountNsMapRW' '$BackendRoot/Download/SrtMountNsMapRO' '$BackendPrivateRoot/Download/SrtMountNsAllow' '$BackendPrivateRoot/Download/SrtMountNsReadOnly' '$BackendPrivateRoot/Download/SrtMountNsMapParent' '$BackendPrivateRoot/Download/SrtMountNsMapRW' '$BackendPrivateRoot/Download/SrtMountNsMapRO'" | Out-Null
-    Invoke-Su "rm -rf '$BackendRoot/Download/SrtMonitor' '$BackendRoot/Download/SrtMonitorMap' '$BackendRoot/Download/SrtMonitorMapped' '$BackendRoot/Download/SrtMonitorLocked' '$BackendRoot/Pictures/SrtRelativeData' '$BackendRoot/Pictures/Nnngram' '$BackendPrivateRoot/Download/SrtMonitor' '$BackendPrivateRoot/Download/SrtMonitorMap' '$BackendPrivateRoot/Download/SrtMonitorMapped' '$BackendPrivateRoot/Download/SrtMonitorLocked' '$BackendPrivateRoot/Pictures/SrtRelativeData' '$BackendPrivateRoot/Pictures/Nnngram'" | Out-Null
-    Invoke-Su "rm -rf '$BackendRoot/Pictures/SrtReadOnlyMedia' '$BackendPrivateRoot/Pictures/SrtReadOnlyMedia'" | Out-Null
-}
-
-function Remove-MediaStoreRowsByPattern {
-    param(
-        [string]$CollectionUri,
-        [string[]]$NamePatterns,
-        [string[]]$PathPatterns
-    )
-
-    $rows = @(Invoke-Su "content query --uri '$CollectionUri' --projection _id:_display_name:_data:relative_path 2>/dev/null || true")
-    foreach ($row in $rows) {
-        if ($row -notmatch "_id=(\d+)") { continue }
-        $id = $Matches[1]
-        $nameMatched = $false
-        foreach ($pattern in $NamePatterns) {
-            if ($row -match $pattern) {
-                $nameMatched = $true
-                break
-            }
-        }
-        if (-not $nameMatched) { continue }
-
-        $pathMatched = $false
-        foreach ($pattern in $PathPatterns) {
-            if ($row -match $pattern) {
-                $pathMatched = $true
-                break
-            }
-        }
-        if (-not $pathMatched) { continue }
-
-        Invoke-Adb @("shell", "content", "delete", "--uri", "$CollectionUri/$id") | Out-Null
-    }
-}
-
-function Remove-RandomMediaStoreRows {
-    $escapedAppId = [regex]::Escape($AppId)
-    Remove-MediaStoreRowsByPattern "content://media/external/images/media" @("_display_name=(\.pending-\d+-|\.trashed-\d+-)?srt_image_\d+( \(\d+\))?\.jpg(,|$)") @("relative_path=Pictures/", "_data=.*/Pictures/", "_data=.*/Android/data/$escapedAppId/sdcard/Pictures/")
-    Remove-MediaStoreRowsByPattern "content://media/external/images/media" @("_display_name=(\.pending-\d+-|\.trashed-\d+-)?srt_own_private_mediastore( \(\d+\))?\.jpg(,|$)") @("_data=.*/Android/media/$escapedAppId/Tencent/QQfile_recv/")
-    Remove-MediaStoreRowsByPattern "content://media/external/images/media" @("_display_name=(\.pending-\d+-|\.trashed-\d+-)?srt_fuse_dcim_media( \(\d+\))?\.jpg(,|$)") @("relative_path=DCIM/SrtFuseQQ/", "_data=.*/DCIM/SrtFuseQQ/", "_data=.*/Android/data/$escapedAppId/sdcard/DCIM/SrtFuseQQ/")
-    Remove-MediaStoreRowsByPattern "content://media/external/images/media" @("_display_name=srt_read_only_media( \(\d+\))?\.jpg(,|$)") @("relative_path=Pictures/SrtReadOnlyMedia/", "_data=.*/Pictures/SrtReadOnlyMedia/", "_data=.*/Android/data/$escapedAppId/sdcard/Pictures/SrtReadOnlyMedia/")
-    Remove-MediaStoreRowsByPattern "content://media/external/video/media" @("_display_name=(\.pending-\d+-|\.trashed-\d+-)?srt_video_\d+( \(\d+\))?\.mp4(,|$)") @("relative_path=Movies/", "_data=.*/Movies/", "_data=.*/Android/data/$escapedAppId/sdcard/Movies/")
-    Remove-MediaStoreRowsByPattern "content://media/external/audio/media" @("_display_name=(\.pending-\d+-|\.trashed-\d+-)?srt_audio_\d+( \(\d+\))?\.mp3(,|$)") @("relative_path=Music/", "_data=.*/Music/", "_data=.*/Android/data/$escapedAppId/sdcard/Music/")
-    Remove-MediaStoreRowsByPattern "content://media/external/file" @("_display_name=(\.pending-\d+-|\.trashed-\d+-)?srt_file_\d+( \(\d+\))?\.txt(,|$)") @("relative_path=Documents/", "_data=.*/Documents/", "_data=.*/Android/data/$escapedAppId/sdcard/Documents/")
-    Remove-MediaStoreRowsByPattern "content://media/external/downloads" @("_display_name=(\.pending-\d+-|\.trashed-\d+-)?srt_download_\d+( \(\d+\))?\.bin(,|$)", "_display_name=(\.pending-\d+-|\.trashed-\d+-)?srt_ci_probe( \(\d+\))?\.part(,|$)", "_display_name=(\.pending-\d+-|\.trashed-\d+-)?srt_qmark_a( \(\d+\))?\.txt(,|$)", "_display_name=(\.pending-\d+-|\.trashed-\d+-)?srt_qmark_ab( \(\d+\))?\.txt(,|$)", "_display_name=(\.pending-\d+-|\.trashed-\d+-)?srt_qmark_file_a( \(\d+\))?\.txt(,|$)", "_display_name=(\.pending-\d+-|\.trashed-\d+-)?srt_mountns_star_media( \(\d+\))?\.bin(,|$)", "_display_name=(\.pending-\d+-|\.trashed-\d+-)?srt_mountns_qmark_media( \(\d+\))?\.bin(,|$)", "_display_name=(\.pending-\d+-|\.trashed-\d+-)?srt_fuse_star_media( \(\d+\))?\.bin(,|$)", "_display_name=(\.pending-\d+-|\.trashed-\d+-)?srt_fuse_star_miss_media( \(\d+\))?\.bin(,|$)", "_display_name=(\.pending-\d+-|\.trashed-\d+-)?srt_fuse_qmark_media( \(\d+\))?\.bin(,|$)", "_display_name=(\.pending-\d+-|\.trashed-\d+-)?srt_fuse_qmark_miss_media( \(\d+\))?\.bin(,|$)") @("relative_path=Download/", "_data=.*/Download/", "_data=.*/Android/data/$escapedAppId/sdcard/Download/")
-    Remove-MediaStoreRowsByPattern "content://media/external/downloads" @("_display_name=(\.pending-\d+-|\.trashed-\d+-)?srt_monitor_[A-Za-z0-9_.-]+( \(\d+\))?\.bin(,|$)") @("relative_path=Download/SrtMonitor", "relative_path=Download/SrtMonitorMap", "relative_path=Download/SrtMonitorMapped", "relative_path=Download/SrtMonitorLocked", "_data=.*/Download/SrtMonitor", "_data=.*/Android/data/$escapedAppId/sdcard/Download/SrtMonitor")
-    Remove-MediaStoreRowsByPattern "content://media/external/images/media" @("_display_name=(\.pending-\d+-|\.trashed-\d+-)?srt_monitor_[A-Za-z0-9_.-]+( \(\d+\))?\.jpg(,|$)") @("relative_path=Pictures/SrtRelativeData", "_data=.*/Pictures/SrtRelativeData", "_data=.*/Android/data/$escapedAppId/sdcard/Pictures/SrtRelativeData", "relative_path=Pictures/Nnngram", "_data=.*/Pictures/Nnngram", "_data=.*/Android/data/$escapedAppId/sdcard/Pictures/Nnngram")
-}
-
-function Remove-RandomPhysicalMediaFiles {
-    Invoke-Su "find '$BackendRoot/Pictures' '$BackendPrivateRoot/Pictures' -maxdepth 1 -type f \( -name 'srt_image_[0-9]*.jpg' -o -name '.pending-*srt_image_[0-9]*.jpg' -o -name '.trashed-*srt_image_[0-9]*.jpg' \) -delete 2>/dev/null || true" | Out-Null
-    Invoke-Su "find '$BackendRoot/DCIM/SrtFuseQQ' '$BackendPrivateRoot/DCIM/SrtFuseQQ' -type f \( -name 'srt_fuse_dcim_media*.jpg' -o -name '.pending-*srt_fuse_dcim_media*.jpg' -o -name '.trashed-*srt_fuse_dcim_media*.jpg' \) -delete 2>/dev/null || true" | Out-Null
-    Invoke-Su "rm -rf '$BackendRoot/Pictures/SrtReadOnlyMedia' '$BackendPrivateRoot/Pictures/SrtReadOnlyMedia' 2>/dev/null || true" | Out-Null
-    Invoke-Su "find '$BackendRoot/Movies' '$BackendPrivateRoot/Movies' -maxdepth 1 -type f \( -name 'srt_video_[0-9]*.mp4' -o -name '.pending-*srt_video_[0-9]*.mp4' -o -name '.trashed-*srt_video_[0-9]*.mp4' \) -delete 2>/dev/null || true" | Out-Null
-    Invoke-Su "find '$BackendRoot/Music' '$BackendPrivateRoot/Music' -maxdepth 1 -type f \( -name 'srt_audio_[0-9]*.mp3' -o -name '.pending-*srt_audio_[0-9]*.mp3' -o -name '.trashed-*srt_audio_[0-9]*.mp3' \) -delete 2>/dev/null || true" | Out-Null
-    Invoke-Su "find '$BackendRoot/Documents' '$BackendPrivateRoot/Documents' -maxdepth 1 -type f \( -name 'srt_file_[0-9]*.txt' -o -name '.pending-*srt_file_[0-9]*.txt' -o -name '.trashed-*srt_file_[0-9]*.txt' \) -delete 2>/dev/null || true" | Out-Null
-    Invoke-Su "find '$BackendRoot/Download' '$BackendPrivateRoot/Download' -maxdepth 1 -type f \( -name 'srt_download_[0-9]*.bin' -o -name '.pending-*srt_download_[0-9]*.bin' -o -name '.trashed-*srt_download_[0-9]*.bin' -o -name 'srt_ci_probe*.part' -o -name '.pending-*srt_ci_probe*.part' -o -name '.trashed-*srt_ci_probe*.part' -o -name 'srt_qmark*.txt' -o -name '.pending-*srt_qmark*.txt' -o -name '.trashed-*srt_qmark*.txt' -o -name 'srt_mountns_*_media.bin' -o -name '.pending-*srt_mountns_*_media.bin' -o -name '.trashed-*srt_mountns_*_media.bin' -o -name 'srt_fuse_*_media.bin' -o -name '.pending-*srt_fuse_*_media.bin' -o -name '.trashed-*srt_fuse_*_media.bin' \) -delete 2>/dev/null || true" | Out-Null
-    Invoke-Su "find '$BackendRoot/Download/SrtMonitor' '$BackendRoot/Download/SrtMonitorMap' '$BackendRoot/Download/SrtMonitorMapped' '$BackendRoot/Download/SrtMonitorLocked' '$BackendRoot/Pictures/SrtRelativeData' '$BackendRoot/Pictures/Nnngram' '$BackendPrivateRoot/Download/SrtMonitor' '$BackendPrivateRoot/Download/SrtMonitorMap' '$BackendPrivateRoot/Download/SrtMonitorMapped' '$BackendPrivateRoot/Download/SrtMonitorLocked' '$BackendPrivateRoot/Pictures/SrtRelativeData' '$BackendPrivateRoot/Pictures/Nnngram' -type f \( -name 'srt_monitor_*.bin' -o -name 'srt_monitor_*.jpg' -o -name '.pending-*srt_monitor_*' -o -name '.trashed-*srt_monitor_*' \) -delete 2>/dev/null || true" | Out-Null
-    Invoke-Su "rm -rf '$BackendResultDir' '$BackendRoot/Android/data/$AppId/files/srt_file_tests' '$InternalResultDir' '/data/data/$AppId/files/srt_file_tests' '$SandboxResultDir' '$BackendPrivateRoot/Android/data/$AppId/files/srt_file_tests' 2>/dev/null || true" | Out-Null
-}
-
-function Restart-MediaProvider {
-    $sdkText = (@(Invoke-Adb @("shell", "getprop", "ro.build.version.sdk")) | Select-Object -First 1).Trim()
-    $sdk = 0
-    if ([int]::TryParse($sdkText, [ref]$sdk) -and $sdk -le 34) {
-        Write-Warning "skip_media_provider_restart sdk=${sdk}: restarting MediaProvider can detach emulated storage on this emulator"
-        return
-    }
-
-    Invoke-Adb @("shell", "am", "force-stop", "com.android.providers.media.module") | Out-Null
-    Invoke-Adb @("shell", "am", "force-stop", "com.google.android.providers.media.module") | Out-Null
-    Invoke-Su "pkill -f com.android.providers.media.module 2>/dev/null || true; pkill -f com.google.android.providers.media.module 2>/dev/null || true" | Out-Null
-    Start-Sleep -Seconds 2
-}
-
-function Ensure-MonitorCollector {
-    Invoke-Su "/data/adb/modules/storage.redirect.x/bin/srxctl ensure-collectors" | Out-Null
-}
-
-function Clear-FileMonitorLog {
-    Invoke-Su "/data/adb/modules/storage.redirect.x/bin/srxctl clear-monitor || { mkdir -p /data/adb/modules/storage.redirect.x/logs; : > '$FileMonitorLogPath'; }" | Out-Null
-}
-
-function Test-FileMonitorWatchCapacityLimited {
-    $status = (@(
-        Invoke-Su "grep -E 'daemon monitor watch limit reached|capacity_limited=true' /data/adb/modules/storage.redirect.x/logs/running.log 2>/dev/null | tail -1 || true"
-    ) -join "`n").Trim()
-    $status -match 'daemon monitor watch limit reached|capacity_limited=true'
-}
-
-function Test-FileMonitorEnabledForScenario {
-    param([string]$Scenario, [string]$Label)
-    $configText = (@(Invoke-Su "cat '$GlobalConfig' 2>/dev/null || true") -join "`n").Trim()
-    $fileMonitorEnabled = $false
-    if ($configText) {
-        try {
-            $fileMonitorEnabled = [bool](($configText | ConvertFrom-Json).file_monitor_enabled)
-        } catch {
-            $fileMonitorEnabled = $configText -match '"file_monitor_enabled"\s*:\s*true'
-        }
-    }
-    if ($fileMonitorEnabled) {
-        return $true
-    }
-    $script:Failures.Add("scenario-$Scenario/$Label file_monitor_enabled is not true")
-    Write-Warning "file_monitor_disabled scenario=$Scenario label=$Label`: file_monitor_enabled must be true for monitor record tests"
-    $configText -split "`n" | ForEach-Object { Write-Host "  global_config: $_" }
-    return $false
-}
-
-function Prepare-FileMonitorAssertion {
-    param([string]$Scenario, [string]$Label)
-    Write-Host "  - monitor prepare $Scenario/$Label"
-    if (-not (Test-FileMonitorEnabledForScenario $Scenario $Label)) {
-        return $false
-    }
-    Invoke-Adb @("logcat", "-c") | Out-Null
-    Clear-FileMonitorLog
-    Ensure-MonitorCollector
-    if ($script:ServiceCaseSettleMilliseconds -gt 0) {
-        Start-Sleep -Milliseconds $script:ServiceCaseSettleMilliseconds
-    }
-    return $true
-}
-
-function Wait-FileMonitorLogLine {
-    param(
-        [string]$Scenario,
-        [string]$Label,
-        [string]$FileName,
-        [ValidateSet("success", "failure", "write")]
-        [string]$Expected,
-        [int]$TimeoutSeconds = 30,
-        [switch]$AllowCapacityLimitedInotifyMiss
-    )
-
-    $deadline = (Get-Date).AddSeconds($TimeoutSeconds)
-    while ((Get-Date) -lt $deadline) {
-        $lines = @(
-            Invoke-Su "grep -F -- '$FileName' '$FileMonitorLogPath' 2>/dev/null || true"
-        )
-        foreach ($line in $lines) {
-            if ($Expected -eq "success" -and $line -notmatch "ret=-1" -and $line -notmatch "op=close_write") {
-                Write-Host "  - monitor_log_found $Scenario/$Label file=$FileName expected=$Expected"
-                return $true
-            }
-            if ($Expected -eq "write" -and ($line -match "op=open:write" -or $line -match "op_filter=open:write" -or $line -match "op=write") -and $line -notmatch "ret=-1") {
-                Write-Host "  - monitor_log_found $Scenario/$Label file=$FileName expected=$Expected"
-                return $true
-            }
-            if ($Expected -eq "failure" -and $line -match "ret=-1" -and $line -match "deny_reason=read_only_rule") {
-                Write-Host "  - monitor_log_found $Scenario/$Label file=$FileName expected=$Expected"
-                return $true
-            }
-        }
-        Start-Sleep -Milliseconds 200
-    }
-    if ($AllowCapacityLimitedInotifyMiss -and (Test-FileMonitorWatchCapacityLimited)) {
-        Write-Warning "已跳过监视日志 $Scenario/$Label file=$FileName expected=$Expected reason=watch-capacity-limited"
-        return $true
-    }
-    Write-Warning "监视日志等待超时 $Scenario/$Label file=$FileName expected=$Expected"
-    $script:Failures.Add("scenario-$Scenario/$Label monitor log timeout file=$FileName expected=$Expected")
-    @(
-        Invoke-Su "tail -80 '$FileMonitorLogPath' 2>/dev/null || true"
-    ) | ForEach-Object { Write-Host "  monitor_tail: $_" }
-    return $false
-}
-
-function New-MonitorFileName {
-    param([string]$Scenario, [string]$Label)
-    "srt_monitor_${Scenario}_${Label}.bin" -replace '[^A-Za-z0-9_.-]', '_'
-}
-
-function Test-NoReadOnlyFailureRecord {
-    param([string]$Scenario, [string]$Label, [string]$FileName)
-    $lines = @(Invoke-Su "grep -F -- '$FileName' '$FileMonitorLogPath' 2>/dev/null || true")
-    foreach ($line in $lines) {
-        if ($line -match "ret=-1" -and $line -match "deny_reason=read_only_rule") {
-            $script:Failures.Add("scenario-$Scenario/$Label unexpected read-only failure file=$FileName")
-            Write-Warning "monitor_read_only_hit: $line"
-            return $false
-        }
-    }
-    $true
-}
-
-function Invoke-FileMonitorWriteSuccessCase {
-    param(
-        [string]$Scenario,
-        [string]$Label,
-        [string]$Path,
-        [string]$ExpectedPath,
-        [string]$PrivatePath = "",
-        [bool]$AllowCapacityLimitedInotifyMiss = $false,
-        [bool]$RequireMonitorRecord = $true,
-        [string]$MonitorSkipReason = "ordinary-app-disabled-direct-write"
-    )
-    $fileName = ($Path -split '/')[-1]
-    if (-not (Prepare-FileMonitorAssertion $Scenario $Label)) { return $false }
-    for ($attempt = 1; $attempt -le 2; $attempt++) {
-        $failureCountBeforeAttempt = $script:Failures.Count
-        $ok = (Invoke-WriteCase ([int]$Scenario) $Label $Path $Payload).Ok
-        $ok = (Require-File "scenario-$Scenario" "$Label expected" $ExpectedPath) -and $ok
-        if ($PrivatePath) {
-            $ok = (Require-Missing "scenario-$Scenario" "$Label private" $PrivatePath) -and $ok
-        }
-        if ($RequireMonitorRecord) {
-            $ok = (Wait-FileMonitorLogLine $Scenario $Label $fileName "success" -AllowCapacityLimitedInotifyMiss:$AllowCapacityLimitedInotifyMiss) -and $ok
-        } else {
-            Write-Host "monitor_success_record_skipped scenario=$Scenario label=$Label file=$fileName reason=$MonitorSkipReason"
-        }
-        if ($ok) { return $true }
-        if ($attempt -lt 2) {
-            if ($script:Failures.Count -gt $failureCountBeforeAttempt) {
-                $script:Failures.RemoveRange($failureCountBeforeAttempt, $script:Failures.Count - $failureCountBeforeAttempt)
-            }
-            Write-Host "  - file_monitor_write_success_retry scenario=$Scenario label=$Label attempt=$attempt"
-            # 与 .sh 的 run_file_monitor_write_success_case 一致：重试前先确认挂载仍在，
-            # 否则重试会在已摘除挂载的状态下白跑一轮。
-            # 不因确认失败而中断：该标签没有期望路径表项，复核结果只作存活检查，
-            # 真正的判定交给下面的用例结果。
-            [void](Ensure-CurrentAppMountConfirmed "scenario-$Scenario-$Label-retry")
-            Prepare-ServiceCase "scenario-$Scenario-$Label-retry"
-            Wait-Storage "scenario-$Scenario-$Label-retry" | Out-Null
-            Start-Sleep -Milliseconds $script:ResultPollMilliseconds
-        }
-    }
-    $false
-}
-
-function Invoke-FileMonitorWriteDeniedCase {
-    param([string]$Scenario, [string]$Label, [string]$Path, [string]$MissingPath = "")
-    $fileName = ($Path -split '/')[-1]
-    if (-not $MissingPath) { $MissingPath = $Path }
-    if (-not (Prepare-FileMonitorAssertion $Scenario $Label)) { return $false }
-    for ($attempt = 1; $attempt -le 2; $attempt++) {
-        $failureCountBeforeAttempt = $script:Failures.Count
-        $ok = (Invoke-ServiceCase "scenario-$Scenario" $Label "file_write_denied" @{ file_path = $Path; payload = $Payload } "^PASS \[file_write_denied\]").Ok
-        $ok = (Require-Missing "scenario-$Scenario" "$Label missing" $MissingPath) -and $ok
-        if ($ok) {
-            Write-Host "  - monitor_failure_record_skipped $Scenario/$Label file=$fileName reason=ordinary-app-inotify"
-            return $true
-        }
-        if ($attempt -lt 2) {
-            if ($script:Failures.Count -gt $failureCountBeforeAttempt) {
-                $script:Failures.RemoveRange($failureCountBeforeAttempt, $script:Failures.Count - $failureCountBeforeAttempt)
-            }
-            Write-Host "  - file_monitor_write_denied_retry scenario=$Scenario label=$Label attempt=$attempt"
-            # 与 .sh 的 run_file_monitor_write_denied_case 一致：重试前先确认挂载仍在。
-            # 同样不因确认失败而中断，理由见上。
-            [void](Ensure-CurrentAppMountConfirmed "scenario-$Scenario-$Label-retry")
-            Prepare-ServiceCase "scenario-$Scenario-$Label-retry"
-            Wait-Storage "scenario-$Scenario-$Label-retry" | Out-Null
-            Start-Sleep -Milliseconds $script:ResultPollMilliseconds
-        }
-    }
-    $false
-}
-
-function Invoke-FileMonitorExistingWriteCase {
-    param([string]$Scenario, [string]$Label, [string]$RequestPath, [string]$BackendPath)
-    $fileName = ($RequestPath -split '/')[-1]
-    $seedPayload = "$Payload-seed-tail"
-    if (-not (Prepare-FileMonitorAssertion $Scenario $Label)) { return $false }
-    # 该用例验证既有文件的原位覆盖；先在映射目标创建种子文件，避免首次 open
-    # 被记录为 open:create，导致把 fixture 未准备完整误判为监视器丢失 write 事件。
-    $backendParent = $BackendPath.Substring(0, $BackendPath.LastIndexOf('/'))
-    Invoke-Su "mkdir -p '$backendParent'; printf '%s' '$seedPayload' > '$BackendPath'; chmod 777 '$BackendPath' 2>/dev/null || true" | Out-Null
-    $ok = (Invoke-ServiceCase "scenario-$Scenario" $Label "file_write_then_overwrite" @{ file_path = $RequestPath; payload = $Payload; expected_payload = $seedPayload } "^PASS \[file_write_then_overwrite\]").Ok
-    $ok = (Require-File "scenario-$Scenario" "$Label expected" $BackendPath) -and $ok
-    $ok = (Wait-FileMonitorLogLine $Scenario $Label $fileName "write") -and $ok
-    $ok
-}
-
-function Invoke-FileMonitorMediaStoreSuccessCase {
-    param(
-        [string]$Scenario,
-        [string]$Label,
-        [string]$RelativePath,
-        [string]$ExpectedPath,
-        [string]$PrivatePath = "",
-        [bool]$RequireMonitorRecord = $true,
-        [string]$MonitorSkipReason = "mediastore-create-result-and-routing-are-authoritative"
-    )
-    $fileName = New-MonitorFileName $Scenario $Label
-    if (-not (Prepare-FileMonitorAssertion $Scenario $Label)) { return $false }
-    $ok = (Invoke-MediaStoreDownloadCreateCase ([int]$Scenario) $Label $fileName $RelativePath).Ok
-    $ok = (Require-File "scenario-$Scenario" "$Label expected" "$ExpectedPath/$fileName") -and $ok
-    if ($PrivatePath) {
-        $ok = (Require-Missing "scenario-$Scenario" "$Label private" "$PrivatePath/$fileName") -and $ok
-    }
-    if ($RequireMonitorRecord) {
-        $ok = (Wait-FileMonitorLogLine $Scenario $Label $fileName "success") -and $ok
-    } else {
-        Write-Host "monitor_success_record_skipped scenario=$Scenario label=$Label file=$fileName reason=$MonitorSkipReason"
-    }
-    $ok
-}
-
-function Invoke-FileMonitorMediaStoreImageSuccessCase {
-    param(
-        [string]$Scenario,
-        [string]$Label,
-        [string]$RelativePath,
-        [string]$ExpectedPath,
-        [string]$PrivatePath = "",
-        [bool]$RequireMonitorRecord = $true,
-        [string]$MonitorSkipReason = "mediastore-image-result-and-routing-are-authoritative"
-    )
-    $fileName = (New-MonitorFileName $Scenario $Label) -replace '\.bin$', '.jpg'
-    if (-not (Prepare-FileMonitorAssertion $Scenario $Label)) { return $false }
-    $ok = (Invoke-MediaStoreImageCreateCase ([int]$Scenario) $Label $fileName $RelativePath).Ok
-    $ok = (Require-File "scenario-$Scenario" "$Label expected" "$ExpectedPath/$fileName") -and $ok
-    $ok = (Test-Su "test -s '$ExpectedPath/$fileName'") -and $ok
-    if ($PrivatePath) {
-        $ok = (Require-Missing "scenario-$Scenario" "$Label private" "$PrivatePath/$fileName") -and $ok
-    }
-    $ok = (Test-NoReadOnlyFailureRecord $Scenario $Label $fileName) -and $ok
-    if ($RequireMonitorRecord) {
-        $ok = (Wait-FileMonitorLogLine $Scenario $Label $fileName "success") -and $ok
-    } else {
-        Write-Host "monitor_success_record_skipped scenario=$Scenario label=$Label file=$fileName reason=$MonitorSkipReason"
-    }
-    $ok
-}
-
-function Invoke-FileMonitorMediaStoreRelativeDataSuccessCase {
-    param(
-        [string]$Scenario,
-        [string]$Label,
-        [string]$RelativeDataDir,
-        [string]$ExpectedPath,
-        [string]$PrivatePath = ""
-    )
-    $fileName = (New-MonitorFileName $Scenario $Label) -replace '\.bin$', '.jpg'
-    if (-not (Prepare-FileMonitorAssertion $Scenario $Label)) { return $false }
-    $ok = (Invoke-MediaStoreImageRelativeDataCreateCase ([int]$Scenario) $Label $fileName $RelativeDataDir).Ok
-    $ok = (Require-File "scenario-$Scenario" "$Label expected" "$ExpectedPath/$fileName") -and $ok
-    $ok = (Test-Su "test -s '$ExpectedPath/$fileName'") -and $ok
-    if ($PrivatePath) {
-        $ok = (Require-Missing "scenario-$Scenario" "$Label private" "$PrivatePath/$fileName") -and $ok
-    }
-    $ok = (Test-NoReadOnlyFailureRecord $Scenario $Label $fileName) -and $ok
-    $ok = (Wait-FileMonitorLogLine $Scenario $Label $fileName "success") -and $ok
-    $ok
-}
-
-function Invoke-FileMonitorMediaStoreDeniedCase {
-    param([string]$Scenario, [string]$Label, [string]$RelativePath, [string]$MissingPath)
-    $fileName = New-MonitorFileName $Scenario $Label
-    if (-not (Prepare-FileMonitorAssertion $Scenario $Label)) { return $false }
-    $ok = (Invoke-MediaStoreDownloadCreateDeniedCase ([int]$Scenario) $Label $fileName $RelativePath).Ok
-    $ok = (Require-Missing "scenario-$Scenario" "$Label missing" "$MissingPath/$fileName") -and $ok
-    Write-Host "monitor_failure_record_skipped scenario=$Scenario label=$Label file=$fileName reason=mediastore-denied-result-is-authoritative"
-    $ok
-}
-
-function Invoke-MonitorCaptureFailOpenScenario {
-    param([int]$Scenario)
-    # 监视专用捕获会话 fail-open 契约验证（公开 issue #3 回归锁）。
-    # 冻结 daemon 主进程制造宿主握手失败窗口：此时启动的未配置应用走到 companion
-    # 挂载的屏障决策点且挂载链路必然失败。旧 fail-closed 语义会在存储根留下只读
-    # 空 tmpfs 屏障并永久遮蔽视图；fail-open 语义不落屏障且视图保持原生存活。
-    # 用 SIGSTOP 而不是 kill：watchdog 的 kill -0 判活对停止态进程仍成立，不会
-    # 触发重启；SIGCONT 后 daemon 原地恢复，不污染后续场景。
-    $daemonPid = ""
-    foreach ($line in @(Invoke-Su 'for p in $(pidof srx_daemon 2>/dev/null); do [ "$(cat /proc/$p/comm 2>/dev/null)" = "srx_daemon" ] && { echo $p; break; }; done')) {
-        $trimmed = $line.Trim()
-        if ($trimmed -match '^\d+$') { $daemonPid = $trimmed; break }
-    }
-    if ([string]::IsNullOrWhiteSpace($daemonPid)) {
-        Write-Host "monitor_capture_failopen_skipped scenario=$Scenario reason=daemon_not_running"
-        return $true
-    }
-    Write-Host "monitor_capture_failopen freeze daemon pid=$daemonPid"
-    if (-not (Test-Su "kill -STOP $daemonPid")) {
-        Write-Host "monitor_capture_failopen freeze failed scenario=$Scenario"
-        return $false
-    }
-
-    $status = $true
-    try {
-        # 冻结窗口内重启应用：挂载链路在屏障决策之后必然失败，旧语义会在存储根
-        # 留下常驻屏障，新语义不落屏障且视图保持原生存活。
-        Invoke-Adb @("shell", "am", "force-stop", $AppId) | Out-Null
-        Start-Sleep -Milliseconds 500
-        Invoke-Adb @("shell", "am", "start", "-W", "-n", "$AppId/.MainActivity") | Out-Null
-        $appPid = ""
-        for ($attempt = 0; $attempt -lt 20; $attempt++) {
-            $appPid = Get-AppPid
-            if (-not [string]::IsNullOrWhiteSpace($appPid)) { break }
-            Start-Sleep -Milliseconds 500
-        }
-        if ([string]::IsNullOrWhiteSpace($appPid)) {
-            Write-Host "monitor_capture_failopen app start failed scenario=$Scenario"
-            $status = $false
-        }
-        else {
-            # 留出 companion 屏障决策与失败路径落地的窗口。
-            Start-Sleep -Milliseconds 2000
-            $barrierCount = 0
-            foreach ($line in @(Invoke-Su "grep -F ' $RealRoot ' '/proc/$appPid/mountinfo' 2>/dev/null | grep -c ' - tmpfs '")) {
-                $trimmed = $line.Trim()
-                if ($trimmed -match '^\d+$') { $barrierCount = [int]$trimmed; break }
-            }
-            if ($barrierCount -ne 0) {
-                Write-Host "monitor_capture_failopen barrier lingers scenario=$Scenario hits=$barrierCount"
-                $status = $false
-            }
-            $viewProbe = @(Invoke-Su "ls '/proc/$appPid/root$RealRoot/' 2>/dev/null | head -1")
-            if (-not ($viewProbe | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })) {
-                Write-Host "monitor_capture_failopen view masked scenario=$Scenario"
-                $status = $false
-            }
-        }
-    }
-    finally {
-        Write-Host "monitor_capture_failopen resume daemon pid=$daemonPid"
-        Test-Su "kill -CONT $daemonPid" | Out-Null
-    }
-
-    if ($status) {
-        # 恢复后按正常路径重启应用：捕获会话应重建，存储视图保持完整。
-        if (Restart-App "scenario-$Scenario-failopen-recover" $false) {
-            $appPid = Get-AppPid
-            $viewProbe = @(Invoke-Su "ls '/proc/$appPid/root$RealRoot/' 2>/dev/null | head -1")
-            if (-not ($viewProbe | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })) {
-                Write-Host "monitor_capture_failopen view broken after recover scenario=$Scenario"
-                $status = $false
-            }
-            # 捕获会话重建只做信息输出：共享宿主接入时机在部分设备上依赖 daemon
-            # reconcile 节奏，不做硬断言，避免把恢复节奏差异误判成功能回归。
-            Invoke-Su "grep -F ' $RealRoot ' '/proc/$appPid/mountinfo' 2>/dev/null | grep -m1 srx_fuse || true" | ForEach-Object { Write-Host "  - capture_session $_" }
-        }
-        else {
-            Write-Host "monitor_capture_failopen recover restart failed scenario=$Scenario"
-            $status = $false
-        }
-    }
-    $status
-}
-
-function Invoke-DisabledRedirectMonitorScenario {
-    param([string]$Scenario)
-    $fileName = "srt_monitor_${Scenario}_disabled_regular.bin"
-    $ok = Invoke-FileMonitorWriteSuccessCase $Scenario "disabled-regular-write" "$MonitorBaseRoot/$fileName" "$MonitorBaseRoot/$fileName" "$PrivateMonitorBaseRoot/$fileName" $true $false
-    $ok = (Invoke-FileMonitorMediaStoreSuccessCase $Scenario "disabled-system-writer-create" "Download/SrtMonitor" $MonitorBaseRoot $PrivateMonitorBaseRoot $false "disabled-profile-mediastore-create-result-and-routing-are-authoritative") -and $ok
-    $ok = (Invoke-FileMonitorMediaStoreImageSuccessCase $Scenario "disabled-nnngram-standard-create" "Pictures/Nnngram" $MonitorNnngramRoot $PrivateMonitorNnngramRoot $false "disabled-profile-standard-mediastore-result-and-routing-are-authoritative") -and $ok
-    $mediaFile = "srt_mediastore_public_only.txt"
-    $mediaResult = Invoke-ServiceCase "scenario-$Scenario" "disabled-mediastore-public-only" "mediastore_create_file" @{ file_name = $mediaFile; relative_path = "Documents/SrtMediaRoutingProbe" } "^PASS \[mediastore_create_file\]"
-    $ok = $mediaResult.Ok -and $ok
-    $ok = (Require-File "scenario-$Scenario" "disabled-mediastore-public-file" "$MediaStoreRoutingProbeRoot/$mediaFile") -and $ok
-    $ok = (Require-Missing "scenario-$Scenario" "disabled-mediastore-private-directory" $PrivateMediaStoreRoutingProbeRoot) -and $ok
-    $ok
-}
-
-function Invoke-RegularMonitorScenario {
-    param([string]$Scenario)
-    $allowFile = "srt_monitor_${Scenario}_allow.bin"
-    $mapFile = "srt_monitor_${Scenario}_map.bin"
-    $existingFile = "srt_monitor_${Scenario}_existing.bin"
-    $lockedFile = "srt_monitor_${Scenario}_locked.bin"
-    $writableFile = "srt_monitor_${Scenario}_writable.bin"
-    $ok = $true
-    if ([int]$Scenario -eq 25) {
-        $ok = (Invoke-FileMonitorWriteSuccessCase $Scenario "regular-allow-write" "$MonitorBaseRoot/$allowFile" "$MonitorBaseRoot/$allowFile" "$PrivateMonitorBaseRoot/$allowFile" $true $false "ordinary-app-scoped-fuse-direct-write") -and $ok
-        $ok = (Test-ScopedFuseDaemonStarted ([int]$Scenario) $MonitorLockedRoot) -and $ok
-    } else {
-        Write-Host "regular_allow_write_skipped scenario=$Scenario reason=mount-namespace-allowed-real-direct-write-is-platform-permission-sensitive"
-    }
-    $ok = (Invoke-FileMonitorWriteSuccessCase $Scenario "regular-mapped-write" "$MonitorMapRequest/$mapFile" "$MonitorMapTarget/$mapFile" "" $false $false "ordinary-app-direct-mapped-write") -and $ok
-    $ok = (Invoke-FileMonitorExistingWriteCase $Scenario "regular-existing-write" "$MonitorMapRequest/$existingFile" "$MonitorMapTarget/$existingFile") -and $ok
-    $ok = (Invoke-FileMonitorWriteDeniedCase $Scenario "regular-read-only-denied" "$MonitorLockedRoot/$lockedFile") -and $ok
-    $ok = (Invoke-FileMonitorWriteSuccessCase $Scenario "regular-read-only-excluded-write" "$MonitorWritableRoot/$writableFile" "$MonitorWritableRoot/$writableFile" "$PrivateMonitorWritableRoot/$writableFile" $true $false "ordinary-app-read-only-exclusion-direct-write") -and $ok
-    $ok
-}
-
-function Invoke-MediaStoreMonitorScenario {
-    param([string]$Scenario)
-    if (-not (Restart-MediaProviderWithHookReady "scenario-$Scenario-mediastore")) { return $false }
-    $ok = $true
-    $ok = (Invoke-FileMonitorMediaStoreSuccessCase $Scenario "media-allow-create" "Download/SrtMonitor" $MonitorBaseRoot $PrivateMonitorBaseRoot) -and $ok
-    if ([int]$Scenario -eq 27) {
-        $ok = (Test-ScopedFuseDaemonStarted ([int]$Scenario) $MonitorLockedRoot) -and $ok
-    }
-    $ok = (Invoke-FileMonitorMediaStoreRelativeDataSuccessCase $Scenario "media-relative-data-create" "Pictures/SrtRelativeData" $MonitorRelativeDataRoot $PrivateMonitorRelativeDataRoot) -and $ok
-    $ok = (Invoke-FileMonitorMediaStoreRelativeDataSuccessCase $Scenario "media-nnngram-relative-data" "/Pictures/Nnngram" $MonitorNnngramRoot $PrivateMonitorNnngramRoot) -and $ok
-    $ok = (Invoke-FileMonitorMediaStoreSuccessCase $Scenario "media-mapped-create" "Download/SrtMonitorMap" $MonitorMapTarget) -and $ok
-    $ok = (Invoke-FileMonitorMediaStoreDeniedCase $Scenario "media-read-only-denied" "Download/SrtMonitorLocked" $MonitorLockedRoot) -and $ok
-    $ok = (Invoke-FileMonitorMediaStoreSuccessCase $Scenario "media-read-only-excluded-create" "Download/SrtMonitorLocked/Writable" $MonitorWritableRoot $PrivateMonitorWritableRoot) -and $ok
-    $ok
-}
-
-function Get-AppPid {
-    $pidText = @(Invoke-Adb @("shell", "pidof", $AppId)) -join " "
-    $pids = [regex]::Matches($pidText, '\d+') | ForEach-Object { [int]$_.Value }
-    if ($pids) { ($pids | Sort-Object -Descending | Select-Object -First 1).ToString() } else { "" }
-}
-
-function Wait-AppProcessStopped {
-    param([int]$TimeoutSeconds = 10)
-    $attempts = [Math]::Max(1, $TimeoutSeconds * 10)
-    for ($attempt = 0; $attempt -lt $attempts; $attempt++) {
-        if ([string]::IsNullOrWhiteSpace((Get-AppPid))) { return $true }
-        Start-Sleep -Milliseconds 100
-    }
-    [string]::IsNullOrWhiteSpace((Get-AppPid))
-}
-
-function Test-AppHasNoStaleFuseMount {
-    param([string]$Label, [string]$ProcessId)
-    $pattern = '(/SrtFuse|/SrtProbe).* - fuse '
-    if (-not (Test-Su "! grep -Eq '$pattern' '/proc/$ProcessId/mountinfo' 2>/dev/null")) {
-        $script:Failures.Add("$Label 新应用命名空间继承了上轮 FUSE 挂载 pid=$ProcessId")
-        Write-Warning "$Label/stale-fuse-mount pid=$ProcessId"
-        Invoke-Su "grep -E '$pattern' '/proc/$ProcessId/mountinfo' 2>/dev/null | head -20"
-        return $false
-    }
-    Write-Host "  - fuse_namespace_clean label=$Label pid=$ProcessId"
-    $true
-}
-
-function Get-ProcessStartTimeTicks {
-    param([int]$ProcessId)
-    $stat = ((Invoke-Su "cat '/proc/$ProcessId/stat' 2>/dev/null || true") -join " ").Trim()
-    if ([string]::IsNullOrWhiteSpace($stat)) { return "" }
-    $nameEnd = $stat.LastIndexOf(')')
-    if ($nameEnd -lt 0 -or $nameEnd + 1 -ge $stat.Length) { return "" }
-    $fields = @($stat.Substring($nameEnd + 1).Trim() -split '\s+')
-    if ($fields.Count -le 19) { return "" }
-    $fields[19]
-}
-
-function Stop-AppAndWaitFuseCleanup {
-    param([string]$Label, [bool]$RequireStateCleanup = $false)
-    $appPid = Get-AppPid
-    if ([string]::IsNullOrWhiteSpace($appPid)) {
-        Invoke-Adb @("shell", "am", "force-stop", $AppId) | Out-Null
-        return $true
-    }
-
-    $statePath = "$MountStateDir/${AppId}_${appPid}.state"
-    $identities = @(
-        Invoke-Su "sed -n 's/^fuse_child=//p' '$statePath' 2>/dev/null || true" |
-            Where-Object { $_ -match '^\d+:\d+$' }
-    )
-    Invoke-Adb @("shell", "am", "force-stop", $AppId) | Out-Null
-
-    $ok = $true
-    if ($Label -like "*quick-initial-app*" -and -not (Wait-AppProcessStopped)) {
-        $script:Failures.Add("$Label 应用进程未在启动前退出 app_pid=$appPid")
-        $ok = $false
-    }
-    foreach ($identity in $identities) {
-        $parts = $identity -split ':', 2
-        $childPid = [int]$parts[0]
-        $expectedStart = $parts[1]
-        $exited = $false
-        for ($attempt = 0; $attempt -lt 50; $attempt++) {
-            if ((Get-ProcessStartTimeTicks $childPid) -ne $expectedStart) {
-                $exited = $true
-                break
-            }
-            Start-Sleep -Milliseconds 100
-        }
-        if (-not $exited) {
-            $script:Failures.Add("$Label FUSE 会话未在应用退出后回收 child=$childPid app_pid=$appPid")
-            $ok = $false
-        }
-    }
-
-    if ($RequireStateCleanup) {
-        # 状态文件没有应用退出时的同步删除路径，由 daemon 的 reconcile 循环按 30 秒
-        # 节流回收（src/daemon.rs 的 PRUNE_INTERVAL_MS）；常规周期 reconcile 也是 30 秒，
-        # 但配置、宿主和控制事件会立即唤醒主循环，不能把事件驱动路径误写成固定周期。
-        # 清理延迟上限约为 30s 节流余量 + 30s 周期 + 扫描耗时；等待窗口必须覆盖
-        # 整个周期加余量，否则是在赌 prune 相位。文件消失即提前返回，正常路径不付出全额等待。
-        $removed = $false
-        for ($attempt = 0; $attempt -lt 400; $attempt++) {
-            if (Test-Su "test ! -e '$statePath'") {
-                $removed = $true
-                break
-            }
-            Start-Sleep -Milliseconds 100
-        }
-        if (-not $removed) {
-            $script:Failures.Add("$Label 挂载状态未在应用退出后清理 path=$statePath")
-            $ok = $false
-        }
-    }
-    if ($ok -and $identities.Count -gt 0) {
-        Write-Host "  - fuse_sessions_cleaned label=$Label app_pid=$appPid count=$($identities.Count)"
-    }
-    $ok
-}
-
-function Invoke-ConfigHotReloadScenario {
-    param([int]$Scenario)
-    $previousFreshAppPerCase = $script:FreshAppPerCase
-    $script:FreshAppPerCase = $false
-
-    try {
-        $initialPid = Get-AppPid
-        if ([string]::IsNullOrWhiteSpace($initialPid)) {
-            $script:Failures.Add("scenario-$Scenario app pid missing before hot reload")
-            return $false
-        }
-        if (-not (Test-AppHasNoStaleFuseMount "scenario-$Scenario/precondition" $initialPid)) {
-            return $false
-        }
-
-        $beforeRequest = "$RealRoot/Download/SrtProbe/$HotBeforeFile"
-        $beforePrivate = "$PrivateRoot/Download/SrtProbe/$HotBeforeFile"
-        $afterRequest = "$RealRoot/Download/SrtProbe/$HotAfterFile"
-        $afterMapped = "$RealRoot/Download/Test/$HotAfterFile"
-        $afterPrivate = "$PrivateRoot/Download/SrtProbe/$HotAfterFile"
-
-        $ok = (Invoke-WriteCase $Scenario "hot-initial-private" $beforeRequest $Payload).Ok
-        $ok = (Require-File "scenario-$Scenario" "initial-private" $beforePrivate) -and $ok
-        $ok = (Require-Missing "scenario-$Scenario" "initial-real" $beforeRequest) -and $ok
-        if (-not $ok) {
-            return $false
-        }
-
-        Write-Host "  - config_hot_reload_update scenario=$Scenario switch default redirect to path mapping without restarting app"
-        Write-DeviceConfig '{"users":{"0":{"enabled":true,"path_mappings":{"Download/SrtProbe":"Download/Test"}}}}'
-
-        for ($attempt = 1; $attempt -le 20; $attempt++) {
-            $currentPid = Get-AppPid
-            if ([string]::IsNullOrWhiteSpace($currentPid) -or $currentPid -ne $initialPid) {
-                $script:Failures.Add("scenario-$Scenario app pid changed during hot reload before=$initialPid after=$currentPid")
-                return $false
-            }
-
-            Invoke-Su "rm -f '$BackendRoot/Download/SrtProbe/$HotAfterFile' '$BackendRoot/Download/Test/$HotAfterFile' '$BackendPrivateRoot/Download/SrtProbe/$HotAfterFile' 2>/dev/null || true" | Out-Null
-            $attemptOk = (Invoke-WriteCase $Scenario "hot-update-mapped-$attempt" $afterRequest $Payload).Ok
-            $attemptOk = (Test-FileExists $afterMapped) -and $attemptOk
-            $attemptOk = (Test-PathMissing $afterRequest) -and $attemptOk
-            $attemptOk = (Test-PathMissing $afterPrivate) -and $attemptOk
-            if ($attemptOk) {
-                $currentPid = Get-AppPid
-                if ([string]::IsNullOrWhiteSpace($currentPid) -or $currentPid -ne $initialPid) {
-                    $script:Failures.Add("scenario-$Scenario app pid changed after hot reload applied before=$initialPid after=$currentPid")
-                    return $false
-                }
-                Write-Host "  - config_hot_reload_applied scenario=$Scenario pid=$initialPid attempt=$attempt"
-                return $true
-            }
-            Start-Sleep -Seconds 1
-        }
-
-        $script:Failures.Add("scenario-$Scenario config hot reload did not apply while app pid stayed $initialPid")
-        # 热重载后写入 ENOENT 的现场取证：必须区分"整块重定向失效"与"只有映射目标失效"。
-        # 两种形态对策完全不同：整块失效说明存储视图根在应用视野里落回了公共存储
-        # （沙箱里才有的路径自然不存在）；只有映射失效则说明根仍指向沙箱、只是新加的
-        # 映射挂载不可见。刻意不用 run-as：它不进入应用的挂载命名空间，量到的是 shell 视图。
-        # KernelSU 真机上 `su <uid>` 同理不可当应用 uid 探针：su 丢弃补充组（everybody）导致
-        # /storage 拒绝（非 SELinux），且不进入应用挂载命名空间；详见 docs/device-testing.md。
-        $rootProbe = "$RealRoot/SrtHotRootProbe.txt"
-        $rootProbePrivate = "$PrivateRoot/SrtHotRootProbe.txt"
-        Invoke-Su "rm -f '$rootProbe' '$rootProbePrivate' 2>/dev/null || true" | Out-Null
-        if ((Invoke-WriteCase $Scenario "hot-root-probe" $rootProbe $Payload).Ok) {
-            # 落点决定结论：配置仍是启用重定向（只多了一条路径映射），非映射路径必须进沙箱。
-            Require-File "scenario-$Scenario" "hot-root-probe-sandbox" $rootProbePrivate | Out-Null
-            Require-Missing "scenario-$Scenario" "hot-root-probe-real" $rootProbe | Out-Null
-        } else {
-            Write-Host "  - hot_root_probe_failed scenario=$Scenario 非映射路径也无法写入，重定向整体未生效"
-        }
-        # 沙箱里才存在的文件：能在应用侧读到就说明存储视图根仍指向沙箱。
-        $sandboxOnlyFile = "$RealRoot/Download/SrtProbe/$HotBeforeFile"
-        if (-not (Invoke-ServiceCase "scenario-$Scenario" "hot-root-visible-sandbox-file" "file_read" @{ file_path = $sandboxOnlyFile } "^PASS \[file_read\]").Ok) {
-            Write-Host "  - hot_sandbox_file_unreadable scenario=$Scenario path=$sandboxOnlyFile"
-        }
-        # 被映射的目录本身是否还解析得到：区分"父目录不可见"与"父目录在但不可写"。
-        Invoke-ServiceCase "scenario-$Scenario" "hot-mapped-dir-list" "file_list_dir" @{ file_dir = "$RealRoot/Download/SrtProbe" } "" | Out-Null
-        Invoke-Su "rm -f '$rootProbe' '$rootProbePrivate' 2>/dev/null || true" | Out-Null
-        Require-File "scenario-$Scenario" "hot-mapped" $afterMapped | Out-Null
-        Require-Missing "scenario-$Scenario" "hot-request" $afterRequest | Out-Null
-        Require-Missing "scenario-$Scenario" "hot-private" $afterPrivate | Out-Null
-        $false
-    } finally {
-        $script:FreshAppPerCase = $previousFreshAppPerCase
-    }
-}
-
-function Invoke-BackendEndpointRecoveryScenario {
-    param([int]$Scenario)
-    $initialPid = Get-AppPid
-    if ([string]::IsNullOrWhiteSpace($initialPid)) {
-        $script:Failures.Add("scenario-$Scenario backend recovery app pid missing")
-        return $false
-    }
-    if (-not (Confirm-MediaProviderHookReady "scenario-$Scenario-before")) { return $false }
-    $initialMediaPid = Get-MediaProviderPid
-    if ([string]::IsNullOrWhiteSpace($initialMediaPid)) {
-        $script:Failures.Add("scenario-$Scenario backend recovery media provider pid missing")
-        return $false
-    }
-
-    $beforeFile = "srt_monitor_32_backend_before.jpg"
-    $afterFile = "srt_monitor_32_backend_after.jpg"
-    $expectedDir = "$RealRoot/Pictures/SrtRelativeData"
-    $ok = (Invoke-MediaStoreImageCreateCase $Scenario "backend-before" $beforeFile "Pictures/SrtRelativeData").Ok
-    $ok = (Require-File "scenario-$Scenario" "backend-before" "$expectedDir/$beforeFile") -and $ok
-    if (-not $ok) { return $false }
-
-    if (-not (Restart-App "scenario-$Scenario-app-restart" $true)) { return $false }
-    if (-not (Wait-Storage "scenario-$Scenario-backend-recovery" 30)) { return $false }
-    $currentPid = Get-AppPid
-    $currentMediaPid = Get-MediaProviderPid
-    if ([string]::IsNullOrWhiteSpace($currentPid) -or $currentPid -eq $initialPid) {
-        $script:Failures.Add("scenario-$Scenario backend recovery app pid changed before=$initialPid after=$currentPid")
-        return $false
-    }
-    if ([string]::IsNullOrWhiteSpace($currentMediaPid) -or $currentMediaPid -ne $initialMediaPid) {
-        $script:Failures.Add("scenario-$Scenario backend recovery media provider restarted before=$initialMediaPid after=$currentMediaPid")
-        return $false
-    }
-
-    $ok = (Invoke-MediaStoreImageCreateCase $Scenario "backend-after" $afterFile "Pictures/SrtRelativeData").Ok
-    $ok = (Require-File "scenario-$Scenario" "backend-after" "$expectedDir/$afterFile") -and $ok
-    $ok
-}
-
-function Invoke-QuickMediaProviderRestartRecoveryScenario {
-    param([int]$Scenario)
-    if (-not (Confirm-MediaProviderHookReady "scenario-$Scenario-before")) { return $false }
-    if ([string]::IsNullOrWhiteSpace((Get-AppPid))) {
-        if (-not (Restart-App "scenario-$Scenario-quick-initial-app" $true)) { return $false }
-    } elseif ($script:MountConfirmTimeoutMilliseconds -gt 0 -and -not (Wait-AppMountConfirmed "scenario-$Scenario-quick-initial-app")) {
-        return $false
-    }
-    $initialMediaPid = Get-MediaProviderPid
-    $before = Invoke-MediaStoreImageCreateCase $Scenario "quick-before" "srt_monitor_33_quick_before.jpg" "Pictures/SrtRelativeData"
-    $ok = (Require-File "scenario-$Scenario" "quick-before" "$RealRoot/Pictures/SrtRelativeData/srt_monitor_33_quick_before.jpg") -and $before.Ok
-    if (-not $ok) { return $false }
-    # 图片用例会按需拉起应用主进程，必须在用例完成后记录稳定 PID。
-    $initialPid = Get-AppPid
-    if ([string]::IsNullOrWhiteSpace($initialPid) -or [string]::IsNullOrWhiteSpace($initialMediaPid)) {
-        $script:Failures.Add("scenario-$Scenario quick restart initial pid missing")
-        return $false
-    }
-
-    try { Invoke-Su "/data/adb/modules/storage.redirect.x/bin/srxctl remount-running" | Out-Null } catch {
-        $script:Failures.Add("scenario-$Scenario quick MediaProvider restart failed: $_")
-        return $false
-    }
-    if (-not (Test-Su "grep -F 'running app remount completed request=' '$LogPath' | tail -1 | grep -F 'request=' >/dev/null")) {
-        $script:Failures.Add("scenario-$Scenario quick remount completion missing")
-        return $false
-    }
-    if (-not (Wait-MediaProviderReady "scenario-$Scenario-quick-provider" 60)) { return $false }
-    if (-not (Wait-MediaProviderHookReady "scenario-$Scenario-quick-hook" 30)) { return $false }
-    $currentMediaPid = Get-MediaProviderPid
-    if ([string]::IsNullOrWhiteSpace($currentMediaPid) -or $currentMediaPid -ne $initialMediaPid) {
-        $script:Failures.Add("scenario-$Scenario quick restart MediaProvider pid changed before=$initialMediaPid after=$currentMediaPid")
-        return $false
-    }
-
-    $preservedAppPid = Get-AppPid
-    if ([string]::IsNullOrWhiteSpace($preservedAppPid) -or $preservedAppPid -ne $initialPid) {
-        $script:Failures.Add("scenario-$Scenario quick restart unexpectedly changed running app pid before=$initialPid after=$preservedAppPid")
-        return $false
-    }
-    Write-Host "  - quick_restart_app_preserved scenario=$Scenario pid=$preservedAppPid"
-
-    $currentPid = Get-AppPid
-    if ([string]::IsNullOrWhiteSpace($currentPid) -or $currentPid -ne $initialPid) {
-        $script:Failures.Add("scenario-$Scenario quick restart app pid changed before=$initialPid after=$currentPid")
-        return $false
-    }
-    $after = Invoke-MediaStoreImageCreateCase $Scenario "quick-after" "srt_monitor_33_quick_after.jpg" "Pictures/SrtRelativeData"
-    (Require-File "scenario-$Scenario" "quick-after" "$RealRoot/Pictures/SrtRelativeData/srt_monitor_33_quick_after.jpg") -and $after.Ok
-}
-
-function Invoke-TestArtifactCleanup {
-    if ($script:CleanupDone) { return }
-    $script:CleanupDone = $true
-    Write-Host "== 清理测试产物 =="
-    try { Invoke-Adb @("shell", "am", "force-stop", $AppId) | Out-Null } catch { Write-Warning "force-stop 清理失败：$_" }
-    try { Restore-CrossAppConfig } catch { Write-Warning "跨应用只读配置恢复失败：$_" }
-    try { Restore-AppConfig } catch { Write-Warning "应用配置恢复失败：$_" }
-    try { Restore-GlobalConfig } catch { Write-Warning "全局配置恢复失败：$_" }
-    try { Clear-Results } catch { Write-Warning "结果清理失败：$_" }
-    try { Invoke-Su "rm -f /data/local/tmp/srx-result-*.marker" | Out-Null } catch { Write-Warning "结果标记清理失败：$_" }
-    try { Remove-TestTargetArtifacts } catch { Write-Warning "目标产物清理失败：$_" }
-    try { Clear-AliasMediaStoreFixture } catch { Write-Warning "别名测试媒体行清理失败：$_" }
-    try { Remove-RandomMediaStoreRows } catch { Write-Warning "MediaStore 清理失败：$_" }
-    try { Remove-RandomPhysicalMediaFiles } catch { Write-Warning "物理文件清理失败：$_" }
-    try { Restart-MediaProvider } catch { Write-Warning "MediaProvider 重启失败：$_" }
-    try { Restore-DeviceExecutionState } catch { Write-Warning "设备执行状态恢复失败：$_" }
-    if ($script:Failures.Count -eq 0) {
-        Remove-Item -LiteralPath (Join-Path $PSScriptRoot "../../temp/scenario-2-mediastore-hook-diag.txt") -Force -ErrorAction SilentlyContinue
-    }
-}
-
-function Restart-App {
-    param([string]$Label, [bool]$ExpectMount = $true)
-    $cleanupOk = Stop-AppAndWaitFuseCleanup "$Label/restart"
-    if (-not $cleanupOk -and $script:FailFast) {
-        throw "[SRT_FAIL_FAST_ITEM] $Label/restart-cleanup"
-    }
-    # 应用即将重启，之前确认过的 PID 一定失效（见 Prepare-ServiceCase 的同款说明）。
-    $script:LastMountConfirmedPid = ""
-    Invoke-Adb @("logcat", "-c") | Out-Null
-    Invoke-Su ": > '$LogPath' 2>/dev/null || true" | Out-Null
-    Invoke-Adb @("shell", "am", "start", "-n", "$AppId/.MainActivity") | Out-Null
-    $confirmed = if ($ExpectMount) { Wait-AppMountConfirmed $Label } else { $true }
-    if (-not $confirmed -and $script:AppLaunchSettleMilliseconds -gt 0) {
-        Start-Sleep -Milliseconds $script:AppLaunchSettleMilliseconds
-    }
-    return (Wait-Storage $Label)
-}
-
-function Get-TargetPath {
-    param([int]$Scenario)
-    if ($Scenario -eq 8) { return "$RuleSandboxRoot/$TestFile" }
-    if ($Scenario -eq 14) { return "$RealRoot/Download/SrtLongest/Deep/$TestFile" }
-    if ($Scenario -eq 15) { return "$RealRoot/Download/SrtPriority/$TestFile" }
-    "$RealRoot/Download/SrtProbe/$TestFile"
-}
-
-function Get-LogicalDir {
-    param([int]$Scenario)
-    if ($Scenario -eq 8) { return $RuleSandboxRoot }
-    if ($Scenario -eq 14) { return "$RealRoot/Download/SrtLongest/Deep" }
-    if ($Scenario -eq 15) { return "$RealRoot/Download/SrtPriority" }
-    "$RealRoot/Download/SrtProbe"
-}
-
-function Get-ExpectedPath {
-    param([int]$Scenario)
-    switch ($Scenario) {
-        1 { "$RealRoot/Download/SrtProbe/$TestFile" }
-        2 { "$PrivateRoot/Download/SrtProbe/$TestFile" }
-        3 { "$RealRoot/Download/Test/$TestFile" }
-        4 { "$RealRoot/Download/Test/$TestFile" }
-        5 { "$RealRoot/Download/SrtProbe/$TestFile" }
-        6 { "$RealRoot/Download/SrtProbe/$TestFile" }
-        7 { "$RealRoot/Download/SrtMapOnlyMapped/$TestFile" }
-        8 { "$PrivateRuleSandboxRoot/$TestFile" }
-        14 { "$RealRoot/Download/SrtLongestDeep/$TestFile" }
-        15 { "$RealRoot/Download/SrtPriorityMapped/$TestFile" }
-    }
-}
-
-function Get-ScenarioTitle {
-    param([int]$Scenario)
-    switch ($Scenario) {
-        1 { "no config keeps real path" }
-        2 { "default redirect to private" }
-        3 { "path mapping to Download/Test" }
-        4 { "mapping priority over allow Download" }
-        5 { "allow Download keeps real path" }
-        6 { "mapping_mode_only unmatched stays real and drifted own dir stays inert" }
-        7 { "mapping_mode_only mapped path maps" }
-        8 { "FUSE mapping_mode_only sandbox hit with unmatched sibling kept real" }
-        9 { "read_only_paths deny writes" }
-        10 { "mapped target read-only deny write" }
-        11 { "allow with inline exclusions and wildcard" }
-        12 { "legacy excluded_real_paths merges into allow exclusions" }
-        13 { "allowed_real_paths question-mark wildcard" }
-        14 { "path mapping longest-prefix match" }
-        15 { "mapping priority over string sandboxed_paths" }
-        16 { "auto backend plain allow plus wildcard allow" }
-        17 { "auto backend read_only_paths exclusion priority" }
-        18 { "auto backend mapped final target read-only policy" }
-        19 { "auto backend sibling wildcard rules stay scoped" }
-        20 { "auto backend allowed wildcard match or namespace fallback" }
-        21 { "auto backend read_only wildcard match or namespace fallback" }
-        22 { "auto backend mapped final target read-only policy" }
-        23 { "file monitor disabled redirect regular app and system writer success records" }
-        24 { "file monitor regular app auto backend mapping and read-only records" }
-        25 { "file monitor regular app with auto backend" }
-        26 { "file monitor system writer with auto backend" }
-        27 { "file monitor system writer with auto backend" }
-        28 { "MediaStore query keeps read-only real image visible" }
-        29 { "config hot reload switches running app from default redirect to path mapping" }
-        30 { "MediaProvider collection URI openTypedAssetFile bypasses single-row remapping" }
-        31 { "disabled redirect keeps thumbnail and full image readable" }
-        32 { "real backend recovery survives app restart without restarting MediaProvider" }
-        33 { "MediaProvider hot reload preserves app mounts and image saving" }
-        34 { "own package QQfile_recv paths stay real" }
-        35 { "arbitrary path mapping matrix across public and private roots" }
-        36 { "mapped private alias continues writing an existing file" }
-        37 { "nested mapping chain applies parent result to child rule" }
-        38 { "download provider own sandboxed_paths native write into sandbox" }
-        39 { "download provider delegated write lands on requester mapping target" }
-        40 { "system uid fuse write attributed to originating service; app-initiated mediaprovider creation attributed to source app; system uid sandbox missing target has zero leak" }
-    }
-}
-
-function Invoke-WriteCase {
-    param([int]$Scenario, [string]$Label, [string]$Path, [string]$Data)
-    Invoke-ServiceCase "scenario-$Scenario" $Label "file_write" @{ file_path = $Path; payload = $Data; expected_payload = $Data } "^PASS \[file_write\]"
-}
-
-function Invoke-OwnPrivateWriteCase {
-    param([int]$Scenario, [string]$Label, [string]$Request, [string]$VisiblePath, [string]$BackendPath, [string]$SandboxPath)
-    # 自有私有目录由模块锚点提供，应用可见视图可能短暂落后于真实后端预置。
-    # 首次写入返回 ENOENT 时重建夹具并重启应用后重跑同一条严格断言，不放宽判定；
-    # 重试仍失败说明不是预置时序，按真实失败上报。真实落点按版本可能是可见路径
-    # （独立卷）或 /data/media 后端拷贝，二选一命中即可，沙盒必须为空。
-    for ($attempt = 1; $attempt -le 2; $attempt++) {
-        $failureCountBeforeAttempt = $script:Failures.Count
-        $writeOk = (Invoke-WriteCase $Scenario $Label $Request $Payload).Ok
-        $realOk = Require-OwnPrivateRealLanding "scenario-$Scenario" "$Label-real" $VisiblePath $BackendPath
-        $sandboxOk = Require-Missing "scenario-$Scenario" "$Label-sandbox" $SandboxPath
-        if ($writeOk -and $realOk -and $sandboxOk) { return $true }
-        if ($attempt -eq 2) { return $false }
-        if ($script:Failures.Count -gt $failureCountBeforeAttempt) {
-            $script:Failures.RemoveRange($failureCountBeforeAttempt, $script:Failures.Count - $failureCountBeforeAttempt)
-        }
-        Write-Output "own_private_write_retry scenario=$Scenario label=$Label attempt=$attempt"
-        Invoke-Adb @("shell", "am", "force-stop", $AppId) | Out-Null
-        Invoke-Adb @("shell", "am", "start", "-W", "-n", "$AppId/.MainActivity") | Out-Null
-        Wait-Storage "scenario-$Scenario-$Label-own-private" | Out-Null
-        Clear-Targets
-        Clear-Results
-    }
-    return $false
-}
-
-function Invoke-OwnPrivateDirectoriesScenario {
-    param([int]$Scenario)
-    $labels = @("data", "media", "obb")
-    $requestRoots = @($OwnPrivateDataRoot, $OwnPrivateMediaRoot, $OwnPrivateObbRoot)
-    $backendRoots = @($BackendOwnPrivateDataRoot, $BackendOwnPrivateMediaRoot, $BackendOwnPrivateObbRoot)
-    $sandboxRoots = @($SandboxOwnPrivateDataRoot, $SandboxOwnPrivateMediaRoot, $SandboxOwnPrivateObbRoot)
-    $ok = $true
-    for ($index = 0; $index -lt $labels.Count; $index++) {
-        $fileName = "srt_qqfile_recv_$($labels[$index]).txt"
-        $requestPath = "$($requestRoots[$index])/$fileName"
-        $backendPath = "$($backendRoots[$index])/$fileName"
-        $sandboxPath = "$($sandboxRoots[$index])/$fileName"
-        $ok = (Invoke-OwnPrivateWriteCase $Scenario "own-$($labels[$index])" $requestPath $requestPath $backendPath $sandboxPath) -and $ok
-    }
-    # 真机回归（2026-09 报障，修复见提交 23388f01）：直写用例只覆盖应用自身命名空间视图，
-    # 补一条经 MediaStore 的 provider 中介链路（insert(DATA=自身 Android/media/<pkg>/...)
-    # → provider 侧 pending 创建与发布 → 回读），断言真实落点存在、沙盒无残留。
-    # 与 run-storage-redirect-scenarios.sh 场景 34 的 own-private-mediastore 用例对等。
-    $mediaStoreFile = "srt_own_private_mediastore.jpg"
-    $ok = (Invoke-MediaStoreImageRelativeDataCreateCase $Scenario "own-private-mediastore" $mediaStoreFile "Android/media/$AppId/Tencent/QQfile_recv").Ok -and $ok
-    $ok = (Require-File "scenario-$Scenario" "own-private-mediastore-real" "$OwnPrivateMediaRoot/$mediaStoreFile") -and $ok
-    $ok = (Require-Missing "scenario-$Scenario" "own-private-mediastore-sandbox" "$SandboxOwnPrivateMediaRoot/$mediaStoreFile") -and $ok
-    $ok
-}
-
-function Invoke-AnyPathMappingScenario {
-    param([int]$Scenario)
-    $cases = @(
-        @{ Label = "relative-android-data-to-public"; Request = "$AnyRelativeRequest/srt_any_relative.txt"; Expected = "$AnyRelativePublicTarget/srt_any_relative.txt"; Source = "$BackendRoot/Android/data/$AppId/srt_any_relative/srt_any_relative.txt" },
-        @{ Label = "absolute-data-user-to-public"; Request = "$AnyAbsoluteUserRequest/srt_any_absolute.txt"; Expected = "$AnyAbsolutePublicTarget/srt_any_absolute.txt"; Source = "$AnyAbsoluteUserRequest/srt_any_absolute.txt" },
-        @{ Label = "user-id-data-user-to-private"; Request = "$AnyUserIdRequest/srt_any_user_id.txt"; Expected = "$BackendRoot/Android/data/$AppId/cache/srt_any_user_id.txt"; Source = "$AnyUserIdRequest/srt_any_user_id.txt" },
-        @{ Label = "legacy-data-data-to-private"; Request = "$AnyLegacyDataRequest/srt_any_legacy.txt"; Expected = "$BackendRoot/Android/media/$AppId/cache/srt_any_legacy.txt"; Source = "$AnyLegacyDataRequest/srt_any_legacy.txt" },
-        @{ Label = "public-to-absolute-private"; Request = "$AnyPublicToPrivateRequest/srt_any_public_private.txt"; Expected = "$AnyUserPrivateTarget/srt_any_public_private.txt"; Source = "$AnyPublicToPrivateRequest/srt_any_public_private.txt" },
-        @{ Label = "mapped-mediastore-target"; Request = "$AnyMediaRequest/$AnyMediaFile"; Expected = "$AnyMediaTarget/$AnyMediaFile"; Source = "$AnyMediaRequest/$AnyMediaFile"; MediaStore = $true }
-    )
-    $ok = $true
-    foreach ($case in $cases) {
-        if ($case.MediaStore) {
-            $mediaResult = Invoke-MediaStoreDownloadCreateCase $Scenario $case.Label $AnyMediaFile "Download/SrtAnyMediaRequest"
-            $ok = $mediaResult.Ok -and $ok
-        } else {
-            $ok = (Invoke-WriteCase $Scenario $case.Label $case.Request $Payload).Ok -and $ok
-        }
-        $ok = (Require-File "scenario-$Scenario" "$($case.Label)-target" $case.Expected) -and $ok
-        $ok = (Require-Missing "scenario-$Scenario" "$($case.Label)-source" $case.Source) -and $ok
-    }
-    $ok
-}
-
-function Clear-AliasMediaStoreFixture {
-    # 固定文件名有请求、公共别名和目标三种索引路径，重复测试前一并清理。
-    # 仅匹配本测试文件及三个精确目录，避免扩大到用户媒体。
-    $namePattern = "_display_name=(\.pending-\d+-|\.trashed-\d+-)?$([regex]::Escape($QqAliasMappedFile))(,|$)"
-    $pathPatterns = @($QqAliasRequestRoot, "$RealRoot/Download/QQ", $QqAliasMappedRoot) | ForEach-Object {
-        "_data=$([regex]::Escape($_))/(\.pending-\d+-|\.trashed-\d+-)?$([regex]::Escape($QqAliasMappedFile))(,|$)"
-    }
-    Remove-MediaStoreRowsByPattern "content://media/external/file" @($namePattern) $pathPatterns
-}
-
-function Invoke-QqAliasMappedExistingFileScenario {
-    param([int]$Scenario)
-    Clear-AliasMediaStoreFixture
-    $requestPath = "$QqAliasRequestRoot/$QqAliasMappedFile"
-    $targetPath = "$QqAliasMappedRoot/$QqAliasMappedFile"
-    $result = Invoke-ServiceCase "scenario-$Scenario" "qq-alias-mediastore-overwrite" "mediastore_create_then_file_overwrite" @{ file_path = $requestPath; target_file_path = $targetPath; payload = "append"; expected_payload = "seedseed" } "^PASS \[mediastore_create_then_file_overwrite\]"
-    $ok = $result.Ok
-    $ok = (Require-File "scenario-$Scenario" "qq-alias-target" $targetPath) -and $ok
-    $ok = (Require-Missing "scenario-$Scenario" "qq-alias-private" $requestPath) -and $ok
-    $ok
-}
-
-function Invoke-NestedMappingChainScenario {
-    param([int]$Scenario)
-    $file = "$NestedMappingRequestRoot/QQfile_recv/nested.bin"
-    $target = "$NestedMappingTargetRoot/nested.bin"
-    $result = Invoke-WriteCase $Scenario "nested-mapping-chain" $file $Payload
-    $ok = $result.Ok
-    $ok = (Require-File "scenario-$Scenario" "nested-mapping-target" $target) -and $ok
-    $ok = (Require-Missing "scenario-$Scenario" "nested-mapping-request" $file) -and $ok
-    $ok
-}
-
-function Invoke-CreateCase {
-    param([int]$Scenario, [string]$Label, [string]$Path)
-    Invoke-ServiceCase "scenario-$Scenario" $Label "file_create" @{ file_path = $Path } "^PASS \[file_create\]"
-}
-
-function Invoke-MediaStoreDownloadCreateCase {
-    param([int]$Scenario, [string]$Label, [string]$FileName, [string]$RelativePath = "")
-    $extras = @{ file_name = $FileName }
-    if ($RelativePath) { $extras.relative_path = $RelativePath }
-    $lastResult = $null
-    for ($attempt = 1; $attempt -le 3; $attempt++) {
-        if (-not (Wait-Storage "scenario-$Scenario-$Label-mediastore-storage")) { return $false }
-        if (-not (Wait-MediaProviderReadyCached "scenario-$Scenario-$Label-mediastore-provider")) { return $false }
-        $lastResult = Invoke-ServiceCase "scenario-$Scenario" $Label "mediastore_create_download" $extras "^PASS \[mediastore_create_download\]"
-        if ($lastResult.Ok) { return $lastResult }
-        if ($attempt -lt 3) {
-            Write-Host "mediastore_download_create_retry scenario=$Scenario label=$Label attempt=$attempt"
-            Start-Sleep -Milliseconds $script:ResultPollMilliseconds
-        }
-    }
-    $lastResult
-}
-
-function Invoke-MediaStoreImageCreateCase {
-    param([int]$Scenario, [string]$Label, [string]$FileName, [string]$RelativePath = "")
-    $extras = @{ file_name = $FileName }
-    if ($RelativePath) { $extras.relative_path = $RelativePath }
-    Invoke-ServiceCase "scenario-$Scenario" $Label "mediastore_create_image" $extras "^PASS \[mediastore_create_image\]"
-}
-
-function Invoke-MediaStoreImageRelativeDataCreateCase {
-    param([int]$Scenario, [string]$Label, [string]$FileName, [string]$RelativeDataDir)
-    $lastResult = $null
-    for ($attempt = 1; $attempt -le 3; $attempt++) {
-        if (-not (Wait-Storage "scenario-$Scenario-$Label-mediastore-relative-storage")) { return $false }
-        if (-not (Wait-MediaProviderReadyCached "scenario-$Scenario-$Label-mediastore-relative-provider")) { return $false }
-        $lastResult = Invoke-ServiceCase "scenario-$Scenario" $Label "mediastore_create_image_relative_data" @{ file_name = $FileName; relative_path = $RelativeDataDir } "^PASS \[mediastore_create_image_relative_data\]"
-        if ($lastResult.Ok) { return $lastResult }
-        if ($attempt -lt 3) {
-            Write-Host "mediastore_image_relative_data_retry scenario=$Scenario label=$Label attempt=$attempt"
-            Start-Sleep -Milliseconds $script:ResultPollMilliseconds
-        }
-    }
-    $lastResult
-}
-
-function Invoke-MediaStoreDownloadCreateDeniedCase {
-    param([int]$Scenario, [string]$Label, [string]$FileName, [string]$RelativePath = "")
-    $extras = @{ file_name = $FileName }
-    if ($RelativePath) { $extras.relative_path = $RelativePath }
-    Invoke-ServiceCase "scenario-$Scenario" $Label "mediastore_create_download_denied" $extras "^PASS \[mediastore_create_download_denied\]"
-}
-
-function Expect-AppEntry {
-    param([int]$Scenario, [string]$Label, [string]$Dir, [string]$FileName)
-    $result = Invoke-ServiceCase "scenario-$Scenario" $Label "file_list_dir" @{ file_dir = $Dir } "^PASS \[file_list_dir\]"
-    if (-not $result.Ok) { return $false }
-    if ($result.Text -match "entries=.*$([regex]::Escape($FileName))") { return $true }
-    $script:Failures.Add("scenario-$Scenario/$Label app view missing $FileName in $Dir :: $($result.Text -replace "`n", " | ")")
-    $false
-}
-
-function Expect-NoAppEntry {
-    param([int]$Scenario, [string]$Label, [string]$Dir, [string]$FileName)
-    $result = Invoke-ServiceCase "scenario-$Scenario" $Label "file_list_dir" @{ file_dir = $Dir } ""
-    if ($result.Text -match "entries=.*$([regex]::Escape($FileName))") {
-        $script:Failures.Add("scenario-$Scenario/$Label app view unexpectedly sees $FileName in $Dir")
-        return $false
-    }
-    $true
-}
-
-# 采集场景 2 MediaStore 子用例的 MediaProvider hook 安装证据（PS1 镜像）。
-# 在 Invoke-ServiceCase 完成后、Require-File 断言前调用，
-# 此时 logcat buffer 仍包含本次 insert 的 SRX 回调日志。
-function Invoke-CaptureScenario2MediastoreHookDiag {
-    $outFile = (Join-Path $script:ArtifactDir "scenario-2-mediastore-hook-diag.txt")
-    $lines = [System.Collections.Generic.List[string]]::new()
-
-    $lines.Add("===media_provider_pid===")
-    $mpPid = Get-MediaProviderPid
-    $lines.Add("pid=$( if ($mpPid) { $mpPid } else { 'missing' } )")
-    $lines.Add("")
-
-    $lines.Add("===srx_logcat_for_media_provider===")
-    if ($mpPid) {
-        $logcatOut = & adb -s $Serial logcat -d --pid $mpPid -s "SRX:V" 2>$null |
-            Select-Object -Last 200
-        $lines.AddRange([string[]]@($logcatOut | Where-Object { $null -ne $_ }))
-    } else {
-        $lines.Add("media_provider_pid_missing: cannot filter logcat")
-    }
-    $lines.Add("")
-
-    $lines.Add("===sandbox_dir_content===")
-    $dirOut = Invoke-Su "ls -la '$PrivateMediaStoreRoutingProbeRoot/' 2>/dev/null || echo dir_missing"
-    $lines.AddRange([string[]]@($dirOut | Where-Object { $null -ne $_ }))
-    $lines.Add("")
-
-    $lines.Add("===running_log_java_hook_lines===")
-    $runningOut = Invoke-Su @"
-grep -aE 'java hook|writer final|writer init|writer boot|boot_lite|specialize' \
-  /data/adb/modules/storage.redirect.x/logs/running.log 2>/dev/null | tail -60 || true
-"@
-    $lines.AddRange([string[]]@($runningOut | Where-Object { $null -ne $_ }))
-    $lines.Add("")
-
-    # 模块在 MediaProvider specialize 时落盘的 Java hook 安装结果。
-    # logcat 采集晚于 MediaProvider specialize，安装记录事后取不到；
-    # 该文件是区分「hook 从未安装」与「已安装但未触发」的唯一硬证据。
-    $lines.Add("===media_hook_install_state===")
-    $installStateOut = Invoke-Su "cat /data/adb/modules/storage.redirect.x/logs/.media_hook_install_state 2>/dev/null || echo state_absent"
-    $lines.AddRange([string[]]@($installStateOut | Where-Object { $null -ne $_ }))
-    $lines.Add("")
-
-    $lines.Add("===media_hook_deferred_marker===")
-    $markerOut = Invoke-Su "ls -la /data/adb/modules/storage.redirect.x/logs/.media_hook_deferred 2>/dev/null || echo marker_absent"
-    $lines.AddRange([string[]]@($markerOut | Where-Object { $null -ne $_ }))
-    $lines.Add("")
-
-    try {
-        $lines | Set-Content -Encoding UTF8 -Path $outFile
-    } catch {
-        # 诊断写入失败不影响断言链
-    }
-}
-
-function Invoke-StandardScenario {
-    param([int]$Scenario)
-    $ok = (Invoke-WriteCase $Scenario "write" (Get-TargetPath $Scenario) $Payload).Ok
-    $ok = (Expect-AppEntry $Scenario "app-view" (Get-LogicalDir $Scenario) $TestFile) -and $ok
-    if ($Scenario -eq 3) { $ok = (Expect-NoAppEntry $Scenario "mapped-real-view" "$RealRoot/Download/Test" $TestFile) -and $ok }
-    if ($Scenario -eq 4) { $ok = (Expect-AppEntry $Scenario "mapped-real-view" "$RealRoot/Download/Test" $TestFile) -and $ok }
-    $ok = (Require-File "scenario-$Scenario" "expected-location" (Get-ExpectedPath $Scenario)) -and $ok
-    switch ($Scenario) {
-        2 {
-            $ok = (Require-Missing "scenario-$Scenario" "real-request" "$RealRoot/Download/SrtProbe/$TestFile") -and $ok
-            $mediaFile = "srt_mediastore_sandbox_only.txt"
-            if (-not (Confirm-MediaProviderHookReady "scenario-$Scenario-before-mediastore")) { return $false }
-            $mediaResult = Invoke-ServiceCase "scenario-$Scenario" "mediastore-sandbox-only" "mediastore_create_file" @{ file_name = $mediaFile; relative_path = "Documents/SrtMediaRoutingProbe" } "^PASS \[mediastore_create_file\]"
-            $ok = $mediaResult.Ok -and $ok
-            # 断言前立即采集 hook 证据，此时 logcat buffer 仍覆盖本次 insert。
-            Invoke-CaptureScenario2MediastoreHookDiag
-            $ok = (Require-File "scenario-$Scenario" "mediastore-sandbox-file" "$PrivateMediaStoreRoutingProbeRoot/$mediaFile") -and $ok
-            $ok = (Require-Missing "scenario-$Scenario" "mediastore-public-file" "$MediaStoreRoutingProbeRoot/$mediaFile") -and $ok
-            $ok = (Require-Missing "scenario-$Scenario" "mediastore-public-parent" "$BackendRoot/Documents/SrtMediaRoutingProbe") -and $ok
-            $ok = (Test-PublicDirectoryOwner "scenario-$Scenario" "android-owner" "$BackendRoot/Android") -and $ok
-        }
-        3 { $ok = (Require-Missing "scenario-$Scenario" "real-request" "$RealRoot/Download/SrtProbe/$TestFile") -and $ok }
-        7 { $ok = (Require-Missing "scenario-$Scenario" "real-request" "$RealRoot/Download/SrtProbe/$TestFile") -and $ok }
-    }
-    if ($Scenario -eq 5) {
-        $ok = (Test-PublicDirectoryOwner "scenario-$Scenario" "download-owner" "$BackendRoot/Download") -and $ok
-    }
-    if ($Scenario -eq 6) { $ok = (Invoke-OwnerDriftOwnDirScenario $Scenario) -and $ok }
-    $ok
-}
-
-# 仅映射模式自有目录属主漂移契约（2026-10-21 起契约反转）：
-# 历史背景是真机 2026-10-17 用户反馈——MediaProvider 代写把应用自有
-# Android/data/<pkg> 子树属主写成 media_rw，原生 FUSE 对属主非本应用的私有
-# 目录只给 others 位，应用访问全部 EACCES。当时的守卫是「浅层属主修复链」，
-# 该链已随 2026-10-20「属主修复体系全面拆除」决定移除；存量漂移改由一次性
-# 迁移（owner-migration-1023）在模块升级重启时修复，运行期不再改写属主。
-# 本场景在应用启动前注入
-# 1023 属主损伤，断言 2026-10-21 起的新契约：旧「浅层属主修复链」已随拆除决定
-# 移除，存量漂移由一次性迁移（owner-migration-1023）在模块升级重启时修复，运行
-# 期守护与应用都不改写私有树属主——应用对漂移目录的读写被原生 DAC 拒绝（各
-# Android 腿一致），后端属主保持 1023；修复链一旦回潮场景当场报错。
-function Set-OwnerDriftFixture {
-    param([string]$Label)
-    $driftBackend = "$BackendRoot/Android/data/$AppId/files/SrtDrift"
-    if (-not (Test-Su "rm -rf '$driftBackend'; mkdir -p '$driftBackend' && printf 'srt-drift-payload' > '$driftBackend/srt_drift_existing.txt' && chown -R 1023:1023 '$driftBackend' && chmod 2771 '$driftBackend' && chmod 660 '$driftBackend/srt_drift_existing.txt' && [ `$(stat -c %u '$driftBackend/srt_drift_existing.txt') -eq 1023 ]")) {
-        throw "owner_drift_fixture_failed label=$Label path=$driftBackend"
-    }
-}
-
-function Invoke-OwnerDriftOwnDirScenario {
-    param([int]$Scenario)
-    $driftVisible = "$RealRoot/Android/data/$AppId/files/SrtDrift"
-    $driftBackend = "$BackendRoot/Android/data/$AppId/files/SrtDrift"
-    $ok = $true
-    # 漂移目录的读与新建写入都必须被原生 DAC 拒绝：任何 PASS 都说明有链路在
-    # 改写属主或绕过 DAC 放行。
-    $ok = (Invoke-ServiceCase "scenario-$Scenario" "own-drift-read-denied" "file_read" @{ file_path = "$driftVisible/srt_drift_existing.txt" } "^FAIL \[file_read\]").Ok -and $ok
-    $ok = (Invoke-ServiceCase "scenario-$Scenario" "own-drift-write-denied" "file_write" @{ file_path = "$driftVisible/srt_drift_probe.txt"; payload = $Payload; expected_payload = $Payload } "^FAIL \[file_write\]").Ok -and $ok
-    # 后端属主必须保持注入的 1023：守护与应用都不得改写私有树属主（拆除契约）。
-    $ownerIntact = Test-Su "[ `$(stat -c %u '$driftBackend/srt_drift_existing.txt') -eq 1023 ]"
-    if (-not $ownerIntact) {
-        $script:Failures.Add("scenario-$Scenario/owner-drift-repaired-unexpectedly") | Out-Null
-        Write-Host "  - scenario-$Scenario/owner-drift-repaired-unexpectedly backend=$driftBackend"
-        return $false
-    }
-    Write-Host "  - scenario-$Scenario/owner-drift-inert"
-    $ok
-}
-
-function Set-ReadOnlySeed {
-    $root = Convert-ToBackendPath $ReadOnlyRoot
-    Invoke-Su "mkdir -p '$root'; rm -f '$root/write_denied.txt' '$root/renamed.txt' '$root/$ReadOnlyHardlink' '$root/$ReadOnlySymlink'; rm -rf '$root/newdir'; printf '%s' '$ReadOnlyPayload' > '$root/$ReadOnlyFile'; chmod -R 777 '$root' 2>/dev/null || true" | Out-Null
-}
-
-function Invoke-ReadOnlyScenario {
-    param([int]$Scenario)
-    $ok = $true
-    $ok = (Invoke-ServiceCase "scenario-$Scenario" "read" "file_read" @{ file_path = "$ReadOnlyRoot/$ReadOnlyFile"; expected_payload = $ReadOnlyPayload } "^PASS \[file_read\]").Ok -and $ok
-    $ok = (Invoke-ServiceCase "scenario-$Scenario" "stat" "file_stat" @{ file_path = "$ReadOnlyRoot/$ReadOnlyFile" } "^PASS \[file_stat\]").Ok -and $ok
-    $ok = (Invoke-ServiceCase "scenario-$Scenario" "access" "file_access" @{ file_path = "$ReadOnlyRoot/$ReadOnlyFile" } "^PASS \[file_access\]").Ok -and $ok
-    $ok = (Invoke-ServiceCase "scenario-$Scenario" "write-denied" "file_write_denied" @{ file_path = "$ReadOnlyRoot/write_denied.txt"; payload = $Payload } "^PASS \[file_write_denied\]").Ok -and $ok
-    $ok = (Invoke-ServiceCase "scenario-$Scenario" "truncate-denied" "file_truncate_denied" @{ file_path = "$ReadOnlyRoot/$ReadOnlyFile"; length = "4" } "^PASS \[file_truncate_denied\]").Ok -and $ok
-    $ok = (Invoke-ServiceCase "scenario-$Scenario" "ftruncate-denied" "file_ftruncate_denied" @{ file_path = "$ReadOnlyRoot/$ReadOnlyFile"; length = "8" } "^PASS \[file_ftruncate_denied\]").Ok -and $ok
-    $ok = (Invoke-ServiceCase "scenario-$Scenario" "chmod-denied" "file_chmod_denied" @{ file_path = "$ReadOnlyRoot/$ReadOnlyFile"; mode = "0600" } "^PASS \[file_chmod_denied\]").Ok -and $ok
-    $ok = (Invoke-ServiceCase "scenario-$Scenario" "fchmod-denied" "file_fchmod_denied" @{ file_path = "$ReadOnlyRoot/$ReadOnlyFile"; mode = "0600" } "^PASS \[file_fchmod_denied\]").Ok -and $ok
-    $ok = (Invoke-ServiceCase "scenario-$Scenario" "link-denied" "file_link_denied" @{ file_path = "$ReadOnlyRoot/$ReadOnlyFile"; target_file_path = "$ReadOnlyRoot/$ReadOnlyHardlink" } "^PASS \[file_link_denied\]").Ok -and $ok
-    $ok = (Invoke-ServiceCase "scenario-$Scenario" "symlink-denied" "file_symlink_denied" @{ file_path = "$ReadOnlyRoot/$ReadOnlyFile"; target_file_path = "$ReadOnlyRoot/$ReadOnlySymlink" } "^PASS \[file_symlink_denied\]").Ok -and $ok
-    $ok = (Invoke-ServiceCase "scenario-$Scenario" "mkdir-denied" "file_mkdir_denied" @{ file_dir = "$ReadOnlyRoot/newdir" } "^PASS \[file_mkdir_denied\]").Ok -and $ok
-    $ok = (Invoke-ServiceCase "scenario-$Scenario" "rename-denied" "file_rename_denied" @{ file_path = "$ReadOnlyRoot/$ReadOnlyFile"; target_file_path = "$ReadOnlyRoot/renamed.txt" } "^PASS \[file_rename_denied\]").Ok -and $ok
-    $ok = (Invoke-ServiceCase "scenario-$Scenario" "delete-denied" "file_delete_denied" @{ file_path = "$ReadOnlyRoot/$ReadOnlyFile" } "^PASS \[file_delete_denied\]").Ok -and $ok
-    $ok = (Require-File "scenario-$Scenario" "seed-still-exists" "$ReadOnlyRoot/$ReadOnlyFile") -and $ok
-    $ok = (Require-Missing "scenario-$Scenario" "write-target" "$ReadOnlyRoot/write_denied.txt") -and $ok
-    $ok = (Require-Missing "scenario-$Scenario" "hardlink-target" "$ReadOnlyRoot/$ReadOnlyHardlink") -and $ok
-    $ok = (Require-Missing "scenario-$Scenario" "symlink-target" "$ReadOnlyRoot/$ReadOnlySymlink") -and $ok
-    $ok = (Require-Missing "scenario-$Scenario" "mkdir-target" "$ReadOnlyRoot/newdir") -and $ok
-    $ok = (Require-Missing "scenario-$Scenario" "rename-target" "$ReadOnlyRoot/renamed.txt") -and $ok
-    $ok
-}
-
-function Wait-MediaStoreReadOnlyImage {
-    $deadline = (Get-Date).AddSeconds(30)
-    while ((Get-Date) -lt $deadline) {
-        $rows = @(Invoke-Su "content query --uri content://media/external/images/media --projection _id:_display_name:_data:relative_path 2>/dev/null | grep -F -- '$ReadOnlyImageFile' || true")
-        foreach ($row in $rows) {
-            if ($row -like "*Pictures/SrtReadOnlyMedia*") {
-                Write-Host "  - mediastore_row_ready $ReadOnlyMediaRoot/$ReadOnlyImageFile"
-                return $true
-            }
-        }
-        Start-Sleep -Milliseconds 500
-    }
-    $script:Failures.Add("scenario-28/read-only-image MediaStore row missing: $ReadOnlyMediaRoot/$ReadOnlyImageFile")
-    $false
-}
-
-function Set-ReadOnlyMediaImage {
-    $backendDir = Convert-ToBackendPath $ReadOnlyMediaRoot
-    $backendPath = "$backendDir/$ReadOnlyImageFile"
-    $privatePath = Convert-ToBackendPath "$PrivateReadOnlyMediaRoot/$ReadOnlyImageFile"
-    Remove-MediaStoreRowsByPattern "content://media/external/images/media" @("_display_name=srt_read_only_media( \(\d+\))?\.jpg(,|$)") @("relative_path=Pictures/SrtReadOnlyMedia/", "_data=.*/Pictures/SrtReadOnlyMedia/")
-    Invoke-Su "mkdir -p '$backendDir'; rm -f '$privatePath'; printf '%s' '$ReadOnlyImageBase64' | base64 -d > '$backendPath'; chmod -R 777 '$backendDir' 2>/dev/null || true" | Out-Null
-    Invoke-Adb @("shell", "content", "insert", "--uri", "content://media/external/images/media", "--bind", "_data:s:$ReadOnlyMediaRoot/$ReadOnlyImageFile", "--bind", "_display_name:s:$ReadOnlyImageFile", "--bind", "mime_type:s:image/jpeg") | Out-Null
-    Invoke-Adb @("shell", "am", "broadcast", "-a", "android.intent.action.MEDIA_SCANNER_SCAN_FILE", "-d", "file://$ReadOnlyMediaRoot/$ReadOnlyImageFile") | Out-Null
-    Wait-MediaStoreReadOnlyImage
-}
-
-# 按 Java String.hashCode() 计算目录的 MediaStore bucket_id。
-#
-# MediaProvider 用小写目录路径的 hashCode 作为 bucket_id，模块也按同一算法把请求
-# 目录的 bucket_id 换成映射目标目录的。这里在测试侧独立实现，用于校验结果是否指向
-# 预期目录，而非与模块自身的计算结果比较。路径不含尾斜杠（与模块实现一致）。
-function Get-JavaBucketId {
-    param([string]$Path)
-    # 用 long 累加并每步取模 2^32，最后再折算为有符号 32 位。
-    # 直接用 [int] 累加会在中间步骤溢出并抛 InvalidCastIConvertible。
-    [long]$hash = 0
-    foreach ($unit in $Path.ToLowerInvariant().ToCharArray()) {
-        $hash = ($hash * 31 + [int][char]$unit) % 4294967296
-    }
-    if ($hash -ge 2147483648) { $hash -= 4294967296 }
-    [int]$hash
-}
-
-# 校验查询结果中的 bucket_id 是否等于指定目录的 bucket_id。
-#
-# bucket_id 是相册按目录分组的键：改写错会让重定向后的文件归入真实目录桶，
-# 或让未重定向的文件被错误改写，表现为相册分组错乱。
-function Test-MediaStoreBucketId {
-    param([string]$Label, [string]$ResultText, [string]$ExpectedDir)
-    if ([string]::IsNullOrWhiteSpace($ResultText)) {
-        $script:Failures.Add("$Label bucket_id 结果为空")
-        return $false
-    }
-    $matched = [regex]::Match($ResultText, 'bucketId=(-?\d+)')
-    if (-not $matched.Success) {
-        $script:Failures.Add("$Label 结果中缺少 bucketId")
-        return $false
-    }
-    $actual = [int]$matched.Groups[1].Value
-    $expected = Get-JavaBucketId $ExpectedDir
-    if ($actual -ne $expected) {
-        $script:Failures.Add("$Label bucket_id 不匹配 dir=$ExpectedDir expected=$expected actual=$actual")
-        return $false
-    }
-    Write-Host "  - $Label/bucket-id-ok dir=$ExpectedDir bucket_id=$actual"
-    return $true
-}
-
-function Invoke-MediaStoreReadOnlyQueryScenario {
-    param([int]$Scenario)
-    $logicalPath = "$ReadOnlyMediaRoot/$ReadOnlyImageFile"
-    $privatePath = "$PrivateReadOnlyMediaRoot/$ReadOnlyImageFile"
-    $ok = Wait-MediaStoreReadOnlyImage
-    $query = Invoke-ServiceCase "scenario-$Scenario" "read-only-image-query" "mediastore_query_read_only_image" @{ file_name = $ReadOnlyImageFile; expected_path = $logicalPath } "^PASS \[mediastore_query_read_only_image\]"
-    $ok = $query.Ok -and $ok
-    $ok = (Test-MediaStoreBucketId "scenario-$Scenario-read-only-image" $query.Text $ReadOnlyMediaRoot) -and $ok
-    $list = Invoke-ServiceCase "scenario-$Scenario" "read-only-image-list" "file_list_dir" @{ file_dir = $ReadOnlyMediaRoot } "^PASS \[file_list_dir\]"
-    $listHasImage = $list.Text -match "entries=.*$([regex]::Escape($ReadOnlyImageFile))"
-    if (-not $listHasImage) {
-        $script:Failures.Add("scenario-$Scenario/read-only-image-list 缺少 $ReadOnlyImageFile :: $($list.Text -replace "`n", " | ")")
-    }
-    $ok = $list.Ok -and $listHasImage -and $ok
-    $ok = (Invoke-ServiceCase "scenario-$Scenario" "read-only-image-file-read" "file_read" @{ file_path = $logicalPath } "^PASS \[file_read\]").Ok -and $ok
-    $ok = (Require-File "scenario-$Scenario" "read-only-media-real" $logicalPath) -and $ok
-    $ok = (Require-Missing "scenario-$Scenario" "read-only-media-private" $privatePath) -and $ok
-    $ok
-}
-
-function Invoke-MediaStoreDisabledRedirectImageScenario {
-    param([int]$Scenario)
-    $logicalPath = "$ReadOnlyMediaRoot/$ReadOnlyImageFile"
-    $privatePath = "$PrivateReadOnlyMediaRoot/$ReadOnlyImageFile"
-    $ok = Wait-MediaStoreReadOnlyImage
-    $ok = (Require-Missing "scenario-$Scenario" "disabled-redirect-stale-map-target" "$RealRoot/Pictures/SrtLocked/$ReadOnlyImageFile") -and $ok
-    $result = Invoke-ServiceCase "scenario-$Scenario" "disabled-redirect-image-read" "mediastore_read_thumbnail_image" @{ file_name = $ReadOnlyImageFile; expected_path = $logicalPath } "^PASS \[mediastore_read_thumbnail_image\]"
-    $ok = $result.Ok -and $ok
-    $ok = (Require-File "scenario-$Scenario" "read-only-media-real" $logicalPath) -and $ok
-    $ok = (Require-Missing "scenario-$Scenario" "read-only-media-private" $privatePath) -and $ok
-    $ok
-}
-
-function Set-MappedReadOnlyTargets {
-    $request = Convert-ToBackendPath $MappedReadOnlyRequest
-    $target = Convert-ToBackendPath $MappedReadOnlyTarget
-    Invoke-Su "mkdir -p '$request' '$target'; rm -f '$request/$TestFile' '$target/$TestFile'; chmod -R 777 '$request' '$target' 2>/dev/null || true" | Out-Null
-}
-
-function Invoke-MappedReadOnlyScenario {
-    param([int]$Scenario)
-    $ok = (Invoke-ServiceCase "scenario-$Scenario" "mapped-write-denied" "file_write_denied" @{ file_path = "$MappedReadOnlyRequest/$TestFile"; payload = $Payload } "^PASS \[file_write_denied\]").Ok
-    $ok = (Require-Missing "scenario-$Scenario" "request-file" "$MappedReadOnlyRequest/$TestFile") -and $ok
-    $ok = (Require-Missing "scenario-$Scenario" "target-file" "$MappedReadOnlyTarget/$TestFile") -and $ok
-    $ok
-}
-
-function Invoke-AllowExclusionScenario {
-    param([int]$Scenario)
-    $keepPath = "$AllowRoot/$AllowKeepFile"
-    $keepPrivate = "$PrivateAllowRoot/$AllowKeepFile"
-    $tmpPath = "$AllowRoot/tmp/$TestFile"
-    $tmpPrivate = "$PrivateAllowRoot/tmp/$TestFile"
-    $partPath = "$RealRoot/Download/$AllowPartFile"
-    $partPrivate = "$PrivateRoot/Download/$AllowPartFile"
-
-    $ok = (Invoke-WriteCase $Scenario "allow-real-write" $keepPath $Payload).Ok
-    $ok = (Require-File "scenario-$Scenario" "allow-real" $keepPath) -and $ok
-    $ok = (Require-Missing "scenario-$Scenario" "allow-real-private" $keepPrivate) -and $ok
-    $ok = (Invoke-WriteCase $Scenario "excluded-dir-write" $tmpPath $Payload).Ok -and $ok
-    $ok = (Require-File "scenario-$Scenario" "excluded-dir-private" $tmpPrivate) -and $ok
-    $ok = (Require-Missing "scenario-$Scenario" "excluded-dir-real" $tmpPath) -and $ok
-    $ok = (Invoke-MediaStoreDownloadCreateCase $Scenario "excluded-glob-download-create" $AllowPartFile).Ok -and $ok
-    $ok = (Require-File "scenario-$Scenario" "excluded-glob-private" $partPrivate) -and $ok
-    $ok = (Require-Missing "scenario-$Scenario" "excluded-glob-real" $partPath) -and $ok
-    $ok
-}
-
-function Invoke-LegacyExclusionScenario {
-    param([int]$Scenario)
-    $keepPath = "$LegacyRoot/$AllowKeepFile"
-    $keepPrivate = "$PrivateLegacyRoot/$AllowKeepFile"
-    $tmpPath = "$LegacyRoot/tmp/$TestFile"
-    $tmpPrivate = "$PrivateLegacyRoot/tmp/$TestFile"
-
-    $ok = (Invoke-WriteCase $Scenario "legacy-allow-real-write" $keepPath $Payload).Ok
-    $ok = (Require-File "scenario-$Scenario" "legacy-allow-real" $keepPath) -and $ok
-    $ok = (Require-Missing "scenario-$Scenario" "legacy-allow-private" $keepPrivate) -and $ok
-    $ok = (Invoke-WriteCase $Scenario "legacy-excluded-write" $tmpPath $Payload).Ok -and $ok
-    $ok = (Require-File "scenario-$Scenario" "legacy-excluded-private" $tmpPrivate) -and $ok
-    $ok = (Require-Missing "scenario-$Scenario" "legacy-excluded-real" $tmpPath) -and $ok
-    $ok
-}
-
-function Invoke-QMarkWildcardScenario {
-    param([int]$Scenario)
-    $singlePath = "$RealRoot/Download/$QMarkSingleFile"
-    $singlePrivate = "$PrivateRoot/Download/$QMarkSingleFile"
-    $doublePath = "$RealRoot/Download/$QMarkDoubleFile"
-    $doublePrivate = "$PrivateRoot/Download/$QMarkDoubleFile"
-    $fileSinglePath = "$RealRoot/Download/$QMarkFileSingleFile"
-    $fileSinglePrivate = "$PrivateRoot/Download/$QMarkFileSingleFile"
-
-    $ok = (Invoke-MediaStoreDownloadCreateCase $Scenario "qmark-single-char-download-create" $QMarkSingleFile).Ok
-    $ok = (Require-File "scenario-$Scenario" "qmark-single-char-real" $singlePath) -and $ok
-    $ok = (Require-Missing "scenario-$Scenario" "qmark-single-char-private" $singlePrivate) -and $ok
-    $ok = (Invoke-MediaStoreDownloadCreateCase $Scenario "qmark-two-char-download-create" $QMarkDoubleFile).Ok -and $ok
-    $ok = (Require-File "scenario-$Scenario" "qmark-two-char-private" $doublePrivate) -and $ok
-    $ok = (Require-Missing "scenario-$Scenario" "qmark-two-char-real" $doublePath) -and $ok
-    $ok = (Invoke-WriteCase $Scenario "qmark-single-char-file-write" $fileSinglePath $Payload).Ok -and $ok
-    $ok = (Require-File "scenario-$Scenario" "qmark-file-single-char-real" $fileSinglePath) -and $ok
-    $ok = (Require-Missing "scenario-$Scenario" "qmark-file-single-char-private" $fileSinglePrivate) -and $ok
-    $ok
-}
-
-function Test-FuseDaemonStarted {
-    param([int]$Scenario)
-    for ($i = 0; $i -lt 5; $i++) {
-        if (Test-Su "grep -Eq 'backend_effective pkg=$AppId|fuse redirect mount start pkg=$AppId|app mount confirmed pid=' '$LogPath' 2>/dev/null") {
-            Write-Host "  - scenario-$Scenario/fuse-daemon-started"
-            return $true
-        }
-        Start-Sleep -Milliseconds $script:ResultPollMilliseconds
-    }
-    Write-Warning "未观察到 scenario-$Scenario/fuse-daemon-started 日志；继续执行行为检查"
-    $true
-}
-
-# 判别性断言：确认 FUSE 数据面真的接管了挂载点，而不是静默回退到 mount namespace。
-#
-# 依据 mountinfo 中的挂载源 srx_fuse_redirect（scoped 前缀）或 srx_fuse_host（共享宿主
-# 前缀，B2-c；与 .sh 的 `app_mountinfo_has_expected_paths` 同口径）。该字符串只有 FUSE
-# 会话建立成功才会出现；bind mount 回退方案无论如何都产生不了它。这比日志断言更可靠：
-# 日志行可能因采样、轮转或格式变化漏判，而挂载表是内核事实。
-function Test-FuseMountActive {
-    param([int]$Scenario)
-    $appPid = ""
-    for ($i = 0; $i -lt 20; $i++) {
-        # am start 返回时进程仍可能处于启动/重建窗口；每轮重新定位当前进程，
-        # 只接受当前 PID 的内核挂载事实，不靠旧日志通过，也不重启应用掩盖崩溃。
-        $appPid = Get-AppPid
-        if ($appPid -and (Test-Su "grep -Eq 'srx_fuse_redirect|srx_fuse_host' `"/proc/$appPid/mountinfo`" 2>/dev/null")) {
-            Write-Host "  - scenario-$Scenario/fuse-mount-active pid=$appPid"
-            return $true
-        }
-        Start-Sleep -Milliseconds $script:ResultPollMilliseconds
-    }
-
-    # 后续行为用例会重启应用并清空日志，先保留当前挂载确认失败现场。
-    $diagnosticDir = $script:ArtifactDir
-    New-Item -ItemType Directory -Path $diagnosticDir -Force | Out-Null
-    $diagnosticPath = Join-Path $diagnosticDir "fuse-mount-failure-$Scenario-$(Get-Date -Format yyyyMMdd-HHmmss).log"
-    Invoke-Su "ps -A -o PID,PPID,NAME,ARGS; if [ -n '$appPid' ]; then cat /proc/$appPid/stat /proc/$appPid/status /proc/$appPid/mountinfo 2>/dev/null; fi; cat '$LogPath'" |
-        Set-Content -LiteralPath $diagnosticPath -Encoding utf8
-    Invoke-Adb @("logcat", "-d", "-t", "2000") | Add-Content -LiteralPath $diagnosticPath -Encoding utf8
-    Write-Warning "scenario-$Scenario/fuse-mount-diagnostic path=$diagnosticPath"
-    if (-not $appPid) {
-        $script:Failures.Add("scenario-$Scenario 等待应用 PID 超时，未确认 FUSE 接管")
-        Write-Warning "scenario-$Scenario/fuse-mount-check-no-pid"
-        return $false
-    }
-    $script:Failures.Add("scenario-$Scenario FUSE 未接管挂载点，可能已静默回退到 mount namespace pid=$appPid")
-    Write-Warning "scenario-$Scenario/fuse-mount-inactive pid=$appPid"
-    Invoke-Su "grep -F 'fuse' `"/proc/$appPid/mountinfo`" 2>/dev/null | head -20"
-    return $false
-}
-
-function Test-ScopedFuseDaemonStarted {
-    param([int]$Scenario, [string]$MountRoot, [bool]$Strict = $true)
-    # 与 .sh 的 check_scoped_fuse_daemon_started 对齐：两轮尝试，第一轮失败先恢复重启
-    # 应用再观察一轮。应用在能力快照退避窗口（如 26→27 连续重启 MediaProvider 后）启动
-    # 会挂成 namespace 回退，mountinfo 中没有任何 srx FUSE 源；恢复重启让 companion 在
-    # 能力恢复后重新挂载，否则一次回退会保持到下一次配置变化。
-    $sawFallback = $false
-    $sawMountFailed = $false
-    $sawServiceFailed = $false
-    for ($attempt = 1; $attempt -le 2; $attempt++) {
-        for ($i = 0; $i -lt 60; $i++) {
-            # 判据 1：独立 scoped 会话启动日志（共享宿主布局下通常缺失）。
-            if (Test-Su "grep -F -- 'fuse redirect mount start pkg=$AppId' '$LogPath' 2>/dev/null | grep -F -- 'mp=$MountRoot ' >/dev/null") {
-                Write-Host "  - scoped_fuse_started scenario=$Scenario root=$MountRoot attempt=$attempt source=log"
-                return $true
-            }
-            # 判据 2：应用 mountinfo 精确挂载根 + srx scoped/宿主 FUSE 源。要求目标路径
-            # 精确匹配，并同时要求 fuse 类型和 srx 前缀，避免把普通目录或 MediaProvider
-            # 挂载误判为成功。
-            $scopedAppPid = Get-AppPid
-            if ($scopedAppPid -and (Test-Su "grep -F -- ' $MountRoot ' `"/proc/$scopedAppPid/mountinfo`" 2>/dev/null | grep -Eq ' - fuse (srx_fuse_redirect|srx_fuse_host)(\[| )'")) {
-                Write-Host "  - scoped_fuse_started scenario=$Scenario root=$MountRoot attempt=$attempt source=app-mountinfo"
-                return $true
-            }
-            # 判据 3（共享宿主布局）：只读根由宿主会话的策略层执行、不再产生独立挂载点，
-            # 精确匹配必然落空。放宽为应用 mountinfo 的存储视图根由 srx_fuse_host 服务即
-            # 判定 scoped 数据面就绪；只读强制语义由后续行为用例（write-denied 等）
-            # 继续真实验证。
-            if ($scopedAppPid -and (Test-Su "grep -F -- ' $RealRoot ' `"/proc/$scopedAppPid/mountinfo`" 2>/dev/null | grep -Eq ' - fuse srx_fuse_host(\[| )'")) {
-                Write-Host "  - scoped_fuse_started scenario=$Scenario root=$MountRoot attempt=$attempt source=app-mountinfo-host"
-                return $true
-            }
-            # 失败标志只收集不提前终止：这些日志可能出现在挂载协商窗口内，随后宿主
-            # 接入仍可能成功；提前判负会把可恢复的竞态误报为失败。
-            if (Test-Su "grep -F -- 'daemon hybrid fuse no scoped service mounted' '$LogPath' 2>/dev/null | grep -F -- 'pkg=$AppId' >/dev/null") {
-                $sawFallback = $true
-            }
-            if (Test-Su "grep -F -- 'fuse redirect mount failed mp=$MountRoot ' '$LogPath' 2>/dev/null >/dev/null") {
-                $sawMountFailed = $true
-            }
-            if (Test-Su "grep -F -- 'daemon hybrid fuse scoped service failed' '$LogPath' 2>/dev/null | grep -F -- 'pkg=$AppId' >/dev/null") {
-                $sawServiceFailed = $true
-            }
-            Start-Sleep -Milliseconds $script:ResultPollMilliseconds
-        }
-        if ($attempt -eq 1 -and $Strict) {
-            Recover-ScopedFuseStart $Scenario $MountRoot
-        }
-    }
-    if (-not $Strict) {
-        if ($sawFallback) {
-            Write-Warning "scoped_fuse_fallback scenario=$Scenario root=$MountRoot; continuing with behavioral checks"
-            return $true
-        }
-        if ($sawMountFailed -or $sawServiceFailed) {
-            Write-Warning "scoped_fuse_start_failed scenario=$Scenario root=$MountRoot; continuing with behavioral checks"
-            return $true
-        }
-        Write-Warning "scoped_fuse_start_log_not_observed scenario=$Scenario root=$MountRoot; continuing with behavioral checks"
-        return $true
-    }
-    if ($sawFallback) {
-        $script:Failures.Add("scenario-$Scenario scoped FUSE 已回退到 mount namespace root=$MountRoot")
-        Write-Warning "scenario-$Scenario/scoped-fuse-fallback root=$MountRoot"
-        return $false
-    }
-    if ($sawMountFailed) {
-        $script:Failures.Add("scenario-$Scenario scoped FUSE 挂载失败 root=$MountRoot")
-        Write-Warning "scenario-$Scenario/scoped-fuse-mount-failed root=$MountRoot"
-        return $false
-    }
-    if ($sawServiceFailed) {
-        $script:Failures.Add("scenario-$Scenario scoped FUSE 服务启动失败 root=$MountRoot")
-        Write-Warning "scenario-$Scenario/scoped-fuse-service-failed root=$MountRoot"
-        return $false
-    }
-    $script:Failures.Add("scenario-$Scenario 未观察到 scoped FUSE 挂载 root=$MountRoot")
-    Write-Warning "scenario-$Scenario/scoped-fuse-missing root=$MountRoot"
-    @(Invoke-Su "grep -F -- '$AppId' '$LogPath' 2>/dev/null | tail -80 || true") | ForEach-Object { Write-Host "  fuse_tail: $_" }
-    @(Invoke-Su "grep -E 'hybrid fuse root|scoped fuse|scoped roots|fuse redirect mount' '$LogPath' 2>/dev/null | tail -60 || true") | ForEach-Object { Write-Host "  fuse_roots: $_" }
-    $false
-}
-
-# 与 .sh 的 recover_scoped_fuse_start 对齐：判据第一轮全部落空时重启应用一次，
-# 让 companion 在能力快照恢复后重新挂载，再观察一轮。
-function Recover-ScopedFuseStart {
-    param([int]$Scenario, [string]$MountRoot)
-    Write-Warning "scoped_fuse_start_recovery scenario=$Scenario root=$MountRoot"
-    Invoke-Adb @("shell", "am", "force-stop", $AppId) | Out-Null
-    # 重启后旧 PID 的挂载确认全部失效，与 Restart-App 同口径清空缓存。
-    $script:LastMountConfirmedPid = ""
-    Invoke-Adb @("shell", "am", "start", "-W", "-n", "$AppId/.MainActivity") | Out-Null
-    Wait-Storage "scenario-$Scenario-scoped-fuse-recovery" 30 | Out-Null
-    Invoke-Su "sleep 1" | Out-Null
-}
-
-function Invoke-RuleSandboxScenario {
-    param([int]$Scenario)
-    $sandboxPath = "$RuleSandboxRoot/$TestFile"
-    $privateSandboxPath = "$PrivateRuleSandboxRoot/$TestFile"
-    $siblingFile = "srt_rule_sibling_atomic.jpg"
-    $siblingPath = "$RuleSiblingRoot/$siblingFile"
-    $backendSiblingPath = "$BackendRuleSiblingRoot/$siblingFile"
-    $privateSiblingPath = "$PrivateRuleSiblingRoot/$siblingFile"
-    $mediaFile = "srt_rule_sibling_mediastore.jpg"
-
-    $ok = Require-Missing "scenario-$Scenario" "sandbox-public-before" $BackendRuleSandboxRoot
-    $ok = (Test-ScopedFuseDaemonStarted $Scenario $RealRoot) -and $ok
-    $ok = (Invoke-WriteCase $Scenario "sandbox-rule-hit" $sandboxPath $Payload).Ok -and $ok
-    $ok = (Require-File "scenario-$Scenario" "sandbox-private" $privateSandboxPath) -and $ok
-    $ok = (Require-Missing "scenario-$Scenario" "sandbox-public" $BackendRuleSandboxRoot) -and $ok
-    $atomicResult = Invoke-ServiceCase "scenario-$Scenario" "sandbox-sibling-atomic-save" "file_atomic_save" @{ file_path = $siblingPath; payload = $Payload; expected_payload = $Payload } "^PASS \[file_atomic_save\]"
-    $ok = $atomicResult.Ok -and $ok
-    $ok = (Require-File "scenario-$Scenario" "sibling-real" $backendSiblingPath) -and $ok
-    $ok = (Require-Missing "scenario-$Scenario" "sibling-private" $privateSiblingPath) -and $ok
-    $ok = (Invoke-MediaStoreImageCreateCase $Scenario "sandbox-sibling-mediastore-save" $mediaFile "DCIM/SrtRuleSibling").Ok -and $ok
-    $ok = (Require-File "scenario-$Scenario" "sibling-mediastore-real" "$BackendRuleSiblingRoot/$mediaFile") -and $ok
-    $ok = (Require-Missing "scenario-$Scenario" "sibling-mediastore-private" "$PrivateRuleSiblingRoot/$mediaFile") -and $ok
-    $ok = (Test-PublicDirectoryOwner "scenario-$Scenario" "dcim-owner" "$BackendRoot/DCIM") -and $ok
-    $ok
-}
-
-function Invoke-ProviderSandboxScenario {
-    # 触发链：提供器配置（Apply-ScenarioConfig 写入）→ force-stop → root content query
-    # 拉起提供器冷启动（新配置生效）→ 断言挂载请求携带沙盒规则且宿主接入成功。
-    # 回归背景（2026-10-21 真机）：桥接进程的挂载请求被清零规则（req sandbox=0），
-    # 宿主接入被拒（attach skipped），退回零规则 scoped 会话后原生写入穿透真实存储。
-    # 修复后判定标记（均可在 running.log 检索）：
-    #   修复前：`req op=apply ... sandbox=0` + `attach skipped ... reason=policy_registration_failed`
-    #   修复后：`req op=apply ... sandbox=1` + `attach ok`（或 scoped 会话 sandbox=1）
-    # 行为级验证（引擎 mkdir 落点）依赖 XL 引擎初始化，CI 模拟器无该引擎，
-    # 由真机复测协议覆盖（见 .workbuddy/memory/2026-10-21.md）。
-    param([int]$Scenario)
-    Write-Host "  - scenario-$Scenario/provider-sandbox: cleanup and force-stop download provider"
-    Invoke-Su "rm -rf '$ProviderRealDir' '$ProviderBackendDir'; am force-stop '$ProviderPackage'" | Out-Null
-    Start-Sleep -Seconds 2
-    # root 身份的 content query 一定会拉起提供器进程（其 specialize 走完整挂载流程）。
-    Invoke-Su "content query --uri content://downloads/my_downloads --projection _id >/dev/null 2>&1" | Out-Null
-    Start-Sleep -Seconds 10
-    Write-Host "  - scenario-$Scenario/provider-sandbox: assert mount request carries sandbox rules"
-    $reqOk = (Invoke-Su "grep -Eq 'req op=apply pid=[0-9]+ pkg=$ProviderPackage .*sandbox=1' '$LogPath' 2>/dev/null; echo exit=`$?" | Select-Object -Last 1) -eq "exit=0"
-    $attachSkipped = (Invoke-Su "grep -q 'attach skipped.*pkg=$ProviderPackage.*reason=policy_registration_failed' '$LogPath' 2>/dev/null; echo exit=`$?" | Select-Object -Last 1) -eq "exit=0"
-    # 诊断输出，不参与断言：宿主接入与重定向证据仅记录，失败形态由上面的日志断言决定。
-    Invoke-Su "grep -h 'SrtDlProbe' '$FileMonitorLogPath' 2>/dev/null | tail -3; grep -h 'pkg=$ProviderPackage' '$LogPath' 2>/dev/null | grep -hE 'attach|req op=apply' | tail -5" | Write-Host
-    if (-not $reqOk) {
-        Write-Host "  - scenario-$Scenario/provider-sandbox: mount request did not carry sandbox rules"
-        return $false
-    }
-    # 正向标记与回归标记与 .sh 的 run_provider_sandbox_scenario 对齐：
-    # 通过 = perf companion mount ok=true（挂载流程成功，hook 兜底拓扑）或
-    # req sandbox=1 请求行；回归 = req sandbox=0 / attach skipped
-    # policy_registration_failed / 提供器出现模块会话。companion 限流或启动
-    # 慢时按 sh 同款重试（重启提供器再试一轮）。
-    $positiveOk = $false
-    for ($round = 1; $round -le 4 -and -not $positiveOk; $round++) {
-        Start-Sleep -Seconds 5
-        $mountOk = (Invoke-Su "grep -Eq 'perf companion mount pkg=$ProviderPackage pid=[0-9]+ .*ok=true' '$LogPath' 2>/dev/null; echo exit=`$?" | Select-Object -Last 1) -eq "exit=0"
-        if ($mountOk) { $positiveOk = $true; break }
-        Invoke-Su "am force-stop '$ProviderPackage'; content query --uri content://downloads/my_downloads --projection _id >/dev/null 2>&1" | Out-Null
-    }
     if (-not $positiveOk) {
-        Write-Host "  - scenario-$Scenario/provider-sandbox: neither companion mount ok nor sandbox request after retries"
+        Write-Host "  - scenario-$Scenario/provider-sandbox: neither companion mount nor system-writer hook found after retries"
         return $false
     }
-    if ($attachSkipped) {
-        Write-Host "  - scenario-$Scenario/provider-sandbox: attach skipped regression marker found"
-        return $false
-    }
+    Invoke-Su "grep -hE 'perf companion mount pkg=$ProviderPackage|hook refresh start profile=system-writer pkg=$ProviderPackage ' '$LogPath' 2>/dev/null | tail -3" | Write-Host
     $true
 }
 
 function Invoke-DownloadOwnerAttributionScenario {
-    # 触发链：测试应用（下载发起者）配置 path_mappings → DownloadManager 入队
-    # 公共路径下载 → 下载提供器（共享 uid 代写者）进程内或 MediaStore insert 侧
-    # 归因到发起者 → 按发起者映射改写 → 文件落在映射目标。
-    # 判定标记（与 .sh 的 run_download_owner_attribution_scenario 一致）：
-    #   通过：下载完成 PASS + 文件落在发起者映射目标（Download/SrtDlOwnerMapped）
-    #         且真实请求路径（Download/SrtDlOwner）零穿透。
-    #   回归：文件出现在真实请求路径（按源归因失效），或下载提供器出现模块会话
-    #         （fuse redirect mount start pkg=下载提供器，同场景 38 边界）。
-    # 前置：前序场景（26/33 等）可能重启过 MediaProvider，下载提供器进程的命名
-    #   空间会持有陈旧 FUSE 连接（改写后的 mkdir 报 errno=107）。与 .sh 同款：
-    #   force-stop 后 root query 冷启动提供器并等待进程就绪。
+    # 请求路径按测试应用的 path_mappings 映射；断言目标存在且请求路径未穿透。
     param([int]$Scenario)
     Write-Host "  - scenario-$Scenario/download-owner: cold start download provider"
     Invoke-Su "am force-stop '$ProviderPackage'; sleep 2; content query --uri content://downloads/my_downloads --projection _id >/dev/null 2>&1" | Out-Null
@@ -5141,63 +3532,103 @@ function Invoke-DownloadOwnerAttributionScenario {
         if ($providerPid) { break }
     }
     Start-Sleep -Seconds 3
-    # 取数源：模拟器对多数外部 CDN 不可达（下载会暂停等待网络），用 runner 侧
-    # 本地 HTTP 服务取数；显式设置了 SRT_DOWNLOAD_URL 时仍优先。
     $dlUrl = $SrtDownloadUrl
     $dlServer = $null
     $dlDir = $null
     $dlPort = 18089
     $usedReverse = $false
-    if (-not $dlUrl) {
-        # 与 .sh 对齐：模拟器（ro.kernel.qemu=1）用宿主 0.0.0.0 绑定 + 模拟器
-        # 内建路由 10.0.2.2 直达（规避 adb reverse 时序风险与 localhost 目标的
-        # 特殊语义）；真机回退 adb reverse + 127.0.0.1 回环。
+    $case = $null
+    try {
         $isEmulator = (Invoke-Adb @("shell", "getprop ro.kernel.qemu") | Out-String).Trim() -eq "1"
-        $dlDir = Join-Path ([IO.Path]::GetTempPath()) ("srt-dl-server-" + [Guid]::NewGuid().ToString('N'))
-        New-Item -ItemType Directory -Path $dlDir | Out-Null
-        Set-Content -Path (Join-Path $dlDir "srt_download.bin") -Value "srt-download-probe"
+        $deviceSdk = [int]((Invoke-Adb @("shell", "getprop ro.build.version.sdk") | Out-String).Trim())
+        if (-not $dlUrl -and $isEmulator) {
+            $dlDir = Join-Path ([IO.Path]::GetTempPath()) ("srt-dl-server-" + [Guid]::NewGuid().ToString('N'))
+            New-Item -ItemType Directory -Path $dlDir | Out-Null
+            Set-Content -Path (Join-Path $dlDir "srt_download.bin") -Value "srt-download-probe"
+            if ($deviceSdk -lt 37) {
+                $bindAddr = "0.0.0.0"
+                $dlUrl = "http://10.0.2.2:$dlPort/srt_download.bin"
+            } else {
+                $bindAddr = "0.0.0.0"
+                $dlUrl = "http://127.0.0.1:$dlPort/srt_download.bin"
+            }
+            $dlArgs = @("-m", "http.server", "$dlPort", "--bind", $bindAddr, "--directory", $dlDir)
+            $dlExe = $null
+            foreach ($candidate in @("python3", "python", "py")) {
+                $resolved = Get-Command $candidate -ErrorAction SilentlyContinue
+                if (-not $resolved) { continue }
+                $pythonArgs = @()
+                if ($candidate -eq "py") { $pythonArgs = @("-3") }
+                # Windows 的应用执行别名可能存在但没有可用解释器；--directory 需要 Python 3.7。
+                & $resolved.Source @pythonArgs -c "import sys; sys.exit(sys.version_info < (3, 7))" 2>$null
+                if ($LASTEXITCODE -eq 0) { $dlExe = $resolved.Source; $dlArgs = $pythonArgs + $dlArgs; break }
+            }
+            if (-not $dlExe) { throw "本地下载服务需要可运行的 Python 3.7 或更新版本。" }
+            $serverStart = [System.Diagnostics.ProcessStartInfo]::new()
+            $serverStart.FileName = $dlExe
+            $serverStart.UseShellExecute = $false
+            $serverStart.CreateNoWindow = $true
+            foreach ($argument in $dlArgs) {
+                [void]$serverStart.ArgumentList.Add([string]$argument)
+            }
+            $dlServer = [System.Diagnostics.Process]::Start($serverStart)
+            if (-not $dlServer) { throw "无法启动本地下载服务。" }
+            Start-Sleep -Seconds 1
+            if ($dlServer.HasExited) { throw "本地下载服务未能保持运行。" }
+            if ($deviceSdk -ge 37) {
+                $usedReverse = $true
+                $reverseResult = Invoke-AdbWithTimeout -Arguments @("reverse", "tcp:$dlPort", "tcp:$dlPort") -TimeoutSeconds 15
+                if ($reverseResult.ExitCode -ne 0) {
+                    throw "adb reverse 创建失败，退出码 $($reverseResult.ExitCode)：$($reverseResult.Output)"
+                }
+            }
+            Write-Host "  - scenario-$Scenario/download-owner: local download server url=$dlUrl"
+        } elseif (-not $dlUrl) {
+            Write-Host "  - scenario-$Scenario/download-owner: using the test app default download URL"
+        }
+        Write-Host "  - scenario-$Scenario/download-owner: download url=$dlUrl"
+        Set-DownloadTestNetwork prepare
         if ($isEmulator) {
-            $bindAddr = "0.0.0.0"
-            $dlUrl = "http://10.0.2.2:$dlPort/srt_download.bin"
-        } else {
-            Invoke-Adb @("reverse", "tcp:$dlPort", "tcp:$dlPort") | Out-Null
-            $usedReverse = $true
-            $bindAddr = "127.0.0.1"
-            $dlUrl = "http://127.0.0.1:$dlPort/srt_download.bin"
+            Invoke-Adb @("shell", "ping -c 1 -W 2 10.0.2.2 >/dev/null 2>&1 && echo net_probe_host_ok || echo net_probe_host_unreachable") | Write-Host
         }
-        # Windows 一般只有 python.exe / py 启动器，按 python3 → python → py -3 依次回退。
-        $dlArgs = @("-m", "http.server", "$dlPort", "--bind", $bindAddr, "--directory", $dlDir)
-        $dlExe = $null
-        foreach ($candidate in @("python3", "python")) {
-            $resolved = Get-Command $candidate -ErrorAction SilentlyContinue
-            if ($resolved) { $dlExe = $resolved.Source; break }
+        Write-Host "  - scenario-$Scenario/download-owner: cleanup attribution probe dirs"
+        Invoke-Su "rm -rf '$BackendRoot/$DlOwnerRequestRel' '$BackendRoot/$DlOwnerMappedRel'" | Out-Null
+        if (-not (Confirm-MediaProviderHookReady "scenario-$Scenario-dlowner-provider")) { return $false }
+        Write-Host "  - scenario-$Scenario/download-owner: restart test app for requester mapping"
+        if (-not (Restart-App "scenario-$Scenario/dlowner-apprestart" $true)) { return $false }
+        $targetDeadline = (Get-Date).AddSeconds(30)
+        $targetReady = $false
+        while ((Get-Date) -lt $targetDeadline) {
+            $remainingSeconds = [Math]::Ceiling(($targetDeadline - (Get-Date)).TotalSeconds)
+            $probeTimeout = [Math]::Max(1, [Math]::Min(10, $remainingSeconds))
+            $targetProbe = Invoke-AdbWithTimeout -Arguments @("shell", "su -c 'test -d `"$BackendRoot/$DlOwnerMappedRel`"'") -TimeoutSeconds $probeTimeout
+            if ($targetProbe.ExitCode -eq 0) {
+                $targetReady = $true
+                break
+            }
+            if ((Get-Date) -lt $targetDeadline) { Start-Sleep -Seconds 1 }
         }
-        if (-not $dlExe) { $dlExe = "py"; $dlArgs = @("-3") + $dlArgs }
-        $dlServer = Start-Process -FilePath $dlExe -ArgumentList $dlArgs -PassThru -WindowStyle Hidden
-        Start-Sleep -Seconds 1
-        Write-Host "  - scenario-$Scenario/download-owner: local download server url=$dlUrl"
-    }
-    Write-Host "  - scenario-$Scenario/download-owner: download url=$dlUrl"
-    # A17 模拟器镜像的网络判定问题：Downloads 应用停在 WAITING_TO_RETRY 且服务端
-    # 零请求——请求根本没发出。两层嫌疑都处理：captive portal 验证失败（R5/R6）
-    # 与 A17 新镜像 Private DNS（DNS-over-TLS）解析失败把默认网络标记为未验证。
-    # 与 sh 运行器对等，对其它版本与真机无副作用。
-    Invoke-Adb @("shell", "settings put global captive_portal_detection_enabled 0") | Write-Host
-    Invoke-Adb @("shell", "settings put global private_dns_mode off") | Write-Host
-    Invoke-Adb @("shell", "ping -c 1 -W 2 10.0.2.2 >/dev/null 2>&1 && echo net_probe_host_ok || echo net_probe_host_unreachable") | Write-Host
-    # 测试应用视图必须已套用本场景的映射（发起者规则）：fresh_app=0 的矩阵里
-    # 应用不会随场景重启，这里显式重启并确认挂载。
-    Write-Host "  - scenario-$Scenario/download-owner: restart test app for requester mapping"
-    Restart-App "scenario-$Scenario/dlowner-apprestart" $true
-    Write-Host "  - scenario-$Scenario/download-owner: cleanup attribution probe dirs"
-    Invoke-Su "rm -rf '$BackendRoot/$DlOwnerRequestRel' '$BackendRoot/$DlOwnerMappedRel'" | Out-Null
-    $case = Invoke-ServiceCase "scenario-$Scenario" "download-owner-attribution" "downloadmanager_enqueue" @{ file_path = $DlOwnerRequestFile; url = $dlUrl } "^PASS \[downloadmanager_enqueue\]"
-    if ($dlServer) {
-        try { $dlServer.Kill() } catch {}
+        if (-not $targetReady) {
+            Write-Host "  - scenario-$Scenario/download-owner: mapping target not ready $DlOwnerMappedRel"
+            return $false
+        }
+        $extras = @{ file_path = $DlOwnerRequestFile }
+        if (-not [string]::IsNullOrWhiteSpace($dlUrl)) { $extras.url = $dlUrl }
+        $case = Invoke-ServiceCase "scenario-$Scenario" "download-owner-attribution" "downloadmanager_enqueue" $extras "^PASS \[downloadmanager_enqueue\]"
+    } finally {
+        if ($dlServer) {
+            try {
+                if (-not $dlServer.HasExited) { $dlServer.Kill() }
+                if (-not $dlServer.WaitForExit(5000)) { throw "本地下载服务未能退出。" }
+            } catch {
+                Write-Warning "scenario-$Scenario/download-owner: 本地下载服务停止失败 pid=$($dlServer.Id)"
+            }
+        }
         if ($usedReverse) {
-            try { Invoke-Adb @("reverse", "--remove", "tcp:$dlPort") | Out-Null } catch {}
+            try { [void](Invoke-AdbWithTimeout -Arguments @("reverse", "--remove", "tcp:$dlPort") -TimeoutSeconds 15) } catch {}
         }
-        Remove-Item -Recurse -Force $dlDir -ErrorAction SilentlyContinue
+        if ($dlDir) { Remove-Item -LiteralPath $dlDir -Recurse -Force -ErrorAction SilentlyContinue }
+        Set-DownloadTestNetwork restore
     }
     if (-not $case.Ok) {
         Write-Host "  - scenario-$Scenario/download-owner: enqueue or download failed"
@@ -5224,41 +3655,20 @@ function Invoke-DownloadOwnerAttributionScenario {
 }
 
 function Invoke-SystemUidAttributionScenario {
-    # 触发链（与 .sh 的 run_system_uid_attribution_scenario 一致）：shell（uid
-    # 2000）进程先存活足够久（pid 表事件化扫描入库）再在公共存储发起 FUSE
-    # mkdir → 引擎请求头携带 uid 与发起任务 id → 系统 uid 归因分支经 pid 表
-    # 反查发起进程 → 监视记录 identify_method=caller。
-    # 判定标记：
-    #   通过：file_monitor.log 出现 SrtUidAttrib 的 MKDIR 记录且
-    #         identify_method=caller、identify_reliability=high。
-    #   回归：记录 identify_method=unknown（归因链断裂）或无记录。
+    # shell 是执行者边界，记录保留原始 UID/PID、域与 native 名称。
     param([int]$Scenario)
     Write-Host "  - scenario-$Scenario/system-uid: cleanup attribution probe dir"
     Invoke-Su "rm -rf '$BackendRoot/$UidAttribRel'" | Out-Null
     Invoke-Su ": > '$FileMonitorLogPath' 2>/dev/null" | Out-Null
-    # 引擎读取补丁（fuse read patch）随 MP FuseDaemon 启动联动安装；模拟器冷启动
-    # 下场景可能早于补丁就绪（R7 实证 mkdir 先于补丁安装 → 请求头无归因信号）。
-    # 与 .sh 对齐：running.log 标记或 .media_hook_install_state 的 stage=init_ok
-    # 任一出现即视为补丁链路已建立；均缺失时按超时放行（诊断 dump 兜底）。
-    $patchReady = $false
-    for ($patchWait = 0; $patchWait -lt 15 -and -not $patchReady; $patchWait++) {
-        $patchReady = ((Invoke-Su "grep -q 'fuse read patch installed' '$LogPath' 2>/dev/null; echo exit=`$?" | Select-Object -Last 1) -eq "exit=0") -or
-            ((Invoke-Su "grep -q 'stage=init_ok' '/data/adb/modules/storage.redirect.x/logs/.media_hook_install_state' 2>/dev/null; echo exit=`$?" | Select-Object -Last 1) -eq "exit=0")
-        if ($patchReady) { break }
-        Start-Sleep -Seconds 2
-    }
-    if (-not $patchReady) { Write-Host "  - scenario-$Scenario/system-uid: read patch marker not found (proceed after timeout)" }
-    # 三次尝试任一归因即通过（单槽接力在并发系统请求下存在互覆窗口）；
-    # 每次尝试用独立目录（已存在目录的 mkdir 会被记录去重跳过）。
+    # Java 初始化只证明当前进程可用；原生 FUSE 归因仍由后续监视记录断言验证。
+    if (-not (Confirm-MediaProviderHookReady "scenario-$Scenario-uid-attribution")) { return $false }
+    # 每次尝试使用独立目录，避免已有目录的 mkdir 被记录去重跳过。
     $found = $false
     for ($attempt = 1; $attempt -le 3 -and -not $found; $attempt++) {
         $probeRel = "$UidAttribProbeRel/attempt$attempt"
         Write-Host "  - scenario-$Scenario/system-uid: attribution attempt $attempt/3"
-        # mkdir 前必须 exec（与 .sh 同款，2026-10-24 取证）：mksh 对 -c 脚本最后
-        # 一条命令 fork 子进程执行，子进程生命周期毫秒级，daemon 事件化扫描必然
-        # 错过（table_seen=false → identify_method=unknown）。exec 让 mkdir 在已
-        # 入表的同一进程内发起，与真实系统服务的归因语义一致。
-        $bg = Start-Process -FilePath "adb" -ArgumentList @("shell", "sleep 4; exec mkdir -p '/storage/emulated/0/$probeRel'") -PassThru -WindowStyle Hidden
+        # exec 保留预存活任务的 PID，并使原生名称变为 mkdir，便于核对执行者快照。
+        $bg = Start-Process -FilePath "adb" -ArgumentList @("-s", $Serial, "shell", "sleep 4; exec mkdir -p '/storage/emulated/0/$probeRel'") -PassThru -WindowStyle Hidden
         $seen = $false
         for ($wait = 0; $wait -lt 14; $wait++) {
             Start-Sleep -Seconds 2
@@ -5269,7 +3679,7 @@ function Invoke-SystemUidAttributionScenario {
         if (-not $seen) { continue }
         for ($poll = 0; $poll -lt 6; $poll++) {
             Start-Sleep -Seconds 3
-            $record = Invoke-Su "grep -E 'MKDIR\|/storage/emulated/0/$probeRel\|' '$FileMonitorLogPath' 2>/dev/null | grep -E 'identify_method=caller\|identify_reliability=high' | head -1"
+            $record = Invoke-Su "grep -F '|MKDIR|/storage/emulated/0/$probeRel|' '$FileMonitorLogPath' 2>/dev/null | grep -E 'identify_method=executor\|identify_reliability=high' | grep -E '(^|\|)caller_uid=2000(\||$)' | grep -E '(^|\|)caller_pid=[1-9][0-9]*(\||$)' | grep -E '(^|\|)caller_start_time=[1-9][0-9]*(\||$)' | grep -F '|caller_context=u:r:shell:s0|' | grep -F '|caller_boundary=shell|' | grep -F '|native=mkdir' | grep -F '|ret=0|' | head -1"
             if ($record) { $found = $true; break }
         }
     }
@@ -5278,53 +3688,84 @@ function Invoke-SystemUidAttributionScenario {
         Invoke-Su "grep 'SrtUidAttrib' '$FileMonitorLogPath' 2>/dev/null | tail -3" | Write-Host
         return $false
     }
-    Write-Host "  - scenario-$Scenario/system-uid: system uid fuse write attributed to originating service"
+    Write-Host "  - scenario-$Scenario/system-uid: shell executor identity recorded"
     Invoke-Su "grep 'SrtUidAttrib' '$FileMonitorLogPath' 2>/dev/null | tail -2" | Write-Host
     Invoke-Su "rm -rf '$BackendRoot/$UidAttribRel'" | Out-Null
     $true
 }
 
-function Invoke-SystemUidSandboxMissingTargetScenario {
-    # 与 .sh 的 run_system_uid_sandbox_missing_target_scenario 一致：shell（uid 2000）
-    # 配置沙盒、真实与沙盒目标都预先删除，以 immediate / aged 两档交错写入，每轮都要求
-    # 真实目录零穿透、沙盒目录建出。mkdir 返回码不作判据（AOSP pf_mkdir 的 lstat 可能 ENOENT）。
+function Invoke-AppCallerMediaProviderAttributionScenario {
+    # MediaProvider 执行 insert，文件监视记录仍须保留发起应用。
+    param([int]$Scenario)
+    $label = "mp-caller-attribution"
+    $fileName = New-MonitorFileName $Scenario $label
+    if (-not (Prepare-FileMonitorAssertion $Scenario $label)) { return $false }
+    if (-not (Wait-Storage "scenario-$Scenario-$label-storage" 30)) { return $false }
+    if (-not (Wait-MediaProviderReadyCached "scenario-$Scenario-$label-provider" 60)) { return $false }
+
+    $case = Invoke-ServiceCase "scenario-$Scenario" $label "mediastore_create_download" @{ file_name = $fileName } "^PASS \[mediastore_create_download\]"
+    if (-not $case.Ok) { return $false }
+    $providerPattern = '\|(com|com\.google)\.android\.providers\.media\.module\|' + [regex]::Escape($AppId) + '\|OPEN\|'
+    $found = $false
+    for ($poll = 0; $poll -lt 10 -and -not $found; $poll++) {
+        $record = Invoke-Su "grep -F -- '$fileName' '$FileMonitorLogPath' 2>/dev/null | grep -Fv -- 'ret=-1' | grep -E -- '$providerPattern' | grep -F -- 'identify_method=caller|identify_reliability=high' | head -1"
+        if ($record) { $found = $true; break }
+        Start-Sleep -Seconds 2
+    }
+    if (-not $found) {
+        $script:Failures.Add("scenario-$Scenario/$label monitor record missing or not attributed to source app")
+        Invoke-Su "grep -F -- '$fileName' '$FileMonitorLogPath' 2>/dev/null | tail -5" | Write-Host
+        return $false
+    }
+    Invoke-Su "grep -F -- '$fileName' '$FileMonitorLogPath' 2>/dev/null | grep -E -- '$providerPattern' | tail -2" | Write-Host
+    Invoke-Su "rm -f '$BackendRoot/Download/$fileName' '$BackendRoot/Download/'.pending-*-$fileName" | Out-Null
+    $true
+}
+
+function Invoke-ShellExecutorBoundaryScenario {
+    # 与 Bash 一致：立即与延迟写入均保留 shell 的原生路径，不套用应用规则。
     param([int]$Scenario)
     $shellConfigBackup = Invoke-Su "test -f '$ShellConfig' && base64 '$ShellConfig' 2>/dev/null | tr -d '[:space:]'" | Select-Object -Last 1
     $json = "{`"users`":{`"0`":{`"enabled`":true,`"mapping_mode_only`":true,`"sandboxed_paths`":[`"$ShellSandboxRel`"]}}}"
     $encoded = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($json))
-    Invoke-Su "printf '%s' '$encoded' | base64 -d > '$ShellConfig.tmp.$PID'; mv -f '$ShellConfig.tmp.$PID' '$ShellConfig'; chmod 644 '$ShellConfig'" | Out-Null
-    Start-Sleep -Seconds 3
     $ok = $true
     $round = 0
-    foreach ($delay in @(4, 0, 4, 0)) {
-        $round++
-        Invoke-Su "rm -rf '$ShellSandboxRealDir' '$ShellSandboxBackendDir'" | Out-Null
-        Start-Sleep -Seconds 1
-        if ($delay -gt 0) {
-            & adb shell "sleep $delay; exec mkdir '/storage/emulated/0/$ShellSandboxRel'" 2>&1 | Out-Null
-        } else {
-            & adb shell "exec mkdir '/storage/emulated/0/$ShellSandboxRel'" 2>&1 | Out-Null
-        }
-        Start-Sleep -Seconds 2
-        $real = (Invoke-Su "test -d '$ShellSandboxRealDir'; echo exit=`$?" | Select-Object -Last 1) -eq "exit=0"
-        $sandbox = (Invoke-Su "test -d '$ShellSandboxBackendDir'; echo exit=`$?" | Select-Object -Last 1) -eq "exit=0"
-        Write-Host "  - scenario-$Scenario/system-uid-sandbox: round=$round delay=${delay}s real=$real sandbox=$sandbox"
-        if ($real -or -not $sandbox) {
-            if ($real) {
-                Write-Host "  - scenario-$Scenario/system-uid-sandbox: request path leaked to real storage"
+    try {
+        Invoke-Su "printf '%s' '$encoded' | base64 -d > '$ShellConfig.tmp.$PID'; mv -f '$ShellConfig.tmp.$PID' '$ShellConfig'; chmod 644 '$ShellConfig'" | Out-Null
+        Start-Sleep -Seconds 3
+        foreach ($delay in @(4, 0, 4, 0)) {
+            $round++
+            # 经 FUSE 删除同一个名称，避免直删后端留下正目录项缓存。
+            Invoke-Adb @("shell", "rm -rf '/storage/emulated/0/$ShellSandboxRel'") | Out-Null
+            if ($LASTEXITCODE -ne 0) { $ok = $false; break }
+            Invoke-Su "rm -rf '$ShellSandboxBackendDir'" | Out-Null
+            Start-Sleep -Seconds 1
+            if ($delay -gt 0) {
+                Invoke-Adb @("shell", "sleep $delay; exec mkdir '/storage/emulated/0/$ShellSandboxRel'") | Out-Null
             } else {
-                Write-Host "  - scenario-$Scenario/system-uid-sandbox: sandbox directory not created"
+                Invoke-Adb @("shell", "exec mkdir '/storage/emulated/0/$ShellSandboxRel'") | Out-Null
             }
-            Invoke-Su "grep -aE 'SrtShellSandbox' '$LogPath' 2>/dev/null | grep -av 'realpath mapped' | tail -6" | Write-Host
-            $ok = $false
-            break
+            $commandExit = $LASTEXITCODE
+            Start-Sleep -Seconds 2
+            $real = (Invoke-Su "test -d '$ShellSandboxRealDir'; echo exit=`$?" | Select-Object -Last 1) -eq "exit=0"
+            $sandbox = (Invoke-Su "test -d '$ShellSandboxBackendDir'; echo exit=`$?" | Select-Object -Last 1) -eq "exit=0"
+            Write-Host "  - scenario-$Scenario/shell-executor: round=$round delay=${delay}s exit=$commandExit real=$real sandbox=$sandbox"
+            if ($commandExit -ne 0 -or -not $real -or $sandbox) {
+                Write-Host "  - scenario-$Scenario/shell-executor: unexpected directory state"
+                Invoke-Su "grep -aE 'SrtShellSandbox' '$LogPath' 2>/dev/null | grep -av 'realpath mapped' | tail -6" | Write-Host
+                $ok = $false
+                break
+            }
         }
-    }
-    Invoke-Su "rm -rf '$ShellSandboxRealDir' '$ShellSandboxBackendDir'" | Out-Null
-    if ($shellConfigBackup -and $shellConfigBackup -notmatch '^exit=') {
-        Invoke-Su "printf '%s' '$shellConfigBackup' | base64 -d > '$ShellConfig.tmp.$PID'; mv -f '$ShellConfig.tmp.$PID' '$ShellConfig'; chmod 644 '$ShellConfig'" | Out-Null
-    } else {
-        Invoke-Su "rm -f '$ShellConfig'" | Out-Null
+    } finally {
+        Invoke-Adb @("shell", "rm -rf '/storage/emulated/0/$ShellSandboxRel'") | Out-Null
+        if ($LASTEXITCODE -ne 0) { $ok = $false }
+        Invoke-Su "rm -rf '$ShellSandboxRealDir' '$ShellSandboxBackendDir'" | Out-Null
+        if ($shellConfigBackup -and $shellConfigBackup -notmatch '^exit=') {
+            Invoke-Su "printf '%s' '$shellConfigBackup' | base64 -d > '$ShellConfig.tmp.$PID'; mv -f '$ShellConfig.tmp.$PID' '$ShellConfig'; chmod 644 '$ShellConfig'" | Out-Null
+        } else {
+            Invoke-Su "rm -f '$ShellConfig'" | Out-Null
+        }
     }
     $ok
 }
@@ -5526,35 +3967,512 @@ function Invoke-MediaStoreOpenTypedCollectionScenario {
     $result.Ok
 }
 
+# 校验模块自建沙盒根（重定向根 `Android/data/<pkg>/sdcard`）的元数据形态，与 .sh
+# 的 check_sandbox_root_metadata 同口径：
+#
+# 1) 两种数据面布局都必须成立的硬判据：组**不能**是应用自己的 uid（模块曾用
+#    chown(uid, uid) 覆盖父目录 setgid 继承来的组，于是 other 位为 0、组里又没有系统
+#    代写进程，MediaProvider 遍历必然 EACCES 并回退到真实公共路径）；other 位不得可写。
+# 2) FUSE 布局再收紧到原生口径：组 == 父目录的组、mode == 02770。这里不写死 1078——
+#    原生关系是「父目录 setgid 继承」本身。namespace bind 布局由挂载规划器建目录
+#    （属主归应用、组 media_rw、mode 02771），只保留上面的硬判据。
+function Test-SandboxRootMetadata {
+    param([int]$Scenario, [string]$Label)
+    $form = ((Invoke-Su "stat -c '%a %u %g' '$BackendPrivateRoot' 2>/dev/null") -join " ").Trim()
+    if ([string]::IsNullOrEmpty($form)) {
+        $script:Failures.Add("scenario-$Scenario/$Label sandbox root missing: $BackendPrivateRoot") | Out-Null
+        Write-Host "  - scenario-$Scenario/$Label sandbox-root-missing path=$BackendPrivateRoot"
+        return $false
+    }
+    $parts = $form -split '\s+'
+    $mode = $parts[0]
+    $owner = $parts[1]
+    $group = $parts[2]
+    $appUid = Test-AppUid
+    $parentGid = ((Invoke-Su "stat -c %g '$BackendRoot/Android/data/$AppId' 2>/dev/null") -join "").Trim()
+    Write-Host "  - scenario-$Scenario/$Label sandbox-root mode=$mode owner=$owner group=$group app_uid=$appUid parent_gid=$parentGid"
+    $ok = $true
+    if ($appUid -and $owner -ne $appUid) {
+        $script:Failures.Add("scenario-$Scenario/$Label owner not app uid: owner=$owner app_uid=$appUid") | Out-Null
+        $ok = $false
+    }
+    if ($appUid -and $group -eq $appUid) {
+        $script:Failures.Add("scenario-$Scenario/$Label group leaked to app uid: group=$group (system writer not in group, other bits cleared)") | Out-Null
+        $ok = $false
+    }
+    if ($group -ne $parentGid -and $group -ne "1023" -and $group -ne "1078") {
+        $script:Failures.Add("scenario-$Scenario/$Label group unusable by system writer: group=$group parent_gid=$parentGid") | Out-Null
+        $ok = $false
+    }
+    if (([Convert]::ToInt32($mode, 8) -band 2) -ne 0) {
+        $script:Failures.Add("scenario-$Scenario/$Label other-writable sandbox root: mode=$mode") | Out-Null
+        $ok = $false
+    }
+    if ($mode -ne "2770" -and $mode -ne "2771") {
+        $script:Failures.Add("scenario-$Scenario/$Label mode not native: mode=$mode expected 2770 or 2771") | Out-Null
+        $ok = $false
+    }
+    $ok
+}
+
+# 私有树祖先链的原生形态校验（与 .sh 的 check_private_tree_native_metadata 同契约）：
+# `Android/data/<包名>` 与 `<包名>/sdcard` 两层都必须满足「应用属主 + 组等于父目录继承值 +
+# other 不可写 + mode 02770/02771」。
+#
+# 逐层查的原因：`sdcard` 的组曾被 chown(uid, uid) 覆盖成应用 uid；`<包名>` 的组曾被挂载
+# 规划器写成 media_rw(1023)，与 Android/data 的原生组 ext_data_rw(1078) 不一致。任一层组错，
+# 系统代写进程就在那一层 EACCES 并回退到真实公共路径。逐层断言能指出是哪一层回归。
+function Test-PrivateTreeMetadata {
+    param([int]$Scenario, [string]$Label)
+    $appUid = Test-AppUid
+    $layers = @(
+        @{ Path = "$BackendRoot/Android/data/$AppId"; Parent = "$BackendRoot/Android/data" },
+        @{ Path = $BackendPrivateRoot; Parent = "$BackendRoot/Android/data/$AppId" }
+    )
+    $ok = $true
+    foreach ($layer in $layers) {
+        $form = ((Invoke-Su "stat -c '%a %u %g' '$($layer.Path)' 2>/dev/null") -join " ").Trim()
+        $parentGid = ((Invoke-Su "stat -c %g '$($layer.Parent)' 2>/dev/null") -join "").Trim()
+        if ([string]::IsNullOrEmpty($form)) {
+            $script:Failures.Add("scenario-$Scenario/$Label private tree missing: $($layer.Path)") | Out-Null
+            $ok = $false
+            continue
+        }
+        $parts = $form -split '\s+'
+        $mode = $parts[0]
+        $owner = $parts[1]
+        $group = $parts[2]
+        Write-Host "  - scenario-$Scenario/$Label private-tree path=$($layer.Path) mode=$mode owner=$owner group=$group parent=$($layer.Parent) parent_gid=$parentGid"
+        if ($appUid -and $owner -ne $appUid) {
+            $script:Failures.Add("scenario-$Scenario/$Label private tree owner mismatch: $($layer.Path) owner=$owner app_uid=$appUid") | Out-Null
+            $ok = $false
+        }
+        if ($appUid -and $group -eq $appUid) {
+            $script:Failures.Add("scenario-$Scenario/$Label private tree group leaked to app uid: $($layer.Path) group=$group") | Out-Null
+            $ok = $false
+        }
+        if ([string]::IsNullOrEmpty($parentGid)) {
+            $script:Failures.Add("scenario-$Scenario/$Label private tree parent unreadable: $($layer.Parent)") | Out-Null
+            $ok = $false
+        } elseif ($group -ne $parentGid) {
+            $script:Failures.Add("scenario-$Scenario/$Label private tree group not inherited: $($layer.Path) group=$group parent_gid=$parentGid") | Out-Null
+            $ok = $false
+        }
+        if (([Convert]::ToInt32($mode, 8) -band 2) -ne 0) {
+            $script:Failures.Add("scenario-$Scenario/$Label private tree other-writable: $($layer.Path) mode=$mode") | Out-Null
+            $ok = $false
+        }
+        if ($mode -ne "2770" -and $mode -ne "2771") {
+            $script:Failures.Add("scenario-$Scenario/$Label private tree mode not native: $($layer.Path) mode=$mode") | Out-Null
+            $ok = $false
+        }
+    }
+    $ok
+}
+
+# 场景 43：存储视图根的条目集合必须与系统视图逐项一致（与 .sh 同契约）。
+#
+# 覆盖两条「视图根上提后口径没跟上」的回归：
+# 1. 根级隐藏：`.transforms` / `.picker_transcoded` 是 MediaProvider 的工作目录，原生
+#    FUSE 在根级对应用隐藏；判据必须按归一后的存储相对路径判空，按视图相对路径判空
+#    会在上提会话里整条跳过隐藏。
+# 2. 点条目：系统视图的 readdir 不返回 `.`/`..`，模块视图若返回，应用比对 getdents
+#    就能分辨存储被接管。
+function Assert-StorageRootViewParity {
+    param([string]$Label)
+
+    # 应用侧接管是异步的：等这个进程的视图根切成模块会话（st_dev 与系统视图不同），
+    # 不按日志等。等不到就是缺陷本身——未接管时两侧条目天然一致，断言会空转。
+    $deadline = (Get-Date).AddSeconds(60)
+    $appDev = ""
+    $sysDev = ""
+    $appPid = ""
+    while ($true) {
+        $appPid = ((Invoke-Su "pidof '$AppId' 2>/dev/null | awk '{print `$1}'") -join "").Trim()
+        $sysDev = ((Invoke-Adb @("shell", "stat -c %d '$RealRoot' 2>/dev/null")) -join "").Trim()
+        if (-not [string]::IsNullOrWhiteSpace($appPid) -and -not [string]::IsNullOrWhiteSpace($sysDev)) {
+            $appDev = ((Invoke-Su "nsenter -t $appPid -m -- stat -c %d '$RealRoot' 2>/dev/null") -join "").Trim()
+            if (-not [string]::IsNullOrWhiteSpace($appDev) -and $appDev -ne $sysDev) { break }
+        }
+        if ((Get-Date) -ge $deadline) {
+            $script:Failures.Add("$Label module view not attached app_dev=$appDev sys_dev=$sysDev")
+            return $false
+        }
+        Start-Sleep -Seconds 1
+    }
+    $appList = @(Invoke-Su "nsenter -t $appPid -m -- ls -a '$RealRoot' 2>/dev/null | sort" | Where-Object { $_ -ne "" })
+    $sysList = @(Invoke-Adb @("shell", "ls -a '$RealRoot' 2>/dev/null | sort") | Where-Object { $_ -ne "" })
+    if ($appList.Count -eq 0 -or $sysList.Count -eq 0) {
+        $script:Failures.Add("$Label root listing unavailable")
+        return $false
+    }
+    # 单层不变式：视图根上只能有本会话一层。叠加会与基线不一致，也让「哪一层在服务请求」
+    # 不可判定；接入路径按替换实现，这里把它钉成断言。
+    $layers = @(Invoke-Su "nsenter -t $appPid -m -- awk -v t='/storage/emulated' '`$5 == t' /proc/self/mountinfo" | Where-Object { $_ -ne "" })
+    if ($layers.Count -ne 1) {
+        $script:Failures.Add("$Label view layer stack layers=$($layers.Count): $($layers -join ' | ')")
+        return $false
+    }
+    foreach ($name in @(".transforms", ".picker_transcoded", ".srx_passthrough_probe")) {
+        if ($appList -contains $name) {
+            $script:Failures.Add("$Label root hidden name leaked: $name")
+            return $false
+        }
+    }
+    foreach ($name in @(".", "..")) {
+        if ($appList -contains $name) {
+            $script:Failures.Add("$Label dot entry in listing: $name")
+            return $false
+        }
+    }
+    # 反向判据：根级过滤只认那两个名字，不能顺手把所有点条目一起藏掉。
+    if (-not ($appList -contains ".SrtRootDotVisible")) {
+        $script:Failures.Add("$Label control dot entry missing")
+        return $false
+    }
+    if (($appList -join "`n") -ne ($sysList -join "`n")) {
+        $script:Failures.Add("$Label root listing mismatch app=[$($appList -join ',')] sys=[$($sysList -join ',')]")
+        return $false
+    }
+    $deep = @(Invoke-Su "nsenter -t $appPid -m -- ls -a '$RealRoot/Download/SrtViewParity' 2>/dev/null" | Where-Object { $_ -ne "" })
+    if (-not ($deep -contains ".transforms")) {
+        $script:Failures.Add("$Label deep same-name hidden: [$($deep -join ',')]")
+        return $false
+    }
+    Write-Host "  root_view_parity_ok label=$Label pid=$appPid entries=$($appList.Count)"
+    return $true
+}
+
+# 覆盖挂载下的视图一致性：把源目录 bind 到应用私有树里，模块视图必须与系统视图逐项一致。
+#
+# 夹具形状对应 HyperOS 每次下载做的系统 bind（`/data/apk-tmp/<pkg>/download` 盖到
+# `Android/data/<pkg>/files/.siexternal`），判定依据是「init 侧在该路径上有覆盖挂载」，
+# 与目录名无关。bind 必须在**接入之后**建：宿主会话的数据面是 f2fs 锚点，锚点是
+# `/data/media/<user>` 的非递归 bind，在建会话那一刻定型；init 侧事后新增的 bind 只能
+# 靠 `backend_overlay` 的路径改写补偿。真机 2026-11-17 的商店故障正是这条链失效：
+# 改写的查询串丢了 `<user>` 段，覆盖表恒不命中，视图退回 bind 遮蔽前的陈旧目录。
+function Assert-OverlayBackedViewParity {
+    param([string]$Label)
+
+    $appPid = ((Invoke-Su "pidof '$AppId' 2>/dev/null | awk '{print `$1}'") -join "").Trim()
+    if ([string]::IsNullOrWhiteSpace($appPid)) {
+        $script:Failures.Add("$Label app not running for overlay view parity")
+        return $false
+    }
+    # bind 必须建在 init 侧的 `/data/media/<user>` 写法上：覆盖挂载表按该写法登记挂载点
+    # （HyperOS 也是把 `/data/apk-tmp/<pkg>/download` 挂到
+    # `/data/media/<user>/Android/data/<pkg>/files/.siexternal`）。建在
+    # `/storage/emulated/<user>` 上只会遮蔽那个 FUSE 挂载自己的视图，f2fs 侧与覆盖表都
+    # 看不到，断言会退化成「验证不了改写」。
+    $mountDir = "$BackendRoot/Android/data/$AppId/files/SrtOverlayBacked"
+    $viewDir = "$RealRoot/Android/data/$AppId/files/SrtOverlayBacked"
+    # 同父目录的普通兄弟目录（不经 bind）与父目录本身，用于区分「整棵子树读不到」与
+    # 「只有覆盖目标读不到」。
+    $viewSourceDir = "$RealRoot/Android/data/$AppId/files/SrtOverlaySource"
+    $viewParentDir = "$RealRoot/Android/data/$AppId/files"
+    $sourceDir = "$BackendRoot/Android/data/$AppId/files/SrtOverlaySource"
+    $marker = "srt_overlay_backed_marker"
+    # 上一轮异常退出可能留下 bind：先拆再建。挂载与拆除都显式进 init 命名空间，
+    # 保证与系统侧一致（不依赖 su 是否复用同一个 mount namespace）。
+    Invoke-Su "nsenter -t 1 -m -- umount '$mountDir' 2>/dev/null; rm -rf '$mountDir' '$sourceDir'" | Out-Null
+    # 建 bind 之前先读一次空目录：这一步把该 inode 的后端解析钉成「bind 遮蔽前的旧值」，
+    # 也就把「解析缓存有没有跟着覆盖表失效」纳入断言。2026-11-17 A16 的偶发失败正是这条：
+    # 首次解析落在覆盖表 1 秒快照窗口内，缓存把旧后端钉死，后面读多少次都回不到 bind 内容。
+    Invoke-Su "nsenter -t 1 -m -- mkdir -p '$mountDir' '$sourceDir'" | Out-Null
+    Invoke-Su "nsenter -t $appPid -m -- ls -a '$viewDir' >/dev/null 2>&1" | Out-Null
+    Invoke-Su "nsenter -t 1 -m -- sh -c ': > `"$sourceDir/$marker`" && echo payload > `"$sourceDir/srt_overlay_backed_second`" && mount --bind `"$sourceDir`" `"$mountDir`"'" | Out-Null
+    # 系统视图（真值）：init 命名空间里 `/data/media/<user>` 侧的同一目录，bind 已生效。
+    # 走 f2fs 直连而不是 `/storage/emulated/<user>`，避免 MP FUSE 的 dentry 缓存让刚建立的
+    # bind 在系统侧暂时不可见，把缓存抖动误报成缺陷。
+    #
+    # 比较前剔除 `.`/`..`：模块 readdir 按设计不返回点条目（场景 43 已单独守卫），系统侧
+    # `ls -a` 必然多这两项，原样比较只会得到「必然不一致」的假失败。
+    $sysList = @(Invoke-Su "nsenter -t 1 -m -- ls -a '$mountDir' 2>/dev/null | grep -vx '\.' | grep -vx '\.\.' | sort" | Where-Object { $_ -ne "" })
+    # 覆盖挂载表有 1 秒快照 TTL：bind 刚建立时首次读可能仍按旧快照解析（ENOENT）。
+    # 这是有界的最终一致窗口，只在这里重试到快照刷新，不能放宽最终断言。
+    $appList = @()
+    # 窗口覆盖两级缓存之和：覆盖表快照 TTL 1 秒 + 目录候选缓存 TTL 2 秒，再留 adb 往返。
+    for ($attempt = 0; $attempt -lt 20; $attempt++) {
+        $appList = @(Invoke-Su "nsenter -t $appPid -m -- ls -a '$viewDir' 2>/dev/null | sort" | Where-Object { $_ -ne "" })
+        if ($appList -contains $marker) { break }
+        Start-Sleep -Milliseconds 500
+    }
+    $ok = $true
+    if (-not ($sysList -contains $marker)) {
+        $sysDetail = ((Invoke-Su "nsenter -t 1 -m -- ls -ld '$mountDir' 2>&1") -join " ").Trim()
+        $script:Failures.Add("$Label system view missing overlay content sys=[$($sysList -join ',')] detail=$sysDetail")
+        $ok = $false
+    }
+    elseif (-not ($appList -contains $marker)) {
+        # 应用侧读空既可能是「目录不存在/不可读」，也可能是「读到 bind 遮蔽前的空目录」，
+        # 判据完全不同：把 ls 的 stderr 一并带出来，别让重定向把 errno 吞掉。
+        $appDetail = ((Invoke-Su "nsenter -t $appPid -m -- ls -ld '$viewDir' 2>&1") -join " ").Trim()
+        # mountinfo 段用来区分「覆盖表没命中该挂载点」与「命中了但换算出的源路径不对」。
+        $mountInfo = ((Invoke-Su "grep -F '$mountDir' /proc/1/mountinfo 2>/dev/null | head -1") -join " ").Trim()
+        # src_probe 直接回答「改写目标在应用命名空间里读不读得到」。
+        $srcProbe = ((Invoke-Su "nsenter -t $appPid -m -- ls -a '$sourceDir' 2>&1") -join " ").Trim()
+        # 同父目录的普通兄弟目录与父目录本身：区分「整棵子树读不到」与「只有覆盖目标读不到」。
+        $viewSourceProbe = ((Invoke-Su "nsenter -t $appPid -m -- ls -a '$viewSourceDir' 2>&1") -join " ").Trim()
+        $viewParentProbe = ((Invoke-Su "nsenter -t $appPid -m -- ls -a '$viewParentDir' 2>&1") -join " ").Trim()
+        # 覆盖表变化日志（全文 grep，不靠 running.log 尾部，避免被启动日志挤掉）。
+        $overlayLog = ((Invoke-Su "grep -h 'overlay' /data/adb/modules/storage.redirect.x/logs/running.log* 2>/dev/null | tail -4") -join " | ").Trim()
+        $script:Failures.Add("$Label module view missing overlay content app=[$($appList -join ',')] sys=[$($sysList -join ',')] detail=$appDetail mountinfo=$mountInfo src_probe=$srcProbe view_src_probe=$viewSourceProbe view_parent_probe=$viewParentProbe overlay_log=$overlayLog")
+        $ok = $false
+    }
+    elseif (($appList -join "`n") -ne ($sysList -join "`n")) {
+        $script:Failures.Add("$Label overlay listing mismatch app=[$($appList -join ',')] sys=[$($sysList -join ',')]")
+        $ok = $false
+    }
+    Invoke-Su "nsenter -t 1 -m -- umount '$mountDir' 2>/dev/null; rm -rf '$mountDir' '$sourceDir'" | Out-Null
+    if ($ok) {
+        Write-Host "  overlay_view_parity_ok label=$Label pid=$appPid entries=$($appList.Count)"
+    }
+    return $ok
+}
+
+# 停用配置（配置文件存在但 enabled=false）在监视开启时不得被接入模块视图：
+# resolve_profile 返回 Some(disabled) → MountOperation::Disable，monitor-only 只在完全
+# 无配置时成立。断言应用仍停在系统视图、根列表里没有 MediaProvider 内部目录——将来若把
+# disabled 也当成监视接管，会在这里变红，而不是等用户在自己的文件管理器里看见 .transforms。
+function Assert-DisabledProfileNotCaptured {
+    param([string]$Label)
+
+    $deadline = (Get-Date).AddSeconds(15)
+    $appPid = ""
+    while ($true) {
+        $appPid = ((Invoke-Su "pidof '$AppId' 2>/dev/null | awk '{print `$1}'") -join "").Trim()
+        if (-not [string]::IsNullOrWhiteSpace($appPid)) { break }
+        if ((Get-Date) -ge $deadline) {
+            $script:Failures.Add("$Label app not running for disabled profile view")
+            return $false
+        }
+        Start-Sleep -Milliseconds 200
+    }
+    $sysDev = ((Invoke-Adb @("shell", "stat -c %d '$RealRoot' 2>/dev/null")) -join "").Trim()
+    $appDev = ((Invoke-Su "nsenter -t $appPid -m -- stat -c %d '$RealRoot' 2>/dev/null") -join "").Trim()
+    if ([string]::IsNullOrWhiteSpace($sysDev) -or [string]::IsNullOrWhiteSpace($appDev)) {
+        $script:Failures.Add("$Label view probe failed")
+        return $false
+    }
+    if ($appDev -ne $sysDev) {
+        $script:Failures.Add("$Label disabled profile attached to module view app_dev=$appDev sys_dev=$sysDev")
+        return $false
+    }
+    $list = @(Invoke-Su "nsenter -t $appPid -m -- ls -a '$RealRoot' 2>/dev/null" | Where-Object { $_ -ne "" })
+    foreach ($name in @(".transforms", ".picker_transcoded", ".srx_passthrough_probe")) {
+        if ($list -contains $name) {
+            $script:Failures.Add("$Label root hidden name leaked: $name")
+            return $false
+        }
+    }
+    Write-Host "  disabled_profile_view_ok label=$Label pid=$appPid dev=$sysDev entries=$($list.Count)"
+    return $true
+}
+
+function Invoke-StorageRootViewParityScenario {
+    param([int]$Scenario)
+
+    $label = "scenario-$Scenario"
+    $fixture = "$RealRoot/Download/SrtViewParity"
+    # 根级对照目录与深层同名目录：前者证明过滤是名字级而不是「藏掉所有点条目」，
+    # 后者证明过滤只作用于视图根。
+    Invoke-Su "mkdir -p '$RealRoot/.SrtRootDotVisible' '$fixture/.transforms' && chmod 777 '$RealRoot/.SrtRootDotVisible' '$fixture' '$fixture/.transforms'" | Out-Null
+    $ok = Assert-StorageRootViewParity "$label-initial"
+    # 再写一次**同一份**配置：触发一轮全量 reconcile（含宿主会话重接）后内容必须不变。
+    # 这里不能写 disabled 配置——那会把应用从模块会话上摘下来，断言换成系统视图后
+    # 就失去意义（实测会看到真实文件系统的 `.`/`..`）。
+    Write-DeviceConfig '{"users":{"0":{"enabled":true,"allowed_real_paths":["*"]}}}'
+    Start-Sleep -Seconds 3
+    $ok = (Assert-StorageRootViewParity "$label-after-reconcile") -and $ok
+    Invoke-Su "rm -rf '$RealRoot/.SrtRootDotVisible' '$fixture'" | Out-Null
+    return $ok
+}
+
+# 场景 44：复刻「没开重定向的应用在别人改规则后突然看见内部目录」的现场（与 .sh 同契约）。
+#
+# 与 43 的差别在接管方式：43 的应用有配置（通配放行整根）、启动即被接管；44 的应用
+# **没有任何配置**，只有全局文件监视开启，应用侧只在 should_redirect 时才发挂载请求，
+# 所以冷启动一定停在系统视图，接管发生在 daemon 因**别的应用**规则变化而做全量
+# reconcile 那一刻——这正是 MT 的现象链。
+function Invoke-MonitorCaptureRootViewScenario {
+    param([int]$Scenario)
+
+    $label = "scenario-$Scenario"
+    $fixture = "$RealRoot/Download/SrtViewParity"
+    Invoke-Su "mkdir -p '$RealRoot/.SrtRootDotVisible' '$fixture/.transforms' && chmod 777 '$RealRoot/.SrtRootDotVisible' '$fixture' '$fixture/.transforms'" | Out-Null
+    # 接管发生在运行中途，夹具必须在这一刻确实存在：缺了会让断言因为「对照条目不见」
+    # 而变红，那是假失败，必须与「过滤失效」区分开。
+    if (-not (Test-Su "test -d '$RealRoot/.SrtRootDotVisible' && test -d '$fixture/.transforms'")) {
+        $script:Failures.Add("$Label fixture missing")
+        Clear-MonitorTriggerConfig
+        return $false
+    }
+
+    $appPid = ((Invoke-Su "pidof '$AppId' 2>/dev/null | awk '{print `$1}'") -join "").Trim()
+    if ([string]::IsNullOrWhiteSpace($appPid)) {
+        $script:Failures.Add("$Label app not running for monitor capture")
+        return $false
+    }
+    $sysDev = ((Invoke-Adb @("shell", "stat -c %d '$RealRoot' 2>/dev/null")) -join "").Trim()
+    $appDev = ((Invoke-Su "nsenter -t $appPid -m -- stat -c %d '$RealRoot' 2>/dev/null") -join "").Trim()
+    # 基线必须停在系统视图：本场景验证的是「改规则后才被接管」，一上来就已接管
+    # 说明上个场景的会话没清干净，后面的断言不再对应这条链路。
+    if ([string]::IsNullOrWhiteSpace($sysDev) -or [string]::IsNullOrWhiteSpace($appDev) -or $appDev -ne $sysDev) {
+        $script:Failures.Add("$Label baseline not system view app_dev=$appDev sys_dev=$sysDev")
+        Clear-MonitorTriggerConfig
+        return $false
+    }
+    Write-Host "  monitor_capture_baseline label=$label pid=$appPid dev=$sysDev"
+
+    # 触发「全量」reconcile：只写某个应用的配置走的是增量路径（计划被过滤到那个包，
+    # 目标应用不在里面就什么也不做），全量必须由全局配置变化触发——WebUI 保存规则时
+    # 同样是写应用配置 + 触碰 global.json。
+    Write-GlobalConfig (Get-TestGlobalConfig 'auto' $true)
+    $ok = Assert-StorageRootViewParity "$label-captured"
+    if ($ok) {
+        # 覆盖挂载链路：商店每次下载都会把暂存目录 bind 到应用私有树，视图必须跟着 bind 走。
+        $ok = Assert-OverlayBackedViewParity "$label-overlay"
+    }
+    Clear-MonitorTriggerConfig
+    Invoke-Su "rm -rf '$RealRoot/.SrtRootDotVisible' '$fixture'" | Out-Null
+    return $ok
+}
+
+# 场景 41：模块自建沙盒根的原生元数据 + 媒体代写零穿透（与 .sh 同契约）。
+#
+# 回归背景（2026-11-09 真机）：王者荣耀的沙盒根被模块建成
+# `2770 应用uid:应用uid`，系统代写进程既非属主也不在组、other 位为 0，穿越直接
+# EACCES；重定向目标不可达后写入回退到真实公共路径，公共存储里凭空长出
+# `Documents/ringtone/gamefree/jly*/a`。本场景把「删掉沙盒根 → 应用重启 → 模块重建」
+# 作为固定前置，再用一条真实 MediaStore 创建证明穿透为零。
+function Invoke-SandboxRootMetadataScenario {
+    param([int]$Scenario)
+    $label = "scenario-$Scenario"
+    $publicParent = "$BackendRoot/$SandboxRootMetadataRel"
+    $sandboxFile = "$BackendPrivateRoot/$SandboxRootMetadataRel/$SandboxRootMetadataFile"
+    $timeoutSeconds = 30
+    if ($env:SRT_SANDBOX_ROOT_TIMEOUT_SECONDS) { $timeoutSeconds = [int]$env:SRT_SANDBOX_ROOT_TIMEOUT_SECONDS }
+    # 模块只在 FUSE 会话初始化时建重定向根：步骤 2 已删掉它，步骤 3 的应用重启就是重建
+    # 时机。只等这一件确定会发生的事；等不到就是缺陷本身，不能跳过断言。
+    $deadline = (Get-Date).AddSeconds($timeoutSeconds)
+    while ((Get-Date) -lt $deadline -and -not (Test-Su "test -d '$BackendPrivateRoot'")) {
+        Start-Sleep -Seconds 1
+    }
+    if (-not (Test-Su "test -d '$BackendPrivateRoot'")) {
+        $script:Failures.Add("scenario-$Scenario/sandbox-root-not-recreated path=$BackendPrivateRoot") | Out-Null
+        Write-Host "  - scenario-$Scenario/sandbox-root-not-recreated path=$BackendPrivateRoot timeout_s=$timeoutSeconds"
+        return $false
+    }
+    $ok = (Test-SandboxRootMetadata $Scenario "sandbox-root-rebuild")
+    # 沙盒根只是链路末端：祖先链每一层都必须是原生形态。
+    $ok = (Test-PrivateTreeMetadata $Scenario "private-tree-rebuild") -and $ok
+    # 应用侧写入：重建出来的沙盒根必须仍能被应用自己写入。落点选在存储根下（即沙盒根内），
+    # 不依赖任何预置子目录——本场景刚刚把整个沙盒根删掉，预置的子目录已随之消失。
+    $appWriteFile = "srt_sandbox_root_appwrite.txt"
+    $ok = (Invoke-WriteCase $Scenario "sandbox-root-app-write" "$RealRoot/$appWriteFile" $Payload).Ok -and $ok
+    $ok = (Require-File "scenario-$Scenario" "sandbox-root-app-write-private" "$BackendPrivateRoot/$appWriteFile") -and $ok
+    $ok = (Require-Missing "scenario-$Scenario" "sandbox-root-app-write-public" "$BackendRoot/$appWriteFile") -and $ok
+    # MediaStore 代写后同时校验沙盒落点和公共路径零残留。
+    if (-not (Wait-MediaProviderHookReady "scenario-$Scenario-sandbox-root" 60)) { $ok = $false }
+    $create = Invoke-MediaStoreCreateCase $Scenario "sandbox-root-mediastore" @{ file_name = $SandboxRootMetadataFile; relative_path = $SandboxRootMetadataRel }
+    $ok = $create.Ok -and $ok
+    $ok = (Require-File "scenario-$Scenario" "sandbox-root-file" $sandboxFile) -and $ok
+    $ok = (Require-Missing "scenario-$Scenario" "sandbox-root-public-parent" $publicParent) -and $ok
+    $ok = (Require-Missing "scenario-$Scenario" "sandbox-root-public-file" "$publicParent/$SandboxRootMetadataFile") -and $ok
+    # 代写链路不得把组改回应用 uid，也不得把 other 写位加回来。
+    $ok = (Test-SandboxRootMetadata $Scenario "sandbox-root-post-write") -and $ok
+    $ok = (Test-PrivateTreeMetadata $Scenario "private-tree-post-write") -and $ok
+    $ok
+}
+
+function Add-ScenarioFailure {
+    param($Scenario, [int]$FailuresBefore, [string]$ErrorMessage)
+    $script:Failures.Add("$Scenario exception: $ErrorMessage")
+    try {
+        Stop-AppAndWaitFuseCleanup "$Scenario/abort" | Out-Null
+    } catch {
+        $script:Failures.Add("$Scenario/abort-cleanup: $($_.Exception.Message)")
+    }
+    $isBasic = $Scenario -eq "basic"
+    if ($isBasic) { Write-Host "FAIL [basic]" } else { Write-Host "FAIL [scenario] id=$Scenario" }
+    $title = if ($isBasic) { "deterministic all + query smoke" } else { Get-ScenarioTitle $Scenario }
+    $script:Summary.Add([pscustomobject]@{
+        Scenario = $Scenario
+        Title = $title
+        Passed = $false
+        NewFailures = ($script:Failures.Count - $FailuresBefore)
+    }) | Out-Null
+    Write-Warning "场景 $Scenario 执行失败：$ErrorMessage"
+}
+
+function Invoke-ScenarioChecks {
+    param([int]$Scenario, [scriptblock[]]$Checks)
+    $ok = $true
+    foreach ($check in $Checks) {
+        try {
+            $result = & $check
+            if ($result -isnot [bool] -or -not $result) { $ok = $false }
+        } catch {
+            $script:Failures.Add("scenario-$Scenario subcheck exception: $($_.Exception.Message)")
+            Write-Warning "场景 $Scenario 子项失败：$($_.Exception.Message)"
+            $ok = $false
+        }
+        if ($script:FailFast -and -not $ok) { break }
+    }
+    $ok
+}
+
 function Invoke-Scenario {
     param([int]$Scenario)
     Write-Host "== scenario ${Scenario}: $(Get-ScenarioTitle $Scenario) =="
     $before = $script:Failures.Count
-    $ok = Stop-AppAndWaitFuseCleanup "scenario-$Scenario/transition" $true
+    $ok = Stop-AppAndWaitFuseCleanup "scenario-$Scenario/transition"
     if (-not $ok -and $script:FailFast) {
         throw "[SRT_FAIL_FAST_ITEM] scenario-$Scenario/transition-cleanup"
     }
-    if ($Scenario -in @(8, 16, 17, 18, 19)) {
+    if ($Scenario -in @(8, 16, 17, 18, 19, 38)) {
         Invoke-Su ": > '$LogPath' 2>/dev/null || true" | Out-Null
+    }
+    if ($Scenario -eq 42) {
+        $script:NativeSymlinkResult = ""
+        $script:NativeHardlinkResult = ""
+        if (-not (Invoke-FileLinkControl)) { throw "场景 42 的未重定向链接对照失败" }
     }
     Apply-ScenarioConfig $Scenario
     Clear-Targets
+    # 后端清理和夹具创建结束后重新校正属主，确保应用首次访问前完成。
+    Fix-SharedFixturePermissions
+    if ($Scenario -eq 42) {
+        if (-not (Test-Su "for name in Sandbox Allowed Request RequestSibling Mapped; do mkdir -p '$BackendRoot/Download/SrtMutation'`$name '$BackendPrivateRoot/Download/SrtMutation'`$name; chmod 777 '$BackendRoot/Download/SrtMutation'`$name '$BackendPrivateRoot/Download/SrtMutation'`$name; done")) {
+            throw "场景 42 的文件变更夹具准备失败"
+        }
+    }
     if ($Scenario -eq 9) { Set-ReadOnlySeed }
     if ($Scenario -eq 6) { Set-OwnerDriftFixture "scenario-$Scenario" }
     if ($Scenario -eq 10) { Set-MappedReadOnlyTargets }
     if ($Scenario -eq 21) { Set-MountNamespaceReadOnlySeed }
     if ($Scenario -in @(28, 31)) { Set-ReadOnlyMediaImage }
+    # 场景 41：沙盒根（重定向根）必须在**应用重启之前**删掉——模块只在 FUSE 会话初始化
+    # 时创建它，重启就是重建时机；删除放在 Clear-Targets/Fix-SharedFixturePermissions 之后，
+    # 避免清理流程自己把目录建回来（那样测到的就不是模块的创建结果）。
+    if ($Scenario -eq 41) {
+        # 先准备已有包目录的继承组夹具，再检查模块新建 sdcard 的结果。
+        if (-not (Test-Su "parent_gid=`$(stat -c %g '$BackendRoot/Android/data') && chgrp `"`$parent_gid`" '$BackendRoot/Android/data/$AppId' && rm -rf '$BackendPrivateRoot' && rm -f '$RealRoot/srt_sandbox_root_appwrite.txt' '$BackendRoot/srt_sandbox_root_appwrite.txt'")) {
+            throw "场景 41 的包目录夹具准备失败"
+        }
+    }
     # 未自行预置夹具的场景，清理后夹具根必须为空；有残留就当场停下，别让污染漂到后面的断言。
     if ($Scenario -notin @(9, 10, 20, 21, 22, 28, 31, 38)) {
         if (-not (Assert-FixtureRootsEmpty "scenario-$Scenario")) {
-            $script:Failures.Add("scenario-$Scenario/fixture-residue")
-            if ($script:FailFast) {
-                throw "[SRT_FAIL_FAST_ITEM] scenario-$Scenario/fixture-residue"
-            }
-            return $false
+            throw "scenario-$Scenario/fixture-residue"
         }
     }
-    Restart-App "scenario-$Scenario" ($Scenario -ne 1)
+    if ($Scenario -in @(38, 40)) {
+        Write-Host "  - scenario-${Scenario}: skip test app restart"
+        Wait-Storage "scenario-$Scenario" | Out-Null
+    } else {
+        $ok = (Restart-App "scenario-$Scenario" ($Scenario -ne 1)) -and $ok
+    }
     $scenarioOk = switch ($Scenario) {
         8 { Invoke-RuleSandboxScenario $Scenario }
         9 { Invoke-ReadOnlyScenario $Scenario }
@@ -5569,7 +4487,7 @@ function Invoke-Scenario {
         20 { Invoke-MountNamespaceAllowWildcardFallbackScenario $Scenario }
         21 { Invoke-MountNamespaceReadOnlyWildcardFallbackScenario $Scenario }
         22 { Invoke-MountNamespaceMappingReadOnlyScenario $Scenario }
-        23 { (Invoke-DisabledRedirectMonitorScenario $Scenario) -and (Invoke-MonitorCaptureFailOpenScenario $Scenario) }
+        23 { Invoke-ScenarioChecks $Scenario @({ Invoke-DisabledRedirectMonitorScenario $Scenario }, { Invoke-MonitorCaptureFailOpenScenario $Scenario }) }
         24 { Invoke-RegularMonitorScenario $Scenario }
         25 { Invoke-RegularMonitorScenario $Scenario }
         26 { Invoke-MediaStoreMonitorScenario $Scenario }
@@ -5586,27 +4504,32 @@ function Invoke-Scenario {
         37 { Invoke-NestedMappingChainScenario $Scenario }
         38 { Invoke-ProviderSandboxScenario $Scenario }
         39 { Invoke-DownloadOwnerAttributionScenario $Scenario }
-        40 { (Invoke-SystemUidAttributionScenario $Scenario) -and (Invoke-SystemUidSandboxMissingTargetScenario $Scenario) }
+        40 { Invoke-ScenarioChecks $Scenario @({ Invoke-SystemUidAttributionScenario $Scenario }, { Invoke-AppCallerMediaProviderAttributionScenario $Scenario }, { Invoke-ShellExecutorBoundaryScenario $Scenario }) }
+        41 { Invoke-SandboxRootMetadataScenario $Scenario }
+        42 { Invoke-ScenarioChecks $Scenario @({ Invoke-FileMutationLifecycleScenario $Scenario }, { Invoke-FileMutationMetadataScenario $Scenario }) }
+        43 { Invoke-StorageRootViewParityScenario $Scenario }
+        44 { Invoke-MonitorCaptureRootViewScenario $Scenario }
         default { Invoke-StandardScenario $Scenario }
     }
-    $ok = [bool]$scenarioOk -and $ok
+    $ok = ($scenarioOk -is [bool] -and $scenarioOk) -and $ok
     Write-Host "  - scenario-$Scenario/backend-effective"
     Invoke-Su "grep -h 'backend_effective' '$LogPath' 2>/dev/null | tail -3 || true; grep -h -E 'fuse_dir_cache_(config|sample)|perf_snapshot component=fuse' '$LogPath' 2>/dev/null | tail -3 || true" | Write-Host
-    $ok = (Stop-AppAndWaitFuseCleanup "scenario-$Scenario/finalize" $true) -and $ok
+    $ok = (Stop-AppAndWaitFuseCleanup "scenario-$Scenario/finalize") -and $ok
     if (-not $ok -and $script:Failures.Count -eq $before) {
         $script:Failures.Add("scenario-$Scenario returned false without a detailed failure")
     }
     $newFailures = $script:Failures.Count - $before
+    if ($ok -and $newFailures -eq 0) { Write-Host "PASS [scenario] id=$Scenario" } else { Write-Host "FAIL [scenario] id=$Scenario" }
     $script:Summary.Add([pscustomobject]@{ Scenario = $Scenario; Title = (Get-ScenarioTitle $Scenario); Passed = ($ok -and $newFailures -eq 0); NewFailures = $newFailures }) | Out-Null
 }
 
 function Invoke-BasicAll {
+    $before = $script:Failures.Count
     Write-Host "== basic suite with default redirect enabled =="
     Set-BackendConfig -Mode "auto"
     Write-DeviceConfig '{"users":{"0":{"enabled":true}}}'
     Clear-Targets
-    Restart-App "all-basic"
-    $before = $script:Failures.Count
+    $setupOk = Restart-App "all-basic"
     $result = Invoke-ServiceCase "basic" "all" "all" @{} "^PASS "
     $failedLines = @()
     if ($result.Text) {
@@ -5615,7 +4538,7 @@ function Invoke-BasicAll {
     foreach ($line in $failedLines) {
         $script:Failures.Add("basic/all $line")
     }
-    $ok = $result.Ok -and $failedLines.Count -eq 0
+    $ok = $setupOk -and $result.Ok -and $failedLines.Count -eq 0
 
     $queryCases = @(
         "mediastore_query_image",
@@ -5629,23 +4552,20 @@ function Invoke-BasicAll {
         $ok = $queryResult.Ok -and $ok
     }
 
+    $ok = $ok -and $script:Failures.Count -eq $before
+    if ($ok) { Write-Host "PASS [basic]" } else { Write-Host "FAIL [basic]" }
     $script:Summary.Add([pscustomobject]@{ Scenario = "basic"; Title = "deterministic all + query smoke"; Passed = $ok; NewFailures = ($script:Failures.Count - $before) }) | Out-Null
 }
 
 $script:ExitCode = 0
 Enter-DeviceRunLock
 try {
+    Grant-TestAppStoragePermissions
     Backup-GlobalConfig
     Backup-AppConfig
     Backup-CrossAppConfig
     Backup-DeviceExecutionState
     Prepare-DeviceExecutionState
-    Invoke-Adb @("shell", "pm", "grant", $AppId, "android.permission.READ_EXTERNAL_STORAGE") | Out-Null
-    Invoke-Adb @("shell", "pm", "grant", $AppId, "android.permission.WRITE_EXTERNAL_STORAGE") | Out-Null
-    Invoke-Adb @("shell", "pm", "grant", $AppId, "android.permission.READ_MEDIA_IMAGES") | Out-Null
-    Invoke-Adb @("shell", "pm", "grant", $AppId, "android.permission.READ_MEDIA_VIDEO") | Out-Null
-    Invoke-Adb @("shell", "pm", "grant", $AppId, "android.permission.READ_MEDIA_AUDIO") | Out-Null
-    Invoke-Adb @("shell", "appops", "set", $AppId, "MANAGE_EXTERNAL_STORAGE", "allow") | Out-Null
     Invoke-Adb @("logcat", "-c") | Out-Null
     Invoke-Su ": > '$LogPath' 2>/dev/null || true" | Out-Null
     Restart-MediaProvider
@@ -5654,25 +4574,22 @@ try {
     if (-not (Confirm-MediaProviderHookReady "initial")) { throw "初始 MediaProvider hook 恢复失败" }
 
     if (-not $SkipBasicAll) {
-        Invoke-BasicAll
+        $failuresBeforeBasic = $script:Failures.Count
+        try {
+            Invoke-BasicAll
+        } catch {
+            Add-ScenarioFailure "basic" $failuresBeforeBasic $_.Exception.Message
+        }
     }
 
-    $scenarios = Get-ScenarioList
+    $scenarios = if ($script:FailFast -and $script:Failures.Count -gt 0) { @() } else { Get-ScenarioList }
 
     foreach ($scenario in $scenarios) {
         $failuresBeforeScenario = $script:Failures.Count
         try {
             Invoke-Scenario $scenario
         } catch {
-            if (-not $_.Exception.Message.StartsWith("[SRT_FAIL_FAST_ITEM]")) { throw }
-            Stop-AppAndWaitFuseCleanup "scenario-$scenario/abort" $true | Out-Null
-            $script:Summary.Add([pscustomobject]@{
-                Scenario = $scenario
-                Title = (Get-ScenarioTitle $scenario)
-                Passed = $false
-                NewFailures = ($script:Failures.Count - $failuresBeforeScenario)
-            }) | Out-Null
-            Write-Warning "场景 $scenario 的单项失败，已按 SRT_FAIL_FAST 立即停止：$($_.Exception.Message)"
+            Add-ScenarioFailure $scenario $failuresBeforeScenario $_.Exception.Message
         }
         if ($script:FailFast -and $script:Failures.Count -gt $failuresBeforeScenario) {
             Write-Warning "场景 $scenario 失败，已按 SRT_FAIL_FAST 停止后续场景"
@@ -5698,11 +4615,10 @@ try {
             Select-Object -Last 160 |
             ForEach-Object { Write-Host $_.Line }
         $script:ExitCode = 1
-    } else {
-        Write-Host "ALL_SCENARIOS_PASSED"
     }
 } finally {
     try { Invoke-TestArtifactCleanup } finally { Exit-DeviceRunLock }
 }
 
+if ($script:ExitCode -eq 0) { Write-Host "ALL_SCENARIOS_PASSED" }
 exit $script:ExitCode

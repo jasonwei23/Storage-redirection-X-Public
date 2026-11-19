@@ -26,7 +26,11 @@ const READ_ONLY_DENIED_SENTINEL_PREFIX: &str = "__SRX_READ_ONLY_DENIED__:";
 
 // MediaProvider cursor 行可能非常频繁地命中此路径。保留 inotify 作为快路径，
 // 并使用限流的指纹检查，避免监视事件遗漏或初始快照为空导致调用方查询过滤失效。
-const REWRITE_FINGERPRINT_RELOAD_INTERVAL_MS: i64 = 1000;
+//
+// 节流值与 `hook::reload`、`redirect::engine` 共用同一个判据：事件通道在线时该判据为
+// 「永不复查」（丢事件由 `IN_Q_OVERFLOW` 精确覆盖），通道不可用时才退回 1 秒。这三处若
+// 各用 1 秒，同一进程每秒就要算三次「readdir + 每个应用配置一次 stat」的指纹。
+
 static LAST_REWRITE_FINGERPRINT_CHECK_MS: AtomicI64 = AtomicI64::new(i64::MIN / 2);
 
 fn refresh_settings_snapshot() {
@@ -38,7 +42,7 @@ fn refresh_settings_snapshot() {
 
     let now_ms = paths::monotonic_ms();
     let last_ms = LAST_REWRITE_FINGERPRINT_CHECK_MS.load(Ordering::Relaxed);
-    if now_ms.saturating_sub(last_ms) < REWRITE_FINGERPRINT_RELOAD_INTERVAL_MS {
+    if now_ms.saturating_sub(last_ms) < crate::hook::fallback_reload_interval_ms() {
         return;
     }
     if LAST_REWRITE_FINGERPRINT_CHECK_MS
@@ -64,11 +68,7 @@ pub(crate) fn rewrite_cursor_storage_path_for_caller(
     if caller_package.is_empty() {
         return None;
     }
-    let hub = InterceptHub::instance();
-    let previous_package = hub.get_current_caller_package();
-    let previous_uid = hub.get_current_caller_uid();
-    hub.set_current_caller_package(&caller_package);
-    hub.set_current_caller_uid(caller_uid);
+    crate::hook::push_current_caller_scope(&caller_package, caller_uid);
     let _explicit_caller = crate::hook::enter_explicit_caller_decision();
     let result = rewrite_cursor_storage_path_for_mapping_view(
         original_text,
@@ -79,8 +79,7 @@ pub(crate) fn rewrite_cursor_storage_path_for_caller(
         true,
     )
     .or_else(|| rewrite_cursor_storage_path_for_non_mapping_view(original_text));
-    hub.set_current_caller_package(&previous_package);
-    hub.set_current_caller_uid(previous_uid);
+    crate::hook::pop_current_caller_scope();
     result
 }
 
@@ -97,16 +96,12 @@ pub(crate) fn resolve_open_storage_path_for_caller(
         return None;
     }
     let hub = InterceptHub::instance();
-    let previous_package = hub.get_current_caller_package();
-    let previous_uid = hub.get_current_caller_uid();
-    hub.set_current_caller_package(&caller_package);
-    hub.set_current_caller_uid(effective_uid);
+    crate::hook::push_current_caller_scope(&caller_package, effective_uid);
     let _explicit_caller = crate::hook::enter_explicit_caller_decision();
     let mapped_view_target =
         resolve_mapping_view_open_target(path_text, &caller_package, effective_uid);
     let decision = process_redirect_path(hub, path_text);
-    hub.set_current_caller_package(&previous_package);
-    hub.set_current_caller_uid(previous_uid);
+    crate::hook::pop_current_caller_scope();
     if decision.is_redirect() && !decision.new_path.is_empty() {
         return Some(decision.new_path);
     }
@@ -120,6 +115,22 @@ pub(crate) fn resolve_open_storage_path_for_caller(
 }
 
 fn resolve_storage_caller_context(caller_uid: i32, path_text: &str) -> (String, i32) {
+    if crate::hook::is_caller_attribution_stopped() {
+        return (String::new(), caller_uid);
+    }
+    let hub = InterceptHub::instance();
+    if crate::hook::is_current_caller_scope_active() && hub.get_current_caller_uid() == caller_uid {
+        let package = hub.get_current_caller_package();
+        if !policy::is_system_writer_package(&package) {
+            // 空成员身份同样不能借用路径历史；下载行归属另按完整 UID 校验。
+            return if package.is_empty() {
+                resolve_download_owner_caller_context(caller_uid, path_text)
+                    .unwrap_or((package, caller_uid))
+            } else {
+                (package, caller_uid)
+            };
+        }
+    }
     let user_id = platform::user_id_from_uid(caller_uid);
     let system_writer = is_system_writer_uid(caller_uid);
     if system_writer
@@ -157,6 +168,14 @@ fn resolve_storage_caller_context(caller_uid: i32, path_text: &str) -> (String, 
         return context;
     }
 
+    // 代写者以自身身份走到这里时，「找到的就是自己」不构成任何归因线索，反而会
+    // 让 writer 决策把有效归属改写成代写者并判定为未启用重定向，从而放行请求
+    // 路径（2026-11-10 A17 场景 39：文件物理落在 SrtDlOwner、映射目标为空）。
+    // 返回空归属，交给上层按 uid / 下载行继续反查，或按未解析路径处理。
+    if system_writer && policy::is_system_writer_package(&caller_package) {
+        return (String::new(), caller_uid);
+    }
+
     (caller_package, caller_uid)
 }
 
@@ -175,11 +194,12 @@ fn resolve_download_owner_caller_context(
         return None;
     }
 
-    let owner_package = crate::monitor::infer_download_owner_package_by_path(path_text)?;
+    let user_id = platform::user_id_from_uid(caller_uid);
+    let (owner_package, owner_uid) =
+        crate::monitor::infer_download_owner_identity_by_path(path_text, user_id)?;
     if owner_package.is_empty() || policy::is_media_intermediate_package(&owner_package) {
         return None;
     }
-    let owner_uid = policy::get_fresh_uid_for_package(&owner_package);
     if owner_uid < writer::ANDROID_APP_UID_START {
         return None;
     }
@@ -199,6 +219,28 @@ fn resolve_proxied_write_caller_context(
 ) -> Option<(String, i32)> {
     resolve_path_hint_caller_context(user_id, path_text)
         .or_else(|| resolve_mapping_request_caller_context(user_id, caller_uid, path_text, true))
+        .or_else(|| resolve_mapping_target_caller_context(user_id, path_text))
+}
+
+/// 用「映射目标」反查归属应用。
+///
+/// 代写者在映射目标上执行后续操作（pending 提交、后端 mkdir、文件 open）时没有
+/// binder 调用方，请求路径提示又可能已被污染或过期；显式配置的映射目标唯一对应
+/// 一个配置方，是确定性证据。冲突目标由配置侧返回空串，保持匿名公共路径边界。
+fn resolve_mapping_target_caller_context(user_id: i32, path_text: &str) -> Option<(String, i32)> {
+    if user_id < 0 || path_text.is_empty() {
+        return None;
+    }
+    let package_name =
+        SettingsHub::instance().resolve_mapping_target_package_by_path_for_user(user_id, path_text);
+    if package_name.is_empty() || policy::is_attribution_intermediate_package(&package_name) {
+        return None;
+    }
+    let uid = policy::get_fresh_uid_for_package_in_user(&package_name, user_id);
+    if uid < writer::ANDROID_APP_UID_START {
+        return None;
+    }
+    Some((package_name, uid))
 }
 
 // 按路径找回最近一次真实调用方登记的归属。MediaProvider 在 insert 阶段由应用
@@ -217,7 +259,7 @@ fn resolve_path_hint_caller_context(user_id: i32, path_text: &str) -> Option<(St
     if package_name.is_empty() || policy::is_system_writer_package(&package_name) {
         return None;
     }
-    let uid = policy::get_fresh_uid_for_package(&package_name);
+    let uid = policy::get_fresh_uid_for_package_in_user(&package_name, user_id);
     if uid < writer::ANDROID_APP_UID_START {
         return None;
     }
@@ -252,7 +294,7 @@ fn resolve_mapping_request_caller_context(
     if inferred.is_empty() {
         return None;
     }
-    let inferred_uid = policy::get_fresh_uid_for_package(&inferred);
+    let inferred_uid = policy::get_fresh_uid_for_package_in_user(&inferred, user_id);
     if inferred_uid >= writer::ANDROID_APP_UID_START {
         if !allow_uid_override
             && caller_uid >= writer::ANDROID_APP_UID_START
@@ -309,7 +351,14 @@ pub(crate) fn rewrite_media_store_storage_path_for_caller(
     // 它们没有 binder 调用方可言，只能靠这里登记的路径归属找回发起者。
     // 放行（Allow）分支同样需要，否则发起者配置放行真实路径时后续操作
     // 会因归属缺失而再次落入未解析路径。
-    remember_media_caller_hint(path_text, &caller_package, effective_uid);
+    //
+    // 但代写者以自身身份回退时不得登记：这种「归属＝代写者自己」的提示对后续归因
+    // 毫无价值，还会盖掉真实发起者的台账，让系统代写归因把有效归属改写成代写者，
+    // 进而判定为「未启用重定向」而放行请求路径（2026-11-10 A17 场景 39：
+    // SrtDlOwner 物理落点留在请求路径、MediaStore 记录却指向映射目标）。
+    if !policy::is_attribution_intermediate_package(&caller_package) {
+        remember_media_caller_hint(path_text, &caller_package, effective_uid);
+    }
     if let Some(mapped_target) =
         resolve_mapping_view_open_target(path_text, &caller_package, effective_uid)
         && let Some(rewritten) =
@@ -580,18 +629,8 @@ pub(crate) fn is_redirect_enabled_for_caller_uid(caller_uid: i32) -> bool {
     if caller_uid < 0 {
         return false;
     }
-    refresh_settings_snapshot();
-    let mut packages = policy::get_packages_for_uid(caller_uid);
-    if packages.is_empty() {
-        policy::refresh_shared_uid_cache();
-        packages = policy::get_packages_for_uid(caller_uid);
-    }
-    packages.sort();
-    packages.dedup();
-    packages.retain(|pkg| !pkg.is_empty() && !policy::is_system_writer_package(pkg));
-    packages
-        .iter()
-        .any(|pkg| SettingsHub::instance().should_redirect(pkg, caller_uid))
+    let package = resolve_redirect_caller_package(caller_uid);
+    !package.is_empty() && SettingsHub::instance().should_redirect(&package, caller_uid)
 }
 
 pub(crate) fn storage_path_exists_by_syscall(path_text: &str) -> bool {
@@ -1315,154 +1354,51 @@ struct PlaceholderCandidate {
     request_len: usize,
 }
 
-/// uid→包名解析的记忆化：cursor 过滤对**同一查询**的每一行都会走到这里
-/// （issue #7：TIM 一次查询两万行，行行重付包表解析、排序去重与按包过滤）。
-/// 只记忆化「只由 uid 决定」的结果——单包 uid 的归属、以及只按启用开关过滤出的
-/// 唯一启用包；共享 uid 的按路径推断结果与行有关，绝不入缓存。
-static CALLER_PACKAGE_MEMO: std::sync::Mutex<Option<CallerPackageMemo>> =
-    std::sync::Mutex::new(None);
-const CALLER_PACKAGE_MEMO_TTL_MS: i64 = 2_000;
-
-#[derive(Default)]
-struct CallerPackageMemo {
-    uid: i32,
-    at_ms: i64,
-    /// 单包 uid 的归属（`resolve_caller_package`）。
-    resolved: Option<String>,
-    /// 只按启用开关过滤后唯一的启用包（`resolve_redirect_caller_package`）。
-    redirect_only: Option<String>,
-}
-
-fn memo_is_fresh(memo: &Option<CallerPackageMemo>, caller_uid: i32) -> bool {
-    memo.as_ref().is_some_and(|memo| {
-        memo.uid == caller_uid
-            && paths::monotonic_ms().saturating_sub(memo.at_ms) < CALLER_PACKAGE_MEMO_TTL_MS
-    })
-}
-
-fn cached_caller_package(caller_uid: i32, redirect_only: bool) -> Option<String> {
-    let memo = CALLER_PACKAGE_MEMO.lock().ok()?;
-    if !memo_is_fresh(&memo, caller_uid) {
-        return None;
+fn resolve_caller_package(caller_uid: i32, _path_text: &str) -> String {
+    if crate::hook::is_caller_attribution_stopped() {
+        return String::new();
     }
-    let memo = memo.as_ref()?;
-    if redirect_only {
-        memo.redirect_only.clone()
-    } else {
-        memo.resolved.clone()
-    }
-}
-
-fn remember_caller_package(caller_uid: i32, package: &str, redirect_only: bool) {
-    if package.is_empty() {
-        return;
-    }
-    let Ok(mut memo) = CALLER_PACKAGE_MEMO.lock() else {
-        return;
-    };
-    let now_ms = paths::monotonic_ms();
-    if !memo_is_fresh(&memo, caller_uid) {
-        *memo = Some(CallerPackageMemo {
-            uid: caller_uid,
-            at_ms: now_ms,
-            ..CallerPackageMemo::default()
-        });
-    }
-    if let Some(memo) = memo.as_mut() {
-        let slot = if redirect_only {
-            &mut memo.redirect_only
-        } else {
-            &mut memo.resolved
-        };
-        *slot = Some(package.to_string());
-    }
-}
-
-fn resolve_caller_package(caller_uid: i32, path_text: &str) -> String {
     refresh_settings_snapshot();
-    let current_package = InterceptHub::instance().get_current_caller_package();
+    let hub = InterceptHub::instance();
+    let current_package = hub.get_current_caller_package();
+    if crate::hook::is_current_caller_scope_active() && hub.get_current_caller_uid() == caller_uid {
+        // 空包名也是本次请求的结果，不能再按路径或启用配置猜共享 UID 的成员。
+        return current_package;
+    }
     if is_package_uid_match(&current_package, caller_uid) {
         return current_package;
     }
-    let saved_package = crate::hook::get_binder_saved_caller_package();
-    if is_package_uid_match(&saved_package, caller_uid) {
-        return saved_package;
+    if crate::hook::is_binder_identity_cleared() {
+        let saved_package = crate::hook::get_binder_saved_caller_package();
+        if is_package_uid_match(&saved_package, caller_uid) {
+            return saved_package;
+        }
     }
-    if let Some(cached) = cached_caller_package(caller_uid, false) {
-        return cached;
-    }
-    let mut packages = caller_redirect_packages(caller_uid);
-    if packages.len() == 1 {
-        let package = packages.remove(0);
-        remember_caller_package(caller_uid, &package, false);
-        return package;
-    }
-    let inferred =
-        SettingsHub::instance().resolve_redirect_package_by_path_for_user(caller_uid, path_text);
-    if is_package_uid_match(&inferred, caller_uid) {
-        return inferred;
-    }
-    let mut enabled = packages
-        .into_iter()
-        .filter(|pkg| SettingsHub::instance().should_redirect(pkg, caller_uid))
-        .collect::<Vec<_>>();
-    if enabled.len() == 1 {
-        return enabled.remove(0);
-    }
-    String::new()
-}
-
-fn resolve_redirect_caller_package(caller_uid: i32) -> String {
-    refresh_settings_snapshot();
-    let current_package = InterceptHub::instance().get_current_caller_package();
-    if is_package_uid_match(&current_package, caller_uid) {
-        return current_package;
-    }
-    let saved_package = crate::hook::get_binder_saved_caller_package();
-    if is_package_uid_match(&saved_package, caller_uid) {
-        return saved_package;
-    }
-    if let Some(cached) = cached_caller_package(caller_uid, true) {
-        return cached;
-    }
-    let resolved = resolve_redirect_caller_package_uncached(caller_uid);
-    remember_caller_package(caller_uid, &resolved, true);
-    resolved
-}
-
-fn resolve_redirect_caller_package_uncached(caller_uid: i32) -> String {
-    let mut enabled = caller_redirect_packages(caller_uid)
-        .into_iter()
-        .filter(|pkg| SettingsHub::instance().should_redirect(pkg, caller_uid))
-        .collect::<Vec<_>>();
-    if enabled.len() == 1 {
-        enabled.remove(0)
-    } else {
-        String::new()
-    }
-}
-
-/// 当前 uid 名下可参与重定向的包：已排序去重并剔除系统代写包。
-fn caller_redirect_packages(caller_uid: i32) -> Vec<String> {
     let mut packages = policy::get_packages_for_uid(caller_uid);
     if packages.is_empty() {
         policy::refresh_shared_uid_cache();
         packages = policy::get_packages_for_uid(caller_uid);
     }
-    packages.sort();
-    packages.dedup();
-    packages.retain(|pkg| !pkg.is_empty() && !policy::is_system_writer_package(pkg));
-    packages
+    if packages.len() == 1 {
+        packages.remove(0)
+    } else {
+        String::new()
+    }
+}
+
+fn resolve_redirect_caller_package(caller_uid: i32) -> String {
+    resolve_caller_package(caller_uid, "")
 }
 
 fn is_package_uid_match(package_name: &str, caller_uid: i32) -> bool {
-    if package_name.is_empty() || caller_uid < writer::ANDROID_APP_UID_START {
+    if caller_uid < 0 || package_name.is_empty() {
         return false;
     }
-    let mut package_uid = policy::get_uid_for_package(package_name);
-    if package_uid < writer::ANDROID_APP_UID_START {
+    let user_id = platform::user_id_from_uid(caller_uid);
+    let mut package_uid = policy::get_uid_for_package_in_user(package_name, user_id);
+    if package_uid < 0 {
         policy::refresh_shared_uid_cache();
-        package_uid = policy::get_uid_for_package(package_name);
+        package_uid = policy::get_uid_for_package_in_user(package_name, user_id);
     }
     package_uid == caller_uid
 }
@@ -1570,23 +1506,31 @@ enum CallerRowPlan {
 }
 
 thread_local! {
-    static CALLER_ROW_PLAN: std::cell::RefCell<Option<(i32, String, CallerRowPlan)>> =
+    static CALLER_ROW_PLAN: std::cell::RefCell<Option<(i32, String, u64, CallerRowPlan)>> =
         const { std::cell::RefCell::new(None) };
 }
 
 fn caller_row_plan(caller_package: &str, caller_uid: i32) -> CallerRowPlan {
+    let version = SettingsHub::instance().config_version();
     let cached = CALLER_ROW_PLAN.with(|slot| {
         let slot = slot.borrow();
         slot.as_ref()
-            .filter(|(uid, package, _)| *uid == caller_uid && package == caller_package)
-            .map(|(_, _, plan)| plan.clone())
+            .filter(|(uid, package, cached_version, _)| {
+                *uid == caller_uid && package == caller_package && *cached_version == version
+            })
+            .map(|(_, _, _, plan)| plan.clone())
     });
     if let Some(plan) = cached {
         return plan;
     }
     let plan = compute_caller_row_plan(caller_package, caller_uid);
     CALLER_ROW_PLAN.with(|slot| {
-        *slot.borrow_mut() = Some((caller_uid, caller_package.to_string(), plan.clone()));
+        *slot.borrow_mut() = Some((
+            caller_uid,
+            caller_package.to_string(),
+            version,
+            plan.clone(),
+        ));
     });
     plan
 }

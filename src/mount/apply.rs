@@ -1,14 +1,13 @@
 use super::apply_targets::{
     build_allowed_real_source_candidates, build_mapping_source_roots, build_read_only_source_roots,
     collect_restored_read_only_excluded_children, detach_mount_if_present,
-    is_covered_by_scoped_fuse_mount, mount_source_for_target_from_mountinfo,
-    mountinfo_device_for_target, mountinfo_has_own_private_restore_layer, mountinfo_has_target,
-    mountinfo_root_is_app_sandbox, mountinfo_root_matches_data_backend,
+    is_covered_by_scoped_fuse_mount, mountinfo_device_for_target,
+    mountinfo_has_own_private_restore_layer, mountinfo_has_target, mountinfo_root_is_app_sandbox,
     namespace_mappings_outside_scoped_fuse, path_overlaps_mapping_request,
     path_shadows_mapping_request, read_mountinfo,
 };
 use super::map::PathMappingApplyOptions;
-use super::{MountPlanner, concrete_mount_fallback_parent};
+use super::{MountPlanner, SystemViewClone, concrete_mount_fallback_parent};
 use crate::domain::PathMapping;
 use crate::platform::{fs, module_paths, paths};
 
@@ -16,281 +15,142 @@ use crate::platform::{fs, module_paths, paths};
 const SYSTEM_UID_LIMIT: i32 = 10000;
 
 impl MountPlanner {
-    fn prepare_real_storage_anchor(&mut self, storage_path: &str) -> Option<String> {
+    fn prepare_real_storage_anchor(&mut self, _storage_path: &str) -> Option<String> {
         self.real_storage_anchor = None;
-        let real_storage_anchor_root = module_paths::REAL_STORAGE_TMP_DIR;
-        let real_storage_anchor = paths::join(real_storage_anchor_root, &self.user_id.to_string());
+        let anchor_mount = super::apply_targets::real_storage_anchor_mount_path(self.user_id);
+        let usable = super::apply_targets::real_storage_anchor_usable_path(self.user_id);
 
-        // storage_root_is_already_redirected 与 real_storage_anchor_is_usable 都是只读探测，
-        // 且两者之间没有挂载变更，共享一次 mountinfo 读取，避免重复整份读取与解析。
-        let mountinfo = if self.redirect_target.is_empty() {
-            String::new()
-        } else {
-            read_mountinfo().unwrap_or_default()
-        };
+        if self.real_storage_anchor_is_usable(&anchor_mount, &usable) {
+            self.real_storage_anchor = Some(usable.clone());
+            return Some(usable);
+        }
 
-        if self.storage_root_is_already_redirected(&mountinfo, storage_path) {
-            if self.real_storage_anchor_is_usable(&mountinfo, &real_storage_anchor) {
-                // 复用前必须确认这个锚点指向的是**真实存储根**，而不是被上一轮重定向污染成沙箱的树。
-                //
-                // 配置热更新时顶层 `/storage/emulated/<user>` 已经被上一轮的沙箱挂载覆盖，这里因此
-                // 判定「已重定向」并复用旧锚点；但旧锚点在上一轮里是从当时的 `/storage/emulated/<user>`
-                // 绑过来的，那时它已经是沙箱，于是锚点也被污染。复用污染锚点会让后继的
-                // `path_mappings` 找不到真实源目录：`apply_resolved_path_mappings` 静默返回 false，
-                // 只留下 `redirect done`，映射目标落到沙箱内而不是真实公共路径
-                // （真机上表现为场景 29 的 `file_missing .../Download/Test/srt_hot_after.txt`，
-                // 文件实际在 .../Android/data/<pkg>/sdcard/Download/Test/）。
-                //
-                // 锚点健康时它应当把真实存储根挂在自身路径上，`root` 字段形如 `/media/<user>`；
-                // 被污染时 `root` 会带 `Android/data/<包名>`。判定只排除「指向本应用沙箱」这一种
-                // 明确污染形态，其它形态仍按可用处理，避免把既有环境差异误判成污染而反复重绑。
-                if !mountinfo_root_is_app_sandbox(
-                    &mountinfo,
-                    &real_storage_anchor,
-                    &self.package_name,
-                ) {
-                    log::info!(
-                        "real storage anchor reused after redirect pkg={} storage={} anchor={}",
-                        self.package_name,
-                        storage_path,
-                        real_storage_anchor
-                    );
-                    self.real_storage_anchor = Some(real_storage_anchor.clone());
-                    return Some(real_storage_anchor.to_string());
-                }
-                log::warn!(
-                    "real storage anchor polluted by previous redirect, rebinding pkg={} anchor={}",
-                    self.package_name,
-                    real_storage_anchor
-                );
-            } else {
-                log::warn!(
-                    "real storage anchor unavailable after redirect, fallback backend pkg={} storage={} anchor={} target={}",
-                    self.package_name,
-                    storage_path,
-                    real_storage_anchor,
-                    self.redirect_target
-                );
-            }
-            // 锚点不可用或被上一轮重定向污染时，摘除视图根上的重定向绑定，用**真实可见
-            // 视图**重建锚点，然后立刻把重定向绑回去。
-            //
-            // 顺序即安全性：摘除之后视图根会短暂回落为真实公共存储，若应用在这个窗口里
-            // 写入，本该进沙箱的文件会落到公共路径。因此下面三个动作必须紧邻执行，中间
-            // 不得插入任何 IO、目录创建或路径遍历——窗口被压缩到三次系统调用。重建用的
-            // 源是重定向目标（沙箱）路径，不经过视图根，所以可以在窗口内安全使用。
-            //
-            // 之所以不能用 /data/media 后端锚点代替：该设备上 /data/media 是 ext4 而不是
-            // FUSE，用它作为映射源会绕过 FUSE 权限层，应用对映射目标没有写权限（表现为
-            // 热重载后首次写入成功、随后连续 Permission denied）。
-            detach_mount_if_present(storage_path);
-            let rebound = self.bind_mount(storage_path, &real_storage_anchor, true);
-            let redirect_backend = self.to_data_media_backend_path(&self.redirect_target);
-            let restored = if redirect_backend.is_empty() {
-                false
-            } else {
-                self.bind_mount(&redirect_backend, storage_path, true)
-            };
-            if rebound {
-                log::info!(
-                    "real storage anchor rebound after detaching redirect pkg={} storage={} anchor={} redirect_restored={}",
-                    self.package_name,
-                    storage_path,
-                    real_storage_anchor,
-                    restored
-                );
-                self.real_storage_anchor = Some(real_storage_anchor.clone());
-                return Some(real_storage_anchor.to_string());
-            }
+        // 重建锚点。源按优先级取 **emulated 根**：
+        //   1) `/mnt/user/<user>/emulated`：MediaProvider FUSE 的真实视图；
+        //   2) `/data/media`：f2fs 后端（MP 不可用时的回退）。
+        //
+        // 两者结构相同（第一段 `<user>` 才是用户存储根），因此可用根口径一致。
+        //
+        // 为什么源必须是 emulated 根、且必须**非递归**：本模块会把
+        // `<emulated>/<user>`（主视图根与三个别名）换成自己的 FUSE。直接 bind
+        // `/storage/emulated/<user>`、或递归 bind emulated 根本身，拿到的都是
+        // **被本模块重定向过的**树——锚点于是指向沙箱，映射目标会落进沙箱而不是真实
+        // 公共路径（历史故障：场景 29 `Download/Test` 落点错、热重载后写入 Permission
+        // denied）。emulated 根本身我们从不覆盖，非递归 bind 只复制那一层，`<user>`
+        // 回落到 MediaProvider 的普通目录节点，正是需要的干净真实视图。
+        //
+        // 由此还消掉了一条更危险的旧路径：过去热重载时锚点可能被污染，修复方式是在
+        // 「存储根已重定向」分支里 **摘掉视图根 → 用真实视图重建锚点 → 立刻绑回**，
+        // 中间有三次系统调用的 fail-open 窗口（窗口内应用写入会落到公共路径）。新源
+        // 不可能被自己的重定向污染，这条分支整条去掉。
+        detach_mount_if_present(&anchor_mount);
+        if !self.ensure_directory_exists(&anchor_mount, false) {
             log::warn!(
-                "real storage anchor rebound failed, fallback backend pkg={} storage={} anchor={}",
+                "real storage anchor dir unavailable pkg={} anchor={}",
                 self.package_name,
-                storage_path,
-                real_storage_anchor
+                anchor_mount
             );
-            let anchor = self.bind_data_media_real_storage_anchor(
-                real_storage_anchor_root,
-                &real_storage_anchor,
+            return None;
+        }
+        let sources = [
+            format!("/mnt/user/{}/emulated", self.user_id),
+            "/data/media".to_string(),
+        ];
+        for source in sources {
+            if !fs::is_directory(&source) {
+                log::debug!(
+                    "real storage anchor source absent pkg={} source={}",
+                    self.package_name,
+                    source
+                );
+                continue;
+            }
+            detach_mount_if_present(&anchor_mount);
+            if !self.bind_mount(&source, &anchor_mount, false) {
+                continue;
+            }
+            if !fs::is_directory(&usable) {
+                log::warn!(
+                    "real storage anchor has no user root pkg={} source={} usable={}",
+                    self.package_name,
+                    source,
+                    usable
+                );
+                detach_mount_if_present(&anchor_mount);
+                continue;
+            }
+            // 兜底复核：锚点的 root 不得指向本应用沙箱（正常不会发生，但一旦发生，
+            // 用它解析映射源会把映射目标落进沙箱，属静默数据错位，必须有明确判据）。
+            let fresh_mountinfo = read_mountinfo().unwrap_or_default();
+            if mountinfo_root_is_app_sandbox(&fresh_mountinfo, &anchor_mount, &self.package_name) {
+                log::warn!(
+                    "real storage anchor points at app sandbox, rejected pkg={} source={} anchor={}",
+                    self.package_name,
+                    source,
+                    anchor_mount
+                );
+                detach_mount_if_present(&anchor_mount);
+                continue;
+            }
+            log::info!(
+                "real storage anchored {} -> {} (usable {}) pkg={}",
+                source,
+                anchor_mount,
+                usable,
+                self.package_name
             );
-            self.real_storage_anchor = anchor.clone();
-            return anchor;
+            self.real_storage_anchor = Some(usable.clone());
+            return Some(usable);
         }
-
-        if let Some(anchor) = self.bind_visible_real_storage_anchor(
-            storage_path,
-            real_storage_anchor_root,
-            &real_storage_anchor,
-        ) {
-            self.real_storage_anchor = Some(anchor.clone());
-            return Some(anchor);
-        }
-
-        // 走到这里说明所有可见别名源建出来的锚点都指向本应用沙箱：判为「未重定向」并不
-        // 代表视图根真的干净，热重载时 storage_root_is_already_redirected 可能漏检（run
-        // 35452820455 实测：该分支下 6 个可见源全部被判污染）。此时同样摘除视图根上的
-        // 重定向、用真实视图重建锚点、再立即绑回，而不是退回后端锚点——后端锚点在部分
-        // 设备上指向 ext4 的 /data/media，会绕过 FUSE 权限层导致 Permission denied。
-        // 三个动作紧邻执行，窗口压缩到三次系统调用，中间不得插入 IO。
-        detach_mount_if_present(storage_path);
-        let rebound = self.bind_visible_real_storage_anchor(
-            storage_path,
-            real_storage_anchor_root,
-            &real_storage_anchor,
+        log::warn!(
+            "real storage anchor unavailable pkg={} anchor={}",
+            self.package_name,
+            anchor_mount
         );
-        let redirect_backend = self.to_data_media_backend_path(&self.redirect_target);
-        let restored = if redirect_backend.is_empty() {
-            false
-        } else {
-            self.bind_mount(&redirect_backend, storage_path, true)
-        };
-        if let Some(anchor) = rebound {
-            log::info!(
-                "real storage anchor rebound after detaching redirect (unredirected branch) pkg={} storage={} anchor={} redirect_restored={}",
-                self.package_name,
-                storage_path,
-                anchor,
-                restored
-            );
-            self.real_storage_anchor = Some(anchor.clone());
-            return Some(anchor);
-        }
-
-        let anchor = self
-            .bind_data_media_real_storage_anchor(real_storage_anchor_root, &real_storage_anchor);
-        self.real_storage_anchor = anchor.clone();
-        anchor
-    }
-
-    fn bind_visible_real_storage_anchor(
-        &self,
-        storage_path: &str,
-        real_storage_anchor_root: &str,
-        real_storage_anchor: &str,
-    ) -> Option<String> {
-        if !self.ensure_directory_exists(real_storage_anchor_root, false)
-            || !self.ensure_directory_exists(real_storage_anchor, false)
-        {
-            return None;
-        }
-
-        let data_media_root = paths::data_media_user_root_for_user(self.user_id);
-        for source_candidate in self.expand_storage_alias_paths(storage_path) {
-            if paths::eq_ignore_case(&source_candidate, &data_media_root) {
-                continue;
-            }
-            if !fs::is_directory(&source_candidate) {
-                continue;
-            }
-            detach_mount_if_present(real_storage_anchor);
-            if self.bind_mount(&source_candidate, real_storage_anchor, true) {
-                // 绑定后必须复核锚点没有指向本应用沙箱：热重载时
-                // `storage_root_is_already_redirected` 可能判为「未重定向」并走到这里，
-                // 但 `/storage/emulated/<user>` 的可见内容已被上一轮重定向覆盖，绑定出来的
-                // 锚点 `root` 会带 `Android/{data,media,obb}/<包名>`，指向沙箱而不是真实存储。
-                // 用被污染的锚点解析 path_mappings 源目录，映射目标会落到沙箱内而不是真实
-                // 公共路径（场景 29 的 `Download/Test` 落点错）。复核失败就摘掉重来，由上层
-                // 回退到以 `/data/media` 为源的后端锚点，那里不受重定向影响。
-                let fresh_mountinfo = read_mountinfo().unwrap_or_default();
-                if mountinfo_root_is_app_sandbox(
-                    &fresh_mountinfo,
-                    real_storage_anchor,
-                    &self.package_name,
-                ) {
-                    log::warn!(
-                        "real storage anchor visible bind polluted, retry backend pkg={} source={} anchor={}",
-                        self.package_name,
-                        source_candidate,
-                        real_storage_anchor
-                    );
-                    detach_mount_if_present(real_storage_anchor);
-                    continue;
-                }
-                log::info!(
-                    "real storage anchored visible {} -> {}",
-                    source_candidate,
-                    real_storage_anchor
-                );
-                return Some(real_storage_anchor.to_string());
-            }
-        }
         None
     }
 
-    fn bind_data_media_real_storage_anchor(
-        &self,
-        real_storage_anchor_root: &str,
-        real_storage_anchor: &str,
-    ) -> Option<String> {
-        if !self.ensure_directory_exists(real_storage_anchor_root, false)
-            || !self.ensure_directory_exists(real_storage_anchor, false)
-        {
-            return None;
-        }
-
-        let data_media_root = paths::data_media_user_root_for_user(self.user_id);
-        if !fs::is_directory(&data_media_root) {
-            log::warn!(
-                "real storage anchor backend missing pkg={} backend={}",
-                self.package_name,
-                data_media_root
-            );
-            return None;
-        }
-
-        detach_mount_if_present(real_storage_anchor);
-        if self.bind_mount(&data_media_root, real_storage_anchor, false) {
-            log::info!(
-                "real storage anchored backend {} -> {}",
-                data_media_root,
-                real_storage_anchor
-            );
-            return Some(real_storage_anchor.to_string());
-        }
-
-        None
-    }
-
-    fn real_storage_anchor_is_usable(&self, mountinfo: &str, real_storage_anchor: &str) -> bool {
-        if !fs::is_directory(real_storage_anchor) {
+    /// 锚点是否可直接复用：挂载仍在、可用根有内容、且没有指向本应用沙箱。
+    fn real_storage_anchor_is_usable(&self, anchor_mount: &str, usable: &str) -> bool {
+        if !fs::is_directory(usable) {
             return false;
         }
-        if !mountinfo_has_target(mountinfo, real_storage_anchor) {
+        let mountinfo = read_mountinfo().unwrap_or_default();
+        if !mountinfo_has_target(&mountinfo, anchor_mount) {
+            return false;
+        }
+        if mountinfo_root_is_app_sandbox(&mountinfo, anchor_mount, &self.package_name) {
+            log::warn!(
+                "real storage anchor polluted by sandbox, rebuilding pkg={} anchor={}",
+                self.package_name,
+                anchor_mount
+            );
             return false;
         }
         ["Android", "Download", "DCIM"]
             .iter()
-            .any(|child| fs::is_directory(&paths::join(real_storage_anchor, child)))
+            .any(|child| fs::is_directory(&paths::join(usable, child)))
     }
 
-    fn storage_root_is_already_redirected(&self, mountinfo: &str, storage_path: &str) -> bool {
-        if self.redirect_target.is_empty() {
-            return false;
+    /// 摘除真实存储锚点（用完即摘）。
+    ///
+    /// 锚点只是映射源与元数据换算用的临时真实视图，不承载任何应用可见路径；留在应用
+    /// 挂载表里就是一条模块私有路径（`tmp/real_storage/<user>`），也就是 namespace 后端
+    /// 唯一剩下的字符串痕迹。摘除只改挂载表：已建立的映射层各自持有超级块与 dentry
+    /// 引用，内容与访问都不受影响。
+    ///
+    /// 幂等：没有锚点（或已被外部摘除）时只清空字段。
+    pub fn detach_real_storage_anchor(&mut self) {
+        if self.real_storage_anchor.take().is_none() {
+            return;
         }
-        let redirect_backend = self.to_data_media_backend_path(&self.redirect_target);
-        if redirect_backend.is_empty() {
-            return false;
-        }
-        let Some(root) = mount_source_for_target_from_mountinfo(mountinfo, storage_path) else {
-            return false;
-        };
-        if paths::is_same_or_child(&redirect_backend, &root) {
-            return true;
-        }
-        let matched = mountinfo_root_matches_data_backend(&root, &redirect_backend);
-        if matched {
-            // 走到归一化命中说明视图根由系统 FUSE 视图承载（`root` 写作 `/<user>/...`）。
-            // 这条记录必须与「真正未重定向」在日志里分得开：前者是复用既有锚点、映射沿用
-            // FUSE 后端权限层的前置条件；后者才是重建锚点流程的起点，而重建在当前视图根
-            // 仍指向沙箱时必然失败并退回 `/data/media` 后端锚点。
-            log::info!(
-                "storage root redirected via fuse view pkg={} target={} root={} backend={}",
-                self.package_name,
-                storage_path,
-                root,
-                redirect_backend
-            );
-        }
-        matched
+        let anchor_mount = super::apply_targets::real_storage_anchor_mount_path(self.user_id);
+        detach_mount_if_present(&anchor_mount);
+        log::info!(
+            "real storage anchor detached anchor={} pkg={}",
+            anchor_mount,
+            self.package_name
+        );
     }
 
     pub fn apply_sdcard_redirect(
@@ -358,9 +218,16 @@ impl MountPlanner {
             return false;
         }
 
+        let redirect_root_preexisting = fs::is_directory(&resolved_target);
         if !self.ensure_directory_exists(&resolved_target, false) {
             log::error!("mkdir redirect failed: {}", resolved_target);
             return false;
+        }
+        // 本次新建的重定向根必须当场归位成原生形态（应用属主 + 继承组 + 02770）：
+        // 随后两处「已存在的私有目录不得改写」守卫会把新建目录一并跳过，属主就固定成
+        // 了运行本流程的 root，系统代写进程只剩组 r-x、进不了沙盒。
+        if !redirect_root_preexisting {
+            self.ensure_native_private_dir_owner(&resolved_target, self.app_uid);
         }
 
         if !self.ensure_writable_mapped_directory(&resolved_target, self.app_uid) {
@@ -380,9 +247,18 @@ impl MountPlanner {
         }
 
         let mut is_storage_redirect_applied = false;
+        // P5-c：主挂载目标与会话挂载点必须同源。整体重定向时上提一层（`…/emulated`），
+        // scoped 子路径保持原位；两处不一致会让策略的 `view_lifted`（由挂载点形态派生）
+        // 与实际落点错位，症状是根目录列错或整棵视图 ENOENT。
+        // P5-c 修订：内容 bind（沙盒根）的落点不上提，保持用户根原样——用户根
+        // `/storage/emulated/<user>` 是 OS 级寻址约定，应用永远按它读写；把沙盒 bind 抬到
+        // 视图根会让应用视图多出一层未剥离的 `<user>` 段，写入落点全部错位（CI Test-flow
+        // 场景 2 全矩阵失败的根因，真机二分 + 应用视图对照实证）。上提的作用域是 FUSE
+        // 视图自身的挂载点（接入根由 host_attach_root_for_user 派生），与内容 bind 无关。
+        let view_root = storage_path.clone();
         if !self.bind_mount_with_storage_aliases(
             &resolved_target,
-            &storage_path,
+            &view_root,
             true,
             super::PrimaryMountFailure::AbortAll,
             Some("storage main mount failed"),
@@ -723,13 +599,14 @@ impl MountPlanner {
         // 源必须是**系统视图锚点**：`real_storage_anchor` 在部分形态下会被污染成沙箱、
         // 或退回 `/data/media` 的 f2fs 后端锚点，用它 bind 会把自有私有目录重新拉出系统
         // FUSE 层，回到「宿主 FUSE 与系统 FUSE 各持一层页缓存」的分裂形态。
-        let Some(system_view) = self.ensure_system_view_anchor() else {
+        let Some(anchor) = self.create_transient_system_view_anchor() else {
             log::warn!(
                 "own private system view anchor unavailable pkg={}",
                 self.package_name
             );
             return 0;
         };
+        let system_view = anchor.user_view.clone();
         for relative in private_roots {
             let storage_target = paths::join(storage_path, &relative);
             let is_media = relative.starts_with("Android/media/");
@@ -770,10 +647,13 @@ impl MountPlanner {
             // 自有 media 子树随后会被 bind 回系统 MediaProvider 视图，而 MP 的
             // FuseDaemon 只能用自身身份打开下层文件（附加组 media_rw/ext_data_rw，
             // CapEff=0）：owner-only 入口在系统视图里连属主自己都打不开（原生同样
-            // 打不开，这是 MP 的既有语义）。这里**不改任何权限位**，只把这种
-            // 「系统视图无法服务」的入口记进诊断，便于现场按日志定位。
+            // 打不开，这是 MP 的既有语义）。这里在把目录交回共享视图**之前**把组位
+            // 归一到「属主位的镜像」并复核，否则「拿回系统视图即打不开」，应用侧就是
+            // PRAGMA journal_mode 阶段的 SQLITE_CANTOPEN（真机 2026-11-12）。
+            // 位置必须在幂等判据之前：已经恢复过的目录会走 `continue`，那恰好是最需要
+            // 归一的已落地场景。
             if is_media {
-                self.report_unserviceable_private_entries(&backend_source);
+                self.normalize_own_private_sqlite_access(&backend_source);
             }
             // 三类自有私有目录统一保留系统 FUSE 的访问控制与上下文：源取系统视图锚点，
             // 缺失时不把 /data/media 直接暴露给应用，保留诊断等待后续恢复。
@@ -836,7 +716,7 @@ impl MountPlanner {
             // 恢复只用 root 身份：目标挂载点在应用视图里，但它的可解析性由
             // `/storage/emulated` 层（MediaProvider 的 FUSE）决定。MP 对**注册过的
             // uid/pid** 才放行，对模块 fork 出的子进程（无论 root 还是降权到应用
-            // uid）在就绪窗口内一律拒绝——真机 2026-11-04 duchamp 实测：同一时刻
+            // uid）在就绪窗口内一律拒绝——真机 2026-11-04 实测：同一时刻
             // root 逐级可达而应用 uid 整片 EACCES，且降权子进程拿到的是更严的
             // EACCES 而非 ENOENT。因此「降权取句柄」救不了这个场景，恢复的成败
             // 只取决于 MP 视图是否已就绪（root 侧 `root_view` 链），见重试闭环。
@@ -855,7 +735,7 @@ impl MountPlanner {
                     crate::mount::own_private_pending::note_success(&self.package_name);
                 }
                 // **不做属主归一**：原生 MediaProvider FUSE 下文件的属主是创建者
-                // 应用 uid（duchamp A16 原生对照实证：9 月20 日微信经原生 FUSE 创建
+                // 应用 uid（A16 原生对照实证：9 月20 日微信经原生 FUSE 创建
                 // 的 `Android/media/com.tencent.mm` 属主为微信 uid，组 media_rw），
                 // 访问放行由 MP 权限层（media 子树共享，见 MP hook 放行）与宿主
                 // 数据面的 root 身份保证，不依赖 DAC 属主。此前的整树 chown 到
@@ -892,21 +772,6 @@ impl MountPlanner {
         restored_count
     }
 
-    /// 只读诊断：统计自有 media 子树里「系统视图打不开」的 sqlite 入口。
-    ///
-    /// MediaProvider 的 FuseDaemon 用自身身份打开下层文件（AOSP `pf_open` 的
-    /// `open(io_path, flags)`，直通只是把这个自开的 fd 交给内核），而它的附加组只有
-    /// media_rw(1023)/ext_data_rw(1078)、`CapEff: 0`。owner-only 入口在系统视图里
-    /// **连属主自己都打不开**——真机 2026-11-04 duchamp 实证：root 经 MP 视图 open
-    /// 一个 0600 文件同样 EACCES，说明拒绝来自 MP 而非内核 DAC。这是 MP 的既有语义，
-    /// 模块**不去改权限位绕开它**（改了等于替用户决定别人的文件该有什么权限，其它
-    /// 场景的后果不可预知），只把现场记进 verbose 日志，便于按 `mode=` 定位到底是
-    /// 哪个入口、由哪条绕过系统视图的写入路径产生的。
-    ///
-    /// 判据只看「属主有、组没有」这一条：组位覆盖了属主位时 MP 就能服务，无需上报。
-    /// 深度与条目数都有上界，避免在大媒体目录上做全量遍历。
-    /// 判据只看「属主有、组没有」这一条：组位覆盖了属主位时 MP 就能服务，无需上报。
-    /// 深度与条目数都有上界，避免在大媒体目录上做全量遍历。
     /// 失败现场的存储视图快照：本进程命名空间里 `/storage/emulated*` 的挂载清单 +
     /// root 身份逐级可达性。
     ///
@@ -915,6 +780,8 @@ impl MountPlanner {
     ///   重试/延后才有可能成功；
     /// - **视图在、但该名字被拒绝**（`root_dir=true`，只有目标级 errno≠0）→ 那是数据面
     ///   或 DAC 语义问题，重试永远不会成功，必须换路径。
+    ///
+    /// 判据只看「属主有、组没有」这一条：组位覆盖了属主位时 MP 就能服务，无需上报。
     fn describe_storage_view(&self, storage_path: &str) -> String {
         let mut mounts = String::new();
         for line in read_mountinfo().unwrap_or_default().lines() {
@@ -1000,14 +867,40 @@ impl MountPlanner {
         format!("no({})", crate::platform::errno::last())
     }
 
-    fn report_unserviceable_private_entries(&self, media_root: &str) {
+    /// 让自有 media 子树里的 sqlite 入口对系统视图可服务：补齐组位、复核、留痕。
+    ///
+    /// MediaProvider 的 FuseDaemon 用自身身份打开下层文件（AOSP `pf_open` 的
+    /// `open(io_path, flags)`，直通只是把这个自开的 fd 交给内核，内核不会改用调用方
+    /// 凭据重开），而它的附加组只有 media_rw(1023)/ext_data_rw(1078)、`CapEff: 0`。
+    /// 于是**组位就是可服务性**：`0660` 能开，owner-only 一律 EACCES——而且连属主自己
+    /// 也打不开，因为这次 `open()` 是 MP 代发的。真机 2026-11-12 实证：root 经
+    /// MP 视图读 0600 的 `-wal`/`-shm` 得 EACCES，管理器侧就是
+    /// `SQLITE_CANTOPEN (code 14) while compiling: PRAGMA journal_mode`（一次冷启 16 条）。
+    ///
+    /// owner-only 只可能来自绕过 MP 的写入路径：SQLite 自建边车按 umask 077 落 0600，
+    /// 而 f2fs 直连层不会像 MP 那样把 mode 归一到 0664。这条产地已在写入侧关闭
+    /// （恢复源改回 MediaProvider FUSE 视图，见 `mount::SystemViewClone`）：本函数因此是
+    /// **历史遗留清理**，同时给「将来又以别的路径产出 owner-only 入口」留一道幂等兜底。
+    ///
+    /// 只做**组位镜像**（`mode |= (mode & 0o700) >> 3`）：不改属主、不动 other 位，也不
+    /// 给「属主自己只读」的入口额外授予写权限。`chmod` 会同时把继承来的 ACL mask 抬到
+    /// 新组位——媒体目录带 MediaProvider 的默认 ACL，0600 创建时内核把 `mask` 压成 `---`，
+    /// 光改 `group::` 条目无效，必须靠 chmod 重置 mask 才让 `group:media_rw` 真正生效。
+    /// 幂等：组位已覆盖属主位时不再改动；只处理属主就是本应用、名字属于 sqlite 的入口。
+    ///
+    /// 深度与条目数都有上界（与恢复主链路同源），避免在大媒体目录上做全量遍历。
+    /// 归一失败不回退任何挂载：`metadata_repair` 关闭的实验构建仍然只复核不修改。
+    fn normalize_own_private_sqlite_access(&self, media_root: &str) {
         use std::os::unix::fs::MetadataExt as _;
         use std::os::unix::fs::PermissionsExt as _;
         const MAX_DEPTH: usize = 4;
         const MAX_ENTRIES: usize = 512;
+        let can_repair = crate::metadata_repair::enabled();
 
         let mut queue = vec![(std::path::PathBuf::from(media_root), 0usize)];
         let mut visited = 0usize;
+        let mut normalized = 0usize;
+        let mut truncated = false;
         let mut unserviceable = 0usize;
         let mut sample = String::new();
         while let Some((dir, depth)) = queue.pop() {
@@ -1017,11 +910,7 @@ impl MountPlanner {
             for entry in entries.flatten() {
                 visited += 1;
                 if visited > MAX_ENTRIES {
-                    log::debug!(
-                        "own private serviceability scan truncated root={} visited={}",
-                        media_root,
-                        visited
-                    );
+                    truncated = true;
                     break;
                 }
                 let Ok(file_type) = entry.file_type() else {
@@ -1034,6 +923,8 @@ impl MountPlanner {
                     }
                     continue;
                 }
+                // 只认普通文件：符号链接的 mode 无意义（`set_permissions` 会打到链接目标
+                // 上），设备/管道也不是 sqlite 入口。
                 if !file_type.is_file() {
                     continue;
                 }
@@ -1053,14 +944,55 @@ impl MountPlanner {
                 {
                     continue;
                 }
+                if can_repair {
+                    let fixed_mode = mode | owner_bits_for_group;
+                    if std::fs::set_permissions(&path, std::fs::Permissions::from_mode(fixed_mode))
+                        .is_ok()
+                    {
+                        normalized += 1;
+                    }
+                }
+                // 复核读回的 mode 才是 MP 实际会看到的值：chmod 成功后语义由它决定，
+                // 失败时这里仍然会命中，两步不需要各写一份判据。
+                let verified = std::fs::symlink_metadata(&path)
+                    .map(|metadata| metadata.permissions().mode() & 0o7777)
+                    .unwrap_or(mode);
+                if verified & owner_bits_for_group == owner_bits_for_group {
+                    continue;
+                }
                 unserviceable += 1;
                 if sample.is_empty() {
-                    sample = format!("{} mode={:o}", path.display(), mode);
+                    sample = format!("{} mode={:o}", path.display(), verified);
                 }
             }
+            // 预算耗尽后队列里剩下的目录不再逐层 read_dir：`break` 只跳出内层循环，
+            // 内层已判定 truncated 时继续 pop 只会白扫一遍剩余目录。
+            if truncated {
+                break;
+            }
+        }
+        if normalized > 0 {
+            // 用 warn 而不是 info：`is_record_enabled` 只放行 warn/error（verbose 关闭时
+            // info 一律丢弃），而这条正是「应用曾经绕过系统视图写过 sqlite 入口」的唯一
+            // 事后证据——本次故障之所以只能靠应用侧 SQLITE_CANTOPEN 反推，就是因为模块
+            // 全程无声。修好即幂等，不会每次挂载重复刷。
+            log::warn!(
+                "own private sqlite access repaired count={} root={}",
+                normalized,
+                media_root
+            );
+        }
+        if truncated {
+            log::debug!(
+                "own private serviceability scan truncated root={} visited={}",
+                media_root,
+                visited
+            );
         }
         if unserviceable > 0 {
-            log::debug!(
+            // 提升到 warn：这条曾经是 debug，verbose 关闭时模块全程无声，现场只能靠
+            // 应用侧 SQLITE_CANTOPEN 反推。
+            log::warn!(
                 "own private sqlite entries unserviceable by system view count={} root={} sample={}",
                 unserviceable,
                 media_root,
@@ -1097,28 +1029,67 @@ impl MountPlanner {
         self.restore_own_private_directories(&storage_path, &data_media_root, scoped_fuse_roots)
     }
 
-    /// 建立（或复用）指向系统存储视图的私有锚点，返回**存储根结构**的路径。
+    /// 建立一个**临时**的系统存储视图锚点，返回持有它的守卫。
     ///
     /// 源取 `/mnt/user/<user>/emulated`：它在应用命名空间里恒为一层未被模块覆盖的
     /// MediaProvider FUSE 视图（模块只覆盖 `<user>` 子树与存储根，不覆盖 emulated
-    /// 本身）。整根 bind 之后，锚点下多一层 `<user>` 才是存储根结构，因此返回
+    /// 本身）。整根 bind 之后，锚点下多一层 `<user>` 才是存储根结构，因此可用视图是
     /// `<anchor>/<user>`；该层次不经过被覆盖的路径解析，是干净的系统视图。
     ///
-    /// 锚点根与 `real_storage` 分开存放（见 `module_paths::SYSTEM_VIEW_TMP_DIR`），
-    /// 避免与「存储根结构」语义的既有锚点互相覆盖。
-    fn ensure_system_view_anchor(&self) -> Option<String> {
+    /// 锚点本身不承载任何应用可见路径，**用完必须摘除**：留着它就是应用 mountinfo 里
+    /// 一条模块私有路径（`/data/adb/modules/<id>/tmp/system_view/<user>`），真机
+    /// 2026-11-02 实测这是整份挂载表里最后一条 `leak_module_path`。摘除只改挂载表，
+    /// 已完成的 bind 各自持有超级块与 dentry 引用，内容不受影响。摘除动作放在
+    /// [`SystemViewAnchor`] 的 `Drop` 里，任何提前返回（包括后续迭代里的 `return`）
+    /// 都不会把锚点留在命名空间里。
+    fn create_transient_system_view_anchor(&self) -> Option<SystemViewAnchor> {
         let anchor_root = paths::join(module_paths::SYSTEM_VIEW_TMP_DIR, &self.user_id.to_string());
         let user_view = paths::join(&anchor_root, &self.user_id.to_string());
-        let source = format!("/mnt/user/{}/emulated", self.user_id);
-        if !fs::is_directory(&source) {
-            log::warn!("system view source unavailable: {}", source);
+        // 首选：附着"本模块挂载落地之前"捕获的系统视图克隆。它给出的是纯系统视图，
+        // 不受别名视图影响；附着点仍是临时锚点，用完即摘，不留私有路径痕迹。
+        if let Some(clone) = self.system_view_clone.borrow_mut().take() {
+            detach_mount_if_present(&anchor_root);
+            let _ = fs::create_directory(&anchor_root, -1);
+            if fs::is_directory(&anchor_root)
+                && clone.attach_at(&anchor_root)
+                && fs::is_directory(&user_view)
+            {
+                log::debug!("system view anchor from clone root={}", anchor_root);
+                return Some(SystemViewAnchor {
+                    root: anchor_root,
+                    user_view,
+                });
+            }
+            log::warn!("system view clone attach unusable root={}", anchor_root);
+            detach_mount_if_present(&anchor_root);
+        }
+        // 回退：本函数会被 companion 与 daemon 各调用一次，而克隆随 `move_mount` 一次性
+        // 消费（第二次进入时 `system_view_clone` 已被 `take` 走），因此这里**重新克隆**。
+        //
+        // 不能退化成 `bind_mount`：`mount(MS_BIND)` 的源必须属于调用方**当前命名空间**
+        // （内核 `do_loopback` 的 `check_mnt`），而 `/proc/1/root/...` 是**跨命名空间**
+        // magic link，bind 必然失败。真机 2026-11-13 AVD(A15) 实测：首次调用走克隆成功，
+        // 第二次落到回退分支并报
+        // `system view anchor bind failed source=/proc/1/root/mnt/user/0/emulated`，
+        // 随即 `own private system view restored count=0`——自有私有目录整段未交回系统视图，
+        // 场景 35 的映射目标（`Android/media/<pkg>/cache`）因此缺失。
+        //
+        // `/proc/1/root/...` 只用于**取数比较**（`stat` 跨 ns 可读），不作为挂载源。
+        let probe = format!("/proc/1/root/mnt/user/{}/emulated", self.user_id);
+        if !fs::is_directory(&probe) {
+            log::warn!("system view source unavailable: {}", probe);
             return None;
         }
-        if same_mount_identity(&anchor_root, &source)
-            && anchor_generation_is_current(&anchor_root, &source)
+        if same_mount_identity(&anchor_root, &probe)
+            && anchor_generation_is_current(&anchor_root, &probe)
             && fs::is_directory(&paths::join(&user_view, "Android"))
         {
-            return Some(user_view);
+            // 既有锚点仍指向当前系统视图：直接复用，避免每轮摘挂抖动。返回值是
+            // RAII 守卫，`Drop` 仍会按"临时锚点"语义在离开作用域时摘除。
+            return Some(SystemViewAnchor {
+                root: anchor_root,
+                user_view,
+            });
         }
         // 锚点是模块私有路径，不承载任何应用可见路径：上一轮遗留（可能已被污染成沙箱
         // 或 f2fs 后端）可以安全摘除后重建，摘除窗口内没有应用 IO 经过它。
@@ -1127,21 +1098,26 @@ impl MountPlanner {
             log::warn!("system view anchor mkdir failed: {}", anchor_root);
             return None;
         }
-        // **必须非递归 bind**：模块会把 `/mnt/user/<user>/emulated/<user>` 换成自己的
-        // FUSE（别名路径也要走重定向），递归 bind 会把这个子挂载一并复制到锚点里，
-        // 锚点下的 `<user>` 仍然是模块层，取的还是 f2fs 直连后端——等于没恢复（真机
-        // 2026-10-25 实测：`tmp/system_view/0/0` 变成 `srx_fuse_host[...]`）。
-        // 非递归 bind 只复制该挂载本身，锚点内 `<user>` 回落到 MediaProvider FUSE 的
-        // 普通目录节点，正是需要的干净系统视图。
-        if !self.bind_mount(&source, &anchor_root, false) {
-            log::warn!(
-                "system view anchor bind failed anchor={} source={}",
-                anchor_root,
-                source
-            );
+        // 与首选分支同一机制：`setns(/proc/1/ns/mnt)` → `open_tree(OPEN_TREE_CLONE)` →
+        // `SCM_RIGHTS` 交回宿主 → `move_mount` 附着。init 命名空间里模块从不挂载，
+        // 那里的 `/mnt/user/<user>/emulated` 恒为 MediaProvider 的 FUSE 视图。
+        let Some(clone) = SystemViewClone::capture(self.user_id) else {
+            log::warn!("system view anchor recapture failed user={}", self.user_id);
+            return None;
+        };
+        if !clone.attach_at(&anchor_root) {
+            log::warn!("system view anchor attach failed anchor={}", anchor_root);
             return None;
         }
-        Some(user_view)
+        if !fs::is_directory(&paths::join(&user_view, "Android")) {
+            log::warn!("system view anchor incomplete anchor={}", anchor_root);
+            detach_mount_if_present(&anchor_root);
+            return None;
+        }
+        Some(SystemViewAnchor {
+            root: anchor_root,
+            user_view,
+        })
     }
 
     fn ensure_scoped_fuse_mount_points(&self, scoped_fuse_roots: &[String], storage_path: &str) {
@@ -1417,7 +1393,7 @@ impl MountPlanner {
     /// 重建 FUSE（触发重建的是视图根的 detach/re-bind）。
     ///
     /// 复用第一次 apply 已建立的 `self.real_storage_anchor`，绝不重新走
-    /// [`prepare_real_storage_anchor`]：那个入口在视图根已被重定向时会 detach/re-bind 视图根
+    /// `prepare_real_storage_anchor`：那个入口在视图根已被重定向时会 detach/re-bind 视图根
     /// 来重建锚点，同样会触发 MediaProvider 重建 FUSE，与摘除的目的相悖。
     ///
     /// 两条挂载路径都会调用：daemon（`daemon_mount`）与 companion
@@ -1869,7 +1845,7 @@ fn is_sqlite_entry_name(name_lower: &str) -> bool {
 /// `same_mount_identity` 只比 dev+ino：锚点是 `source` 的 bind，两者本来就是同一个
 /// superblock 的根 dentry，所以 MediaProvider 重启、`vold` 重新拉起用户视图（minor
 /// 换代）之后这个判据依然成立——但锚点实际绑在上一代连接上，访问会 ENOTCONN 或
-/// 直接 ENOENT（真机 2026-11-03 duchamp：`bind mount failed src=.../tmp/system_view/0/0/
+/// 直接 ENOENT（真机 2026-11-03：`bind mount failed src=.../tmp/system_view/0/0/
 /// Android/media/<pkg> errno=2`，紧接着 `own private restore failed`，自有私有目录
 /// 退回直连层，随后主库被 WAL 回滚成 4096B）。
 ///
@@ -1895,4 +1871,22 @@ fn same_mount_identity(left: &str, right: &str) -> bool {
         return false;
     };
     left_meta.dev() == right_meta.dev() && left_meta.ino() == right_meta.ino()
+}
+
+/// 临时系统视图锚点：析构即摘除，命名空间里不留持久挂载。
+///
+/// 见 [`MountPlanner`] 上 `create_transient_system_view_anchor` 的说明。
+struct SystemViewAnchor {
+    root: String,
+    user_view: String,
+}
+
+impl Drop for SystemViewAnchor {
+    fn drop(&mut self) {
+        // 锚点（无论来自系统视图克隆还是回退的 bind）用完即摘：留着它就是应用
+        // mountinfo 里一条模块私有路径。已建立的恢复 bind 各自持有超级块与 dentry
+        // 引用，摘除不影响内容。
+        detach_mount_if_present(&self.root);
+        log::debug!("system view anchor detached root={}", self.root);
+    }
 }

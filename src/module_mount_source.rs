@@ -18,9 +18,18 @@
 //! [`is_module_mount_source`] 只是上述组合判据里的一条证据（挂载源前缀），单独使用会漏判
 //! 所有 bind 层：bind 会把底层文件系统的源继承下来，真机上本模块每一层的 `source` 都是
 //! MediaProvider FUSE 的 `/dev/fuse`，前缀根本匹配不上。见 [`is_module_redirect_mount`]。
+//!
+//! 读挂载表必须走 [`crate::platform::proc_direct`] 的裸系统调用通道：应用进程内同时存在
+//! 本模块与第三方的 PLT hook，`std::fs` 读到的内容不保证等于内核事实，而本文件的判据
+//! 直接决定应用会不会空等满预算。
 
-use crate::platform::{module_paths, mountinfo, paths};
-use std::fs;
+use crate::platform::{module_paths, mountinfo, paths, proc_direct};
+
+/// 单个 mountinfo 文件的读取上限。
+///
+/// 挂载层数多的设备（宿主机 200 层以上）实测数十 KB，512 KiB 已覆盖余量；
+/// 设上界是为了让"读到脏内容"表现为判空而不是无界分配。
+const MOUNTINFO_READ_LIMIT: usize = 512 * 1024;
 
 /// 本模块挂载源使用的前缀。
 ///
@@ -39,10 +48,10 @@ pub struct ModuleMount {
     ///
     /// 这是命名空间 bind 后端"存储根重定向已建立"的判据：只有从沙箱子树 bind 出来的层才带
     /// 这一段，锚点绑定与系统 FUSE 都不带。应用侧据此判断重定向本体（而不是全部挂载）
-    /// 是否已就位，见 `lifecycle::specialize_post::wait_for_module_mount`。
+    /// 是否已就位，见 `lifecycle::specialize_post::conclude_mount_readiness`。
     ///
     /// collapsed hybrid FUSE 形态不创建沙箱根 bind，这一判据在该形态下恒为 false；
-    /// 就绪判定须叠加 [`is_collapsed_host_view_root`]。
+    /// 就绪判定须叠加 [`storage_view_root_is_module_session`]。
     pub is_sandbox_root: bool,
 }
 
@@ -56,24 +65,58 @@ pub fn is_module_mount_source(source: &str) -> bool {
         .any(|prefix| source.starts_with(prefix))
 }
 
-/// 判断该挂载是否为 collapsed hybrid FUSE 形态的"重定向本体"。
+/// 判断存储视图根（`/storage/emulated/<user>`）当前是否由**本模块的 FUSE 会话**服务。
 ///
-/// `backend=auto` 且按目录 scoped 根被收敛成存储视图根时（见
-/// `companion_mount::scoped_fuse_mount_roots` 的收敛路径），共享宿主会话的视图根直接落在
-/// `/storage/emulated/<user>` 上，按设计**不再创建** `<包名>/sdcard` 沙箱根
-/// bind——重定向语义全部由宿主策略按请求 uid 承担（`collapsed view barrier inert`）。
-/// 因此 [`ModuleMount::is_sandbox_root`] 在这一形态下恒为 false，`wait_for_module_mount`
-/// 若只认沙箱根就会对每个进程空等满预算并误报 `mount unknown/failed`
-/// （真机 2026-10-22 实证：QQ 每次启动的全部进程都误报，单日 running.log 累计 200+ 条）。
-pub fn is_collapsed_host_view_root(source: &str, mount_point: &str) -> bool {
-    is_module_mount_source(source) && is_storage_user_view_root(mount_point)
-}
-
-/// 判断挂载点是否为某用户的存储视图根（`/storage/emulated/<user>`）。
-fn is_storage_user_view_root(mount_point: &str) -> bool {
-    mount_point
-        .strip_prefix("/storage/emulated/")
-        .is_some_and(|rest| !rest.is_empty() && rest.bytes().all(|byte| byte.is_ascii_digit()))
+/// 判据是**设备号比对**，不是"这一层是 fuse"：Android 11 起 vold 自己就用 fuse 挂
+/// `/storage/emulated`，只看"是 fuse"会把系统视图当成我们的会话——真机实测
+/// （2026-11-09）这条误判让一个回落 `namespace_bind` 的应用也打出 `app mount confirmed`。
+///
+/// 正确的对照物是**系统媒体 FUSE 的超级块设备号**：`/mnt/user/<user>/emulated` 上最先
+/// 出现的那一层（mount id 最小 = vold 开机挂的那层；我们的会话是**叠在它上面**的新层）。
+/// 同一路径的最顶层（文件顺序最后一条）才是应用实际看到的视图。两者设备号不同 ⇒ 视图根
+/// 已由本模块会话接管。
+///
+/// 真机两组实证（同一台设备，同一时刻）：
+///
+/// ```text
+/// 已接管：/storage/emulated            -> 0:142（本会话）
+///         /mnt/user/0/emulated 首层     -> 0:131（系统）
+/// 未接管：/storage/emulated            -> 0:131（系统）
+///         /mnt/user/0/emulated 首层     -> 0:131（系统）
+/// ```
+///
+/// 判据不含任何模块标识（源名、锚点路径），挂载源原生化之后依然成立。只读调用方自身的
+/// 挂载表，且走裸系统调用通道（应用进程内 PLT hook 可能改写 std::fs 的结果）。
+pub fn storage_view_root_is_module_session(user_id: i32) -> bool {
+    let view_root = paths::normalize(&crate::platform::paths::storage_user_root_for_user(user_id));
+    let system_root = paths::normalize(&format!("/mnt/user/{user_id}/emulated"));
+    let Some(content) = proc_direct::read_proc_file("/proc/self/mountinfo", MOUNTINFO_READ_LIMIT)
+    else {
+        return false;
+    };
+    let mut system_dev: Option<String> = None;
+    let mut view_dev: Option<String> = None;
+    let mut view_is_fuse = false;
+    for line in content.lines() {
+        let Some(entry) = mountinfo::parse_entry(line) else {
+            continue;
+        };
+        let target = paths::normalize(&mountinfo::unescape_field(entry.target));
+        // 系统媒体 FUSE：取**首层**（先出现 = mount id 更小 = vold 挂的那层）。
+        if system_dev.is_none() && crate::platform::paths::eq_ignore_case(&target, &system_root) {
+            system_dev = Some(entry.dev.to_string());
+            continue;
+        }
+        // 视图根：取**最顶层**（后出现的层压在前面之上），因此循环里持续覆盖。
+        if crate::platform::paths::eq_ignore_case(&target, &view_root) {
+            view_is_fuse = entry.fs_type.starts_with("fuse");
+            view_dev = Some(entry.dev.to_string());
+        }
+    }
+    match (view_dev, system_dev) {
+        (Some(view), Some(system)) => view_is_fuse && view != system,
+        _ => false,
+    }
 }
 
 /// 判断挂载源是否指向模块自己的临时锚点目录。
@@ -259,14 +302,18 @@ pub fn is_module_redirect_mount(
 /// 调用方若要判断**重定向本体**是否已就位（而不是"任意挂载出现了没有"），应看返回项里的
 /// [`ModuleMount::is_sandbox_root`]，不要只数条数：FUSE 根的数量取决于 `allowed_real_paths`，
 /// 沙箱根在命名空间 bind 后端的所有重定向模式下都必然出现；collapsed hybrid FUSE 形态
-/// 例外——它的本体是视图根本身，须叠加 [`is_collapsed_host_view_root`] 判定。
+/// 例外——它的本体是视图根本身，须叠加 [`storage_view_root_is_module_session`] 判定。
 pub fn app_redirect_mounts_in(pid: i32, package_name: &str) -> Vec<ModuleMount> {
     let path = if pid > 0 {
         format!("/proc/{pid}/mountinfo")
     } else {
         "/proc/self/mountinfo".to_string()
     };
-    let Ok(content) = fs::read_to_string(path) else {
+    // 必须走裸系统调用直读，不能用 `std::fs`：本函数在应用进程内判自身的就绪状态，
+    // 而同一进程里存活的 PLT hook（本模块的路径改写 hook、第三方 zygisk 模块）都能
+    // 改写 open/read 的返回值。一旦读到被净化或改写的视图，判据会失效——少认一条层
+    // 就让应用空等满预算、被 AMS 判启动超时。详见 `platform::proc_direct`。
+    let Some(content) = proc_direct::read_proc_file(&path, MOUNTINFO_READ_LIMIT) else {
         return Vec::new();
     };
     let mut mounts = content
