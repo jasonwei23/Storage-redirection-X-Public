@@ -1515,7 +1515,10 @@ fn handle_child_process(
         } else {
             Vec::new()
         };
-        let restored_own_private = mount_mgr.restore_own_private_system_view(&private_skip_roots);
+        let restore_native_cache =
+            host_covers_view && crate::fuse_redirect::config::native_cache_restore_allowed(request);
+        let restored_own_private =
+            mount_mgr.restore_own_private_system_view(&private_skip_roots, restore_native_cache);
         log::info!(
             "own private system view restored count={} pkg={} pid={}",
             restored_own_private,

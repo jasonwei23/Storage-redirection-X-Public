@@ -287,7 +287,12 @@ impl MountPlanner {
         // 同一构建时而生效时而丢失），由调用方在全部挂载动作结束后调用
         // [`Self::restore_own_private_system_view`] 幂等补挂（same_mount_identity
         // 判定已恢复时不再叠层）。
-        self.restore_own_private_directories(&storage_path, &data_media_root, scoped_fuse_roots);
+        self.restore_own_private_directories(
+            &storage_path,
+            &data_media_root,
+            scoped_fuse_roots,
+            false,
+        );
 
         let restored_allowed_paths = self.restore_allowed_real_paths(
             allowed_real_paths,
@@ -570,6 +575,7 @@ impl MountPlanner {
         storage_path: &str,
         data_media_root: &str,
         scoped_fuse_roots: &[String],
+        restore_native_cache: bool,
     ) -> usize {
         // 恢复三类自有私有目录（`Android/{data,media,obb}/<pkg>`）。
         //
@@ -585,11 +591,16 @@ impl MountPlanner {
         // 两层页缓存分裂见下）。`data`/`obb` 在被 scoped FUSE 覆盖时跳过：那种形态
         // 下自有私有路径由 srx FUSE 数据面按真实路径处理，再叠 bind 会绕开引擎、
         // 让监视记录与清理账本对不上。
-        let private_roots = [
+        let mut private_roots = vec![
             format!("Android/data/{}", self.package_name),
             format!("Android/media/{}", self.package_name),
             format!("Android/obb/{}", self.package_name),
         ];
+        // 图片库启动时会遍历缓存索引；不需要监视或规则处理的自有缓存恢复到系统
+        // FUSE，避免每个缓存文件反复经过共享宿主的完整路径查找。只绑定已存在目录。
+        if restore_native_cache {
+            private_roots.push(format!("Android/data/{}/cache", self.package_name));
+        }
         let mut restored_count = 0usize;
         // 系统 uid 没有 app-specific 外部存储语义：它们在 `/data/media/<user>/Android`
         // 下没有按包名隔离的目录，逐个 mkdir 只会在开机风暴期刷出成片告警。
@@ -610,10 +621,12 @@ impl MountPlanner {
         for relative in private_roots {
             let storage_target = paths::join(storage_path, &relative);
             let is_media = relative.starts_with("Android/media/");
+            let is_native_cache = restore_native_cache && relative.ends_with("/cache");
             if scoped_fuse_roots
                 .iter()
                 .any(|root| paths::eq_ignore_case(&storage_target, root))
                 || (!is_media
+                    && !is_native_cache
                     && is_covered_by_scoped_fuse_mount(&storage_target, scoped_fuse_roots))
             {
                 log::info!(
@@ -630,7 +643,13 @@ impl MountPlanner {
             // `Android/media` 下出现全量空目录）。应用真正创建该目录后（经宿主
             // 数据面的 Real 直写，属原生允许路径），下一次挂载事件/reconcile 会在
             // 此恢复系统视图绑定，内容落点与跨进程共享语义不受影响。
-            if !fs::is_directory(&backend_source) {
+            let backend_exists = if is_native_cache {
+                // 缓存绑定只接受真实目录，不能跟随应用留下的符号链接扩大恢复范围。
+                std::fs::symlink_metadata(&backend_source).is_ok_and(|metadata| metadata.is_dir())
+            } else {
+                fs::is_directory(&backend_source)
+            };
+            if !backend_exists {
                 log::debug!(
                     "own private backend absent, skip restore: {}",
                     backend_source
@@ -1017,7 +1036,12 @@ impl MountPlanner {
     /// 全程不触碰存储根。
     /// 参数 `scoped_fuse_roots` 是本轮规划的 scoped FUSE 根：`data`/`obb` 被其覆盖时
     /// 跳过恢复（自有私有路径由 srx FUSE 数据面按真实路径处理），media 无条件恢复。
-    pub fn restore_own_private_system_view(&mut self, scoped_fuse_roots: &[String]) -> usize {
+    /// `restore_native_cache` 仅由请求规则门控开启，额外恢复已存在的自有 cache 子树。
+    pub fn restore_own_private_system_view(
+        &mut self,
+        scoped_fuse_roots: &[String],
+        restore_native_cache: bool,
+    ) -> usize {
         // 系统 uid（<10000）没有 app-specific 外部存储语义，也不该去创建
         // `/data/media/<user>/Android/{data,media,obb}/<pkg>`；跳过可避免开机时整片
         // 系统服务刷出 `own private source mkdir failed`。
@@ -1026,7 +1050,12 @@ impl MountPlanner {
         }
         let storage_path = paths::storage_user_root_for_user(self.user_id);
         let data_media_root = paths::data_media_user_root_for_user(self.user_id);
-        self.restore_own_private_directories(&storage_path, &data_media_root, scoped_fuse_roots)
+        self.restore_own_private_directories(
+            &storage_path,
+            &data_media_root,
+            scoped_fuse_roots,
+            restore_native_cache,
+        )
     }
 
     /// 建立一个**临时**的系统存储视图锚点，返回持有它的守卫。
