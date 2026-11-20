@@ -309,6 +309,7 @@ collect_mount_state() {
 collect_proc_for_pid() {
   pid="$1"
   label="$2"
+  collect_fds="${3:-true}"
   [ -n "$pid" ] || return 0
   [ -d "/proc/$pid" ] || return 0
   prefix="$PROC_DIR/$(safe_name "$label")_$pid"
@@ -338,9 +339,11 @@ collect_proc_for_pid() {
   grep -E ' /storage| /mnt/user| /mnt/runtime| /mnt/media_rw| /sdcard| /data/media|storage.redirect.x|fuse' \
     "/proc/$pid/mountinfo" > "$prefix-mountinfo-storage.txt" 2>/dev/null || true
 
-  {
-    bounded_stream ls -l "/proc/$pid/fd" | head -n 80
-  } > "$prefix-fd.txt" 2>&1
+  if [ "$collect_fds" = true ]; then
+    {
+      bounded_stream ls -l "/proc/$pid/fd" | head -n 80
+    } > "$prefix-fd.txt" 2>&1
+  fi
 
   {
     count=0
@@ -364,12 +367,25 @@ collect_relevant_proc_state() {
   : > "$STATE_DIR/package-pids.txt"
   detail_count=0
   max_detail_pids=12
+  snapshot_count=0
+  max_snapshot_pids=64
   matches="$STATE_DIR/package-pids.raw"
   sorted_matches="$STATE_DIR/package-pids.sorted"
+  configured_packages="$STATE_DIR/configured-packages.txt"
   : > "$matches"
+  : > "$configured_packages"
+  for config_path in "$APPS_CONFIG_DIR"/*.json; do
+    [ -f "$config_path" ] || continue
+    config_name=${config_path##*/}
+    printf '%s\n' "${config_name%.json}" >> "$configured_packages"
+  done
 
   awk '
-    NR == FNR {
+    FILENAME == ARGV[1] {
+      if ($1 != "") configured[$1] = 1
+      next
+    }
+    FILENAME == ARGV[2] {
       if ($1 != "") candidates[$1] = 1
       next
     }
@@ -378,16 +394,18 @@ collect_relevant_proc_state() {
       name = $2
       for (package_name in candidates) {
         if (name == package_name || index(name, package_name ":") == 1) {
-          print package_name "|" pid
+          # 优先保留已配置应用主进程的 fd，避免后台服务按包名排序占满预算。
+          priority = (name == package_name && configured[package_name]) ? 0 : 1
+          print priority "|" package_name "|" pid
         }
       }
       # WebView 沙盒/隔离子进程不属于任何候选包名，但评论/网页图片加载失败时
       # 它们的挂载视图正是需要观测的对象（此前 B 站日志完全缺失该进程）。
       if (index(name, ":sandboxed_process") > 0 || index(name, ":isolated") > 0) {
-        print name "|" pid
+        print "1|" name "|" pid
       }
     }
-  ' "$STATE_DIR/package-candidates.txt" "$STATE_DIR/process-names.txt" >> "$matches" 2>/dev/null || true
+  ' "$configured_packages" "$STATE_DIR/package-candidates.txt" "$STATE_DIR/process-names.txt" >> "$matches" 2>/dev/null || true
 
   for package_name in \
     com.android.providers.media.module \
@@ -401,22 +419,28 @@ collect_relevant_proc_state() {
     bin.mt.plus \
     com.bin.mt.plus; do
     pidof "$package_name" 2>/dev/null | tr ' ' '\n' |
-      awk -v package_name="$package_name" '$1 ~ /^[0-9]+$/ { print package_name "|" $1 }'
+      awk -v package_name="$package_name" '$1 ~ /^[0-9]+$/ { print "1|" package_name "|" $1 }'
   done >> "$matches"
 
-  sort -u "$matches" > "$sorted_matches" 2>/dev/null || true
-  while IFS='|' read -r package_name pid; do
+  sort -u "$matches" | awk -F'|' '!seen[$3]++' > "$sorted_matches" 2>/dev/null || true
+  while IFS='|' read -r priority package_name pid; do
     [ -n "$package_name" ] || continue
     [ -n "$pid" ] || continue
-    if [ "$detail_count" -ge "$max_detail_pids" ]; then
-      echo "proc detail collection capped at $max_detail_pids pids" >> "$STATE_DIR/package-pids.txt"
-      return 0
-    fi
     echo "$package_name $pid" >> "$STATE_DIR/package-pids.txt"
-    progress=$((56 + detail_count * 8 / max_detail_pids))
-    update_progress "$progress" proc "正在采集进程细节 $((detail_count + 1))/$max_detail_pids"
-    collect_proc_for_pid "$pid" "$package_name"
-    detail_count=$((detail_count + 1))
+    if [ "$snapshot_count" -ge "$max_snapshot_pids" ]; then
+      echo "snapshot skipped pid=$pid reason=limit limit=$max_snapshot_pids" >> "$STATE_DIR/package-pids.txt"
+      continue
+    fi
+    # 状态、挂载与线程不依赖 fd 路径解析；即使 fd 预算耗尽也继续保留故障现场。
+    collect_fds=false
+    if [ "$detail_count" -lt "$max_detail_pids" ]; then
+      collect_fds=true
+      detail_count=$((detail_count + 1))
+    fi
+    progress=$((56 + snapshot_count * 8 / max_snapshot_pids))
+    update_progress "$progress" proc "正在采集进程状态 $((snapshot_count + 1))/$max_snapshot_pids"
+    collect_proc_for_pid "$pid" "$package_name" "$collect_fds"
+    snapshot_count=$((snapshot_count + 1))
   done < "$sorted_matches"
 }
 
