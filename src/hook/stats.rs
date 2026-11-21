@@ -9,6 +9,7 @@ use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 
 const SELF_MODULE_PATH: &str = "libsrx_core.so";
 const SQLITE_MODULE_BASENAME: &str = "libsqlite.so";
+const ZYGISK_MODULE_BASENAME: &str = "libzygisk.so";
 const HOOK_SENSITIVE_RENDER_MODULES: &[&str] = &[
     "libhwui.so",
     "libvulkan.so",
@@ -59,8 +60,10 @@ pub struct InterceptHub {
     is_fuse_fix_only: AtomicBool,
     is_boot_lite: AtomicBool,
     is_app_write_only: AtomicBool,
+    is_redirect_via_hook: AtomicBool,
     is_monitor_only: AtomicBool,
     is_monitor_enabled: AtomicBool,
+    is_app_redirect_owner: AtomicBool,
     stats: AtomicStats,
     last_late_hook_refresh_ms: AtomicI64,
 }
@@ -218,12 +221,40 @@ impl InterceptHub {
         self.is_monitor_only.load(Ordering::Relaxed)
     }
 
+    /// 进程自身配置了重定向规则（非代写 hook 路径）。置位后已安装的监视 hook 会对
+    /// 命中规则的写操作执行重定向决策，作为挂载层（宿主/屏障）全部失效时的
+    /// fail-closed 兜底；仅系统桥接进程会置位，普通应用不安装 PLT hook、不受影响。
+    pub fn set_app_redirect_owner(&self, value: bool) {
+        self.is_app_redirect_owner.store(value, Ordering::Relaxed);
+    }
+
+    pub fn is_app_redirect_owner(&self) -> bool {
+        self.is_app_redirect_owner.load(Ordering::Relaxed)
+    }
+
+    /// 重定向判定使用的有效 monitor-only 语义：自身拥有重定向配置的进程不再视为
+    /// 纯监视（其 hook 决策链需要放行到 PathRouter），但 hook 符号集保持 Monitor
+    /// profile 不变，不扩大 hook 面。
+    pub fn effective_monitor_only(&self) -> bool {
+        self.is_monitor_only() && !self.is_app_redirect_owner()
+    }
+
     pub fn is_monitor_enabled(&self) -> bool {
         self.is_monitor_enabled.load(Ordering::Relaxed)
     }
 
     pub fn is_app_write_only(&self) -> bool {
         self.is_app_write_only.load(Ordering::Relaxed)
+    }
+
+    /// 本进程的重定向是否由进程内 hook 承担（系统代写 / app redirect hook）。
+    /// mount/FUSE 后端为 false；此时写类 hook 才需要改写目标路径。
+    pub fn set_redirect_via_hook(&self, enabled: bool) {
+        self.is_redirect_via_hook.store(enabled, Ordering::Relaxed);
+    }
+
+    pub fn is_redirect_via_hook(&self) -> bool {
+        self.is_redirect_via_hook.load(Ordering::Relaxed)
     }
 
     pub fn refresh_monitor_runtime_config(&self) {
@@ -296,6 +327,34 @@ impl InterceptHub {
         context::get_current_caller_uid()
     }
 
+    /// 监视记录专用：CALLER_UID 未设置时回退当前 fsuid（见
+    /// `context::get_effective_caller_uid_for_monitor`）。禁止用于重定向判定。
+    pub fn get_effective_caller_uid_for_monitor(&self) -> i32 {
+        context::get_effective_caller_uid_for_monitor()
+    }
+
+    pub fn record_caller_identity_with_evidence(
+        &self,
+    ) -> (
+        i32,
+        i32,
+        Option<crate::platform::proc_identity::RequestIdentity>,
+    ) {
+        context::record_caller_identity_with_evidence()
+    }
+
+    pub fn set_current_caller_from_mapping_request_owner(
+        &self,
+        caller_package: &str,
+        caller_uid: i32,
+    ) {
+        context::set_current_caller_from_mapping_request_owner(caller_package, caller_uid);
+    }
+
+    pub fn is_current_caller_from_mapping_request_owner(&self) -> bool {
+        context::is_current_caller_from_mapping_request_owner()
+    }
+
     pub fn clear_current_caller(&self) {
         context::clear_current_caller();
     }
@@ -326,26 +385,25 @@ impl InterceptHub {
             return false;
         }
 
-        let ignore_errno = srx_hook::add_ignore(SELF_MODULE_PATH);
-        if !ignore_errno.is_ok() {
-            log::warn!("add_ignore failed err={:?}", ignore_errno);
-        }
-        let sqlite_ignore_errno = srx_hook::add_ignore(SQLITE_MODULE_BASENAME);
-        if !sqlite_ignore_errno.is_ok() {
-            log::warn!(
-                "add_ignore failed path={} err={:?}",
-                SQLITE_MODULE_BASENAME,
-                sqlite_ignore_errno
-            );
-        }
-        for module in HOOK_SENSITIVE_RENDER_MODULES {
+        // 注入器不属于文件操作调用方，也不保证能从应用的 linker namespace 取得租约。
+        for module in [
+            SELF_MODULE_PATH,
+            SQLITE_MODULE_BASENAME,
+            ZYGISK_MODULE_BASENAME,
+        ]
+        .iter()
+        .chain(HOOK_SENSITIVE_RENDER_MODULES)
+        {
             let ignore_errno = srx_hook::add_ignore(module);
             if !ignore_errno.is_ok() {
                 log::warn!("add_ignore failed path={} err={:?}", module, ignore_errno);
             }
         }
 
-        let is_system_writer = self.with_package_name(policy::is_system_writer_package);
+        let is_system_writer = self.with_package_name(|package_name| {
+            policy::is_system_writer_package(package_name)
+                || policy::is_legacy_writer_process_name(package_name)
+        });
         let (active_profiles, profile_name) = select_hook_profile(
             is_system_writer,
             self.is_monitor_only(),
@@ -354,11 +412,11 @@ impl InterceptHub {
             self.is_app_write_only.load(Ordering::Relaxed),
         );
 
-        let entries = build_hook_entries();
-        let selected_hook_count = entries
-            .iter()
+        let selected_entries: Vec<_> = build_hook_entries()
+            .into_iter()
             .filter(|entry| is_hook_enabled(active_profiles, entry.profiles))
-            .count();
+            .collect();
+        let selected_hook_count = selected_entries.len();
         log::info!(
             "hook profile={} count={}",
             profile_name,
@@ -374,43 +432,60 @@ impl InterceptHub {
             hook_caller_allow_filter
         };
 
-        for entry in entries {
-            if !is_hook_enabled(active_profiles, entry.profiles) {
-                continue;
+        let requests: Vec<_> = selected_entries
+            .iter()
+            .map(|entry| srx_hook::HookRequest {
+                caller: srx_hook::HookCaller::Partial {
+                    filter: caller_allow_filter,
+                    arg: std::ptr::null_mut(),
+                },
+                callee_path_name: None,
+                sym_name: entry.symbol,
+                new_func: entry.new_func,
+                hooked: None,
+                hooked_arg: std::ptr::null_mut(),
+            })
+            .collect();
+        let stubs = take_checked_hook_batch_stubs(
+            srx_hook::hook_batch_checked(&requests),
+            profile_name,
+            &self.get_package_name(),
+        );
+        match stubs {
+            Some(stubs) if stubs.len() == selected_entries.len() => {
+                hook_list.extend(selected_entries.iter().map(|entry| entry.symbol));
             }
-
-            let stub = srx_hook::hook_partial(
-                caller_allow_filter,
-                std::ptr::null_mut(),
-                None,
-                entry.symbol,
-                entry.new_func,
-                None,
-                std::ptr::null_mut(),
-            );
-
-            if stub.is_none() {
-                if entry.is_optional {
-                    optional_missing.push(entry.symbol);
-                    log::warn!(
-                        "optional hook unavailable sym={} profile={} pkg={}",
-                        entry.symbol,
-                        profile_name,
-                        self.get_package_name()
-                    );
-                    continue;
-                }
-                required_failed.push(entry.symbol);
-                log::warn!(
-                    "hook register failed sym={} required=true profile={} pkg={}",
-                    entry.symbol,
+            Some(stubs) => {
+                log::error!(
+                    "hook batch stub count mismatch profile={} pkg={} expected={} actual={}",
                     profile_name,
-                    self.get_package_name()
+                    self.get_package_name(),
+                    selected_entries.len(),
+                    stubs.len()
                 );
-                continue;
+                return self.cleanup_after_install_failure("hook_batch_stub_count");
             }
-
-            hook_list.push(entry.symbol);
+            None => {
+                for entry in &selected_entries {
+                    if entry.is_optional {
+                        optional_missing.push(entry.symbol);
+                        log::warn!(
+                            "optional hook unavailable sym={} profile={} pkg={}",
+                            entry.symbol,
+                            profile_name,
+                            self.get_package_name()
+                        );
+                    } else {
+                        required_failed.push(entry.symbol);
+                        log::warn!(
+                            "hook register failed sym={} required=true profile={} pkg={}",
+                            entry.symbol,
+                            profile_name,
+                            self.get_package_name()
+                        );
+                    }
+                }
+            }
         }
 
         if !required_failed.is_empty() {
@@ -423,8 +498,7 @@ impl InterceptHub {
                 hook_list.len(),
                 selected_hook_count
             );
-            srx_hook::clear();
-            return false;
+            return self.cleanup_after_install_failure("required_hook_registration");
         }
 
         let hook_list_text = hook_list.join(", ");
@@ -482,8 +556,7 @@ impl InterceptHub {
                 profile_name,
                 self.get_package_name()
             );
-            srx_hook::clear();
-            return false;
+            return self.cleanup_after_install_failure("hook_refresh");
         }
 
         self.is_hooks_installed.store(true, Ordering::Relaxed);
@@ -491,9 +564,56 @@ impl InterceptHub {
         true
     }
 
+    fn cleanup_after_install_failure(&self, reason: &str) -> bool {
+        let (status, report) = match srx_hook::clear_checked() {
+            Ok(report) => (None, report),
+            Err(error) => (Some(error.status), error.report),
+        };
+        self.is_hooks_installed.store(false, Ordering::Relaxed);
+        for (index, detail) in report.errors.iter().enumerate() {
+            log::warn!(
+                "hook cleanup detail reason={} index={} total={} path={} err={:?}",
+                reason,
+                index + 1,
+                report.errors.len(),
+                detail.module_path,
+                detail.errno
+            );
+        }
+        if let Some(status) = status {
+            log::error!(
+                "hook cleanup failed reason={} err={:?} revision={} removed={} remaining={} protections={}",
+                reason,
+                status,
+                report.revision,
+                report.removed_slots,
+                report.remaining_slots,
+                report.remaining_protections
+            );
+        } else if report.remaining_slots != 0 || report.remaining_protections != 0 {
+            log::error!(
+                "hook cleanup incomplete reason={} revision={} removed={} remaining={} protections={}",
+                reason,
+                report.revision,
+                report.removed_slots,
+                report.remaining_slots,
+                report.remaining_protections
+            );
+        } else {
+            return false;
+        }
+        log::error!(
+            "hook module unavailable after incomplete cleanup reason={} pkg={}",
+            reason,
+            self.get_package_name()
+        );
+        false
+    }
+
     pub fn refresh_hooks_after_late_load(&self, reason: &str) {
         if !self.is_hooks_installed()
-            || !self.is_app_write_only.load(Ordering::Relaxed)
+            || !(self.is_app_write_only.load(Ordering::Relaxed)
+                || self.is_fuse_fix_only.load(Ordering::Relaxed))
             || context::ReentryGuard::is_reentrant()
         {
             return;
@@ -578,6 +698,67 @@ impl InterceptHub {
     }
 }
 
+pub(crate) fn take_checked_hook_stub(
+    symbol: &str,
+    result: Result<srx_hook::HookStub, srx_hook::HookError>,
+) -> Option<srx_hook::HookStub> {
+    match result {
+        Ok(stub) => Some(stub),
+        Err(error) => {
+            log::warn!(
+                "hook registration result sym={} err={:?} stub={:?} module_errors={}",
+                symbol,
+                error.status,
+                error.stub,
+                error.errors.len()
+            );
+            for (index, detail) in error.errors.iter().enumerate() {
+                log::warn!(
+                    "hook registration module error sym={} index={} total={} path={} err={:?}",
+                    symbol,
+                    index + 1,
+                    error.errors.len(),
+                    detail.module_path,
+                    detail.errno
+                );
+            }
+            error.stub
+        }
+    }
+}
+
+fn take_checked_hook_batch_stubs(
+    result: Result<Vec<srx_hook::HookStub>, srx_hook::HookBatchError>,
+    profile_name: &str,
+    package_name: &str,
+) -> Option<Vec<srx_hook::HookStub>> {
+    match result {
+        Ok(stubs) => Some(stubs),
+        Err(error) => {
+            log::warn!(
+                "hook batch registration result profile={} pkg={} err={:?} committed_count={} module_errors={}",
+                profile_name,
+                package_name,
+                error.status,
+                error.stubs.len(),
+                error.errors.len()
+            );
+            for (index, detail) in error.errors.iter().enumerate() {
+                log::warn!(
+                    "hook batch module error profile={} pkg={} index={} total={} path={} err={:?}",
+                    profile_name,
+                    package_name,
+                    index + 1,
+                    error.errors.len(),
+                    detail.module_path,
+                    detail.errno
+                );
+            }
+            (!error.stubs.is_empty()).then_some(error.stubs)
+        }
+    }
+}
+
 fn is_ignorable_refresh_failure(
     refresh_errno: srx_hook::SrxHookErrno,
     refresh_errors: &[srx_hook::RefreshError],
@@ -627,7 +808,7 @@ fn is_module_parse_refresh_failure(
 }
 
 fn should_use_bridge_caller_filter(profile_name: &str) -> bool {
-    profile_name.starts_with("system-writer") || profile_name == "monitor"
+    profile_name.starts_with("system-writer") || matches!(profile_name, "monitor" | "media-runtime")
 }
 
 fn is_deleted_jit_memfd_module(module_path: &str) -> bool {
@@ -695,8 +876,10 @@ static INTERCEPT_HUB: InterceptHub = InterceptHub {
     is_fuse_fix_only: AtomicBool::new(false),
     is_boot_lite: AtomicBool::new(false),
     is_app_write_only: AtomicBool::new(false),
+    is_redirect_via_hook: AtomicBool::new(false),
     is_monitor_only: AtomicBool::new(false),
     is_monitor_enabled: AtomicBool::new(false),
+    is_app_redirect_owner: AtomicBool::new(false),
     stats: AtomicStats::new(),
     last_late_hook_refresh_ms: AtomicI64::new(0),
 };
@@ -737,7 +920,7 @@ fn should_hook_caller_module(pathname: &str) -> bool {
     if lower.ends_with("libsrx_core.so") || lower.ends_with("libsrx_hook.so") {
         return false;
     }
-    if basename == "libsqlite.so" {
+    if basename == "libsqlite.so" || basename == ZYGISK_MODULE_BASENAME {
         return false;
     }
     !is_hook_sensitive_render_module(&lower)

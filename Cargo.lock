@@ -142,7 +142,6 @@ version = "0.1.0"
 dependencies = [
  "libc",
  "log",
- "once_cell",
  "serde",
  "serde_json",
 ]
@@ -375,13 +374,12 @@ checksum = "8ed6a63f02c8539c91a8685a86f4099661ba3da017932f6ebbea6de3f0fa7c90"
 
 [[package]]
 name = "srx_core"
-version = "1.2.60"
+version = "2.3.3"
 dependencies = [
  "fuser",
  "jni-sys",
  "libc",
  "log",
- "once_cell",
  "serde",
  "serde_json",
  "srx_hook",
@@ -390,8 +388,8 @@ dependencies = [
 
 [[package]]
 name = "srx_hook"
-version = "1.0.0"
-source = "git+https://github.com/Kindness-Kismet/srx_hook.git?rev=5ec71115c4b674d282f337bb7523ba66471bd98a#5ec71115c4b674d282f337bb7523ba66471bd98a"
+version = "1.1.1"
+source = "git+https://github.com/Kindness-Kismet/srx_hook.git?rev=481c45ac2ab10c2a5f15c4fad91485d4639b8dc5#481c45ac2ab10c2a5f15c4fad91485d4639b8dc5"
 dependencies = [
  "libc",
  "once_cell",
@@ -401,7 +399,7 @@ dependencies = [
 [[package]]
 name = "srx_inline_hook"
 version = "1.0.0"
-source = "git+https://github.com/Kindness-Kismet/srx_inline_hook.git?rev=e9abbd58e0c6ee459bb0f7724b896a70ece0a661#e9abbd58e0c6ee459bb0f7724b896a70ece0a661"
+source = "git+https://github.com/Kindness-Kismet/srx_inline_hook.git?rev=c8abb2e7249dc72f5e1113c3eb1def202fa0d3cb#c8abb2e7249dc72f5e1113c3eb1def202fa0d3cb"
 dependencies = [
  "bitflags",
  "libc",
@@ -518,3 +516,10 @@ name = "zmij"
 version = "1.0.21"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b8848ee67ecc8aedbaf3e4122217aff892639231befc6a1b58d29fff4c2cabaa"
+
+[[package]]
+name = "zn-runtime-fixture"
+version = "0.1.0"
+dependencies = [
+ "libc",
+]

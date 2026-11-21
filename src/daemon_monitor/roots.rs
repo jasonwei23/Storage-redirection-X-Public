@@ -17,6 +17,39 @@ pub(super) fn build_watch_roots(spec: &MonitorAppSpec) -> Vec<WatchRoot> {
     roots
 }
 
+/// 类别级私有属主 watch 根：每个用户的 `Android/{data,media,obb}` 各一个节点。
+///
+/// 这是事件驱动的属主异常发现通道，覆盖**所有**应用（含未开启重定向的）：
+/// 未配置应用没有包级 watch、事件修复链路也要求 `should_redirect` 通过，历史上
+/// 对它们无人看护——旧版本重定向开启期留下的 media_rw 属主损伤（原生 FUSE 对
+/// 属主非本应用的私有目录只给 others 位）会让应用存档不可读写。这里只在类别
+/// 层挂 watch（不递归展开，树内内容事件与本通道无关），事件到达或登记时对包
+/// 目录做属主异常检查（见 events::repair_private_category_owner）。
+pub(super) fn build_private_category_owner_roots() -> Vec<WatchRoot> {
+    let mut roots = Vec::new();
+    let Ok(users) = std::fs::read_dir("/data/media") else {
+        return roots;
+    };
+    for user in users.flatten() {
+        for kind in ["data", "media", "obb"] {
+            let backend_root = format!("{}/Android/{}", user.path().display(), kind);
+            if !std::path::Path::new(&backend_root).is_dir() {
+                continue;
+            }
+            roots.push(WatchRoot {
+                package_name: String::new(),
+                display_root: backend_root.clone(),
+                backend_root,
+                record_display_root: String::new(),
+                record_from_root: String::new(),
+                excluded_roots: Vec::new(),
+                source: "private_category_owner",
+            });
+        }
+    }
+    roots
+}
+
 pub(super) fn build_private_owner_repair_roots(spec: &MonitorAppSpec) -> Vec<WatchRoot> {
     // Android 私有外部存储根及其子树由 MediaProvider 负责 owner/mode 生命周期。
     // 过去为完整隔离应用建立 private_owner watch，并在事件到达时递归 lchown/chmod，
@@ -453,12 +486,55 @@ fn strip_path_suffix(path: &str, suffix: &str) -> Option<String> {
     Some(normalized[..keep_len].trim_end_matches('/').to_string())
 }
 
+/// 自嵌套重定向伪影判定：后端/显示路径里出现
+/// `Android/data/<pkg>/sdcard/Android/data/...` 形态的重复。
+///
+/// 重定向把存储根映射到 `Android/data/<pkg>/sdcard` 之后，应用视图里的同名子树会在
+/// 后端再落一层，自相似目录一旦出现就会被监视展开、owner 修复与挂载准备逐层放大
+/// （真机实测嵌套 70+ 层直到 ENAMETOOLONG，文件监视线程单核烧满）。这类路径是
+/// 映射伪影而不是用户数据，展开与下载判定都应剪掉。
+pub(super) fn is_self_nested_redirect_path(path: &str) -> bool {
+    const PRIVATE_PREFIX: &str = "Android/data/";
+    const REDIRECT_TAIL: &str = "sdcard/";
+    let mut search_from = 0usize;
+    while let Some(offset) = path[search_from..].find(PRIVATE_PREFIX) {
+        let prefix_start = search_from + offset;
+        let after_prefix = &path[prefix_start + PRIVATE_PREFIX.len()..];
+        // 形态：<pkg>/sdcard/Android/data/...，<pkg> 为单段包名
+        let Some(package_end) = after_prefix.find('/') else {
+            break;
+        };
+        let package = &after_prefix[..package_end];
+        if package.is_empty() {
+            search_from = prefix_start + PRIVATE_PREFIX.len();
+            continue;
+        }
+        let remainder = &after_prefix[package_end + 1..];
+        if let Some(nested) = remainder.strip_prefix(REDIRECT_TAIL)
+            && nested.starts_with(PRIVATE_PREFIX)
+        {
+            return true;
+        }
+        search_from = prefix_start + PRIVATE_PREFIX.len();
+    }
+    false
+}
+
 pub(super) fn should_descend_into_child(
     source: &str,
     record_display_root: &str,
     child_display_dir: &str,
 ) -> bool {
+    // 类别级属主 watch 只看包目录一层：树内内容事件与本通道无关，
+    // 递归展开会把整棵私有树纳入监视（历史教训：成本高且曾因全树
+    // lchown/chmod 破坏系统管理的属主/模式被移除）。
+    if source == "private_category_owner" {
+        return false;
+    }
     if source == "public_owner" && is_android_app_private_path(child_display_dir) {
+        return false;
+    }
+    if is_self_nested_redirect_path(child_display_dir) {
         return false;
     }
     paths::is_same_or_child(child_display_dir, record_display_root)

@@ -1,6 +1,10 @@
 package me.fakerqu.test.storageredirect.test
 
+import android.app.DownloadManager
 import android.content.Context
+import android.net.Uri
+import android.os.SystemClock
+import android.system.Os
 import android.system.OsConstants
 import java.io.File
 import java.io.RandomAccessFile
@@ -12,6 +16,9 @@ class FileTestCases(
     private val context: Context,
 ) {
   private val api = AndroidFileApi()
+
+  /** 稳定的小体积文件；下载是否成功不是断言目标，提供器创建目标文件才是。 */
+  private val defaultDownloadUrl: String = "https://www.baidu.com/img/flexible/logo/pc/result.png"
   private val defaultRoot: File
     get() =
         File(
@@ -36,7 +43,7 @@ class FileTestCases(
               metadata = mapOf("path" to dirPath),
           )
         }
-        val listed = dir.listFiles()?.toList().orEmpty()
+        val listed = dir.listFilesOrFail().toList()
         val entries =
             listed.map { file -> file.name.ifBlank { "." } }.sorted().take(MAX_LISTED_ENTRIES)
         TestCase.FILE_LIST_DIR.pass(
@@ -66,9 +73,9 @@ class FileTestCases(
               metadata = mapOf("path" to dirPath),
           )
         }
-        val children = root.listFiles()?.filter(File::isDirectory).orEmpty()
+        val children = root.listFilesOrFail().filter(File::isDirectory)
         var listedEntries = 0
-        children.forEach { child -> listedEntries += child.listFiles()?.size ?: 0 }
+        children.forEach { child -> listedEntries += child.listFilesOrFail().size }
         TestCase.FILE_LIST_DIR_TREE.pass(
             message = "directory tree listed",
             metadata =
@@ -104,13 +111,6 @@ class FileTestCases(
         val targetPath =
             args.requireFilePath(TestCase.FILE_READ)
                 ?: return@measure args.missingPathResult(TestCase.FILE_READ)
-        val target = File(targetPath)
-        if (!target.isFile) {
-          return@measure TestCase.FILE_READ.fail(
-              message = "file does not exist",
-              metadata = mapOf("path" to targetPath),
-          )
-        }
         val readBack = api.readFile(targetPath).use { it.readBytes() }
         val expected = args.expectedPayload
         if (expected != null && !readBack.contentEquals(expected)) {
@@ -277,6 +277,7 @@ class FileTestCases(
             it.flush()
           }
         } catch (e: Exception) {
+          if (!isAccessDenied(e)) throw e
           return@measure TestCase.FILE_WRITE_DENIED.pass(
               message = "write denied as expected",
               metadata = pathMetadata(targetPath) + exceptionMetadata(e),
@@ -323,21 +324,16 @@ class FileTestCases(
           )
         }
         try {
-          val deleted = api.deleteFile(targetPath)
-          if (deleted || !target.exists()) {
-            return@measure TestCase.FILE_DELETE_DENIED.fail(
-                message = "delete unexpectedly succeeded",
-                metadata = pathMetadata(targetPath),
-            )
-          }
+          Os.remove(targetPath)
         } catch (e: Exception) {
+          if (!isAccessDenied(e)) throw e
           return@measure TestCase.FILE_DELETE_DENIED.pass(
               message = "delete denied as expected",
               metadata = pathMetadata(targetPath) + exceptionMetadata(e),
           )
         }
-        TestCase.FILE_DELETE_DENIED.pass(
-            message = "delete denied as expected",
+        TestCase.FILE_DELETE_DENIED.fail(
+            message = "delete unexpectedly succeeded",
             metadata = pathMetadata(targetPath),
         )
       }
@@ -381,22 +377,29 @@ class FileTestCases(
           )
         }
         try {
-          val created = api.mkdir(dirPath)
-          if (created || dir.exists()) {
-            return@measure TestCase.FILE_MKDIR_DENIED.fail(
-                message = "mkdir unexpectedly succeeded",
-                metadata = pathMetadata(dirPath),
-            )
-          }
+          Os.mkdir(dirPath, OsConstants.S_IRWXU)
         } catch (e: Exception) {
+          if (!isAccessDenied(e)) throw e
           return@measure TestCase.FILE_MKDIR_DENIED.pass(
               message = "mkdir denied as expected",
               metadata = pathMetadata(dirPath) + exceptionMetadata(e),
           )
         }
-        TestCase.FILE_MKDIR_DENIED.pass(
-            message = "mkdir denied as expected",
+        TestCase.FILE_MKDIR_DENIED.fail(
+            message = "mkdir unexpectedly succeeded",
             metadata = pathMetadata(dirPath),
+        )
+      }
+
+  fun mutationLifecycle(args: TestCaseArgs): TestResult =
+      TestCase.FILE_MUTATION_LIFECYCLE.measure {
+        val root =
+            args.requireFileDirOrPath(TestCase.FILE_MUTATION_LIFECYCLE)
+                ?: return@measure args.missingDirOrPathResult(TestCase.FILE_MUTATION_LIFECYCLE)
+        runFileMutationLifecycle(File(root))
+        TestCase.FILE_MUTATION_LIFECYCLE.pass(
+            message = "mutation lifecycle completed",
+            metadata = pathMetadata(root),
         )
       }
 
@@ -496,21 +499,16 @@ class FileTestCases(
           )
         }
         try {
-          val renamed = api.renameFile(fromPath, toPath)
-          if (renamed || !source.exists() || target.exists()) {
-            return@measure TestCase.FILE_RENAME_DENIED.fail(
-                message = "rename unexpectedly succeeded",
-                metadata = renameMetadata(fromPath, toPath),
-            )
-          }
+          Os.rename(fromPath, toPath)
         } catch (e: Exception) {
+          if (!isAccessDenied(e)) throw e
           return@measure TestCase.FILE_RENAME_DENIED.pass(
               message = "rename denied as expected",
               metadata = renameMetadata(fromPath, toPath) + exceptionMetadata(e),
           )
         }
-        TestCase.FILE_RENAME_DENIED.pass(
-            message = "rename denied as expected",
+        TestCase.FILE_RENAME_DENIED.fail(
+            message = "rename unexpectedly succeeded",
             metadata = renameMetadata(fromPath, toPath),
         )
       }
@@ -613,6 +611,119 @@ class FileTestCases(
     return dir
   }
 
+  /**
+   * 通过 DownloadManager 入队下载，由下载提供器在自己的进程内创建目标文件。
+   *
+   * 测试 APP 负责准备目标父目录并轮询下载状态；文件落点由场景脚本断言。
+   */
+  fun downloadManagerEnqueue(args: TestCaseArgs): TestResult =
+      TestCase.DOWNLOADMANAGER_ENQUEUE.measure {
+        val destinationPath = args.filePath
+        if (destinationPath.isNullOrBlank()) {
+          return@measure TestCase.DOWNLOADMANAGER_ENQUEUE.fail(
+              message = "missing required parameter: ${TestCaseArgs.EXTRA_FILE_PATH}",
+          )
+        }
+        // 空白 url 一律回退内置默认取数源：场景脚本在真机形态下不传 url，
+        // am instrument 的空串 extra 不等于缺省。
+        val url = args.url?.takeIf { it.isNotBlank() } ?: defaultDownloadUrl
+        val timeoutMs = 60_000L
+        val destination = File(destinationPath)
+        val parent = destination.parentFile
+        if (parent == null) {
+          return@measure TestCase.DOWNLOADMANAGER_ENQUEUE.fail(
+              message = "destination has no parent directory",
+              metadata = pathMetadata(destinationPath),
+          )
+        }
+        if (!parent.isDirectory && !parent.mkdirs()) {
+          return@measure TestCase.DOWNLOADMANAGER_ENQUEUE.fail(
+              message = "failed to prepare destination parent directory",
+              metadata = pathMetadata(parent.absolutePath),
+          )
+        }
+        if (destination.exists() && !destination.delete()) {
+          return@measure TestCase.DOWNLOADMANAGER_ENQUEUE.fail(
+              message = "stale destination file cannot be removed",
+              metadata = pathMetadata(destinationPath),
+          )
+        }
+        val downloadManager =
+            context.getSystemService(Context.DOWNLOAD_SERVICE) as? DownloadManager
+                ?: return@measure TestCase.DOWNLOADMANAGER_ENQUEUE.fail(
+                    message = "DownloadManager unavailable",
+                    metadata = pathMetadata(destinationPath),
+                )
+        val downloadId =
+            try {
+              downloadManager.enqueue(
+                  DownloadManager.Request(Uri.parse(url))
+                      .setTitle(destination.name)
+                      .setDestinationUri(Uri.fromFile(destination)),
+              )
+            } catch (e: Exception) {
+              return@measure TestCase.DOWNLOADMANAGER_ENQUEUE.fail(
+                  message = "enqueue rejected: ${e.message}",
+                  metadata = pathMetadata(destinationPath) + exceptionMetadata(e),
+              )
+            }
+        val query = DownloadManager.Query().setFilterById(downloadId)
+        val deadline = SystemClock.elapsedRealtime() + timeoutMs
+        var status = -1
+        var reason = -1
+        while (android.os.SystemClock.elapsedRealtime() < deadline) {
+          downloadManager.query(query).use { cursor ->
+            if (cursor.moveToFirst()) {
+              status =
+                  cursor.getInt(
+                      cursor.getColumnIndexOrThrow(DownloadManager.COLUMN_STATUS),
+                  )
+              reason =
+                  cursor.getInt(
+                      cursor.getColumnIndexOrThrow(DownloadManager.COLUMN_REASON),
+                  )
+            }
+          }
+          // 等待网络（reason=1）不视为终态：CI 模拟器网络就绪可能晚于入队，
+          // DownloadManager 会在网络可用后自动恢复下载，继续轮询到截止时间。
+          val waitingForNetwork =
+              status == DownloadManager.STATUS_PAUSED &&
+                  reason == DownloadManager.PAUSED_WAITING_FOR_NETWORK
+          if (
+              (status == DownloadManager.STATUS_SUCCESSFUL ||
+                  status == DownloadManager.STATUS_FAILED) ||
+                  (status == DownloadManager.STATUS_PAUSED && !waitingForNetwork)
+          ) {
+            break
+          }
+          SystemClock.sleep(500)
+        }
+        val metadata =
+            pathMetadata(destinationPath) +
+                mapOf(
+                    "downloadId" to downloadId.toString(),
+                    "status" to status.toString(),
+                    "reason" to reason.toString(),
+                    "destinationExists" to destination.exists().toString(),
+                )
+        // require_destination_visible=false 供映射形态使用：落点在映射目标，
+        // 请求路径的应用视图不可见属预期；落点正确性由场景脚本断言。
+        val destinationVisibleRequirement = args.requireDestinationVisible
+        if (
+            status != DownloadManager.STATUS_SUCCESSFUL ||
+                (destinationVisibleRequirement && !destination.exists())
+        ) {
+          return@measure TestCase.DOWNLOADMANAGER_ENQUEUE.fail(
+              message = "download did not produce destination file",
+              metadata = metadata,
+          )
+        }
+        TestCase.DOWNLOADMANAGER_ENQUEUE.pass(
+            message = "download completed and destination file created",
+            metadata = metadata,
+        )
+      }
+
   private fun pathMetadata(path: String): Map<String, String> = mapOf("path" to path)
 
   private fun renameMetadata(
@@ -654,7 +765,7 @@ class FileTestCases(
             api.truncateFile(targetPath, length)
           }
         } catch (e: Exception) {
-          return@measure if (expectDenied) {
+          return@measure if (expectDenied && isAccessDenied(e)) {
             testCase.pass(
                 message = "truncate denied as expected",
                 metadata = pathMetadata(targetPath) + exceptionMetadata(e),
@@ -719,7 +830,7 @@ class FileTestCases(
             api.chmodFile(targetPath, mode)
           }
         } catch (e: Exception) {
-          return@measure if (expectDenied) {
+          return@measure if (expectDenied && isAccessDenied(e)) {
             testCase.pass(
                 message = "chmod denied as expected",
                 metadata = pathMetadata(targetPath) + exceptionMetadata(e),
@@ -770,7 +881,7 @@ class FileTestCases(
             api.linkFile(fromPath, toPath)
           }
         } catch (e: Exception) {
-          return@measure if (expectDenied) {
+          return@measure if (expectDenied && isAccessDenied(e)) {
             testCase.pass(
                 message = "link denied as expected",
                 metadata = renameMetadata(fromPath, toPath) + exceptionMetadata(e),

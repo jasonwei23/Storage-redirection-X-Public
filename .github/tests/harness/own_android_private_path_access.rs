@@ -6,9 +6,11 @@
 // 目录内的图片与缓存报“权限有问题”。修复在 FuseFix accessible 判定链尾追加
 // should_allow_own_android_private_path_access：owner uid 与调用 uid 完全相等、
 // 同一 Android 用户、且目录所属包排除系统写入包与媒体中间包时放行。
+// 2026-10-25 起（3edee7f6，公开 issue #2）：Android/media/<pkg> 子树对同 user 的
+// 应用 uid 恢复原生共享语义（插件读宿主 media 配置），data/obb 维持属主私有。
 //
 // 与 daemon_mount_health.rs 同思路：抽出真实 fn 注入模板编译执行，绝不抄写实现；
-// 桩只暴露被抽取函数用到的签名。`policy::get_uid_for_package` 依赖运行期包数据库，
+// 桩只暴露被抽取函数用到的签名。`policy::get_uid_for_package_in_user` 依赖运行期包数据库，
 // 这里用固定表桩；包名合法性、用户段解析、路径归一化前缀、uid→user 折算等
 // 判定输入全部使用真实抽取的实现。
 //
@@ -72,13 +74,21 @@ pub mod paths {
 // ---- 真实 redirect::policy 模块的桩：包名集合用最小表；uid 查询用固定表。
 //      集合内容本身不是被测对象，被测函数是否正确**查阅**这些判定才是。 ----
 mod policy {
-    pub fn get_uid_for_package(package_name: &str) -> i32 {
-        match package_name {
+    pub fn get_uid_for_package_in_user(package_name: &str, user_id: i32) -> i32 {
+        if user_id < 0 {
+            return -1;
+        }
+        let app_id = match package_name {
             "com.example.owner" => 10384,
             "com.example.other" => 10111,
             "com.example.systemwriter" => 10242,
             "com.android.providers.media.module" => 10260,
             _ => -1,
+        };
+        if app_id < 0 {
+            -1
+        } else {
+            user_id * 100000 + app_id
         }
     }
 
@@ -152,13 +162,15 @@ fn main() {
         failures.push("own_obb_owner_allowed");
     }
 
-    // --- owner 拒绝边界：非 owner 应用不得借该判定访问他人私有目录。 ---
-    if !expect_deny(
-        "foreign_owner_denied",
+    // --- 非 owner 应用边界：Android/media/<pkg> 子树对同 user 应用 uid 恢复原生
+    //     共享语义（2026-10-25，3edee7f6，公开 issue #2：插件读宿主 media 配置）；
+    //     data/obb 仍是属主私有，跨应用必须拒绝。 ---
+    if !expect_allow(
+        "foreign_media_subtree_allowed",
         "/storage/emulated/0/Android/media/com.example.owner/fun_stable/cache.json",
         10111,
     ) {
-        failures.push("foreign_owner_denied");
+        failures.push("foreign_media_subtree_allowed");
     }
     if !expect_deny(
         "foreign_data_denied",
@@ -166,6 +178,13 @@ fn main() {
         10111,
     ) {
         failures.push("foreign_data_denied");
+    }
+    if !expect_deny(
+        "foreign_obb_denied",
+        "/storage/emulated/0/Android/obb/com.example.owner/patch.dat",
+        10111,
+    ) {
+        failures.push("foreign_obb_denied");
     }
 
     // --- 非 app uid（root / system / media）不放宽。 ---
@@ -185,7 +204,8 @@ fn main() {
     }
 
     // --- 跨用户不放宽：路径 user 10 与调用 uid 折算的 user 0 不一致，直接拒绝；
-    //     user 段一致但包 owner 属另一用户时，owner uid 相等性也必须挡住。 ---
+    //     user 段一致但包 owner 属另一用户时，data/obb 的 owner uid 相等性也必须
+    //     挡住（media 子树在 user 10 内共享是设计语义，见 foreign_media_subtree_allowed）。 ---
     if !expect_deny(
         "cross_user_path_denied",
         "/storage/emulated/10/Android/media/com.example.owner/fun_stable/cache.json",
@@ -194,11 +214,11 @@ fn main() {
         failures.push("cross_user_path_denied");
     }
     if !expect_deny(
-        "cross_user_owner_uid_denied",
-        "/storage/emulated/10/Android/media/com.example.owner/fun_stable/cache.json",
-        1010384,
+        "foreign_data_same_user_denied",
+        "/storage/emulated/10/Android/data/com.example.owner/files/pic.jpg",
+        1010111,
     ) {
-        failures.push("cross_user_owner_uid_denied");
+        failures.push("foreign_data_same_user_denied");
     }
 
     // --- 系统写入包与媒体中间包目录不放宽：即使 uid 表上完全相等也必须拒绝。 ---

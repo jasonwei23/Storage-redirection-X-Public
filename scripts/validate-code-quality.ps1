@@ -84,7 +84,7 @@ function Is-ChineseLanguagePath {
         return $false
     }
 
-    return $Path -match '^(src/|app/|java_src/|native/|tools/|assets/zygisk_module/|scripts/|\.githooks/|\.github/(?:scripts|tests|workflows)/|tests/storage-redirect-test/|docs/)' -or
+    return $Path -match '^(src/|app/|java_src/|native/|tools/|assets/zygisk_module/|scripts/|\.github/(?:scripts|tests|workflows)/|tests/storage-redirect-test/|docs/)' -or
         $Path -match '^(?:AGENTS|CLAUDE|CONTRIBUTING|README)\.md$' -or
         $Path -eq ".github/pull_request_template.md" -or
         $Path -eq "build.rs" -or
@@ -105,10 +105,16 @@ function Get-HumanReadableText {
     if ($Path -match '(?i)\.md$') {
         $candidate = $trimmed -replace '^#{1,6}\s*', ''
         $candidate = $candidate -replace '^(?:[-*+]\s+|\d+[.)]\s+|>\s*)', ''
+        # 纯命令行不是自然语言：除常见构建工具外，gh（Actions 查询与派发）以及
+        # `VAR=value cmd` 形式的环境前缀命令也必须识别，否则文档里可直接复制的命令
+        # 会被误判成英文自然语言（2026-10-25 窄场景命令块实测）。
         if ($candidate -match '^\|.*\|$' -or
             $candidate -match '^[-:| ]+$' -or
             $candidate -match '^(?i:Storage Redirect X)(?:\s+v?[0-9.]+)?$' -or
-            $candidate -match '^(?i:cargo|git|node|npm|pnpm|yarn|gradle|adb|powershell|bash|sh|rustup)\s+' -or
+            $candidate -match '^(?i:cargo|gh|git|node|npm|pnpm|yarn|gradle|adb|powershell|pwsh|bash|sh|rustup|cp|export)\s+' -or
+            $candidate -match '^:[A-Za-z0-9_-]+(?::[A-Za-z0-9_-]+)+(?:\s*\\)?$' -or
+            $candidate -match '^\$[A-Za-z_][A-Za-z0-9_]*\s*=' -or
+            $candidate -match '^[A-Z_][A-Z0-9_]*=\S*\s+\S+' -or
             $candidate -match '^(?:[A-Za-z]:[\\/]|[./~][\\/])') {
             return ""
         }
@@ -122,9 +128,8 @@ function Get-HumanReadableText {
         return $matches[1].Trim()
     }
 
-    if (($Path -match '(?i)\.(?:ps1|psm1|psd1|sh|bash|py|yml|yaml|properties)$' -or
-        $Path -match '^\.githooks/') -and
-        $trimmed -match '^#(?!\!)(.*)$') {
+    if (($Path -match '(?i)\.(?:ps1|psm1|psd1|sh|bash|py|yml|yaml|properties)$') -and
+        $trimmed -match '^#(?![!\[])(.*)$') {
         return $matches[1].Trim()
     }
 

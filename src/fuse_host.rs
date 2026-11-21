@@ -24,7 +24,7 @@ const HOST_READY_TIMEOUT_SEC: i64 = 30;
 ///
 /// 接入子进程只做几次本地系统调用（取句柄、mkdir、bind、复核），正常在毫秒级完成；
 /// 这里给的时间只用于兜住内核里卡住的 `mount`，避免挂载 worker 被长期阻塞。
-const HOST_ATTACH_TIMEOUT_SEC: i64 = 10;
+pub(crate) const HOST_ATTACH_TIMEOUT_SEC: i64 = 10;
 /// 宿主恢复失败后的最短重试间隔，避免每个 reconcile 周期重复 fork。
 const HOST_RECOVERY_BACKOFF_MS: u64 = 5_000;
 /// 应用接入共享宿主会话的**关闭开关**环境变量。
@@ -80,14 +80,7 @@ fn terminate_host_process(pid: libc::pid_t) {
     // SAFETY: pid 是本模块 fork 出的宿主子进程，调用方已凭 pid + 启动时刻确认其身份；
     // SIGKILL 只作用于该进程，不影响其它会话。
     unsafe { libc::kill(pid, libc::SIGKILL) };
-    let mut status: libc::c_int = 0;
-    for _ in 0..10 {
-        // SAFETY: pid 是本模块 fork 出的子进程；WNOHANG 只在它已退出时回收，不会阻塞。
-        if unsafe { libc::waitpid(pid, &mut status as *mut libc::c_int, libc::WNOHANG) } == pid {
-            return;
-        }
-        std::thread::sleep(std::time::Duration::from_millis(10));
-    }
+    let _ = crate::platform::child_wait::wait_child_exit(pid, 100);
 }
 
 /// 判断进程是否已变成僵尸（已退出但未被回收）。
@@ -123,8 +116,17 @@ pub struct FuseHost {
     pub child_start_time_ticks: u64,
     /// 宿主挂载点。
     pub mount_point: String,
-    /// 宿主会话挂载源（`srx_fuse_host[<pid>]`）。
+    /// 宿主会话挂载源（`MountOption::FSName`）。原生化之后它只是诊断字段，
+    /// 归属判定一律用 [`Self::mount_id`] / [`Self::dev`]。
     pub mount_source: String,
+    /// 宿主挂载的挂载 ID（内核事实，只对本次挂载有效）。
+    pub mount_id: u64,
+    /// 宿主挂载的超级块设备号（`major:minor`）。
+    ///
+    /// 同一个宿主会话派生出的一切层（视图根、各存储别名 bind）都共享它——bind 继承超级块。
+    /// 系统 MediaProvider 的 FUSE 是另一个 dev，因此这是"这一层是不是我们的"唯一不依赖
+    /// 挂载源文本的判据。
+    pub dev: String,
 }
 
 /// 宿主会话的跨进程视图。
@@ -140,8 +142,12 @@ pub struct HostSessionView {
     pub child_start_time_ticks: u64,
     /// 宿主挂载点。
     pub mount_point: String,
-    /// 宿主会话挂载源（`srx_fuse_host[<pid>]`）。
+    /// 宿主会话挂载源（`MountOption::FSName`），诊断用。
     pub mount_source: String,
+    /// 宿主挂载的挂载 ID。
+    pub mount_id: u64,
+    /// 宿主挂载的超级块设备号；见 [`FuseHost::dev`]。
+    pub dev: String,
     /// 宿主会话中每个 uid 当前已登记策略的指纹。
     ///
     /// 未登记 uid 的请求会被 fail-closed 拒绝（`deny_all` → ENOENT），因此接入前
@@ -157,6 +163,8 @@ impl From<&FuseHost> for HostSessionView {
             child_start_time_ticks: host.child_start_time_ticks,
             mount_point: host.mount_point.clone(),
             mount_source: host.mount_source.clone(),
+            mount_id: host.mount_id,
+            dev: host.dev.clone(),
             policy_fingerprints,
         }
     }
@@ -194,6 +202,9 @@ fn log_errno(tag: &str) {
 /// 标准错误，因此作为最后兜底的取证手段：即使父进程只看到"未就绪"，也能从阶段行判断
 /// 子进程走到哪一步。
 const FUSE_HOST_STAGE_PATH: &str = crate::platform::module_paths::FUSE_HOST_STAGE_FILE;
+/// 阶段轨迹文件的大小上限。轨迹只用于排障，不能随接入风暴无界追加（真机单次 boot 已
+/// 268KB）；超过上限时清空后继续写，保留最近阶段而不是整段历史。
+const FUSE_HOST_STAGE_MAX_BYTES: i64 = 256 * 1024;
 
 fn append_bytes(buffer: &mut [u8], len: &mut usize, bytes: &[u8]) {
     for byte in bytes {
@@ -244,7 +255,8 @@ fn host_stage_bytes(stage: &[u8]) {
     let Ok(path) = CString::new(FUSE_HOST_STAGE_PATH) else {
         return;
     };
-    // SAFETY: path 是合法 NUL 结尾路径；buffer 与 len 一致，fd 在同一块内关闭。
+    // SAFETY: path 是合法 NUL 结尾路径；buffer 与 len 一致，fd 在同一块内关闭；
+    // lseek/ftruncate 只作用于刚打开的本文件 fd。
     unsafe {
         let fd = libc::open(
             path.as_ptr(),
@@ -253,6 +265,9 @@ fn host_stage_bytes(stage: &[u8]) {
         );
         if fd < 0 {
             return;
+        }
+        if libc::lseek(fd, 0, libc::SEEK_END) >= FUSE_HOST_STAGE_MAX_BYTES {
+            libc::ftruncate(fd, 0);
         }
         libc::write(fd, buffer.as_ptr() as *const libc::c_void, len);
         libc::close(fd);
@@ -279,7 +294,32 @@ fn install_host_panic_hook() {
 }
 
 /// 应用接入共享宿主会话是否生效（默认开启，只认显式关闭）。
-fn host_attach_enabled() -> bool {
+///
+/// 这是共享宿主会话的唯一总闸：宿主会话建立、应用接入、媒体视图绑定与外部 abort
+/// 兜底监控全部以它为前提。任一缺失都会让「关闭接入」变成假关闭——宿主照样建立、
+/// 照样换代，只是没有应用接入它，而换代本身仍会给已附着命名空间留死挂载层。
+pub(crate) fn host_attach_enabled() -> bool {
+    if !host_attach_env_enabled() {
+        return false;
+    }
+    // 落盘开关每次都读：设备上 daemon 由 service.sh 直接拉起、没有注入环境变量的
+    // 位置，现场排障只能靠创建文件。文件与 env 语义完全等价，出现即关闭宿主的全部
+    // 使用路径（不只是应用接入）。
+    if std::path::Path::new(crate::platform::module_paths::HOST_ATTACH_DISABLE_FILE).exists() {
+        static LOGGED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+        if !LOGGED.swap(true, Ordering::Relaxed) {
+            log::warn!(
+                "fuse host disabled by marker file={} effect=no-host-session namespace-bind-only",
+                crate::platform::module_paths::HOST_ATTACH_DISABLE_FILE
+            );
+        }
+        return false;
+    }
+    true
+}
+
+/// 环境变量侧的开关判定（一次性读取并留档）。
+fn host_attach_env_enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
     *ENABLED.get_or_init(|| {
         // 只有明确写成"关闭"的取值才关闭；未设置、空值或其它内容一律按开启处理——
@@ -325,24 +365,57 @@ pub fn can_attach_app(uid: i32, mount_root: &str) -> bool {
     }
     let user_id = crate::platform::user_id_from_uid(uid);
     let view_root = paths::storage_user_root_for_user(user_id);
-    paths::normalize_syntax(mount_root) == paths::normalize_syntax(&view_root)
+    // P5-c：接入目标上提一层后是视图根（`…/emulated`），闸门必须同时放行两种形态；
+    // 只放行旧的用户根会让整族接入被判"根不允许接入"而静默回退 scoped。
+    let lifted_root = crate::fuse_redirect::config::host_attach_root_for_user(user_id);
+    let normalized = paths::normalize_syntax(mount_root);
+    normalized == paths::normalize_syntax(&view_root)
+        || normalized == paths::normalize_syntax(&lifted_root)
 }
 
-/// 某个挂载源是否属于**当前仍在服务**的共享宿主会话。
+/// 当前仍在服务的共享宿主会话的超级块设备号。
 ///
-/// 宿主会话会被自愈逻辑重建（新的 pid、新的挂载源）。旧会话留下的挂载层虽然仍带着
-/// `srx_fuse_host[...]` 前缀、看上去"是本模块的"，但它服务的那条 FUSE 连接已经断了，
-/// 继续当作有效层保留只会让应用访问永远 ENOTCONN。
-pub fn is_current_host_source(source: &str) -> bool {
-    get_fuse_host().is_some_and(|host| host.mount_source == source)
+/// daemon 用内存句柄，companion 用快照文件；两条路径都只返回"当前这一代"的值。
+pub fn current_host_dev() -> Option<String> {
+    if let Some(host) = get_fuse_host() {
+        return Some(host.dev.clone());
+    }
+    read_host_session_view().map(|view| view.dev)
+}
+
+/// 某条实时挂载是否属于**当前仍在服务**的共享宿主会话。
+///
+/// 判据是超级块设备号而不是挂载源文本：宿主会话会被自愈逻辑重建（新的 pid、新的
+/// 超级块），旧会话留下的层仍"看上去是本模块的"（同形挂载、同源文本），但它服务的那条
+/// FUSE 连接已经断了，继续当作有效层保留只会让应用访问永远 ENOTCONN。挂载源原生化之后
+/// 文本不再带模块标识，dev 是唯一还能表达"同一代会话"的内核事实。
+pub fn is_current_host_mount(live: &crate::mount_ledger::LiveMount) -> bool {
+    current_host_dev().is_some_and(|dev| dev == live.dev)
+}
+
+/// 某条实时挂载是否是**本模块的**（当前或历史任一代宿主/会话）。
+///
+/// 只认我们自己登记过的超级块（账本 + 当前快照），因此系统 MediaProvider 的 FUSE
+/// 永远判为 False —— 这是"绝不摘系统挂载"这条安全边界现在的落点。
+pub fn is_module_fuse_mount(live: &crate::mount_ledger::LiveMount) -> bool {
+    !live.dev.is_empty() && crate::mount_ledger::known_module_fuse_devs().contains(&live.dev)
+}
+
+/// 指定路径上最顶层的挂载是否来自**已失效**的本模块会话。
+///
+/// 供只持有挂载点的调用方使用（它们拿不到 [`crate::mount_ledger::LiveMount`]）：
+/// 这里自己读一次最顶层记录，再走 [`is_stale_host_mount`] 的超级块判据。
+pub fn is_stale_host_at(target: &str) -> bool {
+    crate::mount_ledger::topmost_live_mount(0, target)
+        .is_some_and(|live| is_stale_host_mount(&live))
 }
 
 /// 应用接入留下的挂载层是否已经过期。
 ///
-/// "过期"指这层来自共享宿主会话、但不再是当前仍在服务的那个会话：它既是本模块的层
-/// （归属判定会认），又已经失去后端。清理与恢复流程据此决定不保留、按重挂处理。
-pub fn is_stale_host_source(source: &str) -> bool {
-    crate::fuse_redirect::config::is_host_mount_source(source) && !is_current_host_source(source)
+/// "过期"指这层是本模块的层、但不属于当前仍在服务的那一代会话：它已经失去后端。
+/// 清理与恢复流程据此决定不保留、按重挂处理。
+pub fn is_stale_host_mount(live: &crate::mount_ledger::LiveMount) -> bool {
+    is_module_fuse_mount(live) && !is_current_host_mount(live)
 }
 
 /// 一次成功的应用接入。
@@ -361,17 +434,77 @@ pub struct HostAttach {
 ///
 /// attach 上报的 ENOTCONN 有两类来源：宿主 FUSE endpoint 已死（进程假活、连接已断），
 /// 或目标应用 namespace 里残留的死挂载层（路径解析穿过它时报错，宿主本身健康）。
-/// 宿主挂载点位于 daemon/companion 自身可访问的模块目录内，stat 它不经过任何应用
-/// 视图，是区分两类故障最直接的探针。两类故障的处理完全不同：前者必须撤销快照并
-/// 终止假活宿主；后者杀宿主只会触发"恢复→再被杀"的循环，把能力快照的退避越推越深。
+/// 宿主挂载点位于 daemon/companion 自身可访问的模块目录内，对它发起一次**必然穿透到
+/// FUSE 连接**的探测，是区分两类故障最直接的探针。两类故障的处理完全不同：前者必须
+/// 撤销快照并终止假活宿主；后者杀宿主只会触发"恢复→再被杀"的循环，把能力快照的
+/// 退避越推越深。
+///
+/// 探测不能只 `stat` 挂载点本身：根 dentry 的属性缓存在连接死亡后仍然有效，僵死的
+/// 宿主会因此被误判存活（真机实证：2026-10-22 13:22，MediaProvider 重启后宿主
+/// media 视图连接死亡，`endpoint=alive` 误判使 attach 反复 ENOTCONN，直到宿主进程
+/// 自己退出才恢复）。这里改为 lookup 一个**必然不存在**的探测名——该操作无法走任何
+/// 缓存，必须由宿主 FUSE 连接真实应答：连接健康时返回 ENOENT，连接僵死时返回
+/// ENOTCONN/EIO 或超时。探测名意外存在同样视为存活（连接应答了请求即证明健康）。
 fn host_endpoint_alive(view: &HostSessionView) -> bool {
-    let Ok(c_path) = CString::new(view.mount_point.as_str()) else {
+    let Ok(c_ns_path) = CString::new(format!("/proc/{}/ns/mnt", view.child_pid)) else {
         return false;
     };
-    let mut buf = std::mem::MaybeUninit::<libc::stat>::uninit();
-    // SAFETY: c_path 是 NUL 结尾的合法路径；buf 指向本栈帧的未初始化缓冲，stat 返回 0
-    // 时由内核完整写入。
-    unsafe { libc::stat(c_path.as_ptr(), buf.as_mut_ptr()) == 0 }
+    let Ok(c_path) = CString::new(format!("{}/.srx_endpoint_probe", view.mount_point)) else {
+        return false;
+    };
+
+    // 宿主 FUSE 路径绝不能在 daemon 本体内探测：连接僵死时这次 lookup 会把调用者自己
+    // 卡进不可中断的 dentry 查找（真机实证：daemon 停在 d_alloc_parallel →
+    // newfstatat → KernelSU sucompat 的 D 态，随后整机被迫重启）。子进程是一次性的，
+    // 父进程保持可响应，仍能按会话状态自愈。
+    crate::logging::prepare_for_fork();
+    // SAFETY: fork 出的子进程只用 libc/setns/stat 并以 _exit 退出，不触碰 Rust 运行时状态。
+    let child = unsafe { libc::fork() };
+    if child < 0 {
+        return false;
+    }
+    if child == 0 {
+        // SAFETY: 两个 C 串在整个子进程调用序列内保持有效。
+        unsafe {
+            let ns_fd = libc::open(c_ns_path.as_ptr(), libc::O_RDONLY | libc::O_CLOEXEC);
+            if ns_fd < 0 || libc::setns(ns_fd, libc::CLONE_NEWNS) != 0 {
+                libc::_exit(2);
+            }
+            libc::close(ns_fd);
+            let mut buf = std::mem::MaybeUninit::<libc::stat>::uninit();
+            let result = libc::stat(c_path.as_ptr(), buf.as_mut_ptr());
+            if result == 0 {
+                libc::unlink(c_path.as_ptr());
+                libc::_exit(0);
+            }
+            libc::_exit(if crate::platform::errno::last() == libc::ENOENT {
+                0
+            } else {
+                1
+            });
+        }
+    }
+
+    wait_child_exit(child, 5_000) == Some(0)
+}
+
+/// 有界等待 fork 子进程退出，返回退出码；超时、被信号终止或 fork 异常一律返回 `None`。
+///
+/// 子进程可能停在不可中断的 D 态（FUSE 挂死时探测里的 stat 就会这样），所以不能阻塞
+/// waitpid：那会让调用线程陪着一起卡死，正是要避免的失效模式。这里到点即 SIGKILL，
+/// 再交给 `reap_bounded` 做有界回收。等待由 pidfd 退出事件驱动，不反复查询状态。
+fn wait_child_exit(child: i32, timeout_ms: i64) -> Option<i32> {
+    use crate::platform::child_wait::{self, ChildExit};
+    match child_wait::wait_child_exit(child, timeout_ms) {
+        ChildExit::Exited(code) => Some(code),
+        ChildExit::Signaled(_) | ChildExit::Failed(_) => None,
+        ChildExit::TimedOut => {
+            // SAFETY: child 已确认仍在运行；SIGKILL 只作用于它。
+            unsafe { libc::kill(child, libc::SIGKILL) };
+            reap_bounded(child, "probe");
+            None
+        }
+    }
 }
 
 /// 把应用的存储视图接入共享宿主会话。
@@ -389,10 +522,21 @@ fn host_endpoint_alive(view: &HostSessionView) -> bool {
 ///
 /// 子进程在附着成功后立即退出：挂载归 mount namespace 所有，不随创建它的进程消失，
 /// 而常驻只会白占一个进程并拖住应用命名空间的引用计数（应用退出后残留挂载）。
-pub fn attach_app_to_host(view: &HostSessionView, target_root: &str) -> Option<HostAttach> {
+pub fn attach_app_to_host(
+    view: &HostSessionView,
+    target_root: &str,
+    user_id: i32,
+    app_uid: i32,
+    timeout_sec: i64,
+) -> Option<HostAttach> {
     if target_root.is_empty() {
         return None;
     }
+    // 接入子进程要对 target_root 做 open_tree + move_mount，这条路径遍历应用命名空间里的
+    // FUSE 挂载；共享会话只有一条连接，开机风暴时 fuse_get_req 可能把子进程卡在 D 态，
+    // 只有 SIGKILL 能打断。因此等待窗口必须由调用方（挂载子进程）按自己的剩余预算给出，
+    // 而不是固定 10 秒——固定值比父进程的等待预算还长时，挂载子进程必然先被判卡死杀掉。
+    let timeout_sec = timeout_sec.clamp(1, HOST_ATTACH_TIMEOUT_SEC);
     let mut ready_sockets = [0; 2];
     // SAFETY: ready_sockets 是本地数组，长度合法，socketpair 填充两个 fd。
     if unsafe {
@@ -429,7 +573,10 @@ pub fn attach_app_to_host(view: &HostSessionView, target_root: &str) -> Option<H
         unsafe {
             libc::prctl(libc::PR_SET_NAME, name.as_ptr() as libc::c_ulong, 0, 0, 0);
         }
-        let ok = host_attach_child_main(view, target_root, ready_sockets[1]);
+        // SOCK_DGRAM 对端退出没有 EOF：所有正常失败都必须显式回包，避免
+        // 已退出的接入子进程仍让父进程空等 10 秒，挤占后续应用的挂载窗口。
+        let result = host_attach_child_main(view, target_root, user_id, app_uid);
+        let ok = send_host_attach_result(ready_sockets[1], result) && result == 0;
         host_stage(if ok { "attach_ok" } else { "attach_failed" });
         // SAFETY: _exit 终止子进程，不跑 atexit。
         unsafe { libc::_exit(if ok { 0 } else { 1 }) };
@@ -437,7 +584,7 @@ pub fn attach_app_to_host(view: &HostSessionView, target_root: &str) -> Option<H
 
     // SAFETY: 父进程关闭子端 fd 后等待就绪。
     unsafe { libc::close(ready_sockets[1]) };
-    let ready = recv_host_ready(ready_sockets[0], HOST_ATTACH_TIMEOUT_SEC);
+    let ready = recv_host_ready(ready_sockets[0], timeout_sec);
     // SAFETY: ready_sockets[0] 是父进程持有的有效端点。
     unsafe { libc::close(ready_sockets[0]) };
     // 子进程正常会立刻退出，因此这里以阻塞回收为准；异常路径改用强制回收，两者都不能留下僵尸。
@@ -499,14 +646,60 @@ pub fn attach_app_to_host(view: &HostSessionView, target_root: &str) -> Option<H
             false
         }
         None => {
-            let reason = reap_host_child(child);
-            log::warn!(
-                "fuse host attach unavailable child={} timeout_sec={} {}",
-                child,
-                HOST_ATTACH_TIMEOUT_SEC,
-                reason
-            );
-            false
+            // 探针超时**不等于**接入失败。
+            //
+            // 子进程在 step 5.5 用应用凭据 stat 一次刚附着的视图根来做可用性验证，
+            // 那是一次穿过本会话的同步 FUSE 往返。而设备上单条 FUSE 请求偶发 20~60 秒
+            // （真机实测 `no_completion_ms=60551`，同一窗口内 attach 预算只有 5 秒），
+            // 于是「接入其实已经成功、只是验证没回来」会被判成失败，应用回落
+            // namespace bind —— 而且此时目标上已经叠了本会话的层，还会多出一层。
+            //
+            // 「挂载有没有就位」这件事不需要走 FUSE：读本进程命名空间的 mountinfo 即可
+            // （子进程挂在应用命名空间里，父进程同命名空间，看得到）。就位即成功。
+            let landed = crate::fuse_session::storage_view_top_dev(target_root).as_deref()
+                == Some(view.dev.as_str());
+            if landed {
+                // 子进程若恰好停在 move_mount 与传播关系设置之间，层已就位但仍是
+                // shared。父进程与子进程同命名空间，这里幂等地补一次（slave 对已是
+                // slave 的目标无副作用），把「多传出去一层」的可能性彻底关掉。
+                if let Ok(c_target) = CString::new(target_root) {
+                    let fixed = if target_root.trim_end_matches('/').ends_with("/emulated") {
+                        make_mount_slave(&c_target)
+                    } else {
+                        make_mount_private(&c_target)
+                    };
+                    if !fixed {
+                        log::warn!(
+                            "fuse host attach landed but propagate fix failed target={}",
+                            target_root
+                        );
+                    }
+                }
+                let reason = reap_host_child(child);
+                log::warn!(
+                    "fuse host attach probe timeout but mount landed child={} host={} target={} timeout_sec={} {}",
+                    child,
+                    view.child_pid,
+                    target_root,
+                    timeout_sec,
+                    reason
+                );
+                crate::fuse_redirect::config::record_fuse_capability_result(
+                    true,
+                    "host_attach_probe_timeout_but_landed",
+                    "srx_fuse_host",
+                );
+            } else {
+                log_attach_child_blocked_point(child, target_root, app_uid, timeout_sec);
+                let reason = reap_host_child(child);
+                log::warn!(
+                    "fuse host attach unavailable child={} timeout_sec={} {}",
+                    child,
+                    timeout_sec,
+                    reason
+                );
+            }
+            landed
         }
     };
     if !ok {
@@ -522,455 +715,10 @@ pub fn attach_app_to_host(view: &HostSessionView, target_root: &str) -> Option<H
 
 /// 回收已自行退出的接入子进程。
 fn reap_attach_child(pid: libc::pid_t) {
-    let mut status: libc::c_int = 0;
-    for _ in 0..50 {
-        // SAFETY: pid 是本次 fork 出的子进程，已确认就绪，回收不会阻塞。
-        if unsafe { libc::waitpid(pid, &mut status as *mut libc::c_int, libc::WNOHANG) } == pid {
-            return;
-        }
-        std::thread::sleep(std::time::Duration::from_millis(10));
+    if crate::platform::child_wait::wait_child_exit(pid, 500).is_settled() {
+        return;
     }
     reap_host_child(pid);
-}
-
-/// 确保宿主子进程命名空间里存在 MediaProvider FUSE 视图绑定（按用户子树）。
-///
-/// 宿主对自有 `Android/media/<pkg>/` 下 sqlite 三件套的读写原本直连 f2fs，与其它
-/// 调用方（未重定向应用、MediaProvider 自身）经 MediaProvider FUSE 的内核缓存互不
-/// 感知；数据库文件删除重建后两层各持一个代际，读取撕裂表现为 `SQLITE_CORRUPT`
-/// （真机实测：支付宝内 XRadiant）。把 MediaProvider FUSE 挂载克隆进宿主命名空间后，
-/// 策略会把这类文件改经该视图访问，所有访问方共享同一份内核 inode 缓存。
-///
-/// 源挂载 `/mnt/user/<user>/emulated` 在**当前**（daemon 挂载 worker 或应用）命名空间
-/// 中必然存在——应用能发起挂载请求就说明存储已就绪；克隆必须在源命名空间内完成，
-/// 跨命名空间 `mount(MS_BIND)` 会直接 `EINVAL`（与接入逻辑同一约束）。
-///
-/// 幂等：目标用户子树已可寻址即视为就绪，直接返回。失败不阻断登记：
-/// 策略构造时探测不到视图会自动回退直连后端的既有行为。
-pub fn ensure_host_media_fuse_view(user_id: i32) -> bool {
-    // 落盘开关：现场排障时创建该文件即可关闭视图绑定（不用重刷模块），删除后恢复。
-    if std::path::Path::new("/data/adb/modules/storage.redirect.x/.media_view_disabled").exists() {
-        return false;
-    }
-    // 失败退避：视图在某些环境持续不可用（如模拟器镜像），刚失败过就跳过本轮注册，
-    // 避免每次应用注册都阻塞整个超时周期（挂载 worker 是 fork 的，跨 worker 用文件传递）。
-    if media_view_backoff_active() {
-        return false;
-    }
-    // 存储就绪前置检查：源挂载在应用发起挂载请求时已存在，但其内容（<user>/Android）
-    // 在开机早期可能尚未填充——真机实测开机后数分钟内不可见，探测重试（秒级）覆盖
-    // 不了分钟级窗口。这一形态是「尚未就绪」而非「绑定失败」：此时 fork 绑定子进程
-    // 只会让探测失败并写入退避标记，把一次普通的「早到」升级成 10 分钟盲窗。这里在
-    // 调用方命名空间做一次廉价的源可见性检查，不就绪就静默跳过，等下一次注册
-    // （reconcile 周期约 6 秒）重试；不写标记、不进退避。
-    let source_probe = format!("/mnt/user/{user_id}/emulated/{user_id}/Android");
-    if !crate::platform::fs::is_directory(&source_probe) {
-        return false;
-    }
-    let Some(host) = get_fuse_host() else {
-        return false;
-    };
-    let Ok(c_source) = CString::new(format!("/mnt/user/{user_id}/emulated")) else {
-        return false;
-    };
-    // 绑定目标是 MediaProvider FUSE 挂载的**根**（其下自带 `<user>` 子树），策略侧的
-    // 视图根则是 `FUSE_HOST_MEDIA_VIEW_DIR/<user>`。这里不能把目标写成带 user 后缀：
-    // 那会让整棵 fuse 树挂进 <user> 目录，视图里多出一层用户目录导致探测永远失败。
-    let Ok(c_target) = CString::new(crate::platform::module_paths::FUSE_HOST_MEDIA_VIEW_DIR) else {
-        return false;
-    };
-    let Ok(c_probe) = CString::new(format!(
-        "{}/{}",
-        crate::platform::module_paths::FUSE_HOST_MEDIA_VIEW_DIR,
-        user_id
-    )) else {
-        return false;
-    };
-
-    let mut ready_sockets = [0; 2];
-    // SAFETY: ready_sockets 是本地数组，长度合法，socketpair 填充两个 fd。
-    if unsafe {
-        libc::socketpair(
-            libc::AF_UNIX,
-            libc::SOCK_DGRAM,
-            0,
-            ready_sockets.as_mut_ptr(),
-        )
-    } != 0
-    {
-        log_errno("fuse host media view socketpair failed");
-        return false;
-    }
-
-    crate::logging::prepare_for_fork();
-    // SAFETY: fork 前已完成日志准备；子进程只做系统调用后退出。
-    let child = unsafe { libc::fork() };
-    if child < 0 {
-        log_errno("fuse host media view fork failed");
-        // SAFETY: 两个 fd 均为本次 socketpair 打开，此处是唯一清理点。
-        unsafe {
-            libc::close(ready_sockets[0]);
-            libc::close(ready_sockets[1]);
-        }
-        return false;
-    }
-
-    if child == 0 {
-        // SAFETY: 子进程关闭父端 fd；该入口只在完成或失败时返回。
-        unsafe { libc::close(ready_sockets[0]) };
-        let name = b"srx_hostmedia\0";
-        // SAFETY: prctl(PR_SET_NAME) 设置线程名称，name 是 NUL 结尾的静态字节串。
-        unsafe {
-            libc::prctl(libc::PR_SET_NAME, name.as_ptr() as libc::c_ulong, 0, 0, 0);
-        }
-        let ok = host_media_view_child_main(
-            host.child_pid,
-            &c_source,
-            &c_target,
-            &c_probe,
-            ready_sockets[1],
-        );
-        host_stage(if ok {
-            "media_view_ok"
-        } else {
-            "media_view_failed"
-        });
-        // SAFETY: _exit 终止子进程，不跑 atexit。
-        unsafe { libc::_exit(if ok { 0 } else { 1 }) };
-    }
-
-    // SAFETY: 父进程关闭子端 fd 后等待就绪。
-    unsafe { libc::close(ready_sockets[1]) };
-    let ready = recv_host_ready(ready_sockets[0], HOST_ATTACH_TIMEOUT_SEC);
-    // SAFETY: ready_sockets[0] 是父进程持有的有效端点。
-    unsafe { libc::close(ready_sockets[0]) };
-    let ok = match ready {
-        Some(0) => {
-            reap_attach_child(child);
-            true
-        }
-        Some(code) => {
-            let reason = reap_host_child(child);
-            log::warn!(
-                "fuse host media view not ready child={} code={} stage={} {}",
-                child,
-                code,
-                crate::fuse_redirect::config::host_ready_stage(code),
-                reason
-            );
-            mark_media_view_failure();
-            false
-        }
-        None => {
-            let reason = reap_host_child(child);
-            let stage = read_child_last_stage(child);
-            log::warn!(
-                "fuse host media view unavailable child={} timeout_sec={} stage={} {}",
-                child,
-                HOST_ATTACH_TIMEOUT_SEC,
-                stage,
-                reason
-            );
-            mark_media_view_failure();
-            false
-        }
-    };
-    if !ok {
-        log_host_stage_trace();
-    } else {
-        // 绑定成功即清除失败标记：标记只描述「最近一次失败」，不应跨成功存续；
-        // 清掉后本开机的瞬时失败不会把退避状态带进下一次开机的判定。
-        let _ = std::fs::remove_file(crate::platform::module_paths::MEDIA_VIEW_BACKOFF_FILE);
-    }
-    ok
-}
-
-/// 媒体视图绑定失败退避：10 分钟内不重复尝试。
-const MEDIA_VIEW_BACKOFF_MS: i64 = 10 * 60 * 1000;
-
-fn media_view_backoff_active() -> bool {
-    let Ok(text) = std::fs::read_to_string(crate::platform::module_paths::MEDIA_VIEW_BACKOFF_FILE)
-    else {
-        return false;
-    };
-    let Ok(last_failure_ms) = text.trim().parse::<i64>() else {
-        return false;
-    };
-    let now_ms = paths::monotonic_ms();
-    // 标记文件在模块目录里跨重启保留，而 monotonic 时钟每次开机归零。上次开机的
-    // 失败时间戳（随上次开机时长增长，动辄数小时）在重启后远大于当前时刻，
-    // `saturating_sub` 会把它饱和成 0 落进退避窗口：媒体视图被禁用到本开机时钟
-    // 追上旧值为止——盲窗内自有 sqlite 三件套直连 f2fs，与 MediaProvider 的另一
-    // 代内核缓存并行读写，读取撕裂在整窗内可复发。本开机内 monotonic 单调递增、
-    // 写入必然早于读取，因此「失败时间戳大于当前时刻」只可能是跨开机残留：
-    // 判为过期并顺手清理。
-    if last_failure_ms > now_ms {
-        let _ = std::fs::remove_file(crate::platform::module_paths::MEDIA_VIEW_BACKOFF_FILE);
-        return false;
-    }
-    now_ms - last_failure_ms <= MEDIA_VIEW_BACKOFF_MS
-}
-
-fn mark_media_view_failure() {
-    let _ = std::fs::write(
-        crate::platform::module_paths::MEDIA_VIEW_BACKOFF_FILE,
-        paths::monotonic_ms().to_string(),
-    );
-}
-
-/// 读取某个绑定/接入子进程在阶段文件里留下的最后阶段码。阶段文件是所有宿主子
-/// 进程共享的滚动记录（会被后续流程快速覆盖），失败分支把它带进日志才能事后
-/// 定位子进程实际死在哪一步——此前存在「无任何告警行、阶段码也已被覆盖」的
-/// 失败样本，无从排查。
-fn read_child_last_stage(child: i32) -> String {
-    let Ok(text) = std::fs::read_to_string(FUSE_HOST_STAGE_PATH) else {
-        return String::new();
-    };
-    let prefix = format!("pid={child} ");
-    text.lines()
-        .rev()
-        .find_map(|line| {
-            if line.starts_with(&prefix) {
-                line.split("stage=")
-                    .nth(1)
-                    .map(|stage| stage.trim().to_string())
-            } else {
-                None
-            }
-        })
-        .unwrap_or_default()
-}
-
-/// 媒体视图绑定子进程入口：当前命名空间克隆 MediaProvider FUSE 挂载 → 宿主命名空间
-/// 附着 → 幂等复核。
-///
-/// 克隆必须发生在进入宿主命名空间**之前**：宿主命名空间里没有源挂载，`mount(MS_BIND)`
-/// 与 `open_tree` 都要求源在调用方当前命名空间内。幂等探测在附着之前做会导致克隆
-/// 白做一次（探测需要先进入宿主命名空间），代价是几次本地系统调用，可接受。
-fn host_media_view_child_main(
-    host_pid: i32,
-    c_source: &CStr,
-    c_target: &CStr,
-    c_probe: &CStr,
-    ready_sock: libc::c_int,
-) -> bool {
-    // 1. 在当前命名空间克隆游离挂载。
-    let tree_fd = open_detached_mount(c_source);
-
-    // 2. 进入宿主命名空间：目标目录与视图探测都只对宿主视图有意义。
-    host_stage("media_view_ns_entering");
-    let host_ns_path = format!("/proc/{host_pid}/ns/mnt");
-    let Ok(c_host_ns) = CString::new(host_ns_path) else {
-        return false;
-    };
-    // SAFETY: c_host_ns 是 NUL 结尾的合法路径。
-    let host_ns = unsafe { libc::open(c_host_ns.as_ptr(), libc::O_RDONLY | libc::O_CLOEXEC) };
-    if host_ns < 0 {
-        log_errno("fuse host media view ns open failed");
-        host_stage("media_view_ns_open_failed");
-        return false;
-    }
-    // SAFETY: host_ns 是本函数打开的有效 namespace fd。
-    let host_ns = UniqueFd::new(host_ns);
-    // SAFETY: host_ns 是有效的 mount namespace fd。
-    if unsafe { libc::setns(host_ns.get(), libc::CLONE_NEWNS) } != 0 {
-        log_errno("fuse host media view setns failed");
-        host_stage("media_view_setns_failed");
-        return false;
-    }
-    host_stage("media_view_ns_entered");
-
-    // 3. 幂等：目标用户子树已可寻址即视为绑定就绪。
-    if media_view_probe_with_retry(c_probe).is_ok() {
-        host_stage("media_view_already_bound");
-        send_media_view_ready(ready_sock);
-        return true;
-    }
-    if tree_fd < 0 {
-        let errno = crate::platform::errno::last();
-        log::warn!(
-            "fuse host media view open_tree failed src={} errno={} {}",
-            c_source.to_string_lossy(),
-            errno,
-            crate::platform::errno::text(errno)
-        );
-        host_stage("media_view_open_tree_failed");
-        return false;
-    }
-    // SAFETY: tree_fd 是 open_tree 返回的有效 fd。
-    let tree_fd = UniqueFd::new(tree_fd);
-
-    // 4. 目标目录逐级创建（tmp/fuse_host_media 与 <user> 两层都可能不存在；
-    //    libc::mkdir 只建一层，父目录缺失会让这里静默 ENOENT，后续 move_mount
-    //    也跟着 ENOENT——这正是首次刷入后视图绑定失败的根因）。
-    let target = c_target.to_string_lossy().to_string();
-    let mut prefix = String::new();
-    for part in target.split('/').filter(|part| !part.is_empty()) {
-        prefix.push('/');
-        prefix.push_str(part);
-        let Ok(c_prefix) = CString::new(prefix.clone()) else {
-            log::warn!("fuse host media view mkdir path invalid prefix={}", prefix);
-            host_stage("media_view_mkdir_path_invalid");
-            return false;
-        };
-        // SAFETY: c_prefix 是 NUL 结尾的合法路径；EEXIST 属于预期，忽略。
-        unsafe { libc::mkdir(c_prefix.as_ptr(), 0o755) };
-    }
-    host_stage("media_view_mkdir_ok");
-    if let Err(errno) = move_detached_mount(tree_fd.get(), c_target) {
-        log::warn!(
-            "fuse host media view move_mount failed target={} errno={} {}",
-            target,
-            errno,
-            crate::platform::errno::text(errno)
-        );
-        host_stage("media_view_move_failed");
-        return false;
-    }
-    if !make_mount_private(c_target) {
-        host_stage("media_view_private_failed");
-        return false;
-    }
-    host_stage("media_view_moved");
-
-    // 5. 复核：与接入复核同理，系统调用成功不代表视图真的可用。锚点是用户子树
-    //    本身——真机实测 MediaProvider FUSE 对宿主命名空间内的顶层 Android 节点
-    //    lookup 返回 ENOENT（readdir 仍列出、其下访问待验证），用 Android 作硬锚点
-    //    会把挂载完好的视图误判为失败；Android 层的可见性降级为非致命观测。
-    if let Err(errnos) = media_view_probe_with_retry(c_probe) {
-        let last_errno = errnos.last().copied().unwrap_or(0);
-        log::warn!(
-            "fuse host media view probe failed target={} errnos={:?} last_errno={} {}",
-            c_probe.to_string_lossy(),
-            errnos,
-            last_errno,
-            crate::platform::errno::text(last_errno)
-        );
-        // 现场快照：区分「克隆已挂上但内容缺失」与「读取本身报错」。
-        log_media_view_dir_snapshot("view_root", c_target.to_string_lossy().as_ref());
-        log_media_view_dir_snapshot("view_user", c_probe.to_string_lossy().as_ref());
-        host_stage("media_view_probe_failed");
-        // 重试后仍失败：摘除本次刚附着的挂载层。留着它有两个后果——下次绑定时
-        // 在同一目标再 move_mount 一份克隆，失败不清会逐层堆叠（退避把尝试限速
-        // 到每 10 分钟一次，但长时间运行仍会累积）；以及「视图已挂上但被报告为
-        // 不可用」的不一致状态会延续到退避窗口结束，期间所有注册都拿不到视图。
-        // MNT_DETACH 只摘顶层，恰好是本次附着的这一层。
-        // SAFETY: c_target 是 NUL 结尾的合法路径；umount2 不涉及借用指针，失败仅返回负值。
-        unsafe { libc::umount2(c_target.as_ptr(), libc::MNT_DETACH) };
-        return false;
-    }
-
-    // Android 层可见性观测（非致命）：仅记录，不影响绑定判定。
-    let android_path = paths::join(&c_probe.to_string_lossy(), "Android");
-    let android_visible = match CString::new(android_path.clone()) {
-        Ok(c_android) => media_view_probe_once(&c_android).is_ok(),
-        Err(_) => false,
-    };
-    log::info!(
-        "fuse host media view android anchor visible={} path={}",
-        android_visible,
-        android_path
-    );
-
-    // 6. 通知父进程，随后自行退出（协议与接入子进程一致）。
-    host_stage("media_view_sending_ready");
-    send_media_view_ready(ready_sock);
-    true
-}
-
-/// 向父进程发送视图绑定的就绪结果（协议与接入子进程一致）。
-fn send_media_view_ready(ready_sock: libc::c_int) -> bool {
-    let ready: i32 = 0;
-    // SAFETY: ready_sock 是本次绑定的有效端点，ready 是栈变量。
-    let sent = unsafe {
-        libc::send(
-            ready_sock,
-            &ready as *const i32 as *const libc::c_void,
-            std::mem::size_of::<i32>(),
-            0,
-        )
-    };
-    if sent != std::mem::size_of::<i32>() as isize {
-        log_errno("fuse host media view send ready failed");
-        return false;
-    }
-    true
-}
-
-/// 探测重试次数与间隔。
-///
-/// 探测是对 MediaProvider FUSE 视图的一次 `stat`，开机早期或重 IO 时可能瞬时失败
-/// （真机实测：挂载已经附着成功、数秒后同一探测即可通过）。单次失败即判「未绑定」
-/// 会把已就绪的视图再堆一层挂载；单次失败即判「绑定失败」会把刚挂好的可用视图
-/// 留给退避窗口浪费整整 10 分钟。这里最多重试 6 次、间隔 500ms，任一次成功即就绪；
-/// 两次探测（幂等检查与复核）都走重试时最坏耗时约 5 秒，仍在本绑定的 10 秒
-/// 父进程超时之内。
-const MEDIA_VIEW_PROBE_ATTEMPTS: usize = 6;
-const MEDIA_VIEW_PROBE_INTERVAL_MS: u32 = 500;
-
-/// 单次探测并携带 errno：探测给定路径本身（由调用方决定锚点），排查需要区分
-/// 「内容缺失」（ENOENT）、「读取被打断」（EAGAIN/ETIMEOUT 类）与「连接已死」
-/// （ENOTCONN）等形态，bool 不足以定位。
-fn media_view_probe_once(c_target: &CStr) -> Result<(), i32> {
-    let mut st = std::mem::MaybeUninit::<libc::stat>::uninit();
-    // SAFETY: c_target 是 NUL 结尾的合法路径；st 指向本栈帧的未初始化缓冲。
-    let ret = unsafe { libc::stat(c_target.as_ptr(), st.as_mut_ptr()) };
-    if ret != 0 {
-        return Err(crate::platform::errno::last());
-    }
-    // SAFETY: stat 调用成功后缓冲已被内核填充。
-    let st = unsafe { st.assume_init() };
-    if st.st_mode & libc::S_IFMT == libc::S_IFDIR {
-        Ok(())
-    } else {
-        Err(libc::ENOTDIR)
-    }
-}
-
-/// 带重试的探测：成功返回 Ok(())；全部失败返回 Err（每次尝试的 errno 序列），
-/// 供失败日志一次性打出完整形态。
-fn media_view_probe_with_retry(c_target: &CStr) -> Result<(), Vec<i32>> {
-    let mut errnos = Vec::with_capacity(MEDIA_VIEW_PROBE_ATTEMPTS);
-    for attempt in 0..MEDIA_VIEW_PROBE_ATTEMPTS {
-        match media_view_probe_once(c_target) {
-            Ok(()) => return Ok(()),
-            Err(errno) => errnos.push(errno),
-        }
-        if attempt + 1 < MEDIA_VIEW_PROBE_ATTEMPTS {
-            // SAFETY: usleep 只接收整型参数，不涉及借用指针。
-            unsafe { libc::usleep(MEDIA_VIEW_PROBE_INTERVAL_MS * 1000) };
-        }
-    }
-    Err(errnos)
-}
-
-/// 探测失败时的现场快照：把视图目录的实际内容打进日志，区分「克隆已挂上但
-/// 内容缺失」与「目录读取本身报错」两类形态。
-fn log_media_view_dir_snapshot(label: &str, path: &str) {
-    match std::fs::read_dir(path) {
-        Ok(entries) => {
-            let names: Vec<String> = entries
-                .filter_map(|entry| entry.ok())
-                .take(12)
-                .map(|entry| entry.file_name().to_string_lossy().to_string())
-                .collect();
-            log::warn!(
-                "fuse host media view snapshot label={} path={} entries={:?}",
-                label,
-                path,
-                names
-            );
-        }
-        Err(err) => {
-            log::warn!(
-                "fuse host media view snapshot label={} path={} read_failed errno={} {}",
-                label,
-                path,
-                err.raw_os_error().unwrap_or(0),
-                err
-            );
-        }
-    }
 }
 
 /// `open_tree(2)` 的 `OPEN_TREE_CLONE`：克隆出一个游离（未附着到任何命名空间）的挂载。
@@ -989,17 +737,18 @@ const MOVE_MOUNT_F_EMPTY_PATH: libc::c_uint = 0x0000_0004;
 fn host_attach_child_main(
     view: &HostSessionView,
     target_root: &str,
-    ready_sock: libc::c_int,
-) -> bool {
+    user_id: i32,
+    app_uid: i32,
+) -> i32 {
     // 1. 先钉住当前（应用）命名空间：克隆要在宿主命名空间做，句柄是唯一的回头路。
     let Ok(c_app_ns) = CString::new("/proc/self/ns/mnt") else {
-        return false;
+        return -1;
     };
     // SAFETY: c_app_ns 是 NUL 结尾的合法路径。
     let app_ns = unsafe { libc::open(c_app_ns.as_ptr(), libc::O_RDONLY | libc::O_CLOEXEC) };
     if app_ns < 0 {
         log_errno("fuse host attach app ns open failed");
-        return false;
+        return -1;
     }
     // SAFETY: app_ns 是本函数打开的有效 fd，只在切回时使用。
     let app_ns = UniqueFd::new(app_ns);
@@ -1007,24 +756,24 @@ fn host_attach_child_main(
     // 2. 进入宿主命名空间做克隆。
     let host_ns_path = format!("/proc/{}/ns/mnt", view.child_pid);
     let Ok(c_host_ns) = CString::new(host_ns_path) else {
-        return false;
+        return -1;
     };
     // SAFETY: c_host_ns 是 NUL 结尾的合法路径。
     let host_ns = unsafe { libc::open(c_host_ns.as_ptr(), libc::O_RDONLY | libc::O_CLOEXEC) };
     if host_ns < 0 {
         log_errno("fuse host attach host ns open failed");
-        return false;
+        return -1;
     }
     // SAFETY: host_ns 是本函数打开的有效 namespace fd。
     let host_ns = UniqueFd::new(host_ns);
     // SAFETY: host_ns 是有效的 mount namespace fd。
     if unsafe { libc::setns(host_ns.get(), libc::CLONE_NEWNS) } != 0 {
         log_errno("fuse host attach setns host failed");
-        return false;
+        return -1;
     }
 
     let Ok(c_mount_point) = CString::new(view.mount_point.as_str()) else {
-        return false;
+        return -1;
     };
     let tree_fd = open_detached_mount(&c_mount_point);
 
@@ -1032,7 +781,7 @@ fn host_attach_child_main(
     // SAFETY: app_ns 是本子进程进入宿主命名空间前钉住的自身命名空间 fd。
     if unsafe { libc::setns(app_ns.get(), libc::CLONE_NEWNS) } != 0 {
         log_errno("fuse host attach setns app failed");
-        return false;
+        return -1;
     }
     if tree_fd < 0 {
         let errno = crate::platform::errno::last();
@@ -1042,7 +791,7 @@ fn host_attach_child_main(
             errno,
             crate::platform::errno::text(errno)
         );
-        return false;
+        return -1;
     }
     // SAFETY: tree_fd 是 open_tree 返回的有效 fd。
     let tree_fd = UniqueFd::new(tree_fd);
@@ -1057,17 +806,70 @@ fn host_attach_child_main(
 
     // 4. 目标目录：与应用挂载路径同源，允许已存在。
     let Ok(c_target) = CString::new(target_root) else {
-        return false;
+        return -1;
     };
     // SAFETY: c_target 是 NUL 结尾的合法路径；失败只可能是已存在（后续附着会给出结论）。
     unsafe {
         libc::mkdir(c_target.as_ptr(), 0o755);
     }
 
+    // 4.5 替换而非叠加：清空该路径上的既有层，让本会话成为唯一的一层。
+    //
+    // 动机（应用域自检实测）：叠加会多出一条挂载、且为防外播必须私有化下层（其
+    // `master:` 标签随之丢失）。基线应用在该路径上只有一条带 `master:` 的 fuse 层。
+    //
+    // 为什么必须**逐层摘到空**而不是摘一次：目标路径上可能同时压着不止一层——上一代
+    // 会话留下的层与系统视图层并存时，只摘栈顶会让底层留下来，应用命名空间里于是出现
+    // 两条同路径挂载（`0:73` 与 `0:74` 并排、父链仍指向系统层，真机实测）。层数在
+    // 接入前就确定的，摘到空再挂是本函数唯一能保证「挂载栈与基线同为一条」的做法。
+    //
+    // 安全网：摘层前用 `open_tree` 克隆**原栈顶**（应用启动时看到的那个视图）作为回滚
+    // 句柄；附着或校验失败就把本会话层摘掉、把备份放回——宁可本轮不接管，也不能让
+    // 应用失去存储。
+    let had_existing_layer = !crate::mount_ledger::live_mounts_at(0, target_root).is_empty();
+    let mut system_backup_fd = -1;
+    if had_existing_layer {
+        if !make_mount_slave_only(&c_target) {
+            log::warn!(
+                "fuse host attach replace propagate failed target={}",
+                target_root
+            );
+            return -1;
+        }
+        system_backup_fd = open_detached_mount(&c_target);
+        match detach_all_layers_at_target(target_root, &c_target) {
+            Ok(layers) => {
+                if layers > 1 {
+                    log::info!(
+                        "fuse host attach replace detached extra layers target={} layers={}",
+                        target_root,
+                        layers
+                    );
+                }
+            }
+            Err(detached) => {
+                log::warn!(
+                    "fuse host attach replace umount failed target={} detached={} errno={}",
+                    target_root,
+                    detached,
+                    crate::platform::errno::last()
+                );
+                // 已经摘掉若干层时必须把原栈顶放回去：否则应用在剩下的下层上继续跑，
+                // 那一层的归属与内容都不可预期（最坏是空的 tmpfs 目录 → 存储消失）。
+                if detached > 0 && system_backup_fd >= 0 {
+                    let _ = move_detached_mount(system_backup_fd, &c_target);
+                }
+                if system_backup_fd >= 0 {
+                    // SAFETY: 回滚句柄由上方 open_detached_mount 打开（放回后即失效）。
+                    unsafe { libc::close(system_backup_fd) };
+                }
+                return -1;
+            }
+        }
+    }
+
     // 5. 把游离挂载附着到目标路径，并立刻切断传播关系。
     if let Err(errno) = move_detached_mount(tree_fd.get(), &c_target) {
-        // 补记本次接入所用的宿主身份与 errno，用于区分「宿主换代后视图过期」与
-        // 「目标路径残留死挂载」两类故障。
         log::warn!(
             "fuse host attach move_mount detail host_pid={} source={} target={} errno={} {}",
             view.child_pid,
@@ -1076,51 +878,324 @@ fn host_attach_child_main(
             errno,
             crate::platform::errno::text(errno)
         );
-        if !target_had_dead_layers && errno == libc::ENOTCONN {
-            // 目标路径清理后已确认可达（或本就无死层），ENOTCONN 只能来自宿主 FUSE
-            // 连接死亡：回报父进程终止该宿主，交由自愈通道重建。负值避免与宿主建立
-            // 阶段的正数阶段码混淆。
-            let code = -errno;
-            // SAFETY: ready_sock 是本次接入的有效端点，code 是栈变量。
-            unsafe {
-                libc::send(
-                    ready_sock,
-                    &code as *const i32 as *const libc::c_void,
-                    std::mem::size_of::<i32>(),
-                    0,
-                )
-            };
+        if system_backup_fd >= 0 {
+            let _ = move_detached_mount(system_backup_fd, &c_target);
+            // SAFETY: 回滚句柄放回后即失效。
+            unsafe { libc::close(system_backup_fd) };
         }
-        return false;
+        return if !target_had_dead_layers && errno == libc::ENOTCONN {
+            -errno
+        } else {
+            -1
+        };
     }
-    if !make_mount_private(&c_target) {
-        return false;
+    let propagate_ok = if target_root.trim_end_matches('/').ends_with("/emulated") {
+        make_mount_slave(&c_target)
+    } else {
+        make_mount_private(&c_target)
+    };
+    if !propagate_ok {
+        return -1;
     }
 
-    // 6. 复核。挂载源必须就是本次会话的挂载源：只靠系统调用返回 0 无法区分
+    // 5.2 单层不变式：视图根上只允许本会话这一层。
+    //
+    // 4.5 已经把既有层摘到空，正常情况下这里恒为 1。判断仍然要做：摘层与 `move_mount`
+    // 之间没有互斥，系统侧（MediaProvider 的按应用 FUSE 视图）完全可能在这段时间里
+    // 重新建一层；一旦成立，应用 `mountinfo` 里就是两条同路径挂载，与基线不一致，且
+    // 上层归属不可判定。此时整体回滚（摘净、放回备份），宁可本轮不接管也不留下叠层。
+    // 校验必须放在 5.5 之前：那里的探测通过后会关闭回滚句柄，之后就不能再回滚了。
+    let layer_count = crate::mount_ledger::live_mounts_at(0, target_root).len();
+    if layer_count != 1 {
+        log::warn!(
+            "fuse host attach layer stack unexpected target={} layers={}",
+            target_root,
+            layer_count
+        );
+        if system_backup_fd >= 0 && detach_all_layers_at_target(target_root, &c_target).is_ok() {
+            let _ = move_detached_mount(system_backup_fd, &c_target);
+            // SAFETY: 回滚句柄放回后即失效。
+            unsafe { libc::close(system_backup_fd) };
+        }
+        return -1;
+    }
+
+    // 5.5 替换后的可用性验证：以**应用凭据**（fsuid + everybody 组）探测视图根。
+    //     `EACCES` 说明会话已接住请求（活着），只有 ENOENT/ENOTCONN 等"没人应答"才回滚。
+    if had_existing_layer && target_root.trim_end_matches('/').ends_with("/emulated") {
+        // SAFETY: getgroups 只读取当前进程的补充组。
+        let mut previous_groups = [0 as libc::gid_t; 64];
+        let previous_count = unsafe {
+            libc::getgroups(
+                previous_groups.len() as libc::c_int,
+                previous_groups.as_mut_ptr(),
+            )
+        };
+        // SAFETY: setfsuid/setgroups 只影响后续权限检查，euid 仍为 0（挂载能力不受影响）。
+        let prev_fsuid = unsafe { libc::syscall(libc::SYS_setfsuid, app_uid as u32) as i64 };
+        let groups = [9997 as libc::gid_t];
+        unsafe { libc::setgroups(groups.len(), groups.as_ptr()) };
+        let probe = std::fs::metadata(target_root);
+        // SAFETY: 恢复调用前的补充组（previous_groups 由 getgroups 填充，长度已校验）。
+        if previous_count > 0 {
+            unsafe { libc::setgroups(previous_count as usize, previous_groups.as_ptr()) };
+        }
+        // SAFETY: 恢复调用前的 fsuid（prev_fsuid 是 setfsuid 的返回值）。
+        unsafe { libc::syscall(libc::SYS_setfsuid, prev_fsuid as u32) };
+
+        let usable = match &probe {
+            Ok(_) => true,
+            Err(error) => {
+                let denied = error.raw_os_error() == Some(libc::EACCES);
+                log::warn!(
+                    "fuse host attach replace probe target={} err={} treated_usable={}",
+                    target_root,
+                    error,
+                    denied
+                );
+                denied
+            }
+        };
+        if !usable {
+            log::warn!(
+                "fuse host attach replace tree unusable target={}",
+                target_root
+            );
+            // 没有可用备份时不得摘层：摘掉本会话层后目标就空了，应用会直接失去存储。
+            // 这种情况下宁可保留本会话层（它至少能服务请求）并如实报失败。
+            if system_backup_fd < 0 {
+                log::warn!(
+                    "fuse host attach replace unusable without backup target={}",
+                    target_root
+                );
+                return -1;
+            }
+            // SAFETY: 摘掉刚附着的本会话层（以及任何同期出现的额外层）。
+            let detached = detach_all_layers_at_target(target_root, &c_target);
+            let restored =
+                detached.is_ok() && move_detached_mount(system_backup_fd, &c_target).is_ok();
+            // SAFETY: 回滚句柄放回后即失效。
+            unsafe { libc::close(system_backup_fd) };
+            log::warn!(
+                "fuse host attach replace rolled back target={} restored={}",
+                target_root,
+                restored
+            );
+            return -1;
+        }
+        // SAFETY: 验证通过，回滚句柄不再需要。
+        unsafe { libc::close(system_backup_fd) };
+    }
+
+    // 6. 复核。挂载的超级块必须就是本次会话的超级块：只靠系统调用返回 0 无法区分
     //    "挂在应用视图里" 与 "挂在了别处"，而误判成接入成功会让应用静默失去重定向。
+    //    判据是 `dev`（bind/克隆都继承超级块），不是挂载源文本——挂载源原生化之后
+    //    文本与系统 MediaProvider 的 FUSE 完全同形。
     let Some(live) = crate::mount_ledger::topmost_live_mount(0, target_root) else {
         log::warn!("fuse host attach not visible target={}", target_root);
-        return false;
+        return -1;
     };
-    if live.source != view.mount_source {
+    if live.dev != view.dev {
         log::warn!(
-            "fuse host attach source mismatch target={} expected={} actual={} fs={}",
+            "fuse host attach identity mismatch target={} expected_dev={} actual_dev={} source={} fs={}",
             target_root,
-            view.mount_source,
+            view.dev,
+            live.dev,
             live.source,
             live.fs_type
         );
-        return false;
+        return -1;
     }
 
-    // 7. 通知父进程，随后自行退出。
-    let ready: i32 = 0;
-    // SAFETY: ready_sock 是本次接入的有效端点，ready 是栈变量。
+    // 7. 覆盖存储别名族。主目标之外的同义存储出口（`/mnt/user/<user>/emulated/<user>` 等）
+    //    仍指向系统 MediaProvider FUSE（pass_through 甚至直通 f2fs 后端），走别名写入的
+    //    组件会完全绕开宿主策略落到真实存储。失败不回滚：主目标已成功，别名只补覆盖面。
+    attach_host_view_to_storage_aliases(target_root, user_id, view);
+
+    0
+}
+
+/// 解析存储视图根路径里的用户号（`/storage/emulated/<user>` → `Some(user)`）。
+fn storage_user_id_from_view_root(target_root: &str) -> Option<i32> {
+    target_root
+        .strip_prefix("/storage/emulated/")
+        .filter(|rest| !rest.is_empty() && rest.bytes().all(|byte| byte.is_ascii_digit()))
+        .and_then(|rest| rest.parse::<i32>().ok())
+}
+
+/// 判断某个存储别名是否属于 **f2fs 直连后端**（系统进程做下层 I/O 的通道）。
+///
+/// 这类别名不是应用可见视图，而是挂载链的最底层：`/data/media/<user>` 是用户存储的
+/// f2fs 真身，`/mnt/pass_through/<owner>/emulated[/<user>]` 是系统给 MediaProvider 等
+/// 特权进程准备的直通出口，两者最终都落在同一个 f2fs 挂载上。
+///
+/// **不能把宿主 FUSE 视图 bind 到这些路径上**：系统进程（尤其是 MediaProvider 的
+/// FuseDaemon）处理 FUSE 请求时要回到下层真实文件系统做 I/O，一旦下层被模块的 FUSE
+/// 视图占住，这次下层 I/O 就会经内核 VFS 重新进入模块自己的 FUSE 连接，请求只能由
+/// 同一批工作线程应答——线程互相等待、连接整体挂死。这与
+/// `MountPlanner::bind_own_private_restore` 只覆盖 `/storage/` 别名是同一条结论。
+fn is_f2fs_direct_backend_alias(alias_root: &str, user_id: i32) -> bool {
+    if paths::is_same_or_child(alias_root, &paths::data_media_user_root_for_user(user_id)) {
+        return true;
+    }
+    let user = user_id.to_string();
+    let pass_through = [
+        format!("/mnt/pass_through/{user}/emulated"),
+        format!("/mnt/pass_through/emulated/{user}"),
+    ];
+    pass_through
+        .iter()
+        .any(|root| paths::is_same_or_child(alias_root, root))
+}
+
+/// 把宿主视图同步覆盖到存储别名族（collapsed hybrid FUSE 形态的收尾步骤）。
+///
+/// 共享宿主接入默认只把视图根挂到主存储根（`/storage/emulated/<user>`）。但同一棵存储树
+/// 在应用命名空间里还有一整族等价别名（`/mnt/user/<user>/emulated/<user>`、
+/// `/mnt/installer/...`、`/mnt/androidwritable/...`），它们仍指向系统 MediaProvider FUSE，
+/// 走别名写入的组件（真机实证：QQ connect SDK 的 xlog 经别名写 `Tencent/msflogs`，
+/// 2026-10-22 在 `/data/media/0/Tencent` 真实落盘且零监视记录）会完全绕开宿主策略。
+/// 命名空间 bind 后端经 `mount::alias::bind_mount_with_storage_aliases` 覆盖同一族别名；
+/// 宿主接入此前漏掉这一步。
+///
+/// 语义与 `mount::alias` 对齐：
+/// - 不存在的别名目标（lstat 失败，如 `/mnt/runtime/*`）跳过；
+/// - 解析后与主目标同真实路径的符号别名（`/storage/self/primary`、
+///   `/storage/emulated/legacy`）去重跳过；
+/// - **f2fs 直连后端别名不覆盖**：见 [`is_f2fs_direct_backend_alias`]；
+/// - **别名目标 bind 前先私有化**：别名与主目标同处系统共享传播组，附着事件会沿
+///   传播组外播到未配置应用的命名空间（2026-10-29 实测），必须先切断；
+/// - 别名上残留的本模块死层先摘除（与主目标同一套 [`clear_dead_srx_layers_at_target`]）；
+/// - 单个别名失败只告警不回滚：主目标已成功，别名失败不能让整个接入作废。
+fn attach_host_view_to_storage_aliases(target_root: &str, user_id: i32, view: &HostSessionView) {
+    let lifted = target_root.trim_end_matches('/').ends_with("/emulated");
+    if !lifted && storage_user_id_from_view_root(target_root).is_none() {
+        // 非视图根目标（按目录 scoped 根）不展开别名：scoped 会话的别名覆盖仍由
+        // 命名空间 bind 路径承担，这里不改变既有语义。
+        return;
+    }
+    // 上提形态下别名族整体上提一层：`/mnt/{user,installer,androidwritable}/<u>/emulated`。
+    // 仍按用户根展开会绑到 `…/emulated/<u>`——那正是被我们视图盖住的旧落点，覆盖无效。
+    let alias_roots: Vec<String> = if lifted {
+        vec![
+            "/storage/emulated".to_string(),
+            format!("/mnt/user/{user_id}/emulated"),
+            format!("/mnt/installer/{user_id}/emulated"),
+            format!("/mnt/androidwritable/{user_id}/emulated"),
+        ]
+    } else {
+        paths::storage_alias_roots_for_user(user_id)
+    };
+    for alias_root in alias_roots {
+        if alias_root == target_root {
+            continue;
+        }
+        if is_f2fs_direct_backend_alias(&alias_root, user_id) {
+            continue;
+        }
+        // 存在性检查用 lstat 语义：符号别名（primary/legacy）即便悬空也进入去重判定，
+        // 不在这里对存储 FUSE 发起真实 I/O。
+        if std::fs::symlink_metadata(&alias_root).is_err() {
+            log::debug!(
+                "fuse host alias skip reason=absent target={} host={}",
+                alias_root,
+                view.child_pid
+            );
+            continue;
+        }
+        // 符号别名去重（`/storage/self/primary`、`/storage/emulated/legacy` 这类指向主目标的
+        // 软链）**按链接文本**判断，不做 `canonicalize`：后者要在应用命名空间里真正解析一遍
+        // 路径，而 `/storage/emulated/<user>` 此刻已经是本模块的 FUSE 挂载——解析请求以
+        // uid 0 落到自己的会话上会被策略拒绝，`canonicalize` 随即失败。真机 2026-11-02
+        // 实测为此整族别名被静默跳过（一次 attach 一条都没绑上），于是别名写入绕开重定向
+        // 直落真实存储。这里改成纯词法判断，不碰 FUSE 数据面。
+        if alias_is_symbolic_duplicate(&alias_root, target_root) {
+            log::debug!(
+                "fuse host alias skip reason=symlink_to_primary target={} host={}",
+                alias_root,
+                view.child_pid
+            );
+            continue;
+        }
+        // 幂等：顶层已是当前会话的视图就不再叠加（宿主换代重接入时同一超级块不重复 bind）。
+        if let Some(live) = crate::mount_ledger::topmost_live_mount(0, &alias_root)
+            && live.dev == view.dev
+        {
+            continue;
+        }
+        // 传播隔离：别名目标与主目标同处系统共享传播组，bind 事件会沿传播组外播到
+        // 未配置应用的命名空间（真机实测见主目标 4.5 注释）。bind 之后再私有化
+        // 救不回已外播的拷贝，必须先私有化目标；仅当别名当前是挂载点才需要（普通
+        // 目录形态无外播路径）。私有化失败时跳过该别名：宁缺勿滥，决不往共享目标
+        // 上叠加视图。
+        let Ok(c_alias) = CString::new(alias_root.as_str()) else {
+            continue;
+        };
+        if !crate::mount_ledger::live_mounts_at(0, &alias_root).is_empty()
+            && !make_mount_private(&c_alias)
+        {
+            log::warn!(
+                "fuse host attach alias privatize failed target={} errno={} {}",
+                alias_root,
+                crate::platform::errno::last(),
+                crate::platform::errno::text(crate::platform::errno::last())
+            );
+            continue;
+        }
+        clear_dead_srx_layers_at_target(&alias_root);
+        let Ok(c_source) = CString::new(target_root) else {
+            continue;
+        };
+        // SAFETY: 源与目标都是 NUL 结尾的合法路径；同一命名空间内的 bind 不跨命名空间
+        // （跨命名空间 MS_BIND 会 EINVAL，见 host_attach_child_main 的说明），此时主目标
+        // 挂载已属于应用命名空间，bind 合法。
+        if unsafe {
+            libc::mount(
+                c_source.as_ptr(),
+                c_alias.as_ptr(),
+                std::ptr::null(),
+                libc::MS_BIND as libc::c_ulong,
+                std::ptr::null(),
+            )
+        } != 0
+        {
+            log::warn!(
+                "fuse host attach alias bind failed target={} errno={} {}",
+                alias_root,
+                crate::platform::errno::last(),
+                crate::platform::errno::text(crate::platform::errno::last())
+            );
+            continue;
+        }
+        if !make_mount_private(&c_alias) {
+            continue;
+        }
+        log::info!(
+            "fuse host attach alias bound target={} host={}",
+            alias_root,
+            view.child_pid
+        );
+    }
+}
+
+/// 别名是否为指向主目标的符号链接（`/storage/self/primary` 之类）。
+///
+/// 只读链接本身再按词法归一比较：不触发路径解析，避免在"主目标已是本模块 FUSE"之后
+/// 还要穿过自己的会话去解析（那条路会因策略拒绝而失败，见调用点注释）。
+fn alias_is_symbolic_duplicate(alias_root: &str, target_root: &str) -> bool {
+    let Ok(link) = std::fs::read_link(alias_root) else {
+        return false;
+    };
+    paths::normalize(&link.to_string_lossy()) == paths::normalize(target_root)
+}
+
+/// 接入子进程统一回报结果，成功与失败均只发送一次。
+fn send_host_attach_result(ready_sock: libc::c_int, result: i32) -> bool {
+    // SAFETY: ready_sock 是本次接入的有效端点，result 是调用期间存活的栈变量。
     let sent = unsafe {
         libc::send(
             ready_sock,
-            &ready as *const i32 as *const libc::c_void,
+            &result as *const i32 as *const libc::c_void,
             std::mem::size_of::<i32>(),
             0,
         )
@@ -1146,6 +1221,38 @@ fn open_detached_mount(path: &CStr) -> libc::c_int {
     }
 }
 
+/// 视图根上允许同时存在的层数。
+///
+/// 基线在该路径只有一条 fuse 层，所以接入后的目标状态恒为 1；这里的上限只用于把
+/// 「未知来源的异常堆叠」收敛掉，而不是允许它存在。
+const MAX_VIEW_LAYERS: usize = 8;
+
+/// 逐层摘除 `target` 上的**所有**挂载。
+///
+/// 成功返回摘除层数；超过 [`MAX_VIEW_LAYERS`] 或任一次 `umount` 失败返回
+/// `Err(已摘掉的层数)`——调用方据此决定是否要把备份的栈顶放回去（摘了一层以上就必须
+/// 回滚，否则应用会落到归属不明的下层）。
+///
+/// 为什么不能只摘一次：`umount2(path)` 只摘该路径上最顶层的挂载，底层会立刻露出来。
+/// 目标路径上同时有上一代会话层与系统视图层时，只摘一次就让底层留在应用命名空间里，
+/// 接入后又多出本会话层——应用 `mountinfo` 里出现两条同路径挂载，与基线不一致（真机
+/// 实测 `0:73`/`0:74` 并排、父链指向系统层）。接入要求「替换」，就得摘到空为止。
+fn detach_all_layers_at_target(target_root: &str, target: &CStr) -> Result<usize, usize> {
+    let mut detached = 0usize;
+    while !crate::mount_ledger::live_mounts_at(0, target_root).is_empty() {
+        if detached >= MAX_VIEW_LAYERS {
+            return Err(detached);
+        }
+        // SAFETY: target 是 NUL 结尾的合法路径；MNT_DETACH 只摘本命名空间这一份拷贝。
+        let removed = unsafe { libc::umount2(target.as_ptr(), libc::MNT_DETACH) };
+        if removed != 0 {
+            return Err(detached);
+        }
+        detached += 1;
+    }
+    Ok(detached)
+}
+
 /// 把**本命名空间内**的挂载点改为私有，切断与其它命名空间的传播关系。
 ///
 /// 宿主挂载点在宿主会话里开了 shared，克隆出来的这份会带着同一个 peer group（`mountinfo`
@@ -1153,6 +1260,70 @@ fn open_detached_mount(path: &CStr) -> libc::c_int {
 /// 于是任一应用在存储视图下新建或摘除挂载都会传播到其它应用和宿主命名空间——既跨应用干扰，
 /// 也与"卸载一个应用的注入不影响其它应用"的设计前提直接冲突。scoped 会话的挂载本来就是
 /// private，这里改私有后两条路径语义一致。
+/// 把目标处**已有的**挂载降级为 slave（非递归），用于替换前切断外播。
+///
+/// 该层随后就会被摘除，所以它丢失的 `master:` 标签无关紧要。
+fn make_mount_slave_only(target: &CStr) -> bool {
+    // SAFETY: 改传播属性只需要目标路径，source/fs_type/data 均为 null。
+    let result = unsafe {
+        libc::mount(
+            std::ptr::null(),
+            target.as_ptr(),
+            std::ptr::null(),
+            libc::MS_SLAVE as libc::c_ulong,
+            std::ptr::null(),
+        )
+    };
+    if result != 0 {
+        log_errno("fuse host attach make slave only failed");
+        return false;
+    }
+    true
+}
+
+/// P5-d：把**视图挂载本身**做成 slave（`--make-shared` → `--make-slave`），而不是 private。
+///
+/// 基线应用在存储视图根上的那条是 slave（mountinfo 带 `master:69` 这类标签）；我们直接
+/// private 化后标签是空的，这是剩下的可判读差异之一。
+///
+/// 刻意**不带 `MS_REC`**：上一版带 `_REC` 把子树里已有的恢复 bind 一起改了传播属性，
+/// 恢复链随即失效（真机 2026-11-02 21:40 `own private restore failed`）。只动本挂载，
+/// 子树（恢复 bind、别名）的传播口径保持不变。
+///
+/// 先 `MS_SHARED` 单独踢成一个 peer group，再 `MS_SLAVE` 转成该组的 slave：内核记下
+/// `master:<组号>`，形态与基线一致；作为 slave 只接收、不外播（shared 才是外播前提）。
+fn make_mount_slave(target: &CStr) -> bool {
+    // SAFETY: 改传播属性只需要目标路径，source/fs_type/data 均为 null；不触碰文件内容。
+    let shared = unsafe {
+        libc::mount(
+            std::ptr::null(),
+            target.as_ptr(),
+            std::ptr::null(),
+            libc::MS_SHARED as libc::c_ulong,
+            std::ptr::null(),
+        )
+    };
+    if shared != 0 {
+        log_errno("fuse host attach make shared failed");
+        return false;
+    }
+    // SAFETY: 同上；把刚建立的 peer group 转成 slave。
+    let slave = unsafe {
+        libc::mount(
+            std::ptr::null(),
+            target.as_ptr(),
+            std::ptr::null(),
+            libc::MS_SLAVE as libc::c_ulong,
+            std::ptr::null(),
+        )
+    };
+    if slave != 0 {
+        log_errno("fuse host attach make slave failed");
+        return false;
+    }
+    true
+}
+
 fn make_mount_private(target: &CStr) -> bool {
     // SAFETY: 改传播属性只需要目标路径，source/fs_type/data 均为 null；只动传播属性，
     // 不改动任何文件内容，也不会摘除挂载。
@@ -1218,7 +1389,7 @@ const MAX_DEAD_TARGET_LAYERS: usize = 8;
 ///
 /// 摘除条件同时要求：`stat` 穿到死连接（ENOTCONN/EIO——顶层挂载存活时 stat 走顶层、
 /// 不会命中底下的死层），且最顶层挂载确为本模块会话 FUSE（scoped 或宿主，前缀判定
-/// 统一走 `is_srx_session_fuse`）。系统挂载与尚且可达的挂载一概不碰。
+/// 统一走 `is_module_fuse_mount`）。系统挂载与尚且可达的挂载一概不碰。
 ///
 /// 返回是否摘除过死层，供 `move_mount` 失败时区分目标侧与源侧故障。
 fn clear_dead_srx_layers_at_target(target: &str) -> bool {
@@ -1241,11 +1412,12 @@ fn clear_dead_srx_layers_at_target(target: &str) -> bool {
             );
             return removed > 0;
         };
-        if !crate::fuse_redirect::config::is_srx_session_fuse(&live.fs_type, &live.source) {
+        if !is_module_fuse_mount(&live) {
             log::warn!(
-                "fuse host attach dead layer not ours target={} fs={} source={} errno={}",
+                "fuse host attach dead layer not ours target={} fs={} dev={} source={} errno={}",
                 target,
                 live.fs_type,
+                live.dev,
                 live.source,
                 errno
             );
@@ -1270,15 +1442,11 @@ fn clear_dead_srx_layers_at_target(target: &str) -> bool {
             }
         }
         let mut detached_target = None;
-        for candidate in detach_targets {
-            let Some(candidate_live) = crate::mount_ledger::topmost_live_mount(0, &candidate)
-            else {
+        for candidate in &detach_targets {
+            let Some(candidate_live) = crate::mount_ledger::topmost_live_mount(0, candidate) else {
                 continue;
             };
-            if !crate::fuse_redirect::config::is_srx_session_fuse(
-                &candidate_live.fs_type,
-                &candidate_live.source,
-            ) {
+            if !is_module_fuse_mount(&candidate_live) {
                 continue;
             }
             let Ok(c_candidate) = CString::new(candidate.as_str()) else {
@@ -1287,12 +1455,13 @@ fn clear_dead_srx_layers_at_target(target: &str) -> bool {
             // SAFETY: c_candidate 是 NUL 结尾的合法路径；MNT_DETACH 只标记已确认归属
             // 的本模块挂载层，不会向 FUSE endpoint 发起文件 I/O。
             if unsafe { libc::umount2(c_candidate.as_ptr(), libc::MNT_DETACH) } == 0 {
-                detached_target = Some(candidate);
+                detached_target = Some(candidate.clone());
                 break;
             }
         }
         let Some(detached_target) = detached_target else {
             log_errno("fuse host attach dead layer detach failed");
+            dump_dead_target_forensics(target, &detach_targets);
             return removed > 0;
         };
         removed += 1;
@@ -1315,6 +1484,41 @@ fn storage_alias_relative_path(target: &str) -> Option<String> {
     let root = crate::platform::paths::storage_user_root_for_user(0);
     let relative = target.strip_prefix(&root)?;
     Some(relative.trim_start_matches('/').to_string())
+}
+
+/// 死层清理失败取证：打印目标路径的真实文件形态与当前命名空间的 FUSE/存储
+/// 挂载条目。用户设备曾出现「挂载点变成 0B 文件」的形态，但缺少应用命名空间
+/// 的 mountinfo 无法确诊——取证失败的原因（EINVAL 与哪条挂载对应）。
+fn dump_dead_target_forensics(target: &str, detach_targets: &[String]) {
+    let stat_err = match std::fs::metadata(target) {
+        Ok(metadata) => format!("ok dir={} size={}", metadata.is_dir(), metadata.len()),
+        Err(error) => format!("errno={}", error.raw_os_error().unwrap_or_default()),
+    };
+    log::error!(
+        "fuse host attach dead layer forensics target={} stat={stat_err}",
+        target
+    );
+    for candidate in detach_targets {
+        log::error!(
+            "fuse host attach dead layer forensics candidate={} stat-errno={}",
+            candidate,
+            std::fs::metadata(candidate)
+                .err()
+                .and_then(|error| error.raw_os_error())
+                .map_or_else(|| "ok".to_string(), |code| code.to_string())
+        );
+    }
+    if let Ok(mountinfo) = std::fs::read_to_string("/proc/self/mountinfo") {
+        let target_tail = target.rsplit('/').next().unwrap_or_default();
+        for line in mountinfo.lines() {
+            let is_relevant = line.contains("fuse")
+                || line.contains(target)
+                || (target_tail.len() > 2 && line.contains(target_tail));
+            if is_relevant {
+                log::error!("fuse host attach dead layer forensics mountinfo {line}");
+            }
+        }
+    }
 }
 
 /// 只负责关闭 fd 的小包装：命名空间与挂载点句柄在多条失败分支上都要关闭。
@@ -1362,29 +1566,66 @@ fn log_host_stage_trace() {
 /// 退出原因本身也是关键证据：`exit=1` 表示子进程走到了失败返回，`signal=9` 表示它没有
 /// 自己退出（由本次强杀收尾，即卡在某个阶段），`signal=11/6` 表示崩溃。回收是强制的，
 /// 否则每轮恢复都会留下一个僵尸进程。
-fn reap_host_child(pid: libc::pid_t) -> String {
-    let mut status: libc::c_int = 0;
-    let mut reaped = false;
-    // SAFETY: pid 来自本次 fork；先终止再回收，且回收循环带次数上限，不会无限阻塞。
-    unsafe {
-        libc::kill(pid, libc::SIGKILL);
-        for _ in 0..50 {
-            if libc::waitpid(pid, &mut status as *mut libc::c_int, libc::WNOHANG) == pid {
-                reaped = true;
-                break;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(20));
+/// 接入子进程超时且挂载未就位时，把它的阻塞点落盘。
+///
+/// 5 秒窗口里一个 `srx_hostbind` 子进程只活一瞬，现场无法用外部采样抓到（实测轮询
+/// 50ms 也经常错过），所以必须由父进程在**杀掉它之前**自己取证：内核栈 + 等待通道 +
+/// 当前系统调用编号。这三个正是判断「卡在 FUSE 路径解析 / 卡在 setns / 卡在 open_tree」
+/// 的全部依据；没有它，这类失败只会留下一句 `unavailable`。
+fn log_attach_child_blocked_point(
+    child: libc::pid_t,
+    target_root: &str,
+    app_uid: i32,
+    timeout_sec: i64,
+) {
+    let base = format!("/proc/{child}");
+    let read = |name: &str| std::fs::read_to_string(format!("{base}/{name}")).unwrap_or_default();
+    let state = read("stat")
+        .split_whitespace()
+        .nth(2)
+        .unwrap_or("?")
+        .to_string();
+    let wchan = read("wchan").trim().to_string();
+    let syscall = read("syscall").trim().to_string();
+    let mut stack = String::new();
+    for line in read("stack").lines().take(6) {
+        stack.push_str(line.trim());
+        stack.push('|');
+    }
+    log::warn!(
+        "fuse host attach child blocked child={} target={} uid={} timeout_sec={} state={} wchan={} syscall={} stack={}",
+        child,
+        target_root,
+        app_uid,
+        timeout_sec,
+        state,
+        if wchan.is_empty() {
+            "?"
+        } else {
+            wchan.as_str()
+        },
+        if syscall.is_empty() {
+            "?"
+        } else {
+            syscall.as_str()
+        },
+        if stack.is_empty() {
+            "?"
+        } else {
+            stack.as_str()
         }
-    }
-    if !reaped {
-        return "exit=unreaped".to_string();
-    }
-    if libc::WIFSIGNALED(status) {
-        format!("signal={}", libc::WTERMSIG(status))
-    } else if libc::WIFEXITED(status) {
-        format!("exit={}", libc::WEXITSTATUS(status))
-    } else {
-        "exit=unknown".to_string()
+    );
+}
+
+fn reap_host_child(pid: libc::pid_t) -> String {
+    use crate::platform::child_wait::{self, ChildExit};
+    // SAFETY: pid 来自本次 fork；先终止再有界回收，不会无限阻塞。
+    unsafe { libc::kill(pid, libc::SIGKILL) };
+    match child_wait::wait_child_exit(pid, 1_000) {
+        ChildExit::Signaled(signal) => format!("signal={signal}"),
+        ChildExit::Exited(code) => format!("exit={code}"),
+        ChildExit::TimedOut => "exit=unreaped".to_string(),
+        ChildExit::Failed(_) => "exit=unknown".to_string(),
     }
 }
 
@@ -1428,6 +1669,11 @@ pub fn spawn_fuse_host() -> Option<FuseHost> {
     }
 
     reset_host_stage();
+    // 心跳共享页必须在 fork 之前建立：子进程继承同一份 MAP_SHARED 映射，心跳从此不需要
+    // 落盘（见 `platform::host_beat`）。失败只降级为文件心跳，不影响挂载。
+    if !crate::platform::host_beat::install() {
+        log::warn!("host beat shared page unavailable; fallback to file heartbeat");
+    }
     crate::logging::prepare_for_fork();
     // SAFETY: fork 前已完成日志/信号准备，匹配现有 daemon 挂载的 fork 模式。
     // 允许英文：fork 是系统调用名称。
@@ -1520,15 +1766,332 @@ pub fn spawn_fuse_host() -> Option<FuseHost> {
     };
     // 会话可用后才发布控制端：此前任何注册请求都没有真实会话可服务。
     set_host_control_fd(control_sockets[0]);
+    // 宿主挂载落在子进程自己的命名空间里，父进程只能从它的 mountinfo 读回超级块身份。
+    // 身份拿不到就无法复核接入（也无法把系统 FUSE 与本模块 FUSE 分开），因此按失败处理，
+    // 让调用方走 scoped 回退——宁可用回退路径，也不要一个无法复核的宿主会话。
+    let Some((mount_id, dev)) = capture_host_mount_identity(child) else {
+        let reason = reap_host_child(child);
+        log::warn!(
+            "fuse host identity unavailable child={} mount_point={} {}",
+            child,
+            FUSE_HOST_MOUNT_POINT,
+            reason
+        );
+        return None;
+    };
+    log::info!(
+        "fuse host identity child={} mount_id={} dev={}",
+        child,
+        mount_id,
+        dev
+    );
     Some(FuseHost {
         child_pid: child,
         child_start_time_ticks,
         mount_point: FUSE_HOST_MOUNT_POINT.to_string(),
         mount_source: crate::fuse_redirect::config::host_mount_source(child as u32),
+        mount_id,
+        dev,
     })
 }
 
-/// 子进程入口：进入私有 namespace、挂直通 FUSE、设 shared，然后常驻。
+/// 从宿主子进程的 mountinfo 读取宿主挂载点的超级块身份（挂载 ID + 设备号）。
+///
+/// 宿主挂载只在子进程的私有命名空间里可见，父进程通过 `/proc/<child>/mountinfo` 读取，
+/// 不需要 setns，也不触碰数据面（挂载端点异常时这里不会卡在 D 态）。
+fn capture_host_mount_identity(child: i32) -> Option<(u64, String)> {
+    let live = crate::mount_ledger::topmost_live_mount(child, FUSE_HOST_MOUNT_POINT)?;
+    if live.dev.is_empty() {
+        return None;
+    }
+    Some((live.mount_id, live.dev))
+}
+
+/// 摘除传播进宿主命名空间的宿主 FUSE 副本（/data/media/0）——事件触发、单次执行。
+///
+/// 应用接入把宿主挂载 move_mount 到应用命名空间的 /storage/emulated/0 后，
+/// AOSP 存储 bind 链的 shared 传播组（用户设备实证 master:104）会把同一挂载传播
+/// 回宿主命名空间的 /data/media/0——该路径是宿主数据面 backend 的直连 f2fs
+/// 真身，被覆盖后任何 backend stat 的路径解析都会命中自家连接的 dentry 重验证，
+/// 请求发回自己的连接、无人应答，全部 worker 死锁（用户设备两次停摆同源，慢调用
+/// 探针实证卡点）。
+///
+/// 触发时机由 daemon 在每次 attach 成功（move_mount 完成、传播已发生）后经控制
+/// 通道通知，事件精确覆盖副本出现的唯一窗口；数据面本身已由 f2fs 直连锚点
+/// 解耦（见 paths_roots 的 MEDIA_REAL_ANCHOR_ROOT），摘除只承担挂载表卫生。
+///
+/// 只摘确认归属本模块会话的挂载（`is_module_fuse_mount`，按超级块身份），系统挂载与底层 f2fs 一概
+/// 不碰；摘除同时会让已挂起的重验证请求完成。摘除或无可摘都留运行日志。
+pub(crate) fn unpropagate_media_realm() {
+    // 数据面 backend 全部位于主用户的 /data/media/0 之下；多用户副本
+    // （/data/media/999 等）不参与宿主数据面，出现时由后续需求再扩展。
+    let target = "/data/media/0";
+    let Some(live) = crate::mount_ledger::topmost_live_mount(0, target) else {
+        log::debug!(
+            "fuse host media realm unpropagate skip target={} no-mount",
+            target
+        );
+        return;
+    };
+    if !is_module_fuse_mount(&live) {
+        log::warn!(
+            "fuse host media realm unpropagate not-ours target={} fs={} source={}",
+            target,
+            live.fs_type,
+            live.source
+        );
+        return;
+    }
+    let Ok(c_target) = std::ffi::CString::new(target) else {
+        return;
+    };
+    // SAFETY: c_target 是 NUL 结尾的合法路径；MNT_DETACH 只摘已确认归属本模块
+    // 会话的传播副本，不发起任何文件 I/O。
+    if unsafe { libc::umount2(c_target.as_ptr(), libc::MNT_DETACH) } == 0 {
+        log::warn!(
+            "fuse host media realm unpropagated target={} mount_id={} source={}",
+            target,
+            live.mount_id,
+            live.source
+        );
+    } else {
+        log_errno("fuse host media realm unpropagate failed");
+    }
+}
+
+/// 宿主数据面 f2fs 直连锚点：bind /data/media/0 到模块私有目录（private，不参与
+/// 传播组）。必须在任何应用接入之前建立——此时数据面仍属真实块设备文件系统实例；
+/// 之后路径被覆盖也不影响经锚点的解析（见 paths_roots 的 MEDIA_REAL_ANCHOR_ROOT
+/// 文档）。
+///
+/// 用户设备换代现场（gen 恢复）实证：上一代死会话的 FUSE 残留仍盖在 /data/media/0
+/// 顶层，此时若直接拒绝建立锚点，数据面将永久走 FUSE 视图、停摆循环复发。因此
+/// 顶层若确认归属本模块会话（`is_module_fuse_mount`），先 MNT_DETACH 摘除残留再复查
+/// ——本函数运行于 mount_host_fuse 之前，此刻存在的任何 srx 会话 FUSE 都属于已
+/// 死亡的上一代，摘除安全。只有顶层仍是非本模块的 FUSE/模拟视图（无法判定归属，
+/// 如异构 OEM 变体）才拒绝建立并回退；无锚点时数据面依赖看门狗换代兜底，因此
+/// 宁可摘残留也不把污染路径搬进锚点，但也不轻易放弃锚点。
+///
+/// `pub(crate)`：宿主会话运行期按周期校验锚点挂载仍在，发现丢失时由会话循环
+/// 调用本函数就地重建（gen4 冻结现场实证锚点 bind 会静默消失，根因为 MS_BIND
+/// 复制共享传播组成员时新 bind 加入同一 peer 组、系统侧 umount 传播连带卸载，
+/// 已由 bind 后 MS_PRIVATE 私有化根治；重建仅作最后防线）。重建
+/// 语义与启动期一致：摘本模块残留、拒绝污染覆盖、bind f2fs 真身）。
+static MEDIA_REAL_ANCHOR_IDENTITY: std::sync::OnceLock<(u64, u64)> = std::sync::OnceLock::new();
+
+fn path_object_identity(path: &str) -> Option<(u64, u64)> {
+    let path = std::ffi::CString::new(path).ok()?;
+    let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
+    // SAFETY: path 是 NUL 结尾字符串，stat 指向可写结构；仅查询对象元数据。
+    if unsafe { libc::stat(path.as_ptr(), stat.as_mut_ptr()) } != 0 {
+        return None;
+    }
+    // SAFETY: stat 成功后内核已完整初始化结构。
+    let stat = unsafe { stat.assume_init() };
+    // Android 的 64 位目标上 `st_dev`/`st_ino` 本身就是 `u64`；这里显式标注返回类型，
+    // 不在表达式里重复 cast（clippy::unnecessary_cast）。
+    Some((stat.st_dev, stat.st_ino))
+}
+
+/// 验证锚点仍是原始存储目录的私有 f2fs bind，而不是路径上任意一个挂载。
+pub(crate) fn media_real_anchor_is_valid() -> bool {
+    let Some(anchor) = crate::platform::paths::media_real_anchor_root() else {
+        return false;
+    };
+    let Some(expected_identity) = MEDIA_REAL_ANCHOR_IDENTITY.get().copied() else {
+        return false;
+    };
+    if path_object_identity(anchor) != Some(expected_identity) {
+        return false;
+    }
+    let Ok(mountinfo) = std::fs::read_to_string("/proc/self/mountinfo") else {
+        return false;
+    };
+    let mut entries = Vec::new();
+    for line in mountinfo.lines() {
+        let Some(entry) = crate::platform::mountinfo::parse_entry(line) else {
+            continue;
+        };
+        if crate::platform::mountinfo::unescape_field(entry.target) != anchor {
+            continue;
+        }
+        let Some((before_sep, _)) = line.split_once(" - ") else {
+            continue;
+        };
+        let private = before_sep.split_whitespace().skip(6).all(|field| {
+            !field.starts_with("shared:")
+                && !field.starts_with("master:")
+                && !field.starts_with("propagate_from:")
+        });
+        entries.push((
+            entry.mount_id,
+            entry.parent_mount_id,
+            crate::platform::mountinfo::unescape_field(entry.root),
+            entry.fs_type.to_string(),
+            private,
+        ));
+    }
+    let Some(top) =
+        crate::platform::mountinfo::topmost_by_stack(&entries, |entry| entry.0, |entry| entry.1)
+    else {
+        return false;
+    };
+    let direct_fs = is_direct_userdata_fs(&top.3);
+    direct_fs && top.4
+}
+
+/// 用户数据区直连内核文件系统的判据。
+///
+/// 锚点要的是 `/data/media` 背后的真实内核文件系统：主流真机是 f2fs，模拟器与部分
+/// 设备是 ext4。这里只排除「视图类」文件系统（FUSE 与 sdcardfs），不再写死 f2fs——
+/// 写死会让 ext4 设备与模拟器在锚点校验处直接拒绝启动宿主（CI Android 15 实测：
+/// `media anchor verification failed fs=ext4` → `startup refused`）。
+fn is_direct_userdata_fs(fs_type: &str) -> bool {
+    !fs_type.is_empty() && !fs_type.contains("fuse") && fs_type != "sdcardfs"
+}
+
+/// 建立并验证宿主数据面私有锚点。
+///
+/// 返回 `true` 表示锚点已挂载且已脱离传播组；返回 `false` 时调用方必须拒绝
+/// 启动宿主 FUSE，不能回退到已知会触发自再入死锁的 `/data/media/<user>` 直连。
+pub(crate) fn establish_media_real_anchor() -> bool {
+    let user_id = 0;
+    let source = crate::platform::paths::data_media_user_root_for_user(user_id);
+    let mut residue_count = 0u32;
+    while let Some(live) = crate::mount_ledger::topmost_live_mount(0, &source) {
+        if is_module_fuse_mount(&live) {
+            residue_count += 1;
+            if residue_count > 8 {
+                log::warn!(
+                    "fuse host media anchor refuse target={} reason=residue-stack count={residue_count}",
+                    source
+                );
+                return false;
+            }
+            let Ok(c_target) = std::ffi::CString::new(source.as_str()) else {
+                return false;
+            };
+            // SAFETY: c_target 是 NUL 结尾的合法路径；仅摘除已确认属于本模块的残留挂载。
+            if unsafe { libc::umount2(c_target.as_ptr(), libc::MNT_DETACH) } == 0 {
+                log::warn!(
+                    "fuse host media anchor residue detached target={} mount_id={} source={} seq={residue_count}",
+                    source,
+                    live.mount_id,
+                    live.source
+                );
+                continue;
+            }
+            log_errno("fuse host media anchor residue detach failed");
+            return false;
+        }
+        let poisoned = live.fs_type.contains("fuse") || live.fs_type.contains("sdcardfs");
+        if poisoned {
+            log::warn!(
+                "fuse host media anchor refuse target={} fs={} source={}",
+                source,
+                live.fs_type,
+                live.source
+            );
+            return false;
+        }
+        break;
+    }
+    let anchor = format!(
+        "{}/real_media_anchor/{user_id}",
+        crate::platform::module_paths::MODULE_DIR
+    );
+    if let Err(error) = std::fs::create_dir_all(&anchor) {
+        log::warn!("fuse host media anchor mkdir failed path={anchor} err={error}");
+        return false;
+    }
+    let (Ok(c_source), Ok(c_anchor)) = (
+        std::ffi::CString::new(source.as_str()),
+        std::ffi::CString::new(anchor.as_str()),
+    ) else {
+        return false;
+    };
+    // SAFETY: 两个路径都是 NUL 结尾的合法字符串；MS_BIND 只建立挂载关系。
+    if unsafe {
+        libc::mount(
+            c_source.as_ptr(),
+            c_anchor.as_ptr(),
+            std::ptr::null(),
+            libc::MS_BIND,
+            std::ptr::null(),
+        )
+    } != 0
+    {
+        log_errno("fuse host media anchor bind failed");
+        return false;
+    }
+    // SAFETY: c_anchor 是 NUL 结尾的合法路径；MS_PRIVATE 使锚点脱离所有传播组。
+    if unsafe {
+        libc::mount(
+            std::ptr::null(),
+            c_anchor.as_ptr(),
+            std::ptr::null(),
+            libc::MS_PRIVATE,
+            std::ptr::null(),
+        )
+    } != 0
+    {
+        log_errno("fuse host media anchor privatize failed");
+        return false;
+    }
+    let Some(source_identity) = path_object_identity(&source) else {
+        log::error!("fuse host media anchor verification failed source={source} reason=stat");
+        return false;
+    };
+    let Some(anchor_identity) = path_object_identity(&anchor) else {
+        log::error!("fuse host media anchor verification failed anchor={anchor} reason=stat");
+        return false;
+    };
+    if anchor_identity != source_identity {
+        log::error!(
+            "fuse host media anchor verification failed anchor={} source={} anchor_identity={:?} source_identity={:?}",
+            anchor,
+            source,
+            anchor_identity,
+            source_identity
+        );
+        return false;
+    }
+    let Some(mounted) = crate::mount_ledger::topmost_live_mount(0, &anchor) else {
+        log::error!("fuse host media anchor verification failed anchor={anchor} reason=missing");
+        return false;
+    };
+    if !is_direct_userdata_fs(&mounted.fs_type) {
+        log::error!(
+            "fuse host media anchor verification failed anchor={} fs={} root={} source={}",
+            anchor,
+            mounted.fs_type,
+            mounted.root,
+            mounted.source
+        );
+        return false;
+    }
+    let _ = MEDIA_REAL_ANCHOR_IDENTITY.set(anchor_identity);
+    crate::platform::paths::set_media_real_anchor_root(anchor.clone());
+    if !media_real_anchor_is_valid() {
+        log::error!(
+            "fuse host media anchor verification failed anchor={anchor} reason=not-private"
+        );
+        return false;
+    }
+    // 锚点建立成功是一次性正常事件：留档到独立取证文件，运行日志按信息级记录，
+    // 避免以错误级别出现让现场误判为失败（详细日志关闭时不写运行日志）。
+    crate::fuse_redirect::config::forensics_record(&format!(
+        "fuse host media anchor ready source={source} anchor={anchor} private fs={} source={} root={}",
+        mounted.fs_type, mounted.source, mounted.root
+    ));
+    log::info!(
+        "fuse host media anchor ready anchor={anchor} fs={}",
+        mounted.fs_type
+    );
+    true
+}
+
+/// 子进程入口：进入私有 namespace、收敛为 slave、挂直通 FUSE、设 shared，然后常驻。
 fn fuse_host_child_main(ready_sock: libc::c_int, control_sock: libc::c_int) -> bool {
     // 1. 进入私有 mount namespace；unshare 失败则放弃宿主会话。
     host_stage("before_unshare");
@@ -1540,7 +2103,20 @@ fn fuse_host_child_main(ready_sock: libc::c_int, control_sock: libc::c_int) -> b
         return false;
     }
     host_stage("unshared");
-    // 2. 隔离整棵挂载树，阻断向其它 namespace 传播。
+    // 2. 收敛为 slave：只接收入向挂载事件，不向外传播。
+    //
+    // 这里必须用 `MS_SLAVE` 而不是 `MS_PRIVATE`。`MS_PRIVATE` 会同时切断两个方向，
+    // 于是 init 命名空间在宿主会话建立之后创建的挂载永远进不来。HyperOS 的应用商店
+    // 在每次下载时都会把 `/data/apk-tmp/<pkg>/download` bind 到
+    // `/data/media/0/Android/data/com.xiaomi.market/files/.siexternal`，而宿主后端根
+    // 直连 f2fs（`private_real_root`），一旦错过这个 bind，宿主读到的是 bind 遮蔽
+    // 之前的陈旧目录：真机实测那里残留着若干已卸载应用的下载暂存目录
+    // （`com.kylin.read`、`com.taobao.idlefish` 等），商店校验阶段读不到自己刚下载的
+    // APK，表现为 `failed as error=3` 且不重试。
+    //
+    // 出向隔离不依赖这一步：宿主挂载点在 `mount_host_fuse` 里显式设 shared（只与自身
+    // peer 组互通），应用接入时 `make_mount_private` 又把搬运过去的游离挂载改私有，
+    // 因此宿主与应用的挂载事件不会互相污染。
     let Ok(root) = CString::new("/") else {
         host_stage("root_path_invalid");
         return false;
@@ -1551,16 +2127,22 @@ fn fuse_host_child_main(ready_sock: libc::c_int, control_sock: libc::c_int) -> b
             std::ptr::null(),
             root.as_ptr(),
             std::ptr::null(),
-            (libc::MS_REC | libc::MS_PRIVATE) as libc::c_ulong,
+            (libc::MS_REC | libc::MS_SLAVE) as libc::c_ulong,
             std::ptr::null(),
         )
     } != 0
     {
-        log_errno("fuse host MS_PRIVATE failed");
-        host_stage("private_failed");
+        log_errno("fuse host MS_SLAVE failed");
+        host_stage("slave_failed");
         return false;
     }
-    host_stage("private_ok");
+    host_stage("slave_ok");
+
+    if !establish_media_real_anchor() {
+        log::error!("fuse host startup refused: media anchor unavailable");
+        host_stage("anchor_failed");
+        return false;
+    }
 
     // 3. 挂直通宿主 FUSE（mount_host_fuse 内部完成 shared propagation 并常驻）。
     crate::fuse_redirect::config::mount_host_fuse(
@@ -1598,6 +2180,7 @@ fn passthrough_host_config() -> crate::fuse_redirect::FuseRedirectConfig {
         is_monitor_only: false,
         // 宿主会话是直通会话：`redirect_target` 取存储根本身，策略侧据此跳过重定向根推导。
         is_passthrough_host: true,
+        namespace_policy_only: false,
     }
 }
 
@@ -1680,6 +2263,10 @@ pub fn set_global(host: FuseHost) {
         "host_session_ready",
         "srx_fuse_host",
     );
+    // daemon 自身的 mount namespace 直通登记：宿主换代后旧登记随之失效，每代会话
+    // 就绪时重新登记一次。失败不阻断（宿主刚就绪，控制通道理论上可用；失败只损失
+    // uid=0 请求的直通优化，保持原有 namespace miss 回退语义）。
+    crate::fuse_host_control::register_daemon_namespace_passthrough();
 }
 
 /// daemon 侧登记台账：当前宿主会话 pid + 已登记 uid 集合。
@@ -1731,12 +2318,14 @@ fn publish_host_snapshot(view: &HostSessionView) {
         .map(|value| value.trim().to_string())
         .unwrap_or_default();
     let content = format!(
-        "boot_id={}\npid={}\nstart_ticks={}\nmount_point={}\nmount_source={}\npolicies={}\n",
+        "boot_id={}\npid={}\nstart_ticks={}\nmount_point={}\nmount_source={}\nmount_id={}\ndev={}\npolicies={}\n",
         boot_id,
         view.child_pid,
         view.child_start_time_ticks,
         view.mount_point,
         view.mount_source,
+        view.mount_id,
+        view.dev,
         view.policy_fingerprints
             .iter()
             .map(|(uid, fingerprint)| format!("{uid}:{fingerprint}"))
@@ -1760,7 +2349,11 @@ fn publish_host_snapshot(view: &HostSessionView) {
             path.display(),
             error
         );
+        return;
     }
+    // 快照只描述**当前**这一代宿主；换代后旧层还挂在活着的应用命名空间里，只能靠
+    // 持久 dev 历史才能继续认成本模块的层（否则 cleanup 判 foreign、死层永叠栈底）。
+    crate::mount_ledger::remember_module_fuse_devs([view.dev.as_str()]);
 }
 
 /// 登记成功后更新该 UID 对应的策略指纹。
@@ -1794,6 +2387,8 @@ pub fn read_host_session_view() -> Option<HostSessionView> {
     let mut child_start_time_ticks = 0u64;
     let mut mount_point = String::new();
     let mut mount_source = String::new();
+    let mut mount_id = 0u64;
+    let mut dev = String::new();
     let mut policy_fingerprints = std::collections::BTreeMap::new();
     for line in content.lines() {
         let (key, value) = line.split_once('=')?;
@@ -1803,6 +2398,8 @@ pub fn read_host_session_view() -> Option<HostSessionView> {
             "start_ticks" => child_start_time_ticks = value.parse().ok()?,
             "mount_point" => mount_point = value.to_string(),
             "mount_source" => mount_source = value.to_string(),
+            "mount_id" => mount_id = value.parse().ok()?,
+            "dev" => dev = value.to_string(),
             "policies" => {
                 for entry in value.split(',').filter(|value| !value.is_empty()) {
                     let (uid, fingerprint) = entry.split_once(':')?;
@@ -1822,6 +2419,12 @@ pub fn read_host_session_view() -> Option<HostSessionView> {
         revoke_host_snapshot("process_dead", child_pid, child_start_time_ticks);
         return None;
     }
+    if dev.is_empty() {
+        // 旧版本快照没有超级块身份：没有它就无法把本模块 FUSE 与系统 FUSE 分开，
+        // 一律按不可用处理，让调用方回退 scoped，等 daemon 重建并重新发布。
+        revoke_host_snapshot("identity_absent", child_pid, child_start_time_ticks);
+        return None;
+    }
     // 宿主进程可能仍存活，但 MediaProvider 重启后其 FUSE endpoint 已经失效；仅凭
     // pid/start_ticks 会把旧快照继续交给 companion，最终在 move_mount 处得到 ENOTCONN。
     // 私有宿主挂载点是最便宜且不依赖应用 namespace 的健康探针，失效时先撤销快照，
@@ -1839,6 +2442,8 @@ pub fn read_host_session_view() -> Option<HostSessionView> {
         child_start_time_ticks,
         mount_point,
         mount_source,
+        mount_id,
+        dev,
         policy_fingerprints,
     })
 }
@@ -1986,7 +2591,15 @@ pub fn get_fuse_host() -> Option<Arc<FuseHost>> {
 }
 
 /// 确保共享宿主存在；宿主死亡时最多由当前 reconcile 调用方重建一次。
+///
+/// 接入被显式关闭时**不建立宿主**：这条闸门必须覆盖宿主的全部使用路径，否则关闭
+/// 接入只是「没有应用接入」，宿主本身仍会建立、仍会被换代，而每次换代都会给已经
+/// 附着的命名空间留下死挂载层——设备侧用它做 A/B 归因时，看到的现象与开启时没有
+/// 差别，也就无法定位宿主是否为问题的来源。
 pub fn ensure_global() -> bool {
+    if !host_attach_enabled() {
+        return false;
+    }
     if get_fuse_host().is_some() {
         return true;
     }
@@ -2018,7 +2631,7 @@ pub fn ensure_global() -> bool {
 /// 的挂载全部排队。同理，一次等待超时说明宿主在此环境里建不起来（能力缺失、内核
 /// 拒绝），继续让后续请求逐个空等只会放大延迟——30 秒冷却内的请求立即走回退路径，
 /// 冷却到期后再允许一次完整等待，宿主恢复后自然接上。
-const HOST_WAIT_BUDGET_MS: u64 = 6_000;
+pub(crate) const HOST_WAIT_BUDGET_MS: u64 = 6_000;
 const HOST_WAIT_FAIL_COOLDOWN_MS: i64 = 30_000;
 static LAST_HOST_WAIT_FAIL_MS: AtomicI64 = AtomicI64::new(0);
 
@@ -2071,4 +2684,588 @@ pub fn wait_for_host_session() -> bool {
         let remaining = deadline.saturating_sub(current);
         wait_for_host_snapshot_change(remaining, || get_fuse_host().is_some());
     }
+}
+
+// ===== 外部 abort 兜底监控（daemon 侧，最后一道解冻能力）=====
+//
+// 背景（2026-10-29 真机冻结实证）：宿主内停摆看门狗的探测链路自身可能被冻住
+// （探针陷入 D 态、回收路径阻塞），confirmed/dump/abort 全部无法发生，全系统
+// 冻死直到强制断电。daemon 是独立进程、不服务任何 FUSE 请求，由它保留兜底：
+//
+// 触发（宿主心跳给出嫌疑）→ 验证（daemon 亲自进宿主命名空间取证）→ abort。
+// 三段缺一不可：心跳只是嫌疑，直接 abort 会误杀慢而活的会话；验证必须同时
+// 满足「waiting 持续 > 0」与「端到端探测超时」两条硬证据。
+//
+// 宿主内看门狗先于本监控触发（阈值更短），因此本路径只在看门狗失效时才可能
+// 走到 abort——这正是它的设计定位。
+
+/// 心跳陈旧阈值（**下限**）：超过该值未更新说明宿主进程整体冻结（所有线程含非 FUSE
+/// 线程都停了）或已退出（退出场景由 pid 活性检查排除）。
+///
+/// 20 秒 = 活跃期 4 个心跳周期，足以排除调度抖动，又明显短于「冻结到用户可感知」的
+/// 量级。写方在空闲期会把间隔拉长到 60 秒，此时实际阈值按
+/// [`EXTERNAL_ABORT_BEAT_STALE_INTERVALS`] × 心跳里携带的间隔计算，但仍不低于本值。
+const EXTERNAL_ABORT_BEAT_STALE_MS: i64 = 20_000;
+/// 无完成时长阈值：心跳里 last_completion 距今超过该值且 waiting 积压，视为
+/// 停摆嫌疑。必须大于宿主内看门狗的全链路延迟（6s+10s+4s），保证看门狗健康时
+/// 本监控永远轮不到动手。
+const EXTERNAL_ABORT_NO_COMPLETION_MS: i64 = 25_000;
+/// 验证子进程两次 waiting 采样的间隔。
+const EXTERNAL_ABORT_VERIFY_SAMPLE_MS: u64 = 5_000;
+/// 验证子进程端到端探测的超时。
+const EXTERNAL_ABORT_PROBE_TIMEOUT_MS: u64 = 12_000;
+/// 嫌疑验证的最小间隔：alive 结论下按该节流复验，避免冻结期间高频 fork。
+const EXTERNAL_ABORT_VERIFY_THROTTLE_MS: i64 = 60_000;
+/// abort 之后的冷却窗：换代重建需要时间，期间心跳必然异常，禁止重复动手。
+const EXTERNAL_ABORT_COOLDOWN_MS: i64 = 120_000;
+/// 模块停用后的等待上限：此时本线程很快随 daemon 退出，不需要做任何工作。
+const EXTERNAL_ABORT_DISABLED_WAIT_MS: i64 = 30_000;
+/// 陈旧阈值相对写方心跳间隔的倍数。
+///
+/// 写方空闲时把间隔拉长到 60 秒（见 `HOST_HEARTBEAT_IDLE_INTERVAL_MS`），阈值为其两倍
+/// 才能容忍一次错过的写入而不会误判；活跃期间隔 5 秒，两倍仍低于
+/// [`EXTERNAL_ABORT_BEAT_STALE_MS`] 的下限，因此活跃期判据不会被放松。
+const EXTERNAL_ABORT_BEAT_STALE_INTERVALS: i64 = 2;
+
+/// 验证子进程退出码：探测应答（alive）。
+const VERIFY_EXIT_ANSWERED: i32 = 0;
+/// 验证子进程退出码：waiting 清零（alive）。
+const VERIFY_EXIT_WAITING_CLEARED: i32 = 2;
+/// 验证子进程退出码：命名空间/sysfs 不可达（证据不足，放弃）。
+const VERIFY_EXIT_UNAVAILABLE: i32 = 3;
+
+/// 宿主心跳内容。
+///
+/// 两个来源：`platform::host_beat` 的父子共享页（正常路径，零系统调用、零磁盘 I/O），
+/// 以及模块目录下的心跳文件（共享页不可用时的退路，含上次开机的残留）。
+#[derive(Debug)]
+struct HostHeartbeat {
+    /// 仅文件来源有意义：共享页是每次开机新建的匿名映射，不存在跨启动残留。
+    boot_id: String,
+    from_shared_page: bool,
+    host_pid: i32,
+    conn: i32,
+    waiting: u64,
+    last_completion_ms: i64,
+    wall_ms: i64,
+    /// 写方本次使用的心跳间隔；0 表示旧格式（按活跃档处理，取保守值）。
+    interval_ms: i64,
+}
+
+/// 外部 abort 兜底验证结论。
+#[derive(Debug, Eq, PartialEq)]
+enum ExternalVerdict {
+    /// 有 alive 证据（探测应答 / waiting 清零），不动手。
+    Alive(&'static str),
+    /// 硬证据齐了：waiting 持续积压 + 端到端探测超时（含探针 SIGKILL 后仍不退出）。
+    Stalled,
+    /// 证据不足（命名空间进不去、sysfs 消失等），本轮放弃。
+    Unavailable(&'static str),
+}
+
+/// 启动 daemon 侧外部 abort 兜底监控线程。
+///
+/// 宿主未建立会话时心跳文件不存在，线程空转成本为每 2 秒一次文件读取。
+pub fn spawn_external_abort_monitor() {
+    // 接入关闭时没有宿主会话要解冻：监控线程只会空转读一个不存在的
+    // 心跳文件，且它的 abort 动作本来就是为宿主会话准备的。
+    if !host_attach_enabled() {
+        log::info!("daemon external abort monitor skipped: host attach disabled");
+        return;
+    }
+    let spawned = std::thread::Builder::new()
+        .name("srx-external-abort".to_string())
+        .spawn(external_abort_monitor_main);
+    if spawned.is_err() {
+        log::warn!("daemon external abort monitor spawn failed");
+    }
+}
+
+fn external_abort_monitor_main() {
+    log::info!("daemon external abort monitor started");
+    // 唤醒源由 `platform::host_beat` 持有：**daemon 在 fork 宿主之前**建立的 eventfd，
+    // 因此宿主也能写它。两条边沿会叫醒本线程：共享页建立（从「没有会话」进入「有会话」）
+    // 与宿主「空闲→活跃」。
+    let install_wake_fd = crate::platform::host_beat::ensure_wake_fd();
+    if install_wake_fd < 0 {
+        log::warn!("host beat wake fd unavailable; fallback to timed waits");
+    }
+    let mut last_verify_ms = 0i64;
+    let mut cooldown_until_ms = 0i64;
+    // 上一轮是否由事件唤醒：若是，这一轮不能按「空闲间隔 × 2」长期睡下去——事件意味着
+    // 状态刚变过，必须按活跃阈值重新评估。
+    let mut event_woken = false;
+    loop {
+        let mut wait_ms = EXTERNAL_ABORT_BEAT_STALE_MS as i32;
+        if !crate::runtime_control::is_module_runtime_enabled() {
+            // 模块停用后本线程会随 daemon 一起退出，这里只需低频醒着、不做任何工作。
+            wait_ms = EXTERNAL_ABORT_DISABLED_WAIT_MS as i32;
+        } else {
+            // 即使共享页尚未建立也读取文件通道：mmap 失败时宿主仍用文件心跳，不能仅
+            // 因 wake eventfd 存在就无限等待一个永远不会到来的共享页建立事件。
+            let now = paths::monotonic_ms();
+            if now < cooldown_until_ms {
+                wait_ms = (cooldown_until_ms - now).clamp(1_000, 60_000) as i32;
+            } else if let Some(beat) = read_beat_preferring_shared() {
+                // 上次开机的残留心跳（文件写在模块目录，重启后仍在）：boot_id 不符即
+                // 忽略。共享页是本次开机新建的映射，无需该校验。
+                if !beat.from_shared_page && beat.boot_id != read_own_boot_id() {
+                    // 文件通道只可能是升级前的残留：等下次再看。
+                    wait_ms = EXTERNAL_ABORT_BEAT_STALE_MS as i32;
+                } else if !process_alive(beat.host_pid) {
+                    // 宿主进程已退出（正常换代/崩溃）：交给既有 pidfd 换代通道，这里只等
+                    // 新会话开始写心跳。
+                    wait_ms = EXTERNAL_ABORT_BEAT_STALE_MS as i32;
+                } else {
+                    wait_ms = evaluate_beat_and_schedule(
+                        &beat,
+                        &mut last_verify_ms,
+                        &mut cooldown_until_ms,
+                    );
+                }
+            }
+            // 共享页已建立但还没有心跳：等一个陈旧窗口再来问。
+        }
+        if event_woken && wait_ms > 0 {
+            // 事件唤醒后的这一轮只按活跃阈值重评，不按「空闲间隔 × 2」继续长睡。
+            wait_ms = wait_ms.min(EXTERNAL_ABORT_BEAT_STALE_MS as i32).max(1);
+        }
+        event_woken = wait_for_host_beat_signal(install_wake_fd, wait_ms);
+    }
+}
+
+/// 判定一次心跳，返回下一次需要再看的等待毫秒数。
+///
+/// 关键在于「什么时候值得看」：判据只有两条——心跳自身变陈旧（超过
+/// [`EXTERNAL_ABORT_BEAT_STALE_MS`]，宿主整进程冻结时写线程也停了）、以及「队列有
+/// 积压但长时间没有请求完成」。第一条只在**当前这条心跳的陈旧截止点**之后才可能成立，
+/// 因此下一次唤醒直接排到那个时刻，而不是按固定 5 秒节拍空看。
+fn evaluate_beat_and_schedule(
+    beat: &HostHeartbeat,
+    last_verify_ms: &mut i64,
+    cooldown_until_ms: &mut i64,
+) -> i32 {
+    let wall_now = wall_ms();
+    let beat_age = wall_now.saturating_sub(beat.wall_ms);
+    let completion_age = if beat.last_completion_ms > 0 {
+        wall_now.saturating_sub(beat.last_completion_ms)
+    } else {
+        0
+    };
+    // 陈旧阈值跟着写方的心跳间隔走：写方空闲时会把间隔拉长（60 秒），阈值必须至少是
+    // 两倍间隔，否则「心跳变慢」会被误判成「宿主冻结」。下限仍是
+    // `EXTERNAL_ABORT_BEAT_STALE_MS`（20 秒），保证活跃期判据不放松。
+    let stale_threshold_ms = EXTERNAL_ABORT_BEAT_STALE_MS.max(
+        beat.interval_ms
+            .max(1)
+            .saturating_mul(EXTERNAL_ABORT_BEAT_STALE_INTERVALS),
+    );
+    let beat_stale = beat_age > stale_threshold_ms;
+    let completion_stalled = beat.waiting > 0 && completion_age > EXTERNAL_ABORT_NO_COMPLETION_MS;
+    if !beat_stale && !completion_stalled {
+        // 这条心跳仍然新鲜：下一次有意义的检查是它变陈旧的那一刻。
+        let beat_wait_ms = beat
+            .wall_ms
+            .saturating_add(stale_threshold_ms)
+            .saturating_sub(wall_now)
+            .clamp(1_000, stale_threshold_ms.max(1_000));
+        // 队列里有积压时，「无完成」判定会在 `last_completion_ms + 25 秒` 处成立，因此
+        // 那一刻必须能看见它，否则停摆的发现会被推迟到下一次心跳陈旧为止（最多多等
+        // 一个心跳窗口）。没有积压时不存在这个判定，只按上面的心跳截止点醒。
+        if beat.waiting > 0 && beat.last_completion_ms > 0 {
+            let completion_wait_ms = beat
+                .last_completion_ms
+                .saturating_add(EXTERNAL_ABORT_NO_COMPLETION_MS)
+                .saturating_sub(wall_now)
+                .clamp(1_000, stale_threshold_ms.max(1_000));
+            return completion_wait_ms.min(beat_wait_ms) as i32;
+        }
+        return beat_wait_ms as i32;
+    }
+    let now = paths::monotonic_ms();
+    if now.saturating_sub(*last_verify_ms) < EXTERNAL_ABORT_VERIFY_THROTTLE_MS {
+        // 嫌疑已在验证节流窗口内：等窗口过去再看，别空转。
+        return EXTERNAL_ABORT_VERIFY_THROTTLE_MS
+            .saturating_sub(now.saturating_sub(*last_verify_ms))
+            .clamp(1_000, 60_000) as i32;
+    }
+    *last_verify_ms = now;
+    log::warn!(
+        "daemon external stall suspicion host_pid={} conn={} waiting={} beat_age_ms={} completion_age_ms={} trigger={} verifying",
+        beat.host_pid,
+        beat.conn,
+        beat.waiting,
+        beat_age,
+        completion_age,
+        if beat_stale {
+            "beat-stale"
+        } else {
+            "no-completion"
+        }
+    );
+    match verify_host_stall_externally(beat) {
+        ExternalVerdict::Alive(reason) => {
+            log::warn!(
+                "daemon external stall verdict=alive host_pid={} conn={} reason={}",
+                beat.host_pid,
+                beat.conn,
+                reason
+            );
+        }
+        ExternalVerdict::Unavailable(reason) => {
+            log::warn!(
+                "daemon external stall verdict=unavailable host_pid={} conn={} reason={}",
+                beat.host_pid,
+                beat.conn,
+                reason
+            );
+        }
+        ExternalVerdict::Stalled => {
+            crate::fuse_redirect::config::forensics_log(&format!(
+                "daemon external stall confirmed host_pid={} conn={} waiting={} beat_age_ms={} completion_age_ms={} action=abort",
+                beat.host_pid, beat.conn, beat.waiting, beat_age, completion_age
+            ));
+            dump_external_stall_forensics(beat);
+            let aborted = abort_host_connection_externally(beat);
+            crate::fuse_redirect::config::forensics_log(&format!(
+                "daemon external abort done host_pid={} conn={} aborted={} effect=requests-error-out host-exits generation-rebuild",
+                beat.host_pid, beat.conn, aborted
+            ));
+            *cooldown_until_ms = paths::monotonic_ms() + EXTERNAL_ABORT_COOLDOWN_MS;
+        }
+    }
+    EXTERNAL_ABORT_BEAT_STALE_MS as i32
+}
+
+/// 等待下一次检查：只由「共享页建立 / 空闲→活跃」事件或超时唤醒。
+///
+/// `timeout_ms < 0` 表示无限等待（此时只有事件能叫醒它）。返回是否由事件唤醒。
+fn wait_for_host_beat_signal(fd: i32, timeout_ms: i32) -> bool {
+    if fd < 0 {
+        // eventfd 不可用（极端情形）：退回睡眠，语义不变。
+        let sleep_ms = timeout_ms.clamp(1_000, 60_000) as u64;
+        std::thread::sleep(std::time::Duration::from_millis(sleep_ms));
+        return false;
+    }
+    let mut poll_fd = libc::pollfd {
+        fd,
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    // SAFETY: poll_fd 指向本栈帧已初始化的 pollfd；超时值由调用方夹在合理范围。
+    let ready = unsafe { libc::poll(&mut poll_fd, 1, timeout_ms) };
+    if ready <= 0 {
+        return false;
+    }
+    let mut value: u64 = 0;
+    // SAFETY: value 是本栈帧可写的 u64，eventfd 读契约正是 8 字节计数。
+    unsafe {
+        libc::read(
+            fd,
+            &mut value as *mut u64 as *mut libc::c_void,
+            std::mem::size_of::<u64>(),
+        );
+    }
+    true
+}
+
+/// 读取并解析宿主心跳文件；缺失或格式不符返回 None（静默：宿主未建会话是常态）。
+fn read_host_heartbeat() -> Option<HostHeartbeat> {
+    let text =
+        std::fs::read_to_string(crate::platform::module_paths::FUSE_HOST_HEARTBEAT_FILE).ok()?;
+    let fields: Vec<&str> = text.trim().split('|').collect();
+    // 7 段是老格式（没有 interval），按活跃档处理；8 段带写方间隔。
+    if (fields.len() != 7 && fields.len() != 8) || fields[0] != "srx_beat" {
+        return None;
+    }
+    Some(HostHeartbeat {
+        boot_id: fields[1].to_string(),
+        from_shared_page: false,
+        host_pid: fields[2].parse().ok()?,
+        conn: fields[3].parse().ok()?,
+        waiting: fields[4].parse().ok()?,
+        last_completion_ms: fields[5].parse().ok()?,
+        wall_ms: fields[6].parse().ok()?,
+        interval_ms: fields
+            .get(7)
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(EXTERNAL_ABORT_BEAT_STALE_MS),
+    })
+}
+
+/// 读一次宿主心跳：优先共享页（零系统调用、零磁盘 I/O），其次心跳文件。
+///
+/// 顺序不能反过来：共享页是新路径，正常情况下文件心跳根本不会被写入（宿主的写线程在
+/// 共享页可用时不会落盘），因此「文件陈旧」不代表宿主有问题，只有共享页读不到时才回退。
+fn read_beat_preferring_shared() -> Option<HostHeartbeat> {
+    if crate::platform::host_beat::installed() {
+        // 共享页已建立：心跳只可能来自它。此时若读不到（宿主尚未开始写），按「没有
+        // 心跳」处理，绝不回退到文件——那份文件是升级前的残留，会被误判为当前心跳。
+        let beat = crate::platform::host_beat::read_beat()?;
+        return Some(HostHeartbeat {
+            boot_id: String::new(),
+            from_shared_page: true,
+            host_pid: beat.host_pid,
+            conn: beat.conn,
+            waiting: beat.waiting.max(0) as u64,
+            last_completion_ms: beat.last_completion_ms,
+            wall_ms: beat.wall_ms,
+            interval_ms: beat.interval_ms,
+        });
+    }
+    read_host_heartbeat()
+}
+
+/// 当前墙钟毫秒（与宿主心跳的 wall_ms 同口径，宿主与 daemon 共享系统墙钟）。
+fn wall_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_millis() as i64)
+        .unwrap_or(0)
+}
+
+fn read_own_boot_id() -> String {
+    std::fs::read_to_string("/proc/sys/kernel/random/boot_id")
+        .map(|text| text.trim().to_string())
+        .unwrap_or_default()
+}
+
+fn process_alive(pid: i32) -> bool {
+    // kill 0 只做权限与存在性探测，不发信号。
+    // SAFETY: 信号 0 是 POSIX 规定的探测用法，不作用于目标进程。
+    unsafe { libc::kill(pid, 0) == 0 }
+}
+
+/// 外部验证：fork 子进程进入宿主命名空间采样 waiting 并做端到端探测。
+///
+/// 子进程动作序列（全部无 Rust 状态依赖，fork 后安全）：
+/// 1. setns 进宿主 mnt 命名空间——宿主会话连接是游离挂载，daemon 自己的命名空间
+///    看不到（设计如此），必须进入宿主的命名空间才能读它的 sysfs；
+/// 2. 读 waiting，为 0 或读不到 → alive（EXIT_WAITING_CLEARED）；
+/// 3. 等 5 秒再读一次，仍 > 0 才继续——单次积压可能只是瞬时负载；
+/// 4. stat 探针路径：应答（含 ENOENT）→ alive（EXIT_ANSWERED）；停摆则挂起，
+///    由父进程按超时裁决。
+///
+/// 父进程按 pidfd 退出事件有界等待，绝不阻塞：探针 SIGKILL 后仍不退出（D 态等 abort 唤醒）
+/// 与超时同样按 Stalled 裁决——TASK_KILLABLE 只在 FUSE 应答或 abort 时醒来，
+/// 杀不死本身就是队列已死的证据。
+fn verify_host_stall_externally(beat: &HostHeartbeat) -> ExternalVerdict {
+    let Ok(c_ns_path) = CString::new(format!("/proc/{}/ns/mnt", beat.host_pid)) else {
+        return ExternalVerdict::Unavailable("ns-path-invalid");
+    };
+    let Ok(c_probe) = CString::new(format!(
+        "{}/.srx_stall_probe",
+        crate::platform::module_paths::FUSE_HOST_MOUNT_DIR
+    )) else {
+        return ExternalVerdict::Unavailable("probe-path-invalid");
+    };
+    let Ok(c_waiting) = CString::new(format!("/sys/fs/fuse/connections/{}/waiting", beat.conn))
+    else {
+        return ExternalVerdict::Unavailable("waiting-path-invalid");
+    };
+    crate::logging::prepare_for_fork();
+    // SAFETY: fork 前已完成日志准备；子进程只用 libc 与 _exit，不触碰 Rust 运行时状态。
+    let child = unsafe { libc::fork() };
+    if child < 0 {
+        return ExternalVerdict::Unavailable("fork-failed");
+    }
+    if child == 0 {
+        // SAFETY: 三个 c_* 均为 NUL 结尾静态串，指针在整个子进程生命周期内有效。
+        unsafe {
+            let ns_fd = libc::open(c_ns_path.as_ptr(), libc::O_RDONLY | libc::O_CLOEXEC);
+            if ns_fd < 0 {
+                libc::_exit(VERIFY_EXIT_UNAVAILABLE);
+            }
+            if libc::setns(ns_fd, libc::CLONE_NEWNS) != 0 {
+                libc::_exit(VERIFY_EXIT_UNAVAILABLE);
+            }
+            libc::close(ns_fd);
+            for _ in 0..2 {
+                match read_waiting_raw(&c_waiting) {
+                    None => libc::_exit(VERIFY_EXIT_UNAVAILABLE),
+                    Some(0) => libc::_exit(VERIFY_EXIT_WAITING_CLEARED),
+                    Some(_) => {}
+                }
+                libc::sleep((EXTERNAL_ABORT_VERIFY_SAMPLE_MS / 1_000) as libc::c_uint);
+            }
+            let mut buf = std::mem::MaybeUninit::<libc::stat>::uninit();
+            // 结果不检查：ENOENT 与成功同样是「连接可应答」的证据，其它 errno 也是。
+            libc::stat(c_probe.as_ptr(), buf.as_mut_ptr());
+            libc::_exit(VERIFY_EXIT_ANSWERED);
+        }
+    }
+    // 父进程裁决窗：2 次采样间隔 + 探测超时 + 余量。
+    let budget_ms = (EXTERNAL_ABORT_VERIFY_SAMPLE_MS * 2 + EXTERNAL_ABORT_PROBE_TIMEOUT_MS) as i64;
+    use crate::platform::child_wait::{self, ChildExit};
+    match child_wait::wait_child_exit(child, budget_ms) {
+        ChildExit::Exited(VERIFY_EXIT_ANSWERED) => ExternalVerdict::Alive("probe-answered"),
+        ChildExit::Exited(VERIFY_EXIT_WAITING_CLEARED) => ExternalVerdict::Alive("waiting-cleared"),
+        ChildExit::Exited(VERIFY_EXIT_UNAVAILABLE) => ExternalVerdict::Unavailable("ns-or-sysfs"),
+        ChildExit::Exited(_) => ExternalVerdict::Unavailable("unexpected-exit"),
+        ChildExit::Signaled(_) => ExternalVerdict::Unavailable("child-signalled"),
+        ChildExit::Failed(_) => ExternalVerdict::Unavailable("waitpid-failed"),
+        ChildExit::TimedOut => {
+            // SAFETY: child 已确认仍存活；SIGKILL 只作用于它。
+            unsafe { libc::kill(child, libc::SIGKILL) };
+            reap_bounded(child, "external-verify");
+            ExternalVerdict::Stalled
+        }
+    }
+}
+
+/// 在（已 setns 进宿主命名空间的）当前进程读 waiting 计数；仅验证子进程使用。
+///
+/// # SAFETY
+/// c_waiting 必须指向 NUL 结尾串；本函数在 fork 后的子进程内调用，无并发。
+unsafe fn read_waiting_raw(c_waiting: &CString) -> Option<u64> {
+    // SAFETY: c_waiting 是 NUL 结尾静态串，open 只读不写。
+    let fd = libc::open(c_waiting.as_ptr(), libc::O_RDONLY | libc::O_CLOEXEC);
+    if fd < 0 {
+        return None;
+    }
+    let mut buffer = [0u8; 32];
+    // SAFETY: fd 是本函数刚打开的有效描述符，buffer 为栈上可写缓冲。
+    let n = libc::read(fd, buffer.as_mut_ptr() as *mut libc::c_void, buffer.len());
+    // SAFETY: fd 是本函数打开的描述符，读取结束即清理。
+    libc::close(fd);
+    if n <= 0 {
+        return None;
+    }
+    std::str::from_utf8(&buffer[..n as usize])
+        .ok()?
+        .trim()
+        .parse::<u64>()
+        .ok()
+}
+
+/// 有界回收 fork 子进程：至多等 3 秒退出事件，杀不死就记录状态后放弃。
+fn reap_bounded(child: i32, tag: &str) {
+    if crate::platform::child_wait::wait_child_exit(child, 3_000).is_settled() {
+        return;
+    }
+    let state = std::fs::read_to_string(format!("/proc/{child}/stat"))
+        .ok()
+        .and_then(|text| {
+            text.rsplit_once(')')
+                .and_then(|(_, rest)| rest.split_whitespace().nth(1))
+                .map(str::to_string)
+        })
+        .unwrap_or_else(|| "unknown".to_string());
+    crate::fuse_redirect::config::forensics_log(&format!(
+        "daemon external {tag} child unkillable pid={} state={} abandoned",
+        child, state
+    ));
+}
+
+/// 外部 abort：fork 子进程进宿主命名空间写连接 abort 节点。
+///
+/// abort 生效后内核把在途与后续请求全部置错：卡死的宿主 worker 全部带错退出，
+/// 探针 D 态进程随之释放，全系统解冻；宿主进程随会话退出，由既有 pidfd 换代
+/// 通道重建。
+fn abort_host_connection_externally(beat: &HostHeartbeat) -> bool {
+    let Ok(c_ns_path) = CString::new(format!("/proc/{}/ns/mnt", beat.host_pid)) else {
+        return false;
+    };
+    let Ok(c_abort) = CString::new(format!("/sys/fs/fuse/connections/{}/abort", beat.conn)) else {
+        return false;
+    };
+    crate::logging::prepare_for_fork();
+    // SAFETY: fork 前已完成日志准备；子进程只用 libc 与 _exit。
+    let child = unsafe { libc::fork() };
+    if child < 0 {
+        log::error!("daemon external abort fork failed");
+        return false;
+    }
+    if child == 0 {
+        // SAFETY: c_* 均为 NUL 结尾静态串。
+        unsafe {
+            let ns_fd = libc::open(c_ns_path.as_ptr(), libc::O_RDONLY | libc::O_CLOEXEC);
+            if ns_fd < 0 {
+                libc::_exit(VERIFY_EXIT_UNAVAILABLE);
+            }
+            if libc::setns(ns_fd, libc::CLONE_NEWNS) != 0 {
+                libc::_exit(VERIFY_EXIT_UNAVAILABLE);
+            }
+            libc::close(ns_fd);
+            let written = libc::open(c_abort.as_ptr(), libc::O_WRONLY | libc::O_CLOEXEC);
+            if written < 0 {
+                libc::_exit(VERIFY_EXIT_UNAVAILABLE);
+            }
+            let payload = b"1\n";
+            libc::write(
+                written,
+                payload.as_ptr() as *const libc::c_void,
+                payload.len(),
+            );
+            libc::close(written);
+            libc::_exit(0);
+        }
+    }
+    // abort 节点是纯 sysfs 写入，不经过 FUSE 数据面，正常毫秒级；仍给有界窗口。
+    use crate::platform::child_wait::{self, ChildExit};
+    match child_wait::wait_child_exit(child, 5_000) {
+        ChildExit::TimedOut => {
+            // SAFETY: child 已确认仍存活；SIGKILL 只作用于它。
+            unsafe { libc::kill(child, libc::SIGKILL) };
+            reap_bounded(child, "external-abort");
+            false
+        }
+        outcome => outcome.exited_with(0),
+    }
+}
+
+/// 外部 abort 前的 daemon 侧取证：宿主进程全景 + 全系统 D 态 + 内核日志过滤尾。
+///
+/// 宿主内看门狗的 candidate 取证可能已随看门狗线程一起冻结，这里从 daemon 侧
+/// 独立再抓一份——两份现场互为备份，冻结归因不依赖任何单点。
+fn dump_external_stall_forensics(beat: &HostHeartbeat) {
+    let pid = beat.host_pid;
+    if let Ok(status) = std::fs::read_to_string(format!("/proc/{pid}/status")) {
+        for line in status.lines() {
+            if line.starts_with("State:")
+                || line.starts_with("Threads:")
+                || line.starts_with("VmRSS:")
+            {
+                crate::fuse_redirect::config::forensics_log(&format!(
+                    "daemon external stall host-status pid={pid} {line}"
+                ));
+            }
+        }
+    }
+    let Ok(tasks) = std::fs::read_dir(format!("/proc/{pid}/task")) else {
+        crate::fuse_redirect::config::forensics_log(&format!(
+            "daemon external stall host task-list-failed pid={pid}"
+        ));
+        return;
+    };
+    for task in tasks.flatten().take(48) {
+        let tid_path = task.path();
+        let tid = task.file_name().to_string_lossy().to_string();
+        let comm = std::fs::read_to_string(tid_path.join("comm"))
+            .map(|text| text.trim().to_string())
+            .unwrap_or_default();
+        let wchan = std::fs::read_to_string(tid_path.join("wchan"))
+            .map(|text| text.trim().to_string())
+            .unwrap_or_default();
+        crate::fuse_redirect::config::forensics_log(&format!(
+            "daemon external stall host-thread tid={tid} comm={comm} wchan={wchan}"
+        ));
+        if let Ok(syscall) = std::fs::read_to_string(tid_path.join("syscall")) {
+            let syscall = syscall.trim();
+            if !syscall.is_empty() {
+                crate::fuse_redirect::config::forensics_log(&format!(
+                    "daemon external stall host-syscall tid={tid} {syscall}"
+                ));
+            }
+        }
+        if let Ok(stack) = std::fs::read_to_string(tid_path.join("stack")) {
+            for line in stack.lines().take(16) {
+                crate::fuse_redirect::config::forensics_log(&format!(
+                    "daemon external stall host-stack tid={tid} {line}"
+                ));
+            }
+        }
+    }
+    crate::fuse_redirect::config::dump_system_dstate_tasks();
+    crate::fuse_redirect::config::dump_kmsg_forensics();
 }

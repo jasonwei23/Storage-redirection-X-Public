@@ -1,5 +1,6 @@
 use super::stats::InterceptHub;
 use crate::monitor::{AuditTrail, OpKind};
+use crate::platform::log_fields::encode;
 use crate::platform::{self, paths};
 use crate::redirect::policy;
 use libc::{AT_REMOVEDIR, O_APPEND, O_CREAT, O_PATH, O_RDWR, O_TMPFILE, O_TRUNC, O_WRONLY};
@@ -132,9 +133,12 @@ fn record_open_result_with_extra(
         record.is_mapping,
         record_existed_before,
     );
+    // record_operation_with_caller 统一补 caller_uid / caller_pid，供 daemon 登记
+    // 写入路径线索与追踪未配置应用经原生 FUSE 的请求。
     append_extra_tail(&mut extra, extra_tail);
     let caller_package = hub.get_current_caller_package();
-    AuditTrail::instance().record_operation_result(
+    record_operation_with_caller(
+        hub,
         OpKind::Open,
         &caller_package,
         record_path,
@@ -159,9 +163,9 @@ fn build_open_result_extra(
     );
     if !original_pathname.is_empty() && original_pathname != pathname {
         extra.push_str("|from=");
-        extra.push_str(original_pathname);
+        extra.push_str(&encode(original_pathname));
         extra.push_str("|backend=");
-        extra.push_str(pathname);
+        extra.push_str(&encode(pathname));
         extra.push_str("|source=");
         extra.push_str(redirect_source_name(pathname, is_mapping));
     }
@@ -255,17 +259,21 @@ fn record_media_store_pending_commit_if_needed(
     let mut extra = if record.flags >= 0 {
         format!(
             "op={}|op_filter=open:create|flags=0x{:x}|from={}|source=media_store_pending_commit",
-            record.op_name, record.flags, record.old_pathname
+            record.op_name,
+            record.flags,
+            encode(record.old_pathname)
         )
     } else {
         format!(
             "op={}|op_filter=open:create|from={}|source=media_store_pending_commit",
-            record.op_name, record.old_pathname
+            record.op_name,
+            encode(record.old_pathname)
         )
     };
     append_extra_tail(&mut extra, extra_tail);
     let caller_package = hub.get_current_caller_package();
-    AuditTrail::instance().record_operation_result(
+    record_operation_with_caller(
+        hub,
         OpKind::Open,
         &caller_package,
         record.new_pathname,
@@ -303,7 +311,7 @@ fn remember_private_path_caller_hint_for_monitor(hub: &InterceptHub, pathname: &
     };
 
     let process_package = hub.get_package_name();
-    let caller_uid = hub.get_current_caller_uid();
+    let caller_uid = hub.get_effective_caller_uid_for_monitor();
     let caller_package = hub.get_current_caller_package();
     if !should_remember_monitor_private_path_caller_hint(
         &process_package,
@@ -345,7 +353,7 @@ fn private_storage_owner_path(pathname: &str) -> Option<(String, String, i32)> {
     let owner_package = paths::extract_android_private_path_owner(&normalized);
     if owner_package.is_empty()
         || policy::is_system_writer_package(&owner_package)
-        || policy::is_media_intermediate_package(&owner_package)
+        || policy::is_attribution_intermediate_package(&owner_package)
     {
         return None;
     }
@@ -370,7 +378,7 @@ fn should_remember_monitor_private_path_caller_hint(
         || caller_package.is_empty()
         || caller_package == owner_package
         || policy::is_system_writer_package(caller_package)
-        || policy::is_media_intermediate_package(caller_package)
+        || policy::is_attribution_intermediate_package(caller_package)
     {
         return false;
     }
@@ -383,7 +391,7 @@ fn record_saf_bridge_provider_path(hub: &InterceptHub, pathname: &str, op_filter
     if !hub.with_package_name(policy::is_saf_native_monitor_bridge_package) {
         return false;
     }
-    let caller_uid = hub.get_current_caller_uid();
+    let caller_uid = hub.get_effective_caller_uid_for_monitor();
     let caller_package = hub.get_current_caller_package();
     AuditTrail::instance().record_saf_provider_path(
         pathname,
@@ -414,8 +422,8 @@ pub fn record_mkdir_result_from(
     if !original_pathname.is_empty() && original_pathname != pathname {
         let extra_tail = format!(
             "from={}|backend={}|source={}",
-            original_pathname,
-            pathname,
+            encode(original_pathname),
+            encode(pathname),
             redirect_source_name(pathname, false)
         );
         record_mkdir_result_with_extra(hub, op_name, pathname, result, error_no, Some(&extra_tail));
@@ -460,7 +468,8 @@ fn record_mkdir_result_with_extra(
     } else {
         OpKind::Mkdir
     };
-    AuditTrail::instance().record_operation_result(
+    record_operation_with_caller(
+        hub,
         kind,
         &caller_package,
         pathname,
@@ -501,7 +510,8 @@ pub fn record_rename_result_with_display_paths(
     {
         Some(format!(
             "display_from={}|display_to={}",
-            display_old_pathname, display_new_pathname
+            encode(display_old_pathname),
+            encode(display_new_pathname)
         ))
     } else {
         None
@@ -551,14 +561,17 @@ fn record_rename_result_with_extra(
     let mut extra = if record.flags >= 0 {
         format!(
             "op={}|flags=0x{:x}|from={}",
-            record.op_name, record.flags, record.old_pathname
+            record.op_name,
+            record.flags,
+            encode(record.old_pathname)
         )
     } else {
-        format!("op={}|from={}", record.op_name, record.old_pathname)
+        format!("op={}|from={}", record.op_name, encode(record.old_pathname))
     };
     append_extra_tail(&mut extra, extra_tail);
     let caller_package = hub.get_current_caller_package();
-    AuditTrail::instance().record_operation_result(
+    record_operation_with_caller(
+        hub,
         OpKind::Rename,
         &caller_package,
         record.new_pathname,
@@ -589,7 +602,7 @@ pub fn record_unlink_result_from(
     flags: i32,
 ) {
     if !original_pathname.is_empty() && original_pathname != pathname {
-        let extra_tail = format!("from={}", original_pathname);
+        let extra_tail = format!("from={}", encode(original_pathname));
         record_unlink_result_with_extra(
             hub,
             op_name,
@@ -653,7 +666,8 @@ fn record_unlink_result_with_extra(
     };
     append_extra_tail(&mut extra, extra_tail);
     let caller_package = hub.get_current_caller_package();
-    AuditTrail::instance().record_operation_result(
+    record_operation_with_caller(
+        hub,
         kind,
         &caller_package,
         pathname,
@@ -684,7 +698,8 @@ pub fn record_path_operation_result(
         extra.push_str(tail);
     }
     let caller_package = hub.get_current_caller_package();
-    AuditTrail::instance().record_operation_result(
+    record_operation_with_caller(
+        hub,
         kind,
         &caller_package,
         pathname,
@@ -723,6 +738,33 @@ fn append_extra_tail(extra: &mut String, extra_tail: Option<&str>) {
     }
 }
 
+/// 按同一次捕获的 UID/PID 与任务快照记录结果；附加路径不提供身份字段。
+fn record_operation_with_caller(
+    hub: &InterceptHub,
+    kind: OpKind,
+    caller_package: &str,
+    pathname: &str,
+    result: i32,
+    error_no: i32,
+    extra: &str,
+) {
+    let (uid, pid, captured) = hub.record_caller_identity_with_evidence();
+    let caller_package = captured
+        .as_ref()
+        .map(|identity| identity.package.as_str())
+        .filter(|_| {
+            caller_package.is_empty() || policy::is_attribution_intermediate_package(caller_package)
+        })
+        .unwrap_or(caller_package);
+    AuditTrail::instance().record_operation_result(
+        kind,
+        caller_package,
+        pathname,
+        (result, error_no),
+        extra,
+        (uid, pid, captured.as_ref()),
+    );
+}
 fn redirect_source_name(pathname: &str, is_mapping: bool) -> &'static str {
     if is_mapping {
         return "path_mapping";
@@ -738,7 +780,8 @@ fn read_only_extra_tail(record_path: &str, read_only_path: &str) -> String {
     if !read_only_path.is_empty() && read_only_path != record_path {
         format!(
             "read_only_path={}|{}",
-            read_only_path, READ_ONLY_DENY_REASON
+            encode(read_only_path),
+            READ_ONLY_DENY_REASON
         )
     } else {
         READ_ONLY_DENY_REASON.to_string()

@@ -24,7 +24,6 @@ pub(super) fn collect_restored_read_only_excluded_children(
     read_only_paths: &[String],
     excluded_rules: &[String],
     path_mappings: &[PathMapping],
-    scoped_fuse_roots: &[String],
 ) -> Vec<String> {
     let mut restored_children: Vec<String> = Vec::new();
     for read_only_path in read_only_paths {
@@ -35,13 +34,34 @@ pub(super) fn collect_restored_read_only_excluded_children(
                     !paths::contains_wildcards(excluded)
                         && paths::is_child(excluded, read_only_path)
                         && !path_overlaps_mapping_request(excluded, path_mappings)
-                        && !is_covered_by_scoped_fuse_mount(excluded, scoped_fuse_roots)
                 })
                 .cloned(),
         );
     }
     paths::sort_dedup_paths_longest_first_case_insensitive(&mut restored_children);
     restored_children
+}
+
+/// 真实存储锚点的**挂载点**：emulated 根结构（`tmp/real_storage/<user>`）。
+///
+/// 这一层是模块私有路径，只在本轮挂载期间存在（用完即摘，见
+/// `MountPlanner::detach_real_storage_anchor`）。
+pub(super) fn real_storage_anchor_mount_path(user_id: i32) -> String {
+    paths::join(
+        crate::platform::module_paths::REAL_STORAGE_TMP_DIR,
+        &user_id.to_string(),
+    )
+}
+
+/// 真实存储锚点的**可用根**：内容正是该用户存储根（`<anchor>/<user>`）。
+///
+/// emulated 根下面第一段才是用户存储根，因此所有"锚点相当于存储根"的既有调用点
+/// （映射源、元数据换算、扫描根）都只要拿到这一条路径即可，不需要各自再加一段。
+pub(super) fn real_storage_anchor_usable_path(user_id: i32) -> String {
+    paths::join(
+        &real_storage_anchor_mount_path(user_id),
+        &user_id.to_string(),
+    )
 }
 
 pub(super) fn build_mapping_source_roots(
@@ -97,25 +117,6 @@ pub(super) fn build_allowed_real_source_candidates(
     candidates
 }
 
-pub(super) fn namespace_mappings_outside_scoped_fuse(
-    resolved_mappings: &[PathMapping],
-    scoped_fuse_roots: &[String],
-) -> Vec<PathMapping> {
-    if scoped_fuse_roots.is_empty() {
-        return resolved_mappings.to_vec();
-    }
-
-    resolved_mappings
-        .iter()
-        .filter(|mapping| {
-            !scoped_fuse_roots
-                .iter()
-                .any(|root| paths::is_same_or_child(&mapping.request_path, root))
-        })
-        .cloned()
-        .collect()
-}
-
 pub(super) fn is_covered_by_scoped_fuse_mount(path: &str, scoped_fuse_roots: &[String]) -> bool {
     scoped_fuse_roots
         .iter()
@@ -153,6 +154,29 @@ pub(super) fn mount_source_for_target_from_mountinfo(
     matched_root
 }
 
+/// 挂载点 `target` 上那条记录的 `major:minor`（superblock 身份）。
+///
+/// 用于判断两个挂载点是否属于**同一次** FUSE 连接：MediaProvider 重启、`vold`
+/// 重新拉起用户视图后，`/mnt/user/<user>/emulated` 会换成新的 minor，而旧锚点仍
+/// 绑在上一代连接上——此时 dev+ino 完全一致（同一 superblock 的根 dentry），
+/// `is_directory` 也可能为真，但实际访问会 ENOTCONN/ENOENT。
+pub(super) fn mountinfo_device_for_target(content: &str, target: &str) -> Option<String> {
+    let normalized_target = paths::normalize(target);
+    let mut matched: Option<String> = None;
+    for line in content.lines() {
+        let Some(entry) = mountinfo::parse_entry(line) else {
+            continue;
+        };
+        if paths::eq_ignore_case(
+            &paths::normalize(&mountinfo::unescape_field(entry.target)),
+            &normalized_target,
+        ) {
+            matched = Some(entry.dev.to_string());
+        }
+    }
+    matched
+}
+
 /// 只判断挂载点是否存在，命中首个匹配即返回，不解析也不分配 root 字段。
 pub(super) fn mountinfo_has_target(content: &str, target: &str) -> bool {
     let normalized_target = paths::normalize(target);
@@ -184,31 +208,6 @@ pub(super) fn mountinfo_has_target(content: &str, target: &str) -> bool {
 ///
 /// 只接受 `<user>/<非空尾部>` 形态：`/`、`/media`、`/0` 这类没有存储子树尾部的 `root`
 /// 说明不了重定向，一律返回 `None`。
-fn mountinfo_root_as_data_media(root: &str) -> Option<String> {
-    let rest = match root.strip_prefix("/media/") {
-        Some(rest) => rest,
-        None => root.strip_prefix('/')?,
-    };
-    let (user, tail) = rest.split_once('/')?;
-    if user.is_empty() || !user.bytes().all(|byte| byte.is_ascii_digit()) || tail.is_empty() {
-        return None;
-    }
-    Some(format!("/data/media/{rest}"))
-}
-
-/// `root`（mountinfo 的 `root` 字段）是否表示 `backend`（`/data/media/<user>/...` 形态）
-/// 那棵沙箱子树。两种 `root` 写法都接受，见 [`mountinfo_root_as_data_media`]。
-pub(super) fn mountinfo_root_matches_data_backend(root: &str, backend: &str) -> bool {
-    paths::eq_ignore_case(root, backend)
-        || mountinfo_root_as_data_media(root)
-            .map(|source| paths::is_same_or_child(backend, &source))
-            .unwrap_or(false)
-}
-
-/// 判断挂载点 `target` 上那条记录的 `root` 是否落在该应用的私有沙箱里。
-///
-/// 用于识别「锚点被上一轮重定向污染」这一种形态：健康锚点的 `root` 指向真实存储根
-/// （形如 `/media/<user>`），被污染时则带 `Android/data/<包名>`。
 pub(super) fn mountinfo_root_is_app_sandbox(
     content: &str,
     target: &str,
@@ -225,6 +224,31 @@ pub(super) fn mountinfo_root_is_app_sandbox(
         })
         .unwrap_or(false)
 }
+/// 判断挂载点 `target` 上是否已存在 root 精确等于 `expected_root` 的挂载记录。
+///
+/// 自有私有目录恢复的幂等判定：`std::fs::metadata` 的 dev+ino 在「目标上叠着
+/// MediaProvider 二级用户 FUSE 视图」时与恢复源恒不相等（二者是不同的 FUSE
+/// superblock），会把「已恢复」误判成「未恢复」并触发每轮全量重 bind；改比
+/// mountinfo 的 root 字段不受该干扰。命中**任意一条**即算已恢复——即使恢复层
+/// 之上又叠了 MP 的用户视图（root `/<user>`），内容仍取自同一棵底层树，重复
+/// bind 只会触发下一轮重建循环。
+pub(super) fn mountinfo_has_own_private_restore_layer(
+    content: &str,
+    target: &str,
+    expected_root: &str,
+) -> bool {
+    let normalized_target = paths::normalize(target);
+    content.lines().any(|line| {
+        let Some(entry) = mountinfo::parse_entry(line) else {
+            return false;
+        };
+        paths::eq_ignore_case(
+            &paths::normalize(&mountinfo::unescape_field(entry.target)),
+            &normalized_target,
+        ) && paths::eq_ignore_case(&mountinfo::unescape_field(entry.root), expected_root)
+    })
+}
+
 pub(super) fn detach_mount_if_present(target: &str) {
     // 该函数会 umount2 改变挂载表，且被 bind_mount 之间反复调用，必须每次重新读取；
     // 这里只需要判断挂载点是否存在，用存在性探测替代取 source 的整表扫描。

@@ -9,6 +9,11 @@ permissions:
   actions: read
   contents: write
 
+# 发布链路**有意不设 concurrency**：本 workflow 由版本 tag 触发，一次 tag 只有
+# 一次发布机会。加了 cancel-in-progress 后，同一 tag 的重跑或紧邻的另一次发布
+# 会把正在 publish-release 的运行打断，留下半成品 GitHub Release（资产不全、
+# update.json 未更新）。CI 侧用并发组是为了「新 push 取代旧验证」，而发布必须
+# 完整跑完，因此两侧策略相反。
 env:
   # 与 gradle.properties 的 srx.ndkVersion 保持一致；本地构建脚本读取该属性。
   # 版本分叉会让本地与 CI 构建出不同的 hook 实现，因此集中在这里定义。
@@ -19,7 +24,7 @@ env:
 jobs:
   quality:
     if: github.repository == 'z1298808165/Storage-redirection-X-Public' && startsWith(github.ref, 'refs/tags/v')
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     timeout-minutes: 15
     steps:
       - name: Checkout repository
@@ -42,17 +47,19 @@ jobs:
       - name: Install pinned Rust toolchain
         uses: dtolnay/rust-toolchain@master
         with:
-          toolchain: nightly-2026-07-14
-          components: rustfmt
+          toolchain: nightly-2026-11-17
+          components: rustfmt, clippy
 
       - name: Run release quality gate
         run: |
           chmod +x ./gradlew
           cargo fmt --all -- --check
+          cargo clippy --workspace --all-targets --locked -- -D warnings
           ./gradlew --no-daemon --console=plain spotlessCheck
           node scripts/verify-webui-structure.js
           node scripts/verify-webui-config-fixtures.js
-          cargo test -p native-config-fixtures
+          node scripts/verify-webui-app-list-parser.js
+          cargo test -p native-config-fixtures --locked
           python -m unittest discover -s .github/tests -p "test_*.py" -v
 
       - name: Verify inline tests and source quality
@@ -63,17 +70,28 @@ jobs:
 
   prepare:
     if: github.repository == 'z1298808165/Storage-redirection-X-Public' && startsWith(github.ref, 'refs/tags/v')
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     timeout-minutes: 15
     outputs:
       version: ${{ steps.version.outputs.version }}
       version_code: ${{ steps.version.outputs.version_code }}
       release_branch: ${{ steps.version.outputs.release_branch }}
+      test_flow_timeout_minutes: ${{ steps.scope.outputs.test_flow_timeout_minutes }}
+      test_flow_job_timeout_minutes: ${{ steps.scope.outputs.test_flow_job_timeout_minutes }}
     steps:
       - name: Checkout repository
         uses: actions/checkout@v5
         with:
           fetch-depth: 0
+
+      # 发布固定跑全量，但超时预算仍走与 CI 同一份解析脚本，保证两边同源：
+      # 场景数增长时步骤级与 job 级预算一起自适应，不必手工同步两处数字。
+      - name: Resolve scenario scope
+        id: scope
+        run: |
+          python .github/scripts/parse_scenario_scope.py \
+            --message "" --override all --format github |
+            grep -E '^test_flow_' >> "$GITHUB_OUTPUT"
 
       - name: Prepare release version
         id: version
@@ -102,7 +120,7 @@ jobs:
       - quality
       - prepare
     if: startsWith(github.ref, 'refs/tags/v')
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     timeout-minutes: 10
     env:
       VERSION: ${{ needs.prepare.outputs.version }}
@@ -124,7 +142,7 @@ jobs:
       - quality
       - prepare
       - init-release
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     timeout-minutes: 30
     env:
       VERSION: ${{ needs.prepare.outputs.version }}
@@ -150,24 +168,15 @@ jobs:
         with:
           packages: platform-tools
 
-      - name: Install Android SDK build-tools, platform and NDK
-        run: |
-          for attempt in 1 2 3; do
-            if sdkmanager "$SRX_ANDROID_PLATFORM" "$SRX_ANDROID_BUILD_TOOLS" "ndk;$SRX_NDK_VERSION"; then
-              break
-            fi
-            if [ "$attempt" -eq 3 ]; then
-              exit 1
-            fi
-            rm -rf "$ANDROID_HOME/.temp" "$ANDROID_HOME/ndk/$SRX_NDK_VERSION"
-            sleep $((attempt * 10))
-          done
-          echo "ANDROID_NDK_HOME=$ANDROID_HOME/ndk/$SRX_NDK_VERSION" >> $GITHUB_ENV
+      - name: 准备原生构建缓存
+        uses: ./.github/actions/setup-native-cache
+        with:
+          target: aarch64-linux-android
 
       - name: Install pinned Rust toolchain
         uses: dtolnay/rust-toolchain@master
         with:
-          toolchain: nightly-2026-07-14
+          toolchain: nightly-2026-11-17
           targets: aarch64-linux-android
 
       - name: Run build script tests
@@ -179,18 +188,14 @@ jobs:
       - name: Verify logging architecture
         run: python .github/tests/test_logging_architecture.py -v
 
-      - name: Install CMake and Ninja
-        run: |
-          if ! command -v cmake >/dev/null || ! command -v ninja >/dev/null; then
-            sudo apt-get update
-            sudo apt-get install -y cmake ninja-build
-          fi
-
       - name: Configure Cargo for Android NDK
         run: |
           mkdir -p .cargo
           printf '[target.aarch64-linux-android]\nlinker = "aarch64-linux-android29-clang"\n\n[target.x86_64-linux-android]\nlinker = "x86_64-linux-android29-clang"\n' > .cargo/config.toml
           echo "$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin" >> $GITHUB_PATH
+
+      - name: Verify Android rustdoc without warnings
+        run: RUSTDOCFLAGS="-D warnings" cargo doc --target aarch64-linux-android --no-deps --locked
 
       - name: Restore Cargo build cache
         uses: actions/cache@v5.0.5
@@ -215,18 +220,22 @@ jobs:
             ${{ runner.os }}-cargo-target-aarch64-
 
       - name: Build Rust test binaries
-        run: cargo test --target aarch64-linux-android --no-run
+        run: cargo test --target aarch64-linux-android --no-run --locked
         env:
           CXXFLAGS: "-Wno-error=unused-but-set-variable"
 
       - name: Build module binaries
         run: |
-          cargo build --target aarch64-linux-android --release
+          cargo build --target aarch64-linux-android --release --locked
           mkdir -p build/module-bin
           cp target/aarch64-linux-android/release/libsrx_core.so build/module-bin/libsrx_core.so
           cp target/aarch64-linux-android/release/srx_daemon build/module-bin/srx_daemon
         env:
           CXXFLAGS: "-Wno-error=unused-but-set-variable"
+
+      - name: 显示 C/C++ 缓存命中统计
+        if: always() && env.CCACHE_DIR != ''
+        run: ccache --show-stats
 
       - name: Verify Hooker.dex
         run: |
@@ -278,7 +287,7 @@ jobs:
       - quality
       - prepare
       - init-release
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     timeout-minutes: 30
     env:
       VERSION: ${{ needs.prepare.outputs.version }}
@@ -368,7 +377,7 @@ jobs:
     needs:
       - quality
       - prepare
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     timeout-minutes: 30
     env:
       VERSION: ${{ needs.prepare.outputs.version }}
@@ -398,32 +407,17 @@ jobs:
         with:
           packages: platform-tools
 
-      - name: Install Android SDK build-tools, platform and NDK
-        run: |
-          for attempt in 1 2 3; do
-            if sdkmanager "$SRX_ANDROID_PLATFORM" "$SRX_ANDROID_BUILD_TOOLS" "ndk;$SRX_NDK_VERSION"; then
-              break
-            fi
-            if [ "$attempt" -eq 3 ]; then
-              exit 1
-            fi
-            rm -rf "$ANDROID_HOME/.temp" "$ANDROID_HOME/ndk/$SRX_NDK_VERSION"
-            sleep $((attempt * 10))
-          done
-          echo "ANDROID_NDK_HOME=$ANDROID_HOME/ndk/$SRX_NDK_VERSION" >> $GITHUB_ENV
+      - name: 准备原生构建缓存
+        uses: ./.github/actions/setup-native-cache
+        with:
+          target: x86_64-linux-android
 
       - name: Install pinned Rust toolchain
         uses: dtolnay/rust-toolchain@master
         with:
-          toolchain: nightly-2026-07-14
+          toolchain: nightly-2026-11-17
           targets: x86_64-linux-android
-
-      - name: Install CMake and Ninja
-        run: |
-          if ! command -v cmake >/dev/null || ! command -v ninja >/dev/null; then
-            sudo apt-get update
-            sudo apt-get install -y cmake ninja-build
-          fi
+          components: clippy
 
       - name: Configure Cargo for Android NDK
         run: |
@@ -453,12 +447,21 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-cargo-target-x86_64-
 
+      - name: Run x86_64 Clippy lint gate
+        run: cargo clippy --target x86_64-linux-android --release --all-targets --locked -- -D warnings
+        env:
+          CXXFLAGS: "-Wno-error=unused-but-set-variable"
+
       - name: Build x86_64 module zip and test app
         run: |
           chmod +x ./gradlew .github/tests/*.sh .github/scripts/*.sh
           bash .github/scripts/build_test_flow_runtime.sh
         env:
           CXXFLAGS: "-Wno-error=unused-but-set-variable"
+
+      - name: 显示 C/C++ 缓存命中统计
+        if: always() && env.CCACHE_DIR != ''
+        run: ccache --show-stats
 
       - name: Upload release test-flow runtime
         uses: actions/upload-artifact@v7.0.1
@@ -469,6 +472,7 @@ jobs:
           compression-level: 0
           path: |
             build/test-flow/assets/*.zip
+            build/test-flow/native/*
             tests/storage-redirect-test/app/build/outputs/apk/**/*.apk
 
       - name: Upload release test-flow unit test reports
@@ -484,32 +488,34 @@ jobs:
 
   test-flow:
     name: Release test-flow Android ${{ matrix.android.version }}
-    if: startsWith(github.ref, 'refs/tags/v') && needs.quality.result == 'success' && needs.test-flow-build.result == 'success'
+    # 必须显式要求 prepare 成功：job 级 timeout-minutes 直接引用 prepare 的
+    # 预算输出，prepare 未成功时该输出为空，表达式会解析失败。
+    if: startsWith(github.ref, 'refs/tags/v') && needs.quality.result == 'success' && needs.prepare.result == 'success' && needs.test-flow-build.result == 'success'
     needs:
       - quality
       - prepare
       - test-flow-build
-    runs-on: ubuntu-latest
-    timeout-minutes: ${{ matrix.android.timeout_minutes }}
+    runs-on: ubuntu-26.04
+    # 与 CI 同源：job 级预算＝步骤预算 + 15 分钟作业开销，上限 360 分钟，
+    # 必须严格大于步骤预算才能让步骤内收尾跑完。
+    timeout-minutes: ${{ fromJSON(needs.prepare.outputs.test_flow_job_timeout_minutes) }}
     env:
       VERSION: ${{ needs.prepare.outputs.version }}
       VERSION_CODE: ${{ needs.prepare.outputs.version_code }}
-      ANDROID_TARGET: google_apis
+      ANDROID_TARGET: AvdLiteWithoutKsu
+      AVD_NAME: AvdLiteWithoutKsu
       ANDROID_ARCH: x86_64
       TARGET_TRIPLE: x86_64-linux-android
       MODULE_ABI: x86_64
       ANDROID_API_LEVEL: ${{ matrix.android.api_level }}
-      MAGISK_URL: ${{ matrix.android.magisk_url }}
-      # A17 分片走 KernelSU 安装链路（root_method=ksu 时切换安装脚本与 su0 模式）；
-      # 其余版本为空值走 Magisk 探测，收窄变量对 fresh_app_per_case=0 的版本无效。
-      ADB_ROOT_MODE: ${{ matrix.android.adb_root_mode || '' }}
-      MODULE_INSTALL_SCRIPT: ${{ matrix.android.root_method == 'ksu' && '.github/tests/install-storage-redirect-module-ksu.sh' || '.github/tests/install-storage-redirect-module.sh' }}
+      ADB_ROOT_MODE: su0
       SRT_FRESH_APP_SCENARIOS: ${{ matrix.android.fresh_app_scenarios || '' }}
       EMULATOR_GPU_MODE: ${{ matrix.android.gpu_mode }}
       SRT_SCENARIOS: "all"
       SRT_FAIL_FAST: 1
       SRT_SKIP_FINAL_CLEANUP: 1
       SRT_SCENARIO_TIMEOUT_SECONDS: 300
+      SETUP_BUDGET_SECONDS: 900
       # 17 每个服务用例前冷启动应用（脚本默认 1），并按 fresh_app_scenarios 收窄到
       # 配置切换与生命周期场景（1,2,29,32,33）；其余版本复用应用进程（0）。
       SRT_FRESH_APP_PER_CASE: ${{ matrix.android.fresh_app_per_case }}
@@ -520,33 +526,11 @@ jobs:
       fail-fast: true
       matrix:
         android:
-          - api: 33
-            version: 13
-            api_level: "33"
-            fresh_app_per_case: 0
-            magisk_url: ""
-            gpu_mode: ""
-            timeout_minutes: 45
-            boot_timeout: 1500
-            disable_animations: true
-            disable_linux_hw: auto
-          - api: 34
-            version: 14
-            api_level: "34"
-            fresh_app_per_case: 0
-            magisk_url: ""
-            gpu_mode: ""
-            timeout_minutes: 45
-            boot_timeout: 1500
-            disable_animations: true
-            disable_linux_hw: auto
           - api: 35
             version: 15
             api_level: "35"
             fresh_app_per_case: 0
-            magisk_url: ""
             gpu_mode: ""
-            timeout_minutes: 45
             boot_timeout: 1500
             disable_animations: true
             disable_linux_hw: auto
@@ -554,9 +538,7 @@ jobs:
             version: 16
             api_level: "36"
             fresh_app_per_case: 0
-            magisk_url: ""
             gpu_mode: ""
-            timeout_minutes: 45
             boot_timeout: 1500
             disable_animations: true
             disable_linux_hw: auto
@@ -564,14 +546,8 @@ jobs:
             version: 17
             api_level: "37.0"
             fresh_app_per_case: 1
-            # A17 用 KernelSU 方案（实验分支已全量验证 37 场景通过）：ksuAVD 打
-            # ramdisk，ksud 装 Zygisk Next 与 SRX 模块，root shell 走 su 0 sh -c。
-            # 图形读回保护必须保留（跳过即复现 224，最新 A17 镜像仍未修复）。
-            root_method: ksu
-            adb_root_mode: su0
             fresh_app_scenarios: "1,2,29,32,33"
             gpu_mode: swiftshader_indirect
-            timeout_minutes: 50
             boot_timeout: 1800
             disable_animations: false
             disable_linux_hw: false
@@ -582,7 +558,21 @@ jobs:
       - name: Download release test-flow runtime
         env:
           GH_TOKEN: ${{ github.token }}
-        run: gh run download "${{ github.run_id }}" --name "release-test-flow-runtime-v${{ env.VERSION }}" --dir .
+        run: |
+          # 同 ci.yml：产物出网会被 GitHub 偶发限流（`503 Egress is over the account limit`），
+          # `gh run download` 自身的约 25 秒重试窗口不够，这里按仓库既有退避写法重试，
+          # 重试前清掉半成品目录，最后一次仍失败才退出。
+          artifact="release-test-flow-runtime-v${{ env.VERSION }}"
+          for attempt in 1 2 3 4 5; do
+            if gh run download "${{ github.run_id }}" --name "$artifact" --dir .; then
+              break
+            fi
+            if [ "$attempt" -eq 5 ]; then
+              exit 1
+            fi
+            rm -rf build/test-flow/assets tests/storage-redirect-test/app/build/outputs/apk
+            sleep $((attempt * 20))
+          done
 
       - name: Enable KVM permissions
         run: |
@@ -599,72 +589,81 @@ jobs:
         with:
           packages: platform-tools
 
-      - name: Prime Android emulator package
-        run: |
-          set -euo pipefail
-          for attempt in 1 2 3; do
-            if sdkmanager --install emulator --channel=0; then
-              exit 0
-            fi
-            if [ "$attempt" -eq 3 ]; then
-              exit 1
-            fi
-            rm -rf "$ANDROID_HOME/.temp" "$ANDROID_HOME/emulator"
-            sleep $((attempt * 5))
-          done
+      - name: 检查 Zygisk Next 最新稳定版
+        id: zygisk-next-release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python3 .github/scripts/resolve_test_release.py zygisk-next >> "$GITHUB_OUTPUT"
 
-      - name: Prime Android system image package
-        run: |
-          set -euo pipefail
-          package="system-images;android-${ANDROID_API_LEVEL};${ANDROID_TARGET};${ANDROID_ARCH}"
-          install_dir="$ANDROID_HOME/system-images/android-${ANDROID_API_LEVEL}/${ANDROID_TARGET}/${ANDROID_ARCH}"
-          for attempt in 1 2 3; do
-            if sdkmanager --install "$package" --channel=0; then
-              exit 0
-            fi
-            if [ "$attempt" -eq 3 ]; then
-              exit 1
-            fi
-            rm -rf "$ANDROID_HOME/.temp" "$install_dir"
-            sleep $((attempt * 5))
-          done
+      - name: 缓存 Zygisk Next
+        uses: ./.github/actions/cache-release-asset
+        with:
+          name: zygisk-next
+          url: ${{ steps.zygisk-next-release.outputs.url }}
+          version: ${{ steps.zygisk-next-release.outputs.version }}
+          asset: ${{ steps.zygisk-next-release.outputs.asset }}
+          sha256: ${{ steps.zygisk-next-release.outputs.sha256 }}
+          env-name: ZYGISK_NEXT_CACHE_ZIP
+          required-entries: module.prop,lib/x86_64/libzygisk.so
 
-      - name: Run Android test-flow scenarios
-        uses: reactivecircus/android-emulator-runner@v2.37.0
+      - name: 检查 KernelSU 最新稳定版
+        id: kernelsu-release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python3 .github/scripts/resolve_test_release.py kernelsu >> "$GITHUB_OUTPUT"
+
+      - name: 缓存 KernelSU APK
+        uses: ./.github/actions/cache-release-asset
+        with:
+          name: kernelsu
+          url: ${{ steps.kernelsu-release.outputs.url }}
+          version: ${{ steps.kernelsu-release.outputs.version }}
+          asset: ${{ steps.kernelsu-release.outputs.asset }}
+          sha256: ${{ steps.kernelsu-release.outputs.sha256 }}
+          env-name: KERNELSU_APK_CACHE
+          required-entries: AndroidManifest.xml,lib/x86_64/libksud.so
+
+      - name: 准备 Android 模拟器缓存
+        uses: ./.github/actions/setup-android-emulator
         with:
           api-level: ${{ matrix.android.api_level }}
-          target: ${{ env.ANDROID_TARGET }}
-          arch: ${{ env.ANDROID_ARCH }}
-          profile: pixel_7
-          disk-size: 4096M
-          heap-size: 1024M
+
+      - name: Run Android test-flow scenarios
+        # 步骤级预算：与 CI 同源，覆盖场景脚本之前的准备阶段（模拟器启动后、
+        # 模块安装与健康检查期间的挂起脚本内看门狗管不到）。
+        timeout-minutes: ${{ fromJSON(needs.prepare.outputs.test_flow_timeout_minutes) }}
+        uses: ./.github/actions/run-android-emulator
+        with:
           disable-animations: ${{ matrix.android.disable_animations }}
           emulator-boot-timeout: ${{ matrix.android.boot_timeout }}
           disable-linux-hw-accel: ${{ matrix.android.disable_linux_hw }}
-          emulator-options: -no-window -gpu swiftshader_indirect -no-snapshot-load -no-snapshot-save -noaudio -no-boot-anim -no-metrics -feature -Vulkan
-          script: bash .github/tests/run-android-test-flow.sh
+          # 与 CI 同款：A17 镜像在 runner 上网络验证失败（github 不可达、下载停在
+          # WAITING_FOR_NETWORK），显式指定公共 DNS 让 connectivity check 可完成；
+          # 对其它版本无副作用。发布链路同样要跑全量场景（含依赖下载的场景 39），
+          # 缺这一项会让发布的 A17 分片卡在网络验证。
+          emulator-options: -no-window -gpu swiftshader_indirect -no-snapshot-load -no-snapshot-save -noaudio -no-boot-anim -no-metrics -feature -Vulkan -dns-server 8.8.8.8
 
       - name: Upload test-flow artifacts
-        if: always() && matrix.android.version != 17 && hashFiles('scenario-*-result.txt', 'scenario-2-mediastore-hook-diag.txt', 'test-flow-preflight.txt', 'test-flow-app-mountinfo.txt', 'test-flow-fuse-sample.txt', 'test-flow-logcat.txt', 'test-flow-module-state.txt', 'test-flow-backend-diagnostic.txt', 'test-flow-monitor-state.txt', 'media-health.txt') != ''
+        if: always() && matrix.android.version != 17 && hashFiles('temp/test-flow/**/scenario-*-result.txt', 'temp/test-flow/**/scenario-2-mediastore-hook-diag.txt', 'temp/test-flow/**/test-flow-preflight.txt', 'temp/test-flow/**/test-flow-app-mountinfo.txt', 'temp/test-flow/**/test-flow-fuse-sample.txt', 'temp/test-flow/**/test-flow-logcat.txt', 'temp/test-flow/**/test-flow-module-state.txt', 'temp/test-flow/**/test-flow-backend-diagnostic.txt', 'temp/test-flow/**/test-flow-monitor-state.txt', 'temp/test-flow/**/media-health.txt') != ''
         uses: actions/upload-artifact@v7.0.1
         with:
           name: release-test-flow-android${{ matrix.android.version }}-artifacts
           if-no-files-found: ignore
           retention-days: 14
           path: |
-            scenario-*-result.txt
-            scenario-2-mediastore-hook-diag.txt
-            test-flow-preflight.txt
-            test-flow-app-mountinfo.txt
-            test-flow-fuse-sample.txt
-            test-flow-logcat.txt
-            test-flow-module-state.txt
-            test-flow-backend-diagnostic.txt
-            test-flow-monitor-state.txt
-            media-health.txt
+            temp/test-flow/**/scenario-*-result.txt
+            temp/test-flow/**/scenario-2-mediastore-hook-diag.txt
+            temp/test-flow/**/test-flow-preflight.txt
+            temp/test-flow/**/test-flow-app-mountinfo.txt
+            temp/test-flow/**/test-flow-fuse-sample.txt
+            temp/test-flow/**/test-flow-logcat.txt
+            temp/test-flow/**/test-flow-module-state.txt
+            temp/test-flow/**/test-flow-backend-diagnostic.txt
+            temp/test-flow/**/test-flow-monitor-state.txt
+            temp/test-flow/**/media-health.txt
 
       - name: Upload shared FUSE snapshots
-        if: always() && hashFiles('test-flow-shared-fuse-before.txt', 'test-flow-shared-fuse-after.txt') != ''
+        if: always() && hashFiles('temp/test-flow/**/test-flow-shared-fuse-before.txt', 'temp/test-flow/**/test-flow-shared-fuse-after.txt') != ''
         uses: actions/upload-artifact@v7.0.1
         with:
           name: release-test-flow-android${{ matrix.android.version }}-shared-fuse
@@ -672,8 +671,8 @@ jobs:
           retention-days: 14
           compression-level: 0
           path: |
-            test-flow-shared-fuse-before.txt
-            test-flow-shared-fuse-after.txt
+            temp/test-flow/**/test-flow-shared-fuse-before.txt
+            temp/test-flow/**/test-flow-shared-fuse-after.txt
 
   test-flow-required:
     name: Test-flow required gate
@@ -682,7 +681,7 @@ jobs:
       - prepare
       - test-flow
     if: always() && needs.prepare.result != 'skipped'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     timeout-minutes: 10
     steps:
       - name: Require all test-flow matrix jobs to pass
@@ -704,7 +703,7 @@ jobs:
       - module
       - app
       - test-flow-required
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     timeout-minutes: 20
     env:
       VERSION: ${{ needs.prepare.outputs.version }}
@@ -714,13 +713,25 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Generate changelog from AI commit descriptions
+      - name: Generate Chinese changelog
         run: |
           mkdir -p build
           python .github/scripts/generate_changelog.py \
             --mode release \
             --version "$VERSION" \
             --output build/changelog.md
+          RELEASE_NOTES="docs/release-notes/v${VERSION}.md"
+          if [ -f "$RELEASE_NOTES" ]; then
+            cp "$RELEASE_NOTES" build/changelog.md
+          fi
+          # 覆盖正文之后仍需致谢：人工写的发布说明若漏了致谢段，按本发布周期内的
+          # 提交补齐（已有时保持人工措辞不动）。
+          python .github/scripts/generate_changelog.py \
+            --mode release \
+            --ensure-credits build/changelog.md
+          python .github/scripts/validate_release_notes.py \
+            --file build/changelog.md \
+            --version "$VERSION"
       - name: Verify draft GitHub Release assets
         env:
           GH_TOKEN: ${{ github.token }}
@@ -802,7 +813,7 @@ jobs:
       - test-flow-required
       - publish-release
     if: always() && needs.prepare.result == 'success'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     timeout-minutes: 10
     permissions:
       actions: write

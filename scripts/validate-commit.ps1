@@ -61,11 +61,15 @@ if ($PSCmdlet.ParameterSetName -eq "MessageFile") {
 }
 
 $title = (($message -split "`r?`n", 2)[0]).Trim()
+$messageLines = @($message -split "`r?`n")
+if ($messageLines.Count -gt 1 -and $messageLines[1].Trim() -ne '') {
+    throw "Commit 标题必须独占一段：标题行之后必须是一个空行，再开始正文与字段；否则 git log --oneline 等工具会把整段并进标题显示，标题失去简洁性。"
+}
 if ($paths.Count -gt 0 -and $message -notmatch '(?m)^(?:变更|用户影响)[：:]\s*\S') {
     throw "包含文件改动的 Commit 必须由 AI Agent 在正文中写入 变更： 或 用户影响：，供 CI/Release 更新日志直接使用。"
 }
 
-# 更新日志字段精简门禁（AGENTS.md 第 4 条的强制校验）：更新日志生成器按行解析字段，
+# 更新日志字段精简门禁（提交信息规范的强制校验）：更新日志生成器按行解析字段，
 # 会把字段行之后的普通正文行并入该字段、也会原样保留字段值里的字面 \n 转义——
 # 这两类写法会让文件路径、代码符号和验证过程整段泄漏进用户更新日志，必须在提交时拦下。
 $changelogFieldCaps = @{
@@ -78,6 +82,28 @@ $activeChangelogField = $null
 foreach ($rawLine in ($message -split "`r?`n")) {
     $line = $rawLine.Trim()
     if ($line -match '^(AI-Review-|Signed-off-by:|Co-authored-by:)') {
+        continue
+    }
+    # 致谢类字段里的链接必须写成 Markdown 链接：`名称（URL）` 依赖 GitHub 自动链接，
+    # 它会把紧跟在 URL 后的中文标点并进链接，读者点开就跳到错误地址（2.2.1 更新日志实测）。
+    $creditFieldMatch = [regex]::Match($line, '^(致谢|思路来源|贡献者|上游来源|上游作者)[：:]\s*(.*)$')
+    if ($creditFieldMatch.Success) {
+        $creditValue = $creditFieldMatch.Groups[2].Value
+        foreach ($urlMatch in [regex]::Matches($creditValue, 'https?://[^\s，、；：（）()\[\]<>。]+')) {
+            $prefixStart = $urlMatch.Index - 2
+            if ($prefixStart -lt 0 -or $creditValue.Substring($prefixStart, 2) -ne '](') {
+                throw "提交正文致谢字段里的链接必须写成 Markdown 链接：[名称](URL)。当前 $($urlMatch.Value) 是裸链接或 名称（URL） 写法，GitHub 自动链接会把后面的中文标点并进地址，点开跳到错误页面。"
+            }
+        }
+        # 致谢字段是独立条目：后续正文行不会并入字段，也不该续到上一个更新日志字段里。
+        $activeChangelogField = $null
+        continue
+    }
+    # `文档同交：` 与致谢字段同类：它是说明性元数据，不是更新日志字段，不能并进上一个
+    # 更新日志字段（否则放在 `范围：` 之后会被吞掉，判据就失效）。做成独立条目后，
+    # 它在正文任意位置都有效。
+    if ($line -match '^文档同交[：:]') {
+        $activeChangelogField = $null
         continue
     }
     $fieldMatch = [regex]::Match($line, '^(变更|用户影响|范围|限制|验证)[：:]\s*(.*)$')
@@ -109,8 +135,8 @@ foreach ($rawLine in ($message -split "`r?`n")) {
 if ([string]::IsNullOrWhiteSpace($title)) {
     throw "Commit 标题不能为空。"
 }
-if ($title.Length -gt 72) {
-    throw "Commit 标题不得超过 72 个字符；当前为 $($title.Length) 个字符。"
+if ($title.Length -gt 50) {
+    throw "Commit 标题不得超过 50 个字符；当前为 $($title.Length) 个字符。"
 }
 
 $releasePattern = '^Releases: \u53d1\u5e03 \d+\.\d+\.\d+(?:[-+][0-9A-Za-z.-]+)?$'
@@ -120,7 +146,7 @@ if (-not $match.Success -and $title -notmatch $releasePattern) {
     throw @"
 Commit 标题无效：$title
 格式：类型(可选范围) + 中文全角冒号 + 中文描述
-允许的类型值见 AGENTS.md 和 CONTRIBUTING.md。
+允许的类型值见 CONTRIBUTING.md。
 "@
 }
 
@@ -132,7 +158,24 @@ if ($match.Success) {
 
     $pathKinds = @($paths | Where-Object { $_ } | ForEach-Object { Get-PathKind -Path $_ } | Sort-Object -Unique)
     if ($pathKinds.Count -gt 1 -and $pathKinds -contains "docs") {
-        throw "文档与非文档改动必须按目的拆分。"
+        # 提交信息规范允许「配套文档只有在无法独立理解或会导致提交不可用时
+        # 才可与实现同交，并应在提交正文说明原因」。校验必须与规范一致：混装本身不是
+        # 拒绝理由，缺「原因说明」才是。原因由提交正文的「文档同交：」字段承载，值须是
+        # 具体原因；该字段应放在其它更新日志字段之前，避免被字段续行规则并入。
+        $coCommitReason = $null
+        foreach ($line in ($message -split "`r?`n")) {
+            $reasonMatch = [regex]::Match($line, '^文档同交[：:]\s*(.*)$')
+            if ($reasonMatch.Success) {
+                $coCommitReason = $reasonMatch.Groups[1].Value.Trim()
+                break
+            }
+        }
+        if ([string]::IsNullOrWhiteSpace($coCommitReason)) {
+            throw "文档与非文档改动同交时，正文必须写「文档同交：<原因>」说明为什么配套文档无法独立成笔（见 CONTRIBUTING.md 提交信息规范）；否则请按目的拆分。"
+        }
+        if ($coCommitReason.Length -lt 6) {
+            throw "「文档同交：」的原因必须是具体说明，不能是占位词。"
+        }
     }
     $isDocumentationType = $title -match '^\u6587\u6863(?:\(|\uFF1A)'
     $isCiType = $title -match '^CI(?:\(|\uFF1A)'

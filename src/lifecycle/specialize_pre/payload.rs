@@ -1,6 +1,4 @@
 use crate::domain::PathMapping;
-use crate::platform::fs;
-use crate::zygisk::abi;
 
 pub(super) struct CompanionMountRequest<'a> {
     pub(super) pid: i32,
@@ -96,32 +94,4 @@ pub(super) fn build_companion_request_payload(request: &CompanionMountRequest<'_
     });
 
     serde_json::to_string(&payload).unwrap_or_default()
-}
-
-pub(super) fn send_companion_request_payload(api: Option<&abi::Api>, payload: &str) -> bool {
-    let Some(api) = api else {
-        return false;
-    };
-    if payload.is_empty() {
-        return false;
-    }
-
-    let fd = api.connect_companion();
-    if fd < 0 {
-        log::warn!("companion connect failed");
-        return false;
-    }
-
-    let payload_len = payload.len() as u32;
-    let sent =
-        fs::write_all(fd, &payload_len.to_ne_bytes()) && fs::write_all(fd, payload.as_bytes());
-    unsafe { libc::close(fd) };
-
-    if !sent {
-        log::warn!("companion send failed");
-        return false;
-    }
-
-    log::info!("companion req sent (async mount)");
-    true
 }

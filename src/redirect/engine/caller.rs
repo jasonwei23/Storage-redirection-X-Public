@@ -1,7 +1,6 @@
 use super::{is_already_private_path, resolve_android_private_path_owner, resolve_package_uid};
 use crate::config::SettingsHub;
 use crate::hook::stats::InterceptHub;
-use crate::monitor::infer_download_owner_package_by_path;
 use crate::platform;
 use crate::redirect::policy as redirect_policy;
 use crate::redirect::writer;
@@ -40,8 +39,9 @@ impl SystemWriterCallerSignal {
             &effective_caller_package,
             original_caller_uid,
         );
-        let can_infer_caller_by_path =
-            !is_explicit_caller_decision && !crate::hook::is_path_owner_inference_disabled();
+        let can_infer_caller_by_path = !is_explicit_caller_decision
+            && !crate::hook::is_current_caller_scope_active()
+            && !crate::hook::is_path_owner_inference_disabled();
 
         Self {
             effective_caller_uid,
@@ -149,6 +149,14 @@ pub(super) fn resolve_system_writer_caller_context(
         effective_caller_package,
         user_id,
     } = request;
+    if crate::hook::is_caller_attribution_stopped() {
+        return SystemWriterCallerContext {
+            effective_caller_uid: original_caller_uid,
+            effective_caller_package: String::new(),
+            user_id,
+            is_caller_from_inferred: false,
+        };
+    }
     let mut effective_caller_uid = effective_caller_uid;
     let mut effective_caller_package = effective_caller_package;
     let mut is_caller_from_inferred = false;
@@ -218,6 +226,34 @@ pub(super) fn resolve_system_writer_caller_context(
         effective_caller_uid,
     );
 
+    // 代写者在映射目标上执行后续操作（pending 提交、后端 mkdir、文件 open）时已无
+    // binder 调用方可用，只能靠路径反查归属。这里优先用「显式配置的映射源/目标」
+    // 反查：映射目标唯一对应一个配置方时归属是确定的，比按路径提示更可靠——提示
+    // 台账可能被代写者自身登记污染，也可能只是过期残留。
+    if effective_caller_package.is_empty()
+        && can_infer_caller_by_path
+        && redirect_policy::is_system_writer_package(package_name)
+    {
+        let mapping_owner = resolve_mapping_request_owner_package_by_path(user_id, normalized_path);
+        if !mapping_owner.is_empty()
+            && !redirect_policy::is_attribution_intermediate_package(&mapping_owner)
+        {
+            let owner_uid =
+                redirect_policy::get_fresh_uid_for_package_in_user(&mapping_owner, user_id);
+            if owner_uid >= writer::ANDROID_APP_UID_START {
+                effective_caller_uid = owner_uid;
+            }
+            log::debug!(
+                "writer: mapping owner caller={} uid={} path={}",
+                mapping_owner,
+                effective_caller_uid,
+                normalized_path
+            );
+            effective_caller_package = mapping_owner;
+            is_caller_from_inferred = true;
+        }
+    }
+
     // 用路径提示恢复调用方，仅在「当前归属不可信」时进行：归属为空、归属就是本进程
     // （MediaProvider 自己）、或归属本身是系统代写者。这些情况下拿不到真实调用方，
     // 只能靠 insert 阶段登记的路径提示把它带回来。
@@ -230,13 +266,18 @@ pub(super) fn resolve_system_writer_caller_context(
         || effective_caller_package == package_name
         || redirect_policy::is_system_writer_package(&effective_caller_package);
     if can_restore_recent_provider_caller
+        && can_infer_caller_by_path
         && !has_external_caller_signal
         && !crate::hook::is_path_owner_inference_disabled()
         && redirect_policy::is_media_provider_package(package_name)
         && let Some(path_identity) =
             crate::monitor::infer_recent_path_caller_identity(normalized_path, user_id)
+        && !redirect_policy::is_attribution_intermediate_package(&path_identity.package_name)
     {
-        let inferred_uid = redirect_policy::get_fresh_uid_for_package(&path_identity.package_name);
+        let inferred_uid = redirect_policy::get_fresh_uid_for_package_in_user(
+            &path_identity.package_name,
+            user_id,
+        );
         if inferred_uid >= writer::ANDROID_APP_UID_START {
             effective_caller_uid = inferred_uid;
         }
@@ -257,7 +298,7 @@ pub(super) fn resolve_system_writer_caller_context(
         && let Some(path_owner) = resolve_android_private_path_owner(normalized_path)
     {
         crate::monitor::remember_private_path_owner_hint(normalized_path, &path_owner, user_id);
-        let owner_uid = resolve_package_uid(&path_owner);
+        let owner_uid = resolve_package_uid(&path_owner, user_id);
         if owner_uid >= writer::ANDROID_APP_UID_START {
             effective_caller_uid = owner_uid;
         }
@@ -287,7 +328,8 @@ pub(super) fn resolve_system_writer_caller_context(
             }
         } else {
             crate::monitor::remember_private_path_owner_hint(normalized_path, &inferred, user_id);
-            let inferred_uid = redirect_policy::get_fresh_uid_for_package(&inferred);
+            let inferred_uid =
+                redirect_policy::get_fresh_uid_for_package_in_user(&inferred, user_id);
             if inferred_uid >= writer::ANDROID_APP_UID_START {
                 effective_caller_uid = inferred_uid;
             }
@@ -303,11 +345,11 @@ pub(super) fn resolve_system_writer_caller_context(
     }
 
     if effective_caller_package.is_empty()
-        && should_query_download_owner_for_writer(self_uid, package_name)
-        && let Some(owner_package) = infer_download_owner_package_by_path(normalized_path)
+        && should_query_download_owner_for_writer(self_uid, package_name, effective_caller_uid)
+        && let Some((owner_package, owner_uid)) =
+            crate::monitor::infer_download_owner_identity_by_path(normalized_path, user_id)
         && !redirect_policy::is_media_intermediate_package(&owner_package)
     {
-        let owner_uid = redirect_policy::get_fresh_uid_for_package(&owner_package);
         if owner_uid >= writer::ANDROID_APP_UID_START {
             effective_caller_uid = owner_uid;
         }
@@ -323,6 +365,7 @@ pub(super) fn resolve_system_writer_caller_context(
 
     if effective_caller_package.is_empty()
         && is_shared_uid
+        && !crate::hook::is_current_caller_scope_active()
         && !is_already_private_path(normalized_path)
     {
         let mut candidates: Vec<String> = if effective_caller_uid >= writer::ANDROID_APP_UID_START {
@@ -338,7 +381,7 @@ pub(super) fn resolve_system_writer_caller_context(
         }
         candidates.retain(|pkg| !redirect_policy::is_system_writer_package(pkg));
         if let Some(pkg) = crate::monitor::infer_caller_package_by_stack(&candidates) {
-            let inferred_uid = redirect_policy::get_fresh_uid_for_package(&pkg);
+            let inferred_uid = redirect_policy::get_fresh_uid_for_package_in_user(&pkg, user_id);
             if inferred_uid >= writer::ANDROID_APP_UID_START {
                 effective_caller_uid = inferred_uid;
             }
@@ -371,14 +414,23 @@ pub(super) fn resolve_system_writer_caller_context(
     }
 
     if !effective_caller_package.is_empty() {
-        if hub.get_current_caller_package().is_empty() || is_caller_from_mapping_request_owner {
-            hub.set_current_caller_package(&effective_caller_package);
-        }
-        if (hub.get_current_caller_uid() < writer::ANDROID_APP_UID_START
-            || is_caller_from_mapping_request_owner)
-            && effective_caller_uid >= writer::ANDROID_APP_UID_START
-        {
-            hub.set_current_caller_uid(effective_caller_uid);
+        if is_caller_from_mapping_request_owner {
+            // 映射请求侧归属必须保留来源标记：MediaProvider 的 FuseDaemon 在
+            // create/mkdir 之后用原始路径回查 attr 时没有外部调用方信号，查询回退
+            // 只能靠这条归属解析到映射目标，否则应答会 ENOENT。
+            hub.set_current_caller_from_mapping_request_owner(
+                &effective_caller_package,
+                effective_caller_uid,
+            );
+        } else {
+            if hub.get_current_caller_package().is_empty() {
+                hub.set_current_caller_package(&effective_caller_package);
+            }
+            if hub.get_current_caller_uid() < writer::ANDROID_APP_UID_START
+                && effective_caller_uid >= writer::ANDROID_APP_UID_START
+            {
+                hub.set_current_caller_uid(effective_caller_uid);
+            }
         }
     }
 
@@ -391,10 +443,10 @@ pub(super) fn resolve_system_writer_caller_context(
 }
 
 fn resolve_explicit_caller_package_by_uid(
-    process_package: &str,
+    _process_package: &str,
     self_uid: i32,
     caller_uid: i32,
-    user_id: i32,
+    _user_id: i32,
 ) -> Option<String> {
     if caller_uid < writer::ANDROID_APP_UID_START {
         return None;
@@ -405,46 +457,14 @@ fn resolve_explicit_caller_package_by_uid(
         redirect_policy::refresh_shared_uid_cache();
         packages = redirect_policy::get_packages_for_uid(caller_uid);
     }
-    if packages.is_empty() {
-        return None;
-    }
-
-    packages.sort();
-    packages.dedup();
-    packages.retain(|package| {
-        !package.is_empty()
-            && package != process_package
-            && !redirect_policy::is_system_writer_package(package)
-    });
-    if packages.is_empty() {
-        return None;
-    }
-
-    let config_user_id = if user_id >= 0 {
-        user_id
+    if packages.len() == 1
+        && caller_uid != self_uid
+        && !redirect_policy::is_system_writer_package(&packages[0])
+    {
+        packages.pop()
     } else {
-        platform::user_id_from_uid(caller_uid)
-    };
-    let mut configured = packages
-        .iter()
-        .filter(|package| {
-            config_user_id >= 0
-                && SettingsHub::instance()
-                    .get_user_redirect_enablement(package, caller_uid, config_user_id)
-                    .is_enabled()
-        })
-        .cloned()
-        .collect::<Vec<_>>();
-
-    if configured.len() == 1 {
-        return configured.pop();
+        None
     }
-
-    if packages.len() == 1 && caller_uid != self_uid {
-        return packages.pop();
-    }
-
-    None
 }
 
 fn maybe_override_system_writer_caller_by_mapping_request_path(
@@ -464,7 +484,7 @@ fn maybe_override_system_writer_caller_by_mapping_request_path(
         return;
     }
 
-    let inferred_uid = redirect_policy::get_fresh_uid_for_package(&inferred);
+    let inferred_uid = redirect_policy::get_fresh_uid_for_package_in_user(&inferred, user_id);
     if inferred_uid >= writer::ANDROID_APP_UID_START {
         *effective_caller_uid = inferred_uid;
     }
@@ -498,7 +518,7 @@ fn maybe_infer_system_writer_caller_by_redirect_path(
         return;
     }
 
-    let inferred_uid = redirect_policy::get_fresh_uid_for_package(&inferred);
+    let inferred_uid = redirect_policy::get_fresh_uid_for_package_in_user(&inferred, user_id);
     if original_caller_uid >= writer::ANDROID_APP_UID_START
         && original_caller_uid != self_uid
         && original_caller_uid != inferred_uid
@@ -538,7 +558,10 @@ fn resolve_redirect_owner_package_by_path(user_id: i32, normalized_path: &str) -
         .resolve_redirect_package_by_path_for_user(synthetic_uid, normalized_path)
 }
 
-fn resolve_mapping_request_owner_package_by_path(user_id: i32, normalized_path: &str) -> String {
+pub(super) fn resolve_mapping_request_owner_package_by_path(
+    user_id: i32,
+    normalized_path: &str,
+) -> String {
     if user_id < 0 || normalized_path.is_empty() {
         return String::new();
     }
@@ -556,9 +579,16 @@ fn resolve_mapping_request_owner_package_by_path(user_id: i32, normalized_path: 
     settings.resolve_mapping_target_package_by_path_for_user(user_id, normalized_path)
 }
 
-fn should_query_download_owner_for_writer(self_uid: i32, package_name: &str) -> bool {
+fn should_query_download_owner_for_writer(
+    self_uid: i32,
+    package_name: &str,
+    caller_uid: i32,
+) -> bool {
     if redirect_policy::is_media_provider_package(package_name) {
-        return false;
+        // MediaProvider 进程：调用方 uid 属于下载共享组时按行数据反查发起者。
+        // 下载引擎的公共路径写入以 MediaStore insert 与 FUSE 后端操作到达本进程，
+        // 只在下载进程内查表时这里的归因恒落空（2026-10-24 真机取证）。
+        return crate::monitor::caller_uid_shares_download_group(caller_uid);
     }
     redirect_policy::get_packages_for_uid(self_uid)
         .iter()

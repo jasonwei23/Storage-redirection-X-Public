@@ -1,4 +1,5 @@
 use super::super::stats::InterceptHub;
+use super::dir_snapshot::path_exists_for_cursor_row as row_path_exists;
 use super::path_util::{
     download_relative_suffix, has_unsafe_relative_path_segment, is_media_store_pending_path,
     is_probe_path, is_visibility_log_path, java_bucket_id, normalize_bucket_path_for_user,
@@ -25,7 +26,11 @@ const READ_ONLY_DENIED_SENTINEL_PREFIX: &str = "__SRX_READ_ONLY_DENIED__:";
 
 // MediaProvider cursor 行可能非常频繁地命中此路径。保留 inotify 作为快路径，
 // 并使用限流的指纹检查，避免监视事件遗漏或初始快照为空导致调用方查询过滤失效。
-const REWRITE_FINGERPRINT_RELOAD_INTERVAL_MS: i64 = 1000;
+//
+// 节流值与 `hook::reload`、`redirect::engine` 共用同一个判据：事件通道在线时该判据为
+// 「永不复查」（丢事件由 `IN_Q_OVERFLOW` 精确覆盖），通道不可用时才退回 1 秒。这三处若
+// 各用 1 秒，同一进程每秒就要算三次「readdir + 每个应用配置一次 stat」的指纹。
+
 static LAST_REWRITE_FINGERPRINT_CHECK_MS: AtomicI64 = AtomicI64::new(i64::MIN / 2);
 
 fn refresh_settings_snapshot() {
@@ -37,7 +42,7 @@ fn refresh_settings_snapshot() {
 
     let now_ms = paths::monotonic_ms();
     let last_ms = LAST_REWRITE_FINGERPRINT_CHECK_MS.load(Ordering::Relaxed);
-    if now_ms.saturating_sub(last_ms) < REWRITE_FINGERPRINT_RELOAD_INTERVAL_MS {
+    if now_ms.saturating_sub(last_ms) < crate::hook::fallback_reload_interval_ms() {
         return;
     }
     if LAST_REWRITE_FINGERPRINT_CHECK_MS
@@ -63,11 +68,7 @@ pub(crate) fn rewrite_cursor_storage_path_for_caller(
     if caller_package.is_empty() {
         return None;
     }
-    let hub = InterceptHub::instance();
-    let previous_package = hub.get_current_caller_package();
-    let previous_uid = hub.get_current_caller_uid();
-    hub.set_current_caller_package(&caller_package);
-    hub.set_current_caller_uid(caller_uid);
+    crate::hook::push_current_caller_scope(&caller_package, caller_uid);
     let _explicit_caller = crate::hook::enter_explicit_caller_decision();
     let result = rewrite_cursor_storage_path_for_mapping_view(
         original_text,
@@ -78,8 +79,7 @@ pub(crate) fn rewrite_cursor_storage_path_for_caller(
         true,
     )
     .or_else(|| rewrite_cursor_storage_path_for_non_mapping_view(original_text));
-    hub.set_current_caller_package(&previous_package);
-    hub.set_current_caller_uid(previous_uid);
+    crate::hook::pop_current_caller_scope();
     result
 }
 
@@ -96,16 +96,12 @@ pub(crate) fn resolve_open_storage_path_for_caller(
         return None;
     }
     let hub = InterceptHub::instance();
-    let previous_package = hub.get_current_caller_package();
-    let previous_uid = hub.get_current_caller_uid();
-    hub.set_current_caller_package(&caller_package);
-    hub.set_current_caller_uid(effective_uid);
+    crate::hook::push_current_caller_scope(&caller_package, effective_uid);
     let _explicit_caller = crate::hook::enter_explicit_caller_decision();
     let mapped_view_target =
         resolve_mapping_view_open_target(path_text, &caller_package, effective_uid);
     let decision = process_redirect_path(hub, path_text);
-    hub.set_current_caller_package(&previous_package);
-    hub.set_current_caller_uid(previous_uid);
+    crate::hook::pop_current_caller_scope();
     if decision.is_redirect() && !decision.new_path.is_empty() {
         return Some(decision.new_path);
     }
@@ -119,6 +115,22 @@ pub(crate) fn resolve_open_storage_path_for_caller(
 }
 
 fn resolve_storage_caller_context(caller_uid: i32, path_text: &str) -> (String, i32) {
+    if crate::hook::is_caller_attribution_stopped() {
+        return (String::new(), caller_uid);
+    }
+    let hub = InterceptHub::instance();
+    if crate::hook::is_current_caller_scope_active() && hub.get_current_caller_uid() == caller_uid {
+        let package = hub.get_current_caller_package();
+        if !policy::is_system_writer_package(&package) {
+            // 空成员身份同样不能借用路径历史；下载行归属另按完整 UID 校验。
+            return if package.is_empty() {
+                resolve_download_owner_caller_context(caller_uid, path_text)
+                    .unwrap_or((package, caller_uid))
+            } else {
+                (package, caller_uid)
+            };
+        }
+    }
     let user_id = platform::user_id_from_uid(caller_uid);
     let system_writer = is_system_writer_uid(caller_uid);
     if system_writer
@@ -152,7 +164,46 @@ fn resolve_storage_caller_context(caller_uid: i32, path_text: &str) -> (String, 
         return context;
     }
 
+    if let Some(context) = resolve_download_owner_caller_context(caller_uid, path_text) {
+        return context;
+    }
+
+    // 代写者以自身身份走到这里时，「找到的就是自己」不构成任何归因线索，反而会
+    // 让 writer 决策把有效归属改写成代写者并判定为未启用重定向，从而放行请求
+    // 路径（2026-11-10 A17 场景 39：文件物理落在 SrtDlOwner、映射目标为空）。
+    // 返回空归属，交给上层按 uid / 下载行继续反查，或按未解析路径处理。
+    if system_writer && policy::is_system_writer_package(&caller_package) {
+        return (String::new(), caller_uid);
+    }
+
     (caller_package, caller_uid)
+}
+
+/// 下载提供器共享组的调用方未解析出具体成员时，按下载行数据反查真实发起者。
+///
+/// DownloadProvider 引擎的公共路径写入以 MediaStore insert 形式到达本进程，
+/// 调用方只有共享组 uid（2026-10-24 真机：组内消歧失败后曾误归 soundpicker）。
+/// 发起者由 downloads 表的 notificationpackage 列给出；归因成功后返回发起者
+/// 包名与 uid，使 values 改写按发起者自己的规则执行，并沿 hint 台账把归属
+/// 传递给随后的 pending 提交与后端 mkdir。
+fn resolve_download_owner_caller_context(
+    caller_uid: i32,
+    path_text: &str,
+) -> Option<(String, i32)> {
+    if !crate::monitor::caller_uid_shares_download_group(caller_uid) {
+        return None;
+    }
+
+    let user_id = platform::user_id_from_uid(caller_uid);
+    let (owner_package, owner_uid) =
+        crate::monitor::infer_download_owner_identity_by_path(path_text, user_id)?;
+    if owner_package.is_empty() || policy::is_media_intermediate_package(&owner_package) {
+        return None;
+    }
+    if owner_uid < writer::ANDROID_APP_UID_START {
+        return None;
+    }
+    Some((owner_package, owner_uid))
 }
 
 // 代写者（MediaProvider 等）以自身身份提交文件时没有 binder 调用方可用，
@@ -168,6 +219,28 @@ fn resolve_proxied_write_caller_context(
 ) -> Option<(String, i32)> {
     resolve_path_hint_caller_context(user_id, path_text)
         .or_else(|| resolve_mapping_request_caller_context(user_id, caller_uid, path_text, true))
+        .or_else(|| resolve_mapping_target_caller_context(user_id, path_text))
+}
+
+/// 用「映射目标」反查归属应用。
+///
+/// 代写者在映射目标上执行后续操作（pending 提交、后端 mkdir、文件 open）时没有
+/// binder 调用方，请求路径提示又可能已被污染或过期；显式配置的映射目标唯一对应
+/// 一个配置方，是确定性证据。冲突目标由配置侧返回空串，保持匿名公共路径边界。
+fn resolve_mapping_target_caller_context(user_id: i32, path_text: &str) -> Option<(String, i32)> {
+    if user_id < 0 || path_text.is_empty() {
+        return None;
+    }
+    let package_name =
+        SettingsHub::instance().resolve_mapping_target_package_by_path_for_user(user_id, path_text);
+    if package_name.is_empty() || policy::is_attribution_intermediate_package(&package_name) {
+        return None;
+    }
+    let uid = policy::get_fresh_uid_for_package_in_user(&package_name, user_id);
+    if uid < writer::ANDROID_APP_UID_START {
+        return None;
+    }
+    Some((package_name, uid))
 }
 
 // 按路径找回最近一次真实调用方登记的归属。MediaProvider 在 insert 阶段由应用
@@ -186,7 +259,7 @@ fn resolve_path_hint_caller_context(user_id: i32, path_text: &str) -> Option<(St
     if package_name.is_empty() || policy::is_system_writer_package(&package_name) {
         return None;
     }
-    let uid = policy::get_fresh_uid_for_package(&package_name);
+    let uid = policy::get_fresh_uid_for_package_in_user(&package_name, user_id);
     if uid < writer::ANDROID_APP_UID_START {
         return None;
     }
@@ -221,7 +294,7 @@ fn resolve_mapping_request_caller_context(
     if inferred.is_empty() {
         return None;
     }
-    let inferred_uid = policy::get_fresh_uid_for_package(&inferred);
+    let inferred_uid = policy::get_fresh_uid_for_package_in_user(&inferred, user_id);
     if inferred_uid >= writer::ANDROID_APP_UID_START {
         if !allow_uid_override
             && caller_uid >= writer::ANDROID_APP_UID_START
@@ -273,15 +346,24 @@ pub(crate) fn rewrite_media_store_storage_path_for_caller(
     if caller_package.is_empty() {
         return None;
     }
+    // 归因成功即登记归属提示：下载引擎的公共路径写入在 insert 之后还有
+    // pending 提交、后端 mkdir 等由 MediaProvider 自身线程发起的操作，
+    // 它们没有 binder 调用方可言，只能靠这里登记的路径归属找回发起者。
+    // 放行（Allow）分支同样需要，否则发起者配置放行真实路径时后续操作
+    // 会因归属缺失而再次落入未解析路径。
+    //
+    // 但代写者以自身身份回退时不得登记：这种「归属＝代写者自己」的提示对后续归因
+    // 毫无价值，还会盖掉真实发起者的台账，让系统代写归因把有效归属改写成代写者，
+    // 进而判定为「未启用重定向」而放行请求路径（2026-11-10 A17 场景 39：
+    // SrtDlOwner 物理落点留在请求路径、MediaStore 记录却指向映射目标）。
+    if !policy::is_attribution_intermediate_package(&caller_package) {
+        remember_media_caller_hint(path_text, &caller_package, effective_uid);
+    }
     if let Some(mapped_target) =
         resolve_mapping_view_open_target(path_text, &caller_package, effective_uid)
         && let Some(rewritten) =
             rewrite_media_store_mapped_value(path_text, has_file_scheme, &mapped_target)
     {
-        // 显式映射同样要登记归属。此前只有沙箱重定向分支登记，导致配了
-        // path_mappings 的应用在 pending 提交阶段查不到提示，只能退回按
-        // 配置反推归属，进而把其他应用往同一公共目录的保存也认领过来。
-        remember_media_caller_hint(path_text, &caller_package, effective_uid);
         return Some(rewritten);
     }
     if let Some(rewritten) = rewrite_default_sandbox_media_store_value(
@@ -332,7 +414,6 @@ pub(crate) fn rewrite_media_store_storage_path_for_caller(
         has_file_scheme,
         false,
     );
-    remember_media_caller_hint(path_text, &caller_package, effective_uid);
     Some(rewritten)
 }
 
@@ -548,18 +629,8 @@ pub(crate) fn is_redirect_enabled_for_caller_uid(caller_uid: i32) -> bool {
     if caller_uid < 0 {
         return false;
     }
-    refresh_settings_snapshot();
-    let mut packages = policy::get_packages_for_uid(caller_uid);
-    if packages.is_empty() {
-        policy::refresh_shared_uid_cache();
-        packages = policy::get_packages_for_uid(caller_uid);
-    }
-    packages.sort();
-    packages.dedup();
-    packages.retain(|pkg| !pkg.is_empty() && !policy::is_system_writer_package(pkg));
-    packages
-        .iter()
-        .any(|pkg| SettingsHub::instance().should_redirect(pkg, caller_uid))
+    let package = resolve_redirect_caller_package(caller_uid);
+    !package.is_empty() && SettingsHub::instance().should_redirect(&package, caller_uid)
 }
 
 pub(crate) fn storage_path_exists_by_syscall(path_text: &str) -> bool {
@@ -686,8 +757,8 @@ pub(crate) fn should_hide_cursor_storage_path_for_caller(
             true,
         );
     }
-    if path_exists_by_syscall(&fallback_path)
-        || path_exists_by_syscall(&writer::storage_to_data_media_path(&fallback_path))
+    if row_path_exists(&fallback_path)
+        || row_path_exists(&writer::storage_to_data_media_path(&fallback_path))
     {
         return log(
             "fallback_exists",
@@ -700,7 +771,7 @@ pub(crate) fn should_hide_cursor_storage_path_for_caller(
 
     // 保留看似仍处于 pending 状态的 MediaStore 条目行。
     // 对调用方没有可见目标的已有公共原始条目则隐藏。
-    let original_exists = path_exists_by_syscall(path_text);
+    let original_exists = row_path_exists(path_text);
     log(
         if original_exists {
             "hide_public_original"
@@ -797,8 +868,8 @@ where
     }
     if should_keep_existing_rewrite_target(
         decision.is_mapping,
-        path_exists_by_syscall(&decision.new_path),
-        path_exists_by_syscall(&display_path),
+        row_path_exists(&decision.new_path),
+        row_path_exists(&display_path),
     ) {
         let rewritten = if has_file_scheme {
             format!("{}{}", FILE_SCHEME_PREFIX, display_path)
@@ -830,7 +901,7 @@ where
         // Download 场景常见 "先写入后可见"：若在 pending 阶段直接隐藏行，
         // caller 可能拿不到可写 URI，导致保存失败。只保留 MediaStore
         // .pending-* 临时文件，避免普通已删除媒体行继续出现在相册里。
-        if is_media_store_pending_path(path_text) && !path_exists_by_syscall(path_text) {
+        if is_media_store_pending_path(path_text) && !row_path_exists(path_text) {
             let display_path = to_public_storage_path(&decision.new_path);
             let rewritten = if has_file_scheme {
                 format!("{}{}", FILE_SCHEME_PREFIX, display_path)
@@ -975,7 +1046,7 @@ fn rewrite_cursor_storage_path_for_mapping_view(
     if can_hide_rows
         && !mapping_view_path_exists_for_caller(&display_path, caller_package, caller_uid)
     {
-        if is_media_store_pending_path(path_text) && !path_exists_by_syscall(path_text) {
+        if is_media_store_pending_path(path_text) && !row_path_exists(path_text) {
             let rewritten = if has_file_scheme {
                 format!("{}{}", FILE_SCHEME_PREFIX, display_path)
             } else {
@@ -1065,7 +1136,7 @@ fn mapping_view_path_exists_for_caller(
     if let Some(parent) = display_path.strip_suffix("/.srx_probe") {
         return mapping_view_path_exists_for_caller(parent, caller_package, caller_uid);
     }
-    if path_exists_by_syscall(display_path) {
+    if row_path_exists(display_path) {
         return true;
     }
     let mappings = writer::get_caller_mappings(caller_package, caller_uid);
@@ -1076,14 +1147,13 @@ fn mapping_view_path_exists_for_caller(
     if mapped.is_empty() {
         return false;
     }
-    path_exists_by_syscall(&mapped)
-        || path_exists_by_syscall(&writer::storage_to_data_media_path(&mapped))
+    row_path_exists(&mapped) || row_path_exists(&writer::storage_to_data_media_path(&mapped))
 }
 
 fn mapping_target_path_exists(mapped_path: &str) -> bool {
     !mapped_path.is_empty()
-        && (path_exists_by_syscall(mapped_path)
-            || path_exists_by_syscall(&writer::storage_to_data_media_path(mapped_path)))
+        && (row_path_exists(mapped_path)
+            || row_path_exists(&writer::storage_to_data_media_path(mapped_path)))
 }
 
 fn resolve_caller_package_for_media_placeholder(
@@ -1284,79 +1354,51 @@ struct PlaceholderCandidate {
     request_len: usize,
 }
 
-fn resolve_caller_package(caller_uid: i32, path_text: &str) -> String {
+fn resolve_caller_package(caller_uid: i32, _path_text: &str) -> String {
+    if crate::hook::is_caller_attribution_stopped() {
+        return String::new();
+    }
     refresh_settings_snapshot();
-    let current_package = InterceptHub::instance().get_current_caller_package();
+    let hub = InterceptHub::instance();
+    let current_package = hub.get_current_caller_package();
+    if crate::hook::is_current_caller_scope_active() && hub.get_current_caller_uid() == caller_uid {
+        // 空包名也是本次请求的结果，不能再按路径或启用配置猜共享 UID 的成员。
+        return current_package;
+    }
     if is_package_uid_match(&current_package, caller_uid) {
         return current_package;
     }
-    let saved_package = crate::hook::get_binder_saved_caller_package();
-    if is_package_uid_match(&saved_package, caller_uid) {
-        return saved_package;
+    if crate::hook::is_binder_identity_cleared() {
+        let saved_package = crate::hook::get_binder_saved_caller_package();
+        if is_package_uid_match(&saved_package, caller_uid) {
+            return saved_package;
+        }
     }
     let mut packages = policy::get_packages_for_uid(caller_uid);
     if packages.is_empty() {
         policy::refresh_shared_uid_cache();
         packages = policy::get_packages_for_uid(caller_uid);
     }
-    packages.sort();
-    packages.dedup();
-    packages.retain(|pkg| !pkg.is_empty() && !policy::is_system_writer_package(pkg));
     if packages.len() == 1 {
-        return packages[0].clone();
-    }
-    let inferred =
-        SettingsHub::instance().resolve_redirect_package_by_path_for_user(caller_uid, path_text);
-    if is_package_uid_match(&inferred, caller_uid) {
-        return inferred;
-    }
-    let mut enabled = packages
-        .into_iter()
-        .filter(|pkg| SettingsHub::instance().should_redirect(pkg, caller_uid))
-        .collect::<Vec<_>>();
-    if enabled.len() == 1 {
-        return enabled.remove(0);
-    }
-    String::new()
-}
-
-fn resolve_redirect_caller_package(caller_uid: i32) -> String {
-    refresh_settings_snapshot();
-    let current_package = InterceptHub::instance().get_current_caller_package();
-    if is_package_uid_match(&current_package, caller_uid) {
-        return current_package;
-    }
-    let saved_package = crate::hook::get_binder_saved_caller_package();
-    if is_package_uid_match(&saved_package, caller_uid) {
-        return saved_package;
-    }
-    let mut packages = policy::get_packages_for_uid(caller_uid);
-    if packages.is_empty() {
-        policy::refresh_shared_uid_cache();
-        packages = policy::get_packages_for_uid(caller_uid);
-    }
-    packages.sort();
-    packages.dedup();
-    packages.retain(|pkg| !pkg.is_empty() && !policy::is_system_writer_package(pkg));
-    let mut enabled = packages
-        .into_iter()
-        .filter(|pkg| SettingsHub::instance().should_redirect(pkg, caller_uid))
-        .collect::<Vec<_>>();
-    if enabled.len() == 1 {
-        enabled.remove(0)
+        packages.remove(0)
     } else {
         String::new()
     }
 }
 
+fn resolve_redirect_caller_package(caller_uid: i32) -> String {
+    resolve_caller_package(caller_uid, "")
+}
+
 fn is_package_uid_match(package_name: &str, caller_uid: i32) -> bool {
-    if package_name.is_empty() || caller_uid < writer::ANDROID_APP_UID_START {
+    if caller_uid < 0 || package_name.is_empty() {
         return false;
     }
-    let mut package_uid = policy::get_uid_for_package(package_name);
-    if package_uid < writer::ANDROID_APP_UID_START {
+    let user_id = platform::user_id_from_uid(caller_uid);
+    let mut package_uid = policy::get_uid_for_package_in_user(package_name, user_id);
+    if package_uid < 0 {
         policy::refresh_shared_uid_cache();
-        package_uid = policy::get_uid_for_package(package_name);
+        package_uid = policy::get_uid_for_package_in_user(package_name, user_id);
     }
     package_uid == caller_uid
 }
@@ -1445,4 +1487,255 @@ fn sample_visibility_log(
         if target.is_empty() { "empty" } else { target },
         index + 1
     );
+}
+
+/// 调用方级行判定计划：一次查询里同一调用方的每一行都会经过这里。
+///
+/// 原生 MediaProvider 的行循环不做任何判定；模块加的判定在「该调用方没有任何
+/// 路径规则、没有任何映射」时其实是**整库同判**的——目录只影响落点前缀，是否
+/// 可见只取决于重定向后端里有没有这个文件。把这件事算一次，行级就只剩字符串
+/// 拼接与一次存在性查表，不再逐行跑完整路由。
+#[derive(Clone)]
+enum CallerRowPlan {
+    /// 没有重定向后端：行原样保留，只做一次存在性判定。
+    Pass,
+    /// 有重定向后端：行改写为 `to_public(target + 相对路径)`，可见性看后端文件。
+    Redirect { target: String },
+    /// 规则/映射与目录相关，必须逐行完整判定（行为与改动前完全一致）。
+    PerRow,
+}
+
+thread_local! {
+    static CALLER_ROW_PLAN: std::cell::RefCell<Option<(i32, String, u64, CallerRowPlan)>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+fn caller_row_plan(caller_package: &str, caller_uid: i32) -> CallerRowPlan {
+    let version = SettingsHub::instance().config_version();
+    let cached = CALLER_ROW_PLAN.with(|slot| {
+        let slot = slot.borrow();
+        slot.as_ref()
+            .filter(|(uid, package, cached_version, _)| {
+                *uid == caller_uid && package == caller_package && *cached_version == version
+            })
+            .map(|(_, _, _, plan)| plan.clone())
+    });
+    if let Some(plan) = cached {
+        return plan;
+    }
+    let plan = compute_caller_row_plan(caller_package, caller_uid);
+    CALLER_ROW_PLAN.with(|slot| {
+        *slot.borrow_mut() = Some((
+            caller_uid,
+            caller_package.to_string(),
+            version,
+            plan.clone(),
+        ));
+    });
+    plan
+}
+
+fn compute_caller_row_plan(caller_package: &str, caller_uid: i32) -> CallerRowPlan {
+    if caller_package.is_empty() || caller_uid < 0 {
+        return CallerRowPlan::PerRow;
+    }
+    // 有任意规则或多条映射时，逐行结论可能不同：退回完整判定，语义完全不变。
+    if !writer::caller_has_no_path_rules(caller_package, caller_uid) {
+        return CallerRowPlan::PerRow;
+    }
+    if !writer::get_caller_mappings(caller_package, caller_uid).is_empty() {
+        return CallerRowPlan::PerRow;
+    }
+    let user_id = platform::user_id_from_uid(caller_uid);
+    if user_id < 0 {
+        return CallerRowPlan::PerRow;
+    }
+    let target =
+        writer::resolve_system_writer_redirect_target(caller_package, caller_uid, user_id, false);
+    if target.is_empty() {
+        CallerRowPlan::Pass
+    } else {
+        CallerRowPlan::Redirect { target }
+    }
+}
+
+/// Java 行循环的单次入口：一次调用给出「隐藏 / 原样 / 改写到某路径」。
+///
+/// 与改动前的 Java 序列严格同序（改写 → 隐藏判定 → 原始存在性 → 改写目标存在性），
+/// 差异只在于「整库同判」成立时直接给结论，不再逐行跑策略路由与存在性系统调用。
+/// 返回：
+/// - `Some("")`：隐藏该行；
+/// - `Some(path)`：保留并改写为该路径；
+/// - `None`：保留原路径。
+pub(crate) fn cursor_row_action(
+    original_text: &str,
+    caller_uid: i32,
+    allow_missing: bool,
+) -> Option<String> {
+    if caller_uid < 0 {
+        return None;
+    }
+    let (path_text, has_file_scheme) = split_storage_path(original_text)?;
+    let caller_package = resolve_caller_package(caller_uid, path_text);
+    // 归因不到包时没有改写与隐藏可言，但「文件已不存在就丢行」这条判定与调用方无关，
+    // 仍然要执行——否则未知调用方会看到已删除条目的行。
+    let plan = if caller_package.is_empty() {
+        CallerRowPlan::Pass
+    } else {
+        caller_row_plan(&caller_package, caller_uid)
+    };
+    if let Some(decision) =
+        fast_row_action(&plan, path_text, has_file_scheme, caller_uid, allow_missing)
+    {
+        return decision;
+    }
+    legacy_row_action(original_text, path_text, caller_uid, allow_missing)
+}
+
+/// 整库同判成立时的行级结论；`None` 表示该行必须退回完整判定。
+fn fast_row_action(
+    plan: &CallerRowPlan,
+    path_text: &str,
+    has_file_scheme: bool,
+    caller_uid: i32,
+    allow_missing: bool,
+) -> Option<Option<String>> {
+    // 以点开头的名字（`.pending-*`、`.srx_probe`、缩略图）与私有根都走完整判定：
+    // 它们的可见性有额外的例外分支，不能用整库同判近似。
+    if !is_plain_row_path(path_text) {
+        return None;
+    }
+    match plan {
+        CallerRowPlan::PerRow => None,
+        CallerRowPlan::Pass => {
+            if allow_missing || is_media_store_pending_path(path_text) {
+                return Some(None);
+            }
+            if storage_path_exists_for_caller(path_text, caller_uid) {
+                Some(None)
+            } else {
+                Some(Some(String::new()))
+            }
+        }
+        CallerRowPlan::Redirect { target } => {
+            let user_id = platform::user_id_from_uid(caller_uid);
+            if user_id < 0 {
+                return None;
+            }
+            let normalized = paths::resolve_user_path(&paths::normalize(path_text), user_id);
+            if normalized.is_empty() || paths::has_unsafe_segments(&normalized) {
+                return None;
+            }
+            let backend = writer::map_path_by_caller_fallback(&normalized, target, user_id);
+            if backend.is_empty() {
+                return None;
+            }
+            let display_path = to_public_storage_path(&backend);
+            if display_path.is_empty() {
+                return None;
+            }
+            if !allow_missing
+                && !is_media_store_pending_path(path_text)
+                && !row_path_exists(&display_path)
+                && !row_path_exists(&backend)
+                && !row_path_exists(&writer::storage_to_data_media_path(&backend))
+            {
+                return Some(Some(String::new()));
+            }
+            if display_path == path_text {
+                return Some(None);
+            }
+            let rewritten = if has_file_scheme {
+                format!("{}{}", FILE_SCHEME_PREFIX, display_path)
+            } else {
+                display_path
+            };
+            Some(Some(rewritten))
+        }
+    }
+}
+
+/// 行路径能否走「整库同判」：必须是存储根下的普通条目。
+fn is_plain_row_path(path_text: &str) -> bool {
+    if path_text.is_empty() || path_text.ends_with('/') {
+        return false;
+    }
+    let Some((_, name)) = path_text.rsplit_once('/') else {
+        return false;
+    };
+    if name.is_empty() || name.starts_with('.') {
+        return false;
+    }
+    // 私有根（`Android/{data,media,obb}/<pkg>`）有独立视图语义，逐行判定。
+    !path_text.contains("/Android/data/")
+        && !path_text.contains("/Android/media/")
+        && !path_text.contains("/Android/obb/")
+}
+
+/// 与 Java 行循环完全同序的完整判定：整库同判不成立时走这里。
+fn legacy_row_action(
+    original_text: &str,
+    path_text: &str,
+    caller_uid: i32,
+    allow_missing: bool,
+) -> Option<String> {
+    let rewritten = rewrite_cursor_storage_path_for_caller(original_text, caller_uid);
+    if let Some(value) = rewritten.as_deref()
+        && value.is_empty()
+    {
+        return Some(String::new());
+    }
+    let changed = rewritten
+        .as_deref()
+        .filter(|value| *value != original_text && *value != path_text);
+    if changed.is_none() && should_hide_cursor_storage_path_for_caller(original_text, caller_uid) {
+        return Some(String::new());
+    }
+    if !allow_missing
+        && !is_media_store_pending_path(path_text)
+        && !storage_path_exists_for_caller(path_text, caller_uid)
+    {
+        return Some(String::new());
+    }
+    let changed = changed?;
+    if !allow_missing {
+        let rewritten_exists = storage_path_exists_for_caller(changed, caller_uid);
+        let mapping_view = is_mapping_view_rewrite(path_text, changed, caller_uid);
+        if !rewritten_exists && (!mapping_view || !is_media_store_pending_path(path_text)) {
+            return Some(String::new());
+        }
+    }
+    Some(changed.to_string())
+}
+
+/// Java `storagePathExistsForCaller` 的等价实现：先看路径本身，再看它经重定向后的落点。
+fn storage_path_exists_for_caller(path_text: &str, caller_uid: i32) -> bool {
+    if row_path_exists(path_text) {
+        return true;
+    }
+    resolve_open_storage_path_for_caller(path_text, caller_uid)
+        .is_some_and(|mapped| !mapped.is_empty() && row_path_exists(&mapped))
+}
+
+/// Java `isMappingViewRewrite` 的等价实现：改写路径的重定向落点就是原路径。
+fn is_mapping_view_rewrite(original: &str, rewritten: &str, caller_uid: i32) -> bool {
+    let Some(open_target) = resolve_open_storage_path_for_caller(rewritten, caller_uid) else {
+        return false;
+    };
+    if open_target.is_empty() {
+        return false;
+    }
+    let user_id = platform::user_id_from_uid(caller_uid);
+    if user_id < 0 {
+        return false;
+    }
+    let left = to_public_storage_path(&paths::resolve_user_path(
+        &paths::normalize(&open_target),
+        user_id,
+    ));
+    let right = to_public_storage_path(&paths::resolve_user_path(
+        &paths::normalize(original),
+        user_id,
+    ));
+    !left.is_empty() && left == right
 }

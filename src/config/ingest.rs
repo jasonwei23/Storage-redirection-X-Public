@@ -486,7 +486,6 @@ fn parse_user_profile(
     }
 
     user_profile.path_mappings = filter_valid_path_mapping_chains(user_profile.path_mappings);
-    user_profile.path_mappings = filter_valid_path_mapping_chains(user_profile.path_mappings);
     user_profile
 }
 

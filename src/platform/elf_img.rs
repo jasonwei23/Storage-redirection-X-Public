@@ -19,8 +19,18 @@ const SHT_DYNSYM: u32 = 11;
 const SHN_UNDEF: u16 = 0;
 const SHN_LORESERVE: u16 = 0xff00;
 const SHN_HIRESERVE: u16 = 0xffff;
+// 重定位类型按 e_machine 分派：模块自身与目标库可能运行在 arm64（真机）或
+// x86_64（CI 模拟器），两架构的 ELF64 r_info 布局相同（sym 在高 32 位），
+// 仅类型常量不同。
+const EM_AARCH64: u16 = 183;
+const EM_X86_64: u16 = 62;
 const R_AARCH64_GLOB_DAT: u32 = 1025;
 const R_AARCH64_JUMP_SLOT: u32 = 1026;
+const R_X86_64_GLOB_DAT: u32 = 6;
+// x86_64 JUMP_SLOT 是 7（5 是 R_X86_64_COPY）；2026-10-25 本地模拟器实证：
+// 常量误写为 5 导致 libappfuse/libfuse 的 78 项 JUMP_SLOT 全部被拒、read 补丁
+// 在 A13/A14 模拟器形态永不安装（场景 40 归因链断裂的直接根因）。
+const R_X86_64_JUMP_SLOT: u32 = 7;
 
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -85,6 +95,14 @@ struct Elf64Rel {
 pub struct ElfImg {
     load_bias: usize,
     image: Vec<u8>,
+}
+
+impl ElfImg {
+    /// 镜像字节数：诊断「库定位成功但补丁槽位为零」时区分解压库与 APK 内嵌
+    /// 形态（两种形态的镜像量级差异明显）。
+    pub(crate) fn image_len(&self) -> usize {
+        self.image.len()
+    }
 }
 
 struct EmbeddedElf {
@@ -222,7 +240,13 @@ impl ElfImg {
                     (rel.r_offset, rel.r_info)
                 };
                 let rel_type = (r_info & 0xffff_ffff) as u32;
-                if rel_type != R_AARCH64_JUMP_SLOT && rel_type != R_AARCH64_GLOB_DAT {
+                let type_accepted = match ehdr.e_machine {
+                    EM_X86_64 => rel_type == R_X86_64_GLOB_DAT || rel_type == R_X86_64_JUMP_SLOT,
+                    // 其余架构（含 AArch64）按 AArch64 常量处理；未知架构的
+                    // 二进制不会出现在本模块的补丁目标里。
+                    _ => rel_type == R_AARCH64_GLOB_DAT || rel_type == R_AARCH64_JUMP_SLOT,
+                };
+                if !type_accepted {
                     continue;
                 }
                 let sym_idx = (r_info >> 32) as usize;
@@ -298,14 +322,42 @@ fn find_embedded_elf(entry_suffix: &str) -> Option<EmbeddedElf> {
         }
         apk_paths.push(path.to_string());
     }
+    if apk_paths.is_empty() {
+        // 一次性诊断（2026-10-30 A17 排查）：进程 maps 里没有任何 .apk 结尾的
+        // 路径条目，embedded 通道无从下手；正常设备上 MediaProvider 进程至少
+        // 会映射自身 APK（dex/vdex/art 条目）。
+        static EMPTY_DIAG: std::sync::atomic::AtomicBool =
+            std::sync::atomic::AtomicBool::new(false);
+        if !EMPTY_DIAG.swap(true, std::sync::atomic::Ordering::Relaxed) {
+            log::warn!("elf embedded lookup: no .apk path in self maps suffix={entry_suffix}");
+        }
+    }
 
     for apk_path in apk_paths {
         let file_path = resolve_map_path(&apk_path);
         let Ok(file) = std::fs::read(&file_path) else {
+            // 一次性诊断：APK 文件读不到（权限/路径解析失败）。
+            static READ_FAIL_DIAG: std::sync::atomic::AtomicBool =
+                std::sync::atomic::AtomicBool::new(false);
+            if !READ_FAIL_DIAG.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                log::warn!(
+                    "elf embedded lookup: apk read failed path={file_path} suffix={entry_suffix}"
+                );
+            }
             continue;
         };
         if let Some(embedded) = find_zip_stored_elf(&apk_path, &file, entry_suffix) {
             return Some(embedded);
+        }
+        // 一次性诊断：APK 可读但按 entry_suffix 未命中 stored 的 ELF 条目
+        // （zip 结构解析失败或条目被压缩）。
+        static ZIP_FAIL_DIAG: std::sync::atomic::AtomicBool =
+            std::sync::atomic::AtomicBool::new(false);
+        if !ZIP_FAIL_DIAG.swap(true, std::sync::atomic::Ordering::Relaxed) {
+            log::warn!(
+                "elf embedded lookup: zip lookup missed apk_path={apk_path} suffix={entry_suffix} size={}",
+                file.len()
+            );
         }
     }
     None

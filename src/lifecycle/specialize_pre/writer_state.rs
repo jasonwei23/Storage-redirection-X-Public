@@ -35,13 +35,25 @@ pub(super) fn resolve_system_writer_context(
     };
 
     let is_file_monitor_enabled = config.is_file_monitor_enabled();
-    if context.is_monitor_bridge && is_file_monitor_enabled {
-        *should_redirect = false;
+    if context.is_monitor_bridge && is_file_monitor_enabled && !*should_redirect {
+        // 桥接进程默认降级为纯监视，避免影响 SAF/下载/MTP 代写识别链路。
+        // 但仅在应用自身没有被显式启用时才降级：桥接进程也会对**自己**配置的路径
+        // 发起原生写入（如下载提供器写 .xlDownload），若此处把已启用的
+        // should_redirect 清零，挂载请求将变成零规则，FUSE 层拿不到
+        // sandboxed_paths 沙盒策略，原生 mkdir/open 直接穿透到真实存储
+        // （2026-10-21 真机：com.android.providers.downloads 配置了
+        // sandboxed_paths=[.xlDownload]，仍被真实创建即源于此）。
         *is_system_writer_hook_redirect = false;
         if !*should_monitor {
             *should_monitor = true;
         }
         log::info!("monitor bridge on pkg={} uid={}", package_name, app_uid);
+    } else if context.is_monitor_bridge && is_file_monitor_enabled {
+        log::info!(
+            "monitor bridge keeps app redirect pkg={} uid={} (app has enabled profile)",
+            package_name,
+            app_uid
+        );
     }
 
     if !context.is_system_writer {
@@ -107,6 +119,9 @@ pub(super) fn should_defer_media_boot_extras_for_state(
 }
 
 pub(super) fn should_install_java_hook_for_writer(context: &SystemWriterContext) -> bool {
+    if super::mp_hooks_disabled() {
+        return false;
+    }
     // MediaProvider 的 ContentValues 路径补丁需要 Java hook。Android 13
     // 上 MediaProvider 可能在模块配置写入前就已经启动，且测试/部分设备
     // 不能安全重启该进程；因此 Java mutation hook 需要在 MediaProvider

@@ -19,7 +19,6 @@
     allApps: [],
     availableUsers: ["0"],
     moduleStatus: "unknown",
-    compatAppListPreparedUsers: new Set(),
     appListScrollTop: 0,
     shouldRestoreAppListScroll: false,
     logListScrollTop: 0,
@@ -43,6 +42,7 @@
     dashboardModuleStateRequestId: 0,
     dashboardCountsLoaded: false,
     runtimeActivationExact: "0",
+    hostStatus: null,
     appListRequestId: 0,
     renderedApps: [],
     appListRowHeight: 67,
@@ -97,6 +97,12 @@
       name: "fusefixer",
       license: "MIT",
       url: "https://github.com/MaterialCleaner/Media-Provider-FuseFixer",
+    },
+    {
+      group: "模块核心",
+      name: "Fuse-Proxy",
+      license: "GPL-3.0",
+      url: "https://github.com/huniangitb/Fuse-Proxy",
     },
     {
       group: "Root / WebUI",
@@ -446,7 +452,11 @@
           template || {
             id: event.state.templateId,
             name: "",
-            config: { users: { [String(State.currentUserId || "0")]: createDefaultProfile() } },
+            config: {
+              users: {
+                [String(State.currentUserId || "0")]: createDefaultProfile(),
+              },
+            },
           },
           {
             skipHistory: true,
@@ -721,7 +731,10 @@
       if (page === "dashboard") refreshDashboardCounts({ force: true });
       return;
     }
-    routeTo(page, { prioritizeNav: true });
+    // 顶级标签页之间切换不产生可回退的历史：没进二级页面时，系统返回应当一步
+    // 退出 WebUI 回到模块页面，而不是逐个退回访问过的标签页（issue #2 反馈）。
+    // 二级页面（应用配置、主题、关于、更新）仍按 push 进入，返回键逐级回退。
+    routeTo(page, { prioritizeNav: true, replaceHistory: true });
   }
 
   function initNav() {
@@ -863,13 +876,15 @@
     if (showInitialLoading) {
       setDashboardCountLoading("statAppCount", true);
       setDashboardCountLoading("statEnabledAppCount", true);
+      setDashboardCountLoading("statHostStatus", true);
     }
     const run = async () => {
       State.dashboardCountsSchedule = null;
       try {
-        const [configuredConfigs, runtimeActivations] = await Promise.all([
+        const [configuredConfigs, runtimeActivations, storageBackend] = await Promise.all([
           Api.readConfiguredAppConfigs(),
           Api.readStatsCount(),
+          Api.readStorageBackendStatus(),
         ]);
         if (
           State.currentPage !== requestPage ||
@@ -886,8 +901,10 @@
           Api.formatCompactRuntimeActivationCount(runtimeActivations),
           runtimeActivations,
         );
+        renderHostStatusMetric(storageBackend);
         setDashboardCountLoading("statAppCount", false);
         setDashboardCountLoading("statEnabledAppCount", false);
+        setDashboardCountLoading("statHostStatus", false);
       } catch {
         if (
           State.currentPage === requestPage &&
@@ -897,9 +914,11 @@
           if (!State.dashboardCountsLoaded) {
             setDashboardCountValue("statAppCount", "--");
             setDashboardCountValue("statEnabledAppCount", "--");
+            setDashboardCountValue("statHostStatus", "--");
           }
           setDashboardCountLoading("statAppCount", false);
           setDashboardCountLoading("statEnabledAppCount", false);
+          setDashboardCountLoading("statHostStatus", false);
         }
       } finally {
         if (State.dashboardCountsInFlight === requestGeneration) {
@@ -951,6 +970,88 @@
     el.textContent = text;
     if (exactValue != null && String(exactValue) !== text) el.title = String(exactValue);
     else el.removeAttribute("title");
+  }
+
+  /** 渲染概览页的宿主策略指标；与管理 App 一致：活跃展示已登记策略数，未运行为 0，未知为 --。 */
+  function renderHostStatusMetric(storageBackend) {
+    State.hostStatus = storageBackend || null;
+    const state = storageBackend?.state || "unknown";
+    const display =
+      state === "active"
+        ? storageBackend?.policies != null
+          ? String(storageBackend.policies)
+          : "--"
+        : state === "inactive"
+          ? "0"
+          : "--";
+    const exact =
+      state === "active" && storageBackend?.pid != null
+        ? "pid=" +
+          storageBackend.pid +
+          (storageBackend?.policies != null
+            ? "，已登记策略 " + storageBackend.policies + " 个"
+            : "")
+        : null;
+    setDashboardCountValue("statHostStatus", display, exact);
+  }
+
+  async function showHostPolicyDetails() {
+    const backend = State.hostStatus || null;
+    const state = backend?.state || "unknown";
+    const value =
+      state === "active"
+        ? backend?.policies != null
+          ? String(backend.policies)
+          : "--"
+        : state === "inactive"
+          ? "0"
+          : "--";
+    const stateLine =
+      state === "active"
+        ? "共享宿主运行中" + (backend?.pid != null ? "，宿主进程 pid=" + backend.pid : "") + "。"
+        : state === "inactive"
+          ? "共享宿主当前未运行。"
+          : "暂时无法读取共享宿主状态。";
+    let userLines = "";
+    if (state === "active") {
+      const counts = Object.entries(await Api.readHostPolicyUserCounts()).sort(
+        (a, b) => Number(a[0]) - Number(b[0]),
+      );
+      if (counts.length > 0) {
+        userLines =
+          '<div class="modal-hint">' +
+          counts
+            .map(([user, count]) => escapeHtml("用户 " + user + "：" + count + " 个"))
+            .join("<br>") +
+          "</div>";
+      }
+    }
+    showModalWithHistory(
+      '<div class="modal-title">宿主策略</div>' +
+        '<div class="runtime-stats-exact">' +
+        escapeHtml(value) +
+        "</div>" +
+        '<div class="modal-hint">共享宿主 FUSE 会话已登记的重定向策略数量，大致对应已启用重定向的应用会话数；应用实际发起存储访问后才计入。同一应用在不同用户下分别计一条，这里显示的是所有用户合计。共享宿主未运行时显示 0，读取失败或状态未知时显示 --。</div>' +
+        userLines +
+        '<div class="modal-hint">' +
+        escapeHtml(stateLine) +
+        "</div>" +
+        '<div class="modal-actions"><button class="btn btn-primary modal-close" type="button">关闭</button></div>',
+      { backdropClose: true },
+    );
+    document.querySelector(".modal-close")?.addEventListener("click", () => closeActiveModal());
+  }
+
+  function initHostStatusMetricInteraction() {
+    const metric = document.getElementById("hostStatusMetric");
+    if (!metric) return;
+    metric.addEventListener("click", () => showHostPolicyDetails());
+    metric.addEventListener("keydown", (event) => {
+      if (event.key === "Enter" || event.key === " ") {
+        event.preventDefault();
+        showHostPolicyDetails();
+      }
+    });
   }
 
   function showRuntimeActivationDetails() {
@@ -1058,8 +1159,18 @@
         description: "刷新已配置应用的重定向挂载并同步媒体进程",
         action: restartMediaProviderWithLoading,
       },
-      { icon: "download", label: "检查更新", description: "查看模块的新版本", page: "update" },
-      { icon: "file", label: "关于与开源协议", description: "版本信息与依赖许可", page: "about" },
+      {
+        icon: "download",
+        label: "检查更新",
+        description: "查看模块的新版本",
+        page: "update",
+      },
+      {
+        icon: "file",
+        label: "关于与开源协议",
+        description: "版本信息与依赖许可",
+        page: "about",
+      },
     ];
     items.forEach((item) => {
       const el = document.createElement("button");
@@ -1199,7 +1310,12 @@
   let appListCache = { user: [], system: [] };
   let appListCacheUser = "0";
   let currentFilter = "all";
-  const appStatusOrder = { enabled: 0, missing: 1, disabled: 2, unconfigured: 3 };
+  const appStatusOrder = {
+    enabled: 0,
+    missing: 1,
+    disabled: 2,
+    unconfigured: 3,
+  };
 
   function compareAppsByStatus(a, b) {
     const diff =
@@ -1224,11 +1340,13 @@
     for (let i = 0; i < installed.length; i += 1) {
       if (requestId !== State.appListRequestId) return null;
       const pkg = installed[i];
-      const info = Api.getCachedAppInfo ? Api.getCachedAppInfo(pkg) : null;
-      const isSystem =
+      const info = Api.getCachedAppInfo ? Api.getCachedAppInfo(pkg, State.currentUserId) : null;
+      // PackageManager 清单提供所选用户的系统应用标记；包名前缀只用于旧/缺失元数据兜底。
+      const guessedSystem =
         pkg.startsWith("com.android.") ||
         pkg.startsWith("com.google.android.") ||
         pkg.startsWith("android.");
+      const isSystem = info && typeof info.isSystem === "boolean" ? info.isSystem : guessedSystem;
       const label = info ? info.appLabel || info.label || info.name || "" : "";
       const status = configuredState.get(pkg) || "unconfigured";
       const app = {
@@ -1373,9 +1491,12 @@
       const cfg = item.config || {};
       const users = cfg.users || {};
       const profile = users[String(userId || "0")];
+      // 旧格式只有全局 enabled，对任何用户都生效；新格式按 users.<id> 判定，
+      // 当前用户没有档案时该应用不应出现在他的「已配置/缺失」集合里。
       const legacyEnabled = Object.prototype.hasOwnProperty.call(cfg, "enabled")
         ? cfg.enabled === true
-        : false;
+        : null;
+      if (!profile && legacyEnabled === null) return;
       map.set(
         item.packageName,
         (profile ? profile.enabled === true : legacyEnabled) ? "enabled" : "disabled",
@@ -1426,6 +1547,11 @@
       chip.addEventListener("click", () => {
         State.currentUserId = chip.dataset.user;
         switcher.classList.remove("open");
+        // 批量选择与滚动位置都属于上一名用户，切换后必须一并清掉并立即回到顶部。
+        exitAppSelectionMode();
+        State.appListScrollTop = 0;
+        const scroller = getAppListScroller();
+        if (scroller) setScrollerTopInstant(scroller, 0);
         renderAppUserSwitcher();
         Theme.showToast("已切换到用户 " + State.currentUserId);
         loadAppList(true);
@@ -1655,9 +1781,7 @@
     if (!bar) {
       bar = document.createElement("div");
       bar.id = "appBatchBar";
-      bar.className = "app-batch-bar visible miuix-floating-container miuix-blur";
-      bar.dataset.miuixUi = "floating-container";
-      bar.dataset.miuixBlur = "realtime";
+      bar.className = "app-batch-bar visible";
       document.body.appendChild(bar);
     }
     bar.innerHTML =
@@ -1774,6 +1898,31 @@
     });
   }
 
+  /**
+   * 应用列表标题栏刷新入口。
+   * 长列表下回到顶部再下拉刷新的成本太高，因此与模块管理器一致，在标题栏保留常驻刷新按钮。
+   */
+  function initAppListRefresh() {
+    const button = $("#appListRefresh");
+    if (!button || button._srxBound) return;
+    button._srxBound = true;
+    button.addEventListener("click", () => {
+      if (button.disabled) return;
+      // 刷新语义包含「看最新结果」，先回到顶部，避免刷完仍停在旧位置。
+      const scroller = getAppListScroller();
+      if (scroller) setScrollerTopInstant(scroller, 0);
+      State.appListScrollTop = 0;
+      button.disabled = true;
+      button.setAttribute("aria-busy", "true");
+      loadAppList(true)
+        .catch(() => {})
+        .finally(() => {
+          button.disabled = false;
+          button.removeAttribute("aria-busy");
+        });
+    });
+  }
+
   function initLogSearch() {
     const input = $("#logSearchInput"),
       clearBtn = $("#logSearchClear");
@@ -1820,8 +1969,12 @@
   function initListPerformanceControls() {
     const appList = $("#appList");
     const logViewer = $("#logViewer");
-    appList?.addEventListener("scroll", scheduleAppListWindowRender, { passive: true });
-    logViewer?.addEventListener("scroll", scheduleLogListAppend, { passive: true });
+    appList?.addEventListener("scroll", scheduleAppListWindowRender, {
+      passive: true,
+    });
+    logViewer?.addEventListener("scroll", scheduleLogListAppend, {
+      passive: true,
+    });
     window.addEventListener("resize", () => {
       State.appListWindowStart = -1;
       scheduleAppListWindowRender();
@@ -1856,7 +2009,7 @@
       '<div class="loading-state"><div class="spinner"></div><span>加载配置...</span></div>';
     try {
       const [label, config, globalConfig] = await Promise.all([
-        Api.getAppLabel(packageName).catch(() => ""),
+        Api.getAppLabel(packageName, State.configUserId).catch(() => ""),
         Api.readAppConfig(packageName),
         Api.readGlobalConfig().catch(() => null),
       ]);
@@ -2608,7 +2761,9 @@
         const toggle = event.currentTarget;
         toggle.classList.toggle("on");
         saveUpdatePrefs(
-          Object.assign({}, updatePrefs(), { autoCheckUpdates: toggle.classList.contains("on") }),
+          Object.assign({}, updatePrefs(), {
+            autoCheckUpdates: toggle.classList.contains("on"),
+          }),
         );
         Theme.showToast("设置已保存", "success");
       });
@@ -3246,7 +3401,10 @@
       return { valid: false, msg: "路径不能包含 . 或 .." };
     if (/[<>:"|?*\x00-\x1f]/.test(body)) return { valid: false, msg: "路径包含非法字符" };
     if (!options?.allowApplicationPrivateRoot && isApplicationPrivateRootPath(text)) {
-      return { valid: false, msg: "不能直接映射应用私有目录根路径，请填写其下的子路径" };
+      return {
+        valid: false,
+        msg: "不能直接映射应用私有目录根路径，请填写其下的子路径",
+      };
     }
     return { valid: true, msg: "路径格式正确" };
   }
@@ -3322,7 +3480,10 @@
     const unsafeRe = allowWildcards ? /[<>:"|\x00-\x1f]/ : /[<>:"|?*\x00-\x1f]/;
     if (unsafeRe.test(pathPart)) return { valid: false, msg: "路径包含非法字符" };
     if (options?.disallowPrivateAndroidTarget && isAndroidDataOrObbPath(pathPart)) {
-      return { valid: false, msg: "映射目标不能位于 Android/data 或 Android/obb" };
+      return {
+        valid: false,
+        msg: "映射目标不能位于 Android/data 或 Android/obb",
+      };
     }
     return { valid: true, msg: "路径格式正确" };
   }
@@ -3368,10 +3529,18 @@
       .replace(/\/+/g, "/");
     if (!value) return { valid: false, value: "", msg: "路径不能为空" };
     if (hasMonitorFilterStorageRootPrefix(value))
-      return { valid: false, value: "", msg: "不能带存储根目录，请输入相对路径" };
+      return {
+        valid: false,
+        value: "",
+        msg: "不能带存储根目录，请输入相对路径",
+      };
     if (value.startsWith("/")) {
       if (!allowLegacyAbsolute)
-        return { valid: false, value: "", msg: "不能使用绝对路径，请输入相对路径" };
+        return {
+          valid: false,
+          value: "",
+          msg: "不能使用绝对路径，请输入相对路径",
+        };
       value = value.replace(/^\/+/, "");
     }
     value = value.replace(/^\/+|\/+$/g, "");
@@ -3382,7 +3551,11 @@
     if (value.split("/").some((part) => part === "." || part === ".."))
       return { valid: false, value: "", msg: "路径不能包含 . 或 .." };
     if (hasMonitorFilterStorageRootPrefix(value))
-      return { valid: false, value: "", msg: "不能带存储根目录，请输入相对路径" };
+      return {
+        valid: false,
+        value: "",
+        msg: "不能带存储根目录，请输入相对路径",
+      };
     if (/[<>:"|\x00-\x1f]/.test(value)) return { valid: false, value: "", msg: "路径包含非法字符" };
     return { valid: true, value, msg: "路径格式正确" };
   }
@@ -3391,7 +3564,9 @@
     const seen = new Set();
     const out = [];
     (Array.isArray(list) ? list : []).forEach((item) => {
-      const result = validateMonitorFilterPath(item, { allowLegacyAbsolute: true });
+      const result = validateMonitorFilterPath(item, {
+        allowLegacyAbsolute: true,
+      });
       if (!result.valid || seen.has(result.value)) return;
       seen.add(result.value);
       out.push(result.value);
@@ -3438,7 +3613,9 @@
       inputEl.classList.remove("invalid");
       return false;
     }
-    const result = validateMonitorFilterPath(inputEl.value, { allowLegacyAbsolute: false });
+    const result = validateMonitorFilterPath(inputEl.value, {
+      allowLegacyAbsolute: false,
+    });
     hintEl.textContent = result.msg;
     hintEl.className = "path-validation " + (result.valid ? "valid" : "invalid");
     inputEl.classList.toggle("invalid", !result.valid);
@@ -3492,7 +3669,11 @@
     const splitInputPath = (value) => {
       const normalized = normalizeRelative(value);
       if (!normalized || normalized.endsWith("/")) {
-        return { dirRel: normalized.replace(/\/$/, ""), query: "", prefix: normalized };
+        return {
+          dirRel: normalized.replace(/\/$/, ""),
+          query: "",
+          prefix: normalized,
+        };
       }
       const slash = normalized.lastIndexOf("/");
       if (slash === -1) return { dirRel: "", query: normalized.toLowerCase(), prefix: "" };
@@ -3615,7 +3796,11 @@
   function showAddPathDialog(packageName, users, type, editOptions) {
     const originalPath = editOptions?.originalPath || "";
     const isEdit = !!originalPath;
-    const titles = { allow: "添加允许路径", sandbox: "添加沙盒路径", readonly: "添加只读路径" };
+    const titles = {
+      allow: "添加允许路径",
+      sandbox: "添加沙盒路径",
+      readonly: "添加只读路径",
+    };
     const hints = {
       allow: "直接输入路径可放行；仅支持共享存储根下的相对路径；加 ! 前缀可排除子路径。",
       sandbox: "仅映射模式下，未命中映射时进入沙盒；支持 *、? 通配及 ! 排除子路径。",
@@ -3908,33 +4093,6 @@
     );
   }
 
-  function accentPaletteHtml(selected) {
-    return (
-      '<div class="theme-color-palette" role="radiogroup" aria-label="强调色">' +
-      WEBUI_ACCENT_COLOR_OPTIONS.map((option) => {
-        const active = option.value === selected;
-        const color = option.color || "var(--system-accent-color, var(--color-primary))";
-        return (
-          '<button class="theme-color-swatch' +
-          (active ? " active" : "") +
-          (option.value === 0 ? " system" : "") +
-          '" type="button" data-value="' +
-          option.value +
-          '" role="radio" aria-checked="' +
-          String(active) +
-          '" aria-label="' +
-          option.label +
-          '" title="' +
-          option.label +
-          '" style="--swatch-color:' +
-          color +
-          '"><span aria-hidden="true"></span></button>'
-        );
-      }).join("") +
-      "</div>"
-    );
-  }
-
   function pageScaleControlHtml(scale) {
     const percent = webUiPageScalePercent(scale);
     const progress = ((percent - 80) / 30) * 100;
@@ -4182,7 +4340,7 @@
           "Fuse Fixer",
           "fuseFix",
           State.globalConfig.fuse_fix_enabled !== false,
-          "SRX 内置 Fuse Fixer 兼容保护，处理特殊 Unicode 字符",
+          "SRX 内置 Fuse Fixer 兼容保护，修正 MediaProvider 的 FUSE 可访问性判定与 passthrough 行为",
         ) +
         switchRow(
           "详细日志",
@@ -4259,7 +4417,11 @@
           {
             id: createTemplateId(),
             name: "\u65b0\u914d\u7f6e\u6a21\u677f",
-            config: { users: { [String(State.currentUserId || "0")]: createDefaultProfile() } },
+            config: {
+              users: {
+                [String(State.currentUserId || "0")]: createDefaultProfile(),
+              },
+            },
           },
           { originPage: "settings" },
         );
@@ -4973,7 +5135,10 @@
     rawReadOnly.forEach((item) =>
       pushUniquePath(
         readOnlyPaths,
-        sanitizeBackupPath(item, { allowRuleSyntax: true, allowWildcards: true }),
+        sanitizeBackupPath(item, {
+          allowRuleSyntax: true,
+          allowWildcards: true,
+        }),
       ),
     );
     profile.allowed_real_paths = sortPathRules(
@@ -5000,7 +5165,10 @@
     rawSandboxed.forEach((item) =>
       pushUniquePath(
         sandboxed,
-        sanitizeBackupPath(item, { allowRuleSyntax: true, allowWildcards: true }),
+        sanitizeBackupPath(item, {
+          allowRuleSyntax: true,
+          allowWildcards: true,
+        }),
       ),
     );
     profile.sandboxed_paths = sortPathRules(sandboxed);
@@ -5452,7 +5620,10 @@
         return await window.showSaveFilePicker({
           suggestedName: fileName,
           types: [
-            { description: "Storage Redirect X Backup", accept: { "application/zip": [".zip"] } },
+            {
+              description: "Storage Redirect X Backup",
+              accept: { "application/zip": [".zip"] },
+            },
           ],
         });
       } catch (error) {
@@ -5487,7 +5658,9 @@
 
   async function saveBackupWithDirectoryHandle(dirHandle, fileName, bytes) {
     if (!dirHandle) return false;
-    const fileHandle = await dirHandle.getFileHandle(fileName, { create: true });
+    const fileHandle = await dirHandle.getFileHandle(fileName, {
+      create: true,
+    });
     await writeBackupToFileHandle(fileHandle, bytes);
     return true;
   }
@@ -5644,7 +5817,16 @@
       }
       loading.close();
       loading = null;
-      Theme.showToast(path ? "日志包已导出：" + path : "日志导出失败", path ? "success" : "error");
+      if (!path) {
+        Theme.showToast("日志导出失败", "error");
+      } else if (path.indexOf("/data/adb/modules/") === 0) {
+        Theme.showToast(
+          "Download 不可写，日志包已保存到模块目录（请用 root 文件管理器或 adb 手动拷贝）：" + path,
+          "success",
+        );
+      } else {
+        Theme.showToast("日志包已导出：" + path, "success");
+      }
     } catch (error) {
       loading?.close();
       if (error?.name === "AbortError") return;
@@ -5815,7 +5997,12 @@
         verboseOptions.forEach((verboseOption) => {
           uiOptions.forEach((uiOption) => {
             templateOptions.forEach((templateOption) => {
-              optionSets.push({ ...autoOption, ...verboseOption, ...uiOption, ...templateOption });
+              optionSets.push({
+                ...autoOption,
+                ...verboseOption,
+                ...uiOption,
+                ...templateOption,
+              });
             });
           });
         });
@@ -5830,7 +6017,9 @@
       );
     };
     const baseDigests = await buildDigestCandidates(data);
-    const legacyMonitorData = cloneForBackupDigest(data, { legacyDefaultMonitorOperations: true });
+    const legacyMonitorData = cloneForBackupDigest(data, {
+      legacyDefaultMonitorOperations: true,
+    });
     const legacyMonitorDigests =
       stableJson(legacyMonitorData) === stableJson(data)
         ? []
@@ -5842,7 +6031,9 @@
       stableJson(legacyFullMonitorData) === stableJson(data)
         ? []
         : await buildDigestCandidates(legacyFullMonitorData);
-    const noMonitorData = cloneForBackupDigest(data, { includeMonitorFilters: false });
+    const noMonitorData = cloneForBackupDigest(data, {
+      includeMonitorFilters: false,
+    });
     const monitorCompatDigests = await buildDigestCandidates(noMonitorData);
     if (
       ![
@@ -5919,13 +6110,36 @@
     const loading = Theme.showLoadingDialog("正在重新挂载运行中应用...");
     try {
       const result = await Api.restartMediaProvider();
-      if (!result?.ok) throw new Error("MediaProvider hot reload timeout");
+      if (!result?.ok) {
+        Theme.showToast(remountFailureMessage(result?.failureReason), "error");
+        return;
+      }
       Api.showManagerToast("运行中应用已重新挂载，MediaProvider 已同步热重载");
     } catch (error) {
       Theme.showToast("重新挂载运行中应用失败", "error");
     } finally {
       loading.close();
       State.mediaProviderReloadRunning = false;
+    }
+  }
+
+  /** 把 srxctl 的 remount_reason 令牌翻译成用户可读的失败提示。 */
+  function remountFailureMessage(reason) {
+    switch (reason) {
+      case "provider-not-running":
+        return "MediaProvider 未在运行，无法同步热重载";
+      case "daemon-not-running":
+        return "模块 daemon 未运行，无法重新挂载运行中应用";
+      case "hot-reload-timeout":
+        return "MediaProvider 热重载超时";
+      case "remount-timeout":
+        return "运行中应用重新挂载超时";
+      case "daemon-control-failed":
+      case "hot-reload-request-failed":
+      case "hot-reload-signal-failed":
+        return "热重载或重挂请求发送失败";
+      default:
+        return "重新挂载运行中应用失败";
     }
   }
 
@@ -5945,10 +6159,13 @@
       viewer.innerHTML =
         '<div class="loading-state"><div class="spinner"></div><span>加载日志...</span></div>';
     try {
-      await Api.ensureLogCollectors?.();
+      // 采集器自愈独立于快照读取，维护命令变慢时仍可查看已有日志。
+      Api.ensureLogCollectors?.().catch(() => {});
       const [content, filters] = await Promise.all([
         Api.readFileWithBackups(FILE_MONITOR_LOG),
-        Api.readMonitorFilters({ force: true }).catch(() => State.monitorFilters || null),
+        Api.readMonitorFilters({ force: true, timeoutMs: 5000 }).catch(
+          () => State.monitorFilters || null,
+        ),
       ]);
       if (loadGeneration !== State.logLoadGeneration) return;
       if (filters) State.monitorFilters = filters;
@@ -5959,7 +6176,7 @@
         Theme.showToast("刷新文件监视失败", "error");
         throw new Error("refresh failed");
       } else {
-        viewer.innerHTML = '<div class="log-empty">暂无日志或无法读取</div>';
+        viewer.innerHTML = '<div class="log-empty">日志读取失败，请下拉重试</div>';
       }
     }
   }
@@ -5990,8 +6207,7 @@
       .map(parseLogLine)
       .filter(Boolean)
       .filter((entry) => !shouldFilterMonitorLogEntry(entry, filters));
-    const mappingPaths = collectMappingPaths(entries);
-    return coalesceLogEntries(entries, mappingPaths);
+    return coalesceLogEntries(entries);
   }
 
   function initDashboardRefreshHooks() {
@@ -6014,6 +6230,8 @@
     lines.forEach((line) => {
       const parts = String(line || "").split("|");
       const extras = parseLogExtras(parts.slice(5));
+      if (extras.caller_boundary || ["shared_uid", "executor"].includes(extras.identify_method))
+        return;
       [parts[1], parts[2], extras.watch_package].forEach((pkg) => {
         if (pkg && pkg !== "-" && /^[A-Za-z0-9_.-]+$/.test(pkg)) packages.add(pkg);
       });
@@ -6039,8 +6257,8 @@
     } else {
       infoEl.textContent =
         renderedCount < filteredCount
-          ? "显示 " + renderedCount + " / 共 " + totalCount + " 条"
-          : "共 " + totalCount + " 条";
+          ? "最近记录：显示 " + renderedCount + " / 共 " + totalCount + " 条（最多读取1000行）"
+          : "最近记录：共 " + totalCount + " 条（最多读取1000行）";
     }
   }
 
@@ -6108,20 +6326,22 @@
   }
 
   function parseLogLine(line) {
-    const parts = String(line || "").split("|");
+    let parts = String(line || "").split("|");
+    const extras = parseLogExtras(parts.slice(5));
+    if (extras.field_encoding === "percent") parts = parts.map(decodeLogField);
     const timestamp = parts[0] || "";
     const processPkg = parts[1] || "";
-    const callerPkg = parts[2] || "";
+    const callerPkg = extras.record_integrity === "ambiguous" ? "-" : parts[2] || "";
     const eventKind = parts[3] || "";
     const path = parts[4] || extractPathFromLog(line);
-    const extras = parseLogExtras(parts.slice(5));
     const filterOperation = extras.op_filter || extras.op || eventKind;
     const rawOperation = extras.op || eventKind;
     const operationIntent = monitorOperationIntent(filterOperation);
     if (extras.op === "monitor_watch") return null;
     const ret = Number(extras.ret ?? NaN);
     const errno = Number(extras.errno ?? NaN);
-    const ok = Number.isFinite(ret) ? ret >= 0 : !/error|fail|denied/i.test(line);
+    const ambiguous = extras.record_integrity === "ambiguous";
+    const ok = !ambiguous && (Number.isFinite(ret) ? ret >= 0 : !/error|fail|denied/i.test(line));
     const watchPkg = extras.watch_package || "";
     const fromPath = extras.from || "";
     const landingPath = normalizeLogLandingPath(path);
@@ -6129,30 +6349,42 @@
     const backendPath = normalizeLogLandingPath(extras.backend || "");
     const displayPath = selectLogPrimaryPath(landingPath || path, backendPath, extras);
     const identifyMethod = extras.identify_method || "";
+    const hasApplicationIdentity =
+      !extras.caller_boundary && !["shared_uid", "executor"].includes(identifyMethod);
     const eventRole = inferMonitorEventRole(extras.event_role, identifyMethod, rawOperation);
     const correlationId = extras.correlation_id || "";
     const observerPackage = extras.observer_package || "";
-    const isModuleWebUiExport = isModuleExportLogEntry(extras, processPkg, callerPkg, watchPkg);
+    const isModuleWebUiExport =
+      !ambiguous && isModuleExportLogEntry(extras, processPkg, callerPkg, watchPkg);
     const pkg = isModuleWebUiExport
       ? BACKUP_MODULE_ID
-      : selectLogDisplayPackage(
-          processPkg,
-          callerPkg,
-          watchPkg,
-          identifyMethod,
-          eventRole,
-          extras.source || "",
-        );
+      : !hasApplicationIdentity
+        ? callerPkg || "-"
+        : selectLogDisplayPackage(
+            processPkg,
+            callerPkg,
+            watchPkg,
+            identifyMethod,
+            eventRole,
+            extras.source || "",
+          );
     const attributedObservation = isAttributedFilesystemObservation(
       eventRole,
       identifyMethod,
       pkg,
       extras.source || "",
     );
+    const unattributedIntermediateSource =
+      !isModuleWebUiExport &&
+      isUnattributedIntermediateSource(pkg, identifyMethod, extras.identify_reliability || "");
     const appName =
       eventRole === "observation" && !isModuleWebUiExport && !attributedObservation
         ? "文件系统观察"
-        : getLogPackageLabel(pkg);
+        : unattributedIntermediateSource
+          ? "未知来源"
+          : !hasApplicationIdentity
+            ? pkg
+            : getLogPackageLabel(pkg);
     const operationLabel = isModuleWebUiExport
       ? "export"
       : eventRole === "observation"
@@ -6169,7 +6401,11 @@
         ? describeLogObservationSource(processPkg, watchPkg, observerPackage, extras)
         : describeLogSource(processPkg, callerPkg, extras);
     const status = ok ? "success" : "error";
-    const statusText = ok ? "成功" : describeErrno(errno, extras);
+    const statusText = ambiguous
+      ? "结果未知：日志字段冲突"
+      : ok
+        ? "成功"
+        : describeErrno(errno, extras);
     const timeText = timestamp.length >= 16 ? timestamp.slice(11, 16) : "--:--";
     const meta = [];
     if (operationIntent) meta.push(monitorIntentLabel(operationIntent));
@@ -6177,6 +6413,8 @@
     if (extras.identify_reliability)
       meta.push("可靠性 " + formatReliability(extras.identify_reliability));
     if (eventRole === "observation") meta.unshift("文件系统观察");
+    if (unattributedIntermediateSource && processPkg)
+      meta.push("代写进程 " + getLogPackageLabel(processPkg));
     if (observerPackage && eventRole === "observation") meta.push("落盘进程 " + observerPackage);
     if (watchPkg && eventRole === "observation") meta.push("监视上下文 " + watchPkg);
     if (correlationId) meta.push("关联 " + correlationId);
@@ -6230,6 +6468,7 @@
       correlationId,
       observerPackage,
       observationCount: 0,
+      hasApplicationIdentity,
       meta,
       extras,
       searchText,
@@ -6239,7 +6478,11 @@
 
   function inferMonitorEventRole(explicitRole, identifyMethod, rawOperation) {
     if (explicitRole === "request" || explicitRole === "observation") return explicitRole;
-    if (identifyMethod === "media_provider_fallback" || identifyMethod === "daemon_inotify") {
+    if (
+      identifyMethod === "media_provider_fallback" ||
+      identifyMethod === "daemon_inotify" ||
+      rawOperation === "inotify"
+    ) {
       return "observation";
     }
     if (
@@ -6307,7 +6550,9 @@
   }
 
   function monitorPathFilterMatches(rule, path) {
-    const result = validateMonitorFilterPath(rule, { allowLegacyAbsolute: true });
+    const result = validateMonitorFilterPath(rule, {
+      allowLegacyAbsolute: true,
+    });
     if (!result.valid) return false;
     const pattern = result.value;
     const relative = monitorFilterRelativeLogPath(path);
@@ -6347,13 +6592,13 @@
     return new RegExp("^" + escaped + "$").test(String(value || ""));
   }
 
-  function coalesceLogEntries(entries, mappingPaths = emptyMappingPaths()) {
+  function coalesceLogEntries(entries) {
     const groups = new Map();
     const correlationIndexes = new Map();
     const ordered = [];
     entries.forEach((entry) => {
       if (!entry) return;
-      if (shouldHideCompanionLogEntry(entry, mappingPaths)) return;
+      if (shouldHideCompanionLogEntry(entry)) return;
       const createWriteIndex = ordered.findIndex((existing) =>
         mergeFuseCreateWriteDuplicate(existing, entry),
       );
@@ -6374,6 +6619,8 @@
           ordered[correlatedIndex] = merged;
           const previousKey = buildLogCoalesceKey(previous);
           if (previousKey) groups.set(previousKey, merged);
+          const mergedKey = buildLogCoalesceKey(merged);
+          if (mergedKey) groups.set(mergedKey, merged);
           return;
         }
       }
@@ -6385,6 +6632,8 @@
           ordered[uncorrelatedIndex],
           entry,
         );
+        const mergedKey = buildLogCoalesceKey(ordered[uncorrelatedIndex]);
+        if (mergedKey) groups.set(mergedKey, ordered[uncorrelatedIndex]);
         return;
       }
       const key = buildLogCoalesceKey(entry);
@@ -6415,7 +6664,9 @@
 
   function mergeFuseCreateWriteDuplicate(existing, candidate) {
     if (!existing || !candidate) return null;
+    if (existing.status !== "success" || candidate.status !== "success") return null;
     if (existing.eventRole !== "request" || candidate.eventRole !== "request") return null;
+    if (logRequestIdentityKey(existing) !== logRequestIdentityKey(candidate)) return null;
     if (existing.pkg !== candidate.pkg) return null;
     if (!["fuse_redirect", "fuse_monitor_only"].includes(existing.extras?.identify_method)) {
       return null;
@@ -6478,10 +6729,8 @@
     } else if (existing.eventRole === "observation" && candidate.eventRole === "request") {
       request = candidate;
       observation = existing;
-    } else if (existing.eventRole === "request" && candidate.eventRole === "request") {
-      return pickPreferredLogEntry(existing, candidate);
     } else {
-      return existing;
+      return null;
     }
     const observer = observation.observerPackage || request.observerPackage || "";
     const observationCount =
@@ -6556,44 +6805,10 @@
     };
   }
 
-  function emptyMappingPaths() {
-    return { sources: new Set(), targets: new Set() };
-  }
-
-  function collectMappingPaths(entries) {
-    const mappingPaths = emptyMappingPaths();
-    entries.forEach((entry) => {
-      if (!entry || entry.status !== "success") return;
-      if (entry?.extras?.source !== "path_mapping") return;
-      const sourcePath = entry?.sourcePath || entry?.fromPath || "";
-      const targetPath = entry?.landingPath || entry?.path || "";
-      if (sourcePath) mappingPaths.sources.add(sourcePath);
-      if (targetPath) mappingPaths.targets.add(targetPath);
-    });
-    return mappingPaths;
-  }
-
-  function shouldHideCompanionLogEntry(entry, mappingPaths = emptyMappingPaths()) {
+  function shouldHideCompanionLogEntry(entry) {
     const path = entry?.originalPath || entry?.landingPath || entry?.path || "";
     const name = path.split("/").pop() || "";
-    if (/^\.[^/]+\.js$/i.test(name)) return true;
-    if (entry?.status !== "error") return false;
-    const sources = mappingPaths?.sources || new Set();
-    const targets = mappingPaths?.targets || new Set();
-    if (!sources.size && !targets.size) return false;
-    const sourcePath = entry?.sourcePath || entry?.fromPath || "";
-    const targetPath = entry?.landingPath || entry?.path || "";
-    if (!sourcePath || !targetPath) return false;
-    if (!sources.has(sourcePath) || !targets.has(targetPath)) return false;
-    const opFilter = String(
-      entry?.extras?.op_filter || entry?.extras?.op || entry?.operationLabel || "",
-    ).toLowerCase();
-    return (
-      opFilter.includes("open") ||
-      opFilter.includes("provider_open") ||
-      opFilter.includes("create") ||
-      opFilter.includes("write")
-    );
+    return /^\.[^/]+\.js$/i.test(name);
   }
 
   function buildLogCoalesceKey(entry) {
@@ -6610,17 +6825,42 @@
           entry?.operationLabel || entry?.extras?.op_filter || entry?.extras?.op || "",
         );
     const correlation = entry?.correlationId || "";
-    if (correlation) return "correlation|" + correlation;
+    if (correlation)
+      return [
+        "correlation",
+        correlation,
+        logRequestIdentityKey(entry),
+        getLogResultGroup(entry),
+      ].join("|");
     return [
       (entry.timestamp || "").slice(0, 16),
       coalescePath.replace(/^\/storage\/emulated\/\d+\//, "/storage/emulated/*/"),
       op,
       getLogResultGroup(entry),
-      "*",
+      logRequestIdentityKey(entry),
     ].join("|");
   }
 
+  function logRequestIdentityKey(entry) {
+    if (entry.eventRole !== "request") return "*";
+    const extra = entry.extras || {};
+    return [
+      "request",
+      entry.pkg,
+      extra.caller_uid,
+      extra.caller_pid,
+      extra.caller_start_time,
+      extra.caller_context,
+      extra.caller_boundary,
+      extra.native,
+      ["shared_uid", "executor"].includes(extra.identify_method) ? extra.identify_method : "app",
+    ]
+      .map((value) => value ?? "")
+      .join(":");
+  }
+
   function getLogResultGroup(entry) {
+    if (entry?.extras?.record_integrity === "ambiguous") return "unknown:log_fields";
     if (!entry || entry.status === "success") return "ok";
     if (entry.extras?.deny_reason === "read_only_rule") return "deny:read_only_rule";
     return "error:" + (entry.statusText || "unknown");
@@ -6789,9 +7029,11 @@
     const intent = monitorOperationIntent(syscallOp);
     if (op === "provider_open") {
       return (
-        { read: "Provider 读取请求", write: "Provider 写入请求", create: "Provider 创建请求" }[
-          intent
-        ] || "Provider 打开请求"
+        {
+          read: "Provider 读取请求",
+          write: "Provider 写入请求",
+          create: "Provider 创建请求",
+        }[intent] || "Provider 打开请求"
       );
     }
     if (op === "open" || op === "openat" || op === "openat2") {
@@ -6839,6 +7081,10 @@
 
   function describeLogSource(processPkg, callerPkg, extras) {
     const method = extras.identify_method || "unknown";
+    if (extras.caller_boundary === "unverified") return "来源未知（任务未核验）";
+    if (extras.caller_boundary || method === "executor")
+      return "执行者 " + (extras.native || callerPkg || "-");
+    if (method === "shared_uid") return "共享用户 " + callerPkg + "（共享 UID 回退）";
     if (
       callerPkg &&
       callerPkg !== "-" &&
@@ -6938,15 +7184,32 @@
         ""
       );
     }
+    // 无点原生身份（如 MT 管理器 root 复制时 helper 进程的 basename mtio）：
+    // 归因链已经抓到调用方，只是身份是原生 basename。落盘进程又是媒体组件时
+    // 不能退回其标签（issue #2：.boot_ok 因此显示成“媒体选择工具”），保留
+    // 原身份展示，详情里的 caller_uid / native 字段仍可核查。
+    const dotlessCallerIdentity =
+      callerPkg !== processPkg &&
+      callerPkg !== "-" &&
+      callerPkg &&
+      !isIntermediateLogPackage(callerPkg) &&
+      isIntermediateLogPackage(processPkg)
+        ? callerPkg
+        : "";
     return (
       [
         callerPkg !== processPkg && !isIntermediateLogPackage(callerPkg) ? callerPkg : "",
         identifyMethod === "watch_package" && !isIntermediateLogPackage(watchPkg) ? watchPkg : "",
         !isIntermediateLogPackage(callerPkg) ? callerPkg : "",
         !isIntermediateLogPackage(processPkg) ? processPkg : "",
+        dotlessCallerIdentity,
         callerPkg,
         processPkg,
-      ].find(isSinglePackageName) ||
+      ].find(
+        (value) =>
+          isSinglePackageName(value) ||
+          (value && value === dotlessCallerIdentity && !isIntermediateLogPackage(value)),
+      ) ||
       processPkg ||
       ""
     );
@@ -6967,7 +7230,19 @@
       pkg === "com.android.externalstorage" ||
       pkg === "com.android.mtp" ||
       pkg.includes(".documentsui") ||
-      pkg.includes(".photopicker")
+      pkg.includes("photopicker") ||
+      pkg.includes("mediapicker")
+    );
+  }
+
+  // 归因不可靠、展示包又落在系统代写中间层时，不再把中间层应用当成来源。
+  // 落盘进程是 MediaProvider、相册选择器这类代写进程，直接显示它的标签会让用户
+  // 以为文件是那个系统应用写出来的（issue #2 反馈“显示为媒体选择工具”），而实际
+  // 调用方是当时在场、无法归因的第三方应用。中间层进程仍保留在详情行里。
+  function isUnattributedIntermediateSource(pkg, identifyMethod, identifyReliability) {
+    return (
+      isIntermediateLogPackage(pkg) &&
+      (identifyMethod === "unknown" || identifyReliability === "none" || !identifyReliability)
     );
   }
 
@@ -7002,12 +7277,34 @@
 
   function parseLogExtras(parts) {
     const out = {};
+    let ambiguous = false;
     parts.forEach((part) => {
       const index = part.indexOf("=");
       if (index <= 0) return;
-      out[part.slice(0, index)] = part.slice(index + 1);
+      const key = part.slice(0, index);
+      if (Object.prototype.hasOwnProperty.call(out, key)) ambiguous = true;
+      else out[key] = part.slice(index + 1);
     });
+    if (out.field_encoding === "percent") {
+      Object.keys(out).forEach((key) => {
+        out[key] = decodeLogField(out[key]);
+      });
+    }
+    if (ambiguous || out.record_integrity === "ambiguous") {
+      out.record_integrity = "ambiguous";
+      out.caller_boundary = "unverified";
+      out.identify_method = "unknown";
+      out.identify_reliability = "none";
+    }
     return out;
+  }
+
+  function decodeLogField(value) {
+    return value
+      .replace(/%7C/g, "|")
+      .replace(/%0D/g, "\r")
+      .replace(/%0A/g, "\n")
+      .replace(/%25/g, "%");
   }
 
   function extractPathFromLog(line) {
@@ -7059,11 +7356,13 @@
   }
 
   function renderLogCard(entry) {
-    const iconSrc = Api.getAppIconSrc ? Api.getAppIconSrc(entry.pkg) : "";
+    const iconSrc =
+      entry.hasApplicationIdentity && Api.getAppIconSrc ? Api.getAppIconSrc(entry.pkg) : "";
     const initial = (entry.appName || entry.pkg || "?").trim().charAt(0).toUpperCase() || "?";
     const timeText = formatLogTime(entry);
     const timeTitle = State.logFullTime ? "切换为仅显示时间" : "切换为日期和时间";
     const canOpenApp =
+      entry.hasApplicationIdentity &&
       (entry.eventRole !== "observation" || entry.attributedObservation) &&
       isSinglePackageName(entry.pkg) &&
       !entry.isModuleWebUiExport;
@@ -7086,6 +7385,17 @@
         "</button>"
       : '<div class="log-app-identity is-disabled">' + identityContent + "</div>";
     const detailParts = [];
+    for (const [key, label] of [
+      ["caller_uid", "请求 UID"],
+      ["caller_pid", "请求 PID/TID"],
+      ["caller_start_time", "任务启动时钟"],
+      ["caller_context", "SELinux 域"],
+      ["caller_boundary", "归因边界"],
+      ["native", "原生执行者"],
+    ]) {
+      const value = entry.extras?.[key];
+      if (value != null && value !== "") detailParts.push(label + "：" + escapeHtml(String(value)));
+    }
     const requestPath = requestPathForLogEntry(entry);
     if (entry.backendPath && entry.backendPath !== entry.path)
       detailParts.push("实际路径：" + escapeHtml(entry.backendPath));
@@ -7374,8 +7684,14 @@
     const addCurrentValue = async () => {
       const result =
         activeType === `path`
-          ? validateMonitorFilterPath(input.value, { allowLegacyAbsolute: false })
-          : { valid: true, value: String(input.value || String()).trim(), msg: String() };
+          ? validateMonitorFilterPath(input.value, {
+              allowLegacyAbsolute: false,
+            })
+          : {
+              valid: true,
+              value: String(input.value || String()).trim(),
+              msg: String(),
+            };
       if (!result.valid || !result.value) {
         Theme.showToast(result.msg || `规则不能为空`, `error`);
         if (activeType === `path`) showMonitorFilterPathValidation(input, validation);
@@ -7493,6 +7809,9 @@
       normalizeUsersConfig,
       logOperationCopyValue,
       parseLogLine,
+      parseMonitorLogEntries,
+      renderLogCard,
+      coalesceLogEntries,
       shouldFilterMonitorLogEntry,
       splitMonitorOperationRules,
       setToggleBusy,
@@ -7508,12 +7827,14 @@
     setupHistory();
     initNav();
     initSearch();
+    initAppListRefresh();
     initLogSearch();
     initAppIconFallback();
     initListPerformanceControls();
     initPullRefreshControls();
     initDashboardRefreshHooks();
     initRuntimeActivationInteractions();
+    initHostStatusMetricInteraction();
     loadDashboard();
   }
   if (document.readyState === "loading") document.addEventListener("DOMContentLoaded", init);

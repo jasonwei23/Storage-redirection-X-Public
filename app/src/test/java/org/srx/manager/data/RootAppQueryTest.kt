@@ -9,93 +9,89 @@ import org.srx.manager.root.shellQuote
 
 class RootAppQueryTest {
   @Test
-  fun listUsersParsesDistinctUserIds() = runBlocking {
-    val shell =
-        CapturingShell(
-            ShellResult(
-                0,
-                """
-                Users:
-                    UserInfo{0:Owner:13} running
-                    UserInfo{10:Work:30} running
-                    UserInfo{10:Work:30} running
-                """
-                    .trimIndent(),
-                "",
-            ),
-        )
+  fun listUsersReadsSystemServerInventory() = runBlocking {
+    val shell = CapturingShell(ShellResult(0, "0\n10\n10\n", ""))
     val query = RootAppQuery(shell)
 
     assertEquals(listOf("0", "10"), query.listUsers())
     assertEquals(
-        "cmd user list 2>/dev/null || pm list users 2>/dev/null",
+        "${shellQuote(SrxDaemonPath)} package-query T",
         shell.invocations.single().command,
     )
   }
 
   @Test
-  fun listUsersFallsBackToOwnerWhenNoUserOutput() = runBlocking {
-    val query = RootAppQuery(CapturingShell(ShellResult(0, "", "")))
-
-    assertEquals(listOf("0"), query.listUsers())
-  }
-
-  @Test
-  fun rejectsUnsafeUserId() = runBlocking {
-    val shell = CapturingShell()
-    val query = RootAppQuery(shell)
-
-    assertTrue(query.loadDexAppLabels("0;rm").isEmpty())
-    assertTrue(shell.invocations.isEmpty())
-  }
-
-  @Test
-  fun loadDexAppLabelsRunsDexAndFiltersUnsafePackages() = runBlocking {
-    val shell =
-        CapturingShell(
-            ShellResult(0, "", ""),
-            ShellResult(
-                0,
-                """
-                com.example.alpha=Alpha
-                bad/pkg=Bad
-                # comment
-                org.demo.beta Beta Label
-                """
-                    .trimIndent(),
-                "",
-            ),
-        )
-    val query = RootAppQuery(shell)
-
-    val labels = query.loadDexAppLabels("10")
-
-    assertEquals(mapOf("com.example.alpha" to "Alpha", "org.demo.beta" to "org.demo.beta"), labels)
-    assertEquals(2, shell.invocations.size)
-    assertTrue(
-        shell.invocations[0].command.contains("--user 10 > ${shellQuote(ListAppsOutputPath)}")
+  fun listUsersFallsBackToOwnerWhenQueryFailsOrIsEmpty() = runBlocking {
+    assertEquals(listOf("0"), RootAppQuery(CapturingShell()).listUsers())
+    assertEquals(
+        listOf("0"),
+        RootAppQuery(CapturingShell(ShellResult(0, "", ""))).listUsers(),
     )
-    assertEquals("cat ${shellQuote(ListAppsOutputPath)} 2>/dev/null", shell.invocations[1].command)
   }
 
   @Test
-  fun rootPackageListFiltersUnsafeNames() = runBlocking {
+  fun listsOnlyTheRequestedUsersApplicationsAndMetadata() = runBlocking {
     val shell =
         CapturingShell(
             ShellResult(
                 0,
-                """
-                package:/data/app/alpha/base.apk=com.example.alpha uid:10001
-                package:/data/app/bad/base.apk=bad/pkg uid:10002
-                package:/system/app/beta/base.apk=org.demo.beta uid:10003
-                """
-                    .trimIndent(),
+                "10\t1010123\t1\tcom.example.system\tSystem%20App\t%2Fsystem%2Fapp%2Fsystem%2Fbase.apk\n" +
+                    "10\t1010456\t0\tcom.example.user\tUser%09App\t%2Fdata%2Fapp%2Fuser%2Fbase.apk\n",
                 "",
             ),
         )
-    val query = RootAppQuery(shell)
 
-    assertEquals(listOf("com.example.alpha", "org.demo.beta"), query.listInstalledPackages("0"))
-    assertTrue(shell.invocations.single().command.contains("pm list packages -f -U --user 0"))
+    val apps = RootAppQuery(shell).listUserPackages("10")
+
+    assertEquals(listOf("com.example.system", "com.example.user"), apps.packageNames)
+    assertEquals(setOf("com.example.system"), apps.systemPackages)
+    assertEquals(mapOf("com.example.system" to 1010123, "com.example.user" to 1010456), apps.uids)
+    assertEquals("User\tApp", apps.labels["com.example.user"])
+    assertEquals(
+        "/data/app/user/base.apk",
+        apps.apkPaths["com.example.user"],
+    )
+    assertEquals(
+        "${shellQuote(SrxDaemonPath)} package-query A 10",
+        shell.invocations.single().command,
+    )
+  }
+
+  @Test
+  fun rejectsUnsafeUserAndMixedUserOrMalformedRows() = runBlocking {
+    val shell = CapturingShell()
+    assertEquals(UserPackageList.Empty, RootAppQuery(shell).listUserPackages("0;rm"))
+    assertTrue(shell.invocations.isEmpty())
+
+    assertEquals(
+        UserPackageList.Empty,
+        parseSystemServerAppList("11\t1010123\t0\tcom.example.app\tApp\t%2Fdata%2Fapp.apk\n", "10"),
+    )
+    assertEquals(
+        UserPackageList.Empty,
+        parseSystemServerAppList(
+            "10\t1010123\t0\tcom.example.app\tBad%2\t%2Fdata%2Fapp.apk\n",
+            "10",
+        ),
+    )
+    assertEquals(
+        UserPackageList.Empty,
+        parseSystemServerAppList("10\t1010123\t0\tcom.example.app\tApp\trelative.apk\n", "10"),
+    )
+    assertEquals(
+        UserPackageList.Empty,
+        parseSystemServerAppList("10\t+10123\t0\tcom.example.app\tApp\t%2Fdata%2Fapp.apk\n", "10"),
+    )
+    assertEquals(
+        UserPackageList.Empty,
+        parseSystemServerAppList("10\t10123\t0\tcom.example.app\tApp\t%2Fdata%2Fapp.apk\n", "10"),
+    )
+    assertEquals(
+        UserPackageList.Empty,
+        parseSystemServerAppList(
+            "10\t2147483648\t0\tcom.example.app\tApp\t%2Fdata%2Fapp.apk\n",
+            "10",
+        ),
+    )
   }
 }

@@ -3,18 +3,44 @@ use crate::platform::module_paths;
 use std::fs;
 use std::path::PathBuf;
 
-/// 挂载事实文件只在成功后生成；意图文件用于记录请求尚未执行或正在执行的阶段。
-/// 两者分离后，管理端可以观察到挂载前状态，也不会把失败请求误当成可卸载挂载点。
-pub fn mark_planned(
-    package_name: &str,
-    pid: i32,
-    uid: i32,
-    backend: StorageBackendMode,
-    config_version: u64,
-) {
-    write_state(package_name, pid, uid, backend, config_version, "planned");
+#[path = "mount_intent/identity.rs"]
+// quality-allow(lint-suppression): 身份读取与校验仅由 daemon 使用，cdylib 只写入意图。
+#[allow(dead_code)]
+mod identity;
+
+/// root 写入的意图同时保留 native 进程身份；daemon 按 UID 与 starttime 复核后使用。
+// quality-allow(lint-suppression): 仅 daemon 进程枚举记录，cdylib 只写入意图。
+#[allow(dead_code)]
+pub fn registered_processes() -> Vec<identity::RegisteredProcess> {
+    use std::os::unix::fs::MetadataExt;
+    let Ok(entries) = fs::read_dir(module_paths::MOUNT_INTENT_DIR) else {
+        return Vec::new();
+    };
+    entries
+        .flatten()
+        .filter_map(|entry| {
+            let path = entry.path();
+            if path.extension()?.to_str()? != "intent" {
+                return None;
+            }
+            let metadata = fs::symlink_metadata(&path).ok()?;
+            if !metadata.is_file()
+                || metadata.uid() != 0
+                || metadata.mode() & 0o022 != 0
+                || metadata.len() > 4096
+            {
+                return None;
+            }
+            identity::decode(&fs::read_to_string(path).ok()?)
+        })
+        .collect()
 }
 
+/// 挂载事实文件只在成功后生成；意图文件用于记录请求尚未执行或正在执行的阶段。
+/// 两者分离后，管理端可以观察到挂载前状态，也不会把失败请求误当成可卸载挂载点。
+///
+/// 应用进程不写意图文件：它在 zygote 域对模块目录没有写权限，写必然 EACCES，只会留下
+/// 噪音日志。意图从 daemon / companion 收到请求时的 `applying` 开始记录。
 pub fn mark_state(
     package_name: &str,
     pid: i32,

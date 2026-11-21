@@ -29,6 +29,7 @@ import org.srx.manager.data.BackupArchiveCodec
 import org.srx.manager.data.ConfigTemplate
 import org.srx.manager.data.DashboardState
 import org.srx.manager.data.DiagnosticArchiveProgress
+import org.srx.manager.data.DiagnosticExportResult
 import org.srx.manager.data.FileMonitorFilters
 import org.srx.manager.data.GlobalConfig
 import org.srx.manager.data.InstalledApp
@@ -83,20 +84,21 @@ private const val DashboardCountsThrottleMs = 1200L
  * 进程级应用列表缓存。
  *
  * ViewModel 会随界面重建而重新初始化，若每次都要等 root 与 PackageManager 查询完成才出内容，
- * 返回应用页时会重复出现空列表。这里按用户缓存最近一次结果，重建后可以先渲染旧列表， 后台刷新完成再替换。
+ * 返回应用页时会重复出现空列表。这里按用户缓存最近一次结果，重建后可以先渲染旧列表， 后台刷新完成再替换。 按用户分槽保存：切回上一次看过的用户时不必再等一次完整加载。
  */
 private object AppListMemoryCache {
-  private var cachedUserId: String? = null
-  private var cachedApps: List<InstalledApp> = emptyList()
+  private const val MaxCachedUsers = 4
+  private val cached = LinkedHashMap<String, List<InstalledApp>>()
 
-  @Synchronized
-  fun get(userId: String): List<InstalledApp> =
-      if (cachedUserId == userId) cachedApps else emptyList()
+  @Synchronized fun get(userId: String): List<InstalledApp> = cached[userId].orEmpty()
 
   @Synchronized
   fun put(userId: String, apps: List<InstalledApp>) {
-    cachedUserId = userId
-    cachedApps = apps
+    cached.remove(userId)
+    cached[userId] = apps
+    while (cached.size > MaxCachedUsers) {
+      cached.remove(cached.keys.first())
+    }
   }
 }
 
@@ -219,6 +221,7 @@ class SrxViewModel(
                                 runtimeActivations = runtimeActivations,
                             ),
                     )
+                refreshStorageBackendStatus()
               }
               .onFailure {
                 // 计数刷新失败时数字会停留在旧值，与「确实没有已启用应用」无法区分，
@@ -227,6 +230,23 @@ class SrxViewModel(
                 showMessage("加载概览计数失败：${it.message ?: "未知错误"}")
               }
         }
+  }
+
+  /**
+   * 单独刷新概览页的共享宿主状态指示。
+   *
+   * 失败时保持旧值不清空：宿主状态读取走的是一次额外 root 调用， 偶发失败不应该把上一次的有效状态抹成未知。
+   */
+  private fun refreshStorageBackendStatus() {
+    viewModelScope.launch {
+      runCatching { repository.readStorageBackendStatus() }
+          .onSuccess { status ->
+            _state.value =
+                _state.value.copy(
+                    dashboard = _state.value.dashboard.copy(storageBackend = status),
+                )
+          }
+    }
   }
 
   fun refreshUsers() {
@@ -245,18 +265,20 @@ class SrxViewModel(
     appsJob =
         viewModelScope.launch {
           _state.value = _state.value.copy(appsRefreshing = true)
+          val userId = _state.value.selectedUser
+          // 两段式：手上有旧数据（进程缓存或上一次的磁盘快照）就先上屏，再等真实查询替换。
+          // 冷启动和非主用户首次切换都要等一次 root 查询，先出内容才不会出现「空列表 + 转圈」。
+          if (_state.value.apps.isEmpty()) {
+            val seed =
+                AppListMemoryCache.get(userId).ifEmpty { repository.readCachedAppList(userId) }
+            if (seed.isNotEmpty() && _state.value.selectedUser == userId) {
+              publishApps(userId, seed, refreshing = true)
+            }
+          }
           try {
-            val apps = repository.loadInstalledApps(_state.value.selectedUser, force)
-            AppListMemoryCache.put(_state.value.selectedUser, apps)
-            _state.value =
-                _state.value.copy(
-                    apps = apps,
-                    appsRefreshing = false,
-                    appsLoaded = true,
-                    error = null,
-                    dashboard =
-                        _state.value.dashboard.copy(enabledApps = apps.count { it.isEnabled }),
-                )
+            val apps = repository.loadInstalledApps(userId, force)
+            if (_state.value.selectedUser != userId) return@launch
+            publishApps(userId, apps, refreshing = false)
           } catch (canceled: CancellationException) {
             throw canceled
           } catch (error: Throwable) {
@@ -266,19 +288,22 @@ class SrxViewModel(
         }
   }
 
+  private fun publishApps(userId: String, apps: List<InstalledApp>, refreshing: Boolean) {
+    AppListMemoryCache.put(userId, apps)
+    _state.value =
+        _state.value.copy(
+            apps = apps,
+            appsRefreshing = refreshing,
+            appsLoaded = true,
+            error = null,
+            dashboard = _state.value.dashboard.copy(enabledApps = apps.count { it.isEnabled }),
+        )
+  }
+
   fun ensureAppsLoaded() {
     val state = _state.value
     if (state.appsLoaded || state.appsRefreshing) return
-    // 先用进程级缓存立即出内容，再在后台刷新，避免每次进入应用页都从空列表开始等待。
-    val cached = AppListMemoryCache.get(state.selectedUser)
-    if (cached.isNotEmpty()) {
-      _state.value =
-          state.copy(
-              apps = cached,
-              appsLoaded = true,
-              dashboard = state.dashboard.copy(enabledApps = cached.count { it.isEnabled }),
-          )
-    }
+    // 首屏内容由 refreshApps 的预热阶段负责上屏（进程缓存 → 磁盘快照），这里只负责触发加载。
     // force=false：初始化时 refreshDashboardCounts 已预热了配置 TTL 缓存，
     // 无需再次拉起 su 进程；只有 TTL 超期或配置写入后 invalidateConfiguredAppsCache
     // 主动使缓存失效时，才会实际触发 root 读取。
@@ -295,7 +320,9 @@ class SrxViewModel(
             appsLoaded = false,
             logApps = emptyList(),
         )
-    refreshApps(force = true)
+    // force=false：切换用户不会改变已安装内容，配置与应用包清单的 TTL 缓存可以复用，
+    // 否则每次切换都要重新拉起 su 读配置，切换多用户会明显变慢。
+    refreshApps(force = false)
   }
 
   fun setFilter(filter: AppFilter) {
@@ -554,18 +581,6 @@ class SrxViewModel(
     }
   }
 
-  fun addTemplate(name: String) {
-    viewModelScope.launch {
-      val ok = repository.upsertTemplate(name, defaultAppConfig())
-      if (ok) {
-        _state.value = _state.value.copy(templates = repository.readTemplates())
-        showMessage("模板已添加")
-      } else {
-        showMessage("添加模板失败")
-      }
-    }
-  }
-
   fun saveTemplate(template: ConfigTemplate) {
     viewModelScope.launch {
       val ok = repository.upsertTemplate(template.name, template.config, template.id)
@@ -574,22 +589,6 @@ class SrxViewModel(
         showMessage("模板已保存")
       } else {
         showMessage("保存模板失败")
-      }
-    }
-  }
-
-  fun renameTemplate(
-      templateId: String,
-      name: String,
-  ) {
-    viewModelScope.launch {
-      val template = repository.readTemplates().firstOrNull { it.id == templateId } ?: return@launch
-      val ok = repository.upsertTemplate(name, template.config, templateId)
-      if (ok) {
-        _state.value = _state.value.copy(templates = repository.readTemplates())
-        showMessage("模板已重命名")
-      } else {
-        showMessage("重命名失败")
       }
     }
   }
@@ -728,7 +727,7 @@ class SrxViewModel(
     viewModelScope.launch {
       updateBusy(
           BusyStateChange.Started(
-              if (enabled) "正在启动模块并重启 MediaProvider" else "正在停止模块并重启 MediaProvider"
+              if (enabled) "正在启动模块并请求 MediaProvider 热重载" else "正在停止模块并请求 MediaProvider 热重载"
           )
       )
       val ok = repository.setModuleEnabled(enabled)
@@ -751,7 +750,7 @@ class SrxViewModel(
                     if (result.success) {
                       "运行中应用已重新挂载，MediaProvider 已同步热重载"
                     } else {
-                      "运行中应用重新挂载超时"
+                      remountFailureMessage(result.failureReason)
                     },
                 )
               }
@@ -762,6 +761,23 @@ class SrxViewModel(
       }
     }
   }
+
+  /**
+   * 把 srxctl 的 remount_reason 令牌翻译成用户可读的失败提示。
+   *
+   * srxctl 在 daemon 未运行、MediaProvider 未运行、热重载超时等场景各有独立日志， 此前 UI 一律报「超时」，用户无法区分是环境没就绪还是真的超时。
+   */
+  private fun remountFailureMessage(reason: String?): String =
+      when (reason) {
+        "provider-not-running" -> "MediaProvider 未在运行，无法同步热重载"
+        "daemon-not-running" -> "模块 daemon 未运行，无法重新挂载运行中应用"
+        "hot-reload-timeout" -> "MediaProvider 热重载超时"
+        "remount-timeout" -> "运行中应用重新挂载超时"
+        "daemon-control-failed",
+        "hot-reload-request-failed",
+        "hot-reload-signal-failed" -> "热重载或重挂请求发送失败"
+        else -> "重新挂载运行中应用失败"
+      }
 
   fun refreshLogs() {
     viewModelScope.launch {
@@ -858,6 +874,7 @@ class SrxViewModel(
                               runtimeActivations = runtimeActivations,
                           ),
                   )
+              refreshStorageBackendStatus()
             }
         showMessage("生效次数已清零")
       } else {
@@ -876,16 +893,6 @@ class SrxViewModel(
     return "storage-redirect-x-logs-$stamp.tar.gz"
   }
 
-  fun exportDiagnosticArchiveToUri(uri: Uri) {
-    viewModelScope.launch {
-      updateBusy(BusyStateChange.Started("正在启动日志导出", 0.01f))
-      runCatching { repository.exportDiagnosticArchive(uri, ::updateDiagnosticArchiveProgress) }
-          .onSuccess { ok -> showMessage(if (ok) "日志包已保存" else "日志导出失败") }
-          .onFailure { showMessage(it.message ?: "日志导出失败") }
-      updateBusy(BusyStateChange.Finished)
-    }
-  }
-
   fun exportDiagnosticArchiveToDirectory(uri: Uri) {
     viewModelScope.launch {
       updateBusy(BusyStateChange.Started("正在启动日志导出", 0.01f))
@@ -896,11 +903,20 @@ class SrxViewModel(
                 ::updateDiagnosticArchiveProgress,
             )
           }
-          .onSuccess { ok -> showMessage(if (ok) "日志包已保存" else "日志导出失败") }
+          .onSuccess { result -> showMessage(describeDiagnosticExport(result)) }
           .onFailure { showMessage(it.message ?: "日志导出失败") }
       updateBusy(BusyStateChange.Finished)
     }
   }
+
+  /** 目标存储不可写时降级到模块目录的导出结果，需提示用户手动拷贝。 */
+  private fun describeDiagnosticExport(result: DiagnosticExportResult): String =
+      when {
+        !result.saved -> "日志导出失败"
+        result.fallbackPath != null ->
+            "目标存储不可写，日志包已保存到模块目录（请用 root 文件管理器或 adb 手动拷贝）：${result.fallbackPath}"
+        else -> "日志包已保存"
+      }
 
   private fun updateDiagnosticArchiveProgress(progress: DiagnosticArchiveProgress) {
     updateBusy(BusyStateChange.Progress(progress))

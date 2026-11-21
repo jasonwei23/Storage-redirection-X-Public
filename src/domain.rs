@@ -19,6 +19,29 @@ impl PathMapping {
     }
 }
 
+/// 单条跨媒体目录映射可直接用 namespace bind 表达。输入是按用户归一的绝对路径。
+pub fn is_single_concrete_media_mapping(mappings: &[PathMapping], storage_root: &str) -> bool {
+    let [mapping] = mappings else {
+        return false;
+    };
+    let Some(source) = paths::relative_child_path(&mapping.request_path, storage_root) else {
+        return false;
+    };
+    let Some(target) = paths::relative_child_path(&mapping.final_path, storage_root) else {
+        return false;
+    };
+    let Some((target_root, target_subpath)) = target.split_once('/') else {
+        return false;
+    };
+    matches!(source, "DCIM" | "Pictures" | "Movies")
+        && matches!(target_root, "DCIM" | "Pictures" | "Movies")
+        && source != target_root
+        && !paths::contains_wildcards(target_subpath)
+        && !target_subpath.contains('$')
+        && !paths::has_unsafe_segments(target_subpath)
+        && target_subpath.split('/').all(|segment| !segment.is_empty())
+}
+
 pub fn sort_path_mappings_longest_request_first(mappings: &mut [PathMapping]) {
     mappings.sort_by(|a, b| {
         if a.request_path.len() != b.request_path.len() {
@@ -39,6 +62,44 @@ pub fn sort_path_mappings_longest_request_first_case_insensitive(mappings: &mut 
                 .then_with(|| a.request_path.cmp(&b.request_path))
         }
     });
+}
+
+/// 判定映射表里是否存在「存储视图根之外」的一侧。
+///
+/// request 或 target 解析后落在私有 fs（如 `/data/user/0/<pkg>/files`、
+/// `/data/data/<pkg>/code_cache`）的映射，只能靠应用命名空间 bind 挂载实现；
+/// 共享宿主策略层只覆盖存储视图内的路径。宿主预接入（preattach）成功会短路
+/// 整个 planner，这类映射会被整体丢弃，因此命中时调用方必须放弃 preattach、
+/// 回落 planner 流程（planner 内部仍会优先宿主接入）。
+pub fn mappings_need_namespace_mount(
+    uid: i32,
+    app_data_dir: &str,
+    redirect_target: &str,
+    path_mappings: &[PathMapping],
+) -> bool {
+    if path_mappings.is_empty() {
+        return false;
+    }
+    let user_id = crate::platform::user_id_from_uid(uid);
+    let storage_root = paths::storage_user_root_for_user(user_id);
+    path_mappings.iter().any(|mapping| {
+        [&mapping.request_path, &mapping.final_path]
+            .iter()
+            .any(|raw| {
+                let resolved = paths::resolve_user_path(
+                    &paths::resolve_placeholders(
+                        &paths::normalize(raw),
+                        app_data_dir,
+                        redirect_target,
+                    ),
+                    user_id,
+                );
+                !resolved.is_empty()
+                    && !paths::has_unsafe_segments(&resolved)
+                    && paths::is_absolute(&resolved)
+                    && !paths::is_same_or_child(&resolved, &storage_root)
+            })
+    })
 }
 
 pub fn sort_path_mappings_shortest_request_first(mappings: &mut [PathMapping]) {
@@ -124,6 +185,7 @@ fn map_mapping_chain(path: &str, mappings: &[PathMapping], reverse: bool) -> Str
 
 /// 将链式路径规则展开为独立挂载点，保留直接入口并补齐每个父映射下的子入口。
 /// 所有最终目标仍由原规则按最长前缀解析，沿用循环检测和链深度边界。
+/// 输入须已按用户解析；主用户私有目录同时生成 `/data/data` 挂载入口。
 pub fn expand_namespace_path_mappings(mappings: &[PathMapping]) -> Vec<PathMapping> {
     let mut expanded = Vec::new();
     let mut seen = HashSet::new();
@@ -158,6 +220,17 @@ pub fn expand_namespace_path_mappings(mappings: &[PathMapping]) -> Vec<PathMappi
             }
         }
     }
+    // 传播隔离后两个私有目录入口的子挂载互不传播，不能只挂规范入口。
+    let legacy_entries: Vec<_> = expanded
+        .iter()
+        .filter_map(|mapping| {
+            let suffix = mapping.request_path.strip_prefix("/data/user/0/")?;
+            let request = format!("/data/data/{suffix}");
+            seen.insert(paths::match_key(&request))
+                .then(|| PathMapping::new(request, mapping.final_path.clone()))
+        })
+        .collect();
+    expanded.extend(legacy_entries);
     expanded
 }
 

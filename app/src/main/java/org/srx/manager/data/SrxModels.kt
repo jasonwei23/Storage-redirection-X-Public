@@ -18,9 +18,8 @@ const val StatsPath = "$StatsPersistDir/stats"
 const val RuntimeDisablePath = "$ModuleDir/.runtime_disabled"
 const val BootModuleVersionPath = "$ModuleDir/.boot_module_version"
 const val SrxCtlPath = "$ModuleDir/bin/srxctl"
+const val SrxDaemonPath = "$ModuleDir/bin/srx_daemon"
 const val DiagnosticArchiveScriptPath = "$ModuleDir/service.d/diagnostic_archive.sh"
-const val ListAppsDexPath = "$ModuleDir/bin/list_apps.dex"
-const val ListAppsOutputPath = "/data/Namespace-Proxy/list.config"
 const val FileMonitorLogPath = "$LogsDir/file_monitor.log"
 const val BackupMaxBytes = 8 * 1024 * 1024
 
@@ -110,15 +109,17 @@ data class InstalledApp(
     val appInfo: ApplicationInfo?,
     val config: AppConfig?,
     val isInstalled: Boolean = appInfo != null,
+    /** 该条目按哪个 Android 用户加载：配置状态必须按同一用户判定，否则分身用户会显示主用户的启用状态。 */
+    val userId: String = "0",
 ) {
   val isConfigured: Boolean
-    get() = config != null
+    get() = config?.users?.get(userId) != null
 
   val isMissing: Boolean
     get() = isConfigured && !isInstalled
 
   val isEnabled: Boolean
-    get() = isInstalled && config?.users?.values?.any { it.enabled } == true
+    get() = isInstalled && config?.users?.get(userId)?.enabled == true
 
   // 搜索框每次输入都会重算过滤结果，逐项调用 lowercase() 会在大列表上产生大量临时字符串，
   // 因此在构造后一次性缓存小写形式供 UI 复用。
@@ -146,6 +147,12 @@ data class LogEntry(
     val watchPackage: String = "",
     val identifyMethod: String = "",
     val identifyReliability: String = "",
+    val callerUid: Int? = null,
+    val callerPid: Int? = null,
+    val callerStartTime: Long? = null,
+    val callerContext: String = "",
+    val callerBoundary: String = "",
+    val nativeIdentity: String = "",
     /** request 是调用方操作，observation 是 daemon 对文件系统结果的观察。 */
     val eventRole: String = "",
     val correlationId: String = "",
@@ -156,7 +163,10 @@ data class LogEntry(
     val filterOperation: String = "",
     val operationIntent: String = "",
     val isModuleWebUiExport: Boolean = false,
-)
+) {
+  val hasApplicationIdentity: Boolean
+    get() = identifyMethod !in setOf("shared_uid", "executor") && callerBoundary.isBlank()
+}
 
 data class DashboardState(
     val status: ModuleStatus = ModuleStatus.Unknown,
@@ -164,6 +174,7 @@ data class DashboardState(
     val globalConfig: GlobalConfig = GlobalConfig(),
     val enabledApps: Int = 0,
     val runtimeActivations: String = "0",
+    val storageBackend: StorageBackendStatus? = null,
 )
 
 @Serializable

@@ -61,6 +61,7 @@ enum class TestCase(val id: String) {
   FILE_MKDIR("file_mkdir"),
   FILE_MKDIR_DENIED("file_mkdir_denied"),
   FILE_ATOMIC_SAVE("file_atomic_save"),
+  FILE_MUTATION_LIFECYCLE("file_mutation_lifecycle"),
   FILE_RENAME("file_rename"),
   FILE_RENAME_DENIED("file_rename_denied"),
   FILE_STAT("file_stat"),
@@ -77,7 +78,8 @@ enum class TestCase(val id: String) {
   FILE_LINK("file_link"),
   FILE_LINK_DENIED("file_link_denied"),
   FILE_SYMLINK("file_symlink"),
-  FILE_SYMLINK_DENIED("file_symlink_denied");
+  FILE_SYMLINK_DENIED("file_symlink_denied"),
+  DOWNLOADMANAGER_ENQUEUE("downloadmanager_enqueue");
 
   fun getMediaType(): MediaStoreApi.MediaType? =
       when (this) {
@@ -186,7 +188,8 @@ enum class TestCase(val id: String) {
               FILE_SYMLINK_DENIED,
           )
 
-  fun requiresFileDir(): Boolean = this == FILE_LIST_DIR || this == FILE_LIST_DIR_TREE
+  fun requiresFileDir(): Boolean =
+      this == FILE_LIST_DIR || this == FILE_LIST_DIR_TREE || this == FILE_MUTATION_LIFECYCLE
 
   fun run(context: Context, args: TestCaseArgs = TestCaseArgs()): TestResult {
     val mediaStore = MediaStoreTestCases(context)
@@ -255,6 +258,7 @@ enum class TestCase(val id: String) {
       FILE_MKDIR -> file.mkdir(args)
       FILE_MKDIR_DENIED -> file.mkdirDenied(args)
       FILE_ATOMIC_SAVE -> file.atomicSave(args)
+      FILE_MUTATION_LIFECYCLE -> file.mutationLifecycle(args)
       FILE_RENAME -> file.rename(args)
       FILE_RENAME_DENIED -> file.renameDenied(args)
       FILE_STAT -> file.stat(args)
@@ -272,6 +276,7 @@ enum class TestCase(val id: String) {
       FILE_LINK_DENIED -> file.linkDenied(args)
       FILE_SYMLINK -> file.symlink(args)
       FILE_SYMLINK_DENIED -> file.symlinkDenied(args)
+      DOWNLOADMANAGER_ENQUEUE -> file.downloadManagerEnqueue(args)
     }
   }
 

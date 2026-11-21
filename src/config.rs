@@ -1,10 +1,9 @@
 use crate::domain::PathMapping;
 use crate::platform;
 use crate::platform::module_paths;
-use once_cell::sync::Lazy;
 use std::collections::{HashMap, HashSet};
-use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{LazyLock, Mutex};
 
 /// 普通应用存储数据面的内部规划模式。
 ///
@@ -79,8 +78,6 @@ pub struct ResolvedUserProfile {
     pub path_mappings: Vec<PathMapping>,
 }
 
-// quality-allow(lint-suppression): 仅 daemon 使用的整轮快照不会出现在 cdylib 构建中。
-#[allow(dead_code)]
 /// 判断未配置重定向的普通应用是否进入“监视专用 FUSE”数据面。
 ///
 /// 该模式只用于共享存储上的文件操作审计：不改变路径后端，不安装应用侧 native hook，
@@ -89,10 +86,61 @@ pub fn should_capture_unconfigured_app(package_name: &str, uid: i32, enabled: bo
     enabled
         && !package_name.is_empty()
         && package_name != "com.storage.redirect.x"
-        && (10_000..90_000).contains(&uid)
+        && (10_000..90_000).contains(&(uid % platform::ANDROID_USER_ID_OFFSET))
         && !crate::redirect::policy::is_system_writer_package(package_name)
         && !crate::redirect::policy::is_file_monitor_bridge_package(package_name)
         && !crate::redirect::policy::is_file_monitor_ui_package(package_name)
+}
+
+/// 内核 FUSE passthrough 是否被逃生口关闭（`.fuse_passthrough_disabled` 标记文件）。
+///
+/// 默认（无标记）**自动开启**，设备兼容性由每次重启后的端到端探针判定
+/// （见 daemon 侧 passthrough probe）：探针发现内核缺陷（open/read EIO）则
+/// 设备级降级为关闭并重建宿主会话。标记文件是紧急排障通道，不是配置开关。
+pub fn is_fuse_passthrough_disabled() -> bool {
+    std::path::Path::new(module_paths::FUSE_PASSTHROUGH_DISABLE_FILE).exists()
+}
+
+fn fuse_passthrough_boot_id() -> String {
+    std::fs::read_to_string("/proc/sys/kernel/random/boot_id")
+        .map(|content| content.trim().to_string())
+        .unwrap_or_default()
+}
+
+/// passthrough 探测状态（仅当前 boot 有效）：`Some(true)`=探针通过，
+/// `Some(false)`=内核缺陷（设备级降级），`None`=未知（本 boot 尚未探测）。
+/// 绑定 boot_id：内核 OTA/重启后状态归零重新探测，避免一次性误判固化。
+pub fn fuse_passthrough_probe_state() -> Option<bool> {
+    let content = std::fs::read_to_string(module_paths::FUSE_PASSTHROUGH_STATE_FILE).ok()?;
+    let mut boot_matches = false;
+    let mut status = None;
+    for line in content.lines() {
+        if let Some(id) = line.strip_prefix("boot=") {
+            boot_matches = !id.is_empty() && id == fuse_passthrough_boot_id();
+        } else if let Some(value) = line.strip_prefix("status=") {
+            status = match value {
+                "ok" => Some(true),
+                "broken" => Some(false),
+                _ => None,
+            };
+        }
+    }
+    if boot_matches { status } else { None }
+}
+
+// quality-allow(lint-suppression): 调用方 daemon 侧探针位于 daemon_mount，仅由 bin #[path] 再编译。
+#[allow(dead_code)]
+pub fn write_fuse_passthrough_probe_state(ok: bool) {
+    let boot_id = fuse_passthrough_boot_id();
+    if boot_id.is_empty() {
+        return;
+    }
+    let content = format!(
+        "boot={}\nstatus={}\n",
+        boot_id,
+        if ok { "ok" } else { "broken" }
+    );
+    let _ = std::fs::write(module_paths::FUSE_PASSTHROUGH_STATE_FILE, content);
 }
 
 // quality-allow(lint-suppression): 字段由 daemon 二进制读取，cdylib 构建目标不会直接读取。
@@ -234,6 +282,13 @@ struct SettingsState {
     is_loaded: bool,
     should_log_summary: bool,
     last_fingerprint: u64,
+    /// 最近一次成功载入时看到的**廉价指纹**（目录 + 两个根配置文件的 stat）。
+    /// 非空时用它做「有没有人改过配置」的一秒级判定，避免每秒做完整指纹。
+    last_quick_fingerprint: Option<u64>,
+    /// 最近一次做**完整指纹**（readdir + 每个应用配置一次 stat）的时刻。
+    /// 廉价指纹只覆盖「目录被碰过」的写入形态；就地覆盖写不会改目录 mtime，因此仍需
+    /// 按分钟级做一次完整指纹兜底，不能让廉价判据把这类写入永久漏掉。
+    last_full_fingerprint_ms: i64,
     invalid_packages: HashSet<String>,
 }
 
@@ -250,6 +305,8 @@ impl SettingsState {
             is_loaded: false,
             should_log_summary: true,
             last_fingerprint: 0,
+            last_quick_fingerprint: None,
+            last_full_fingerprint_ms: 0,
             invalid_packages: HashSet::new(),
         }
     }
@@ -298,4 +355,4 @@ impl SettingsHub {
     }
 }
 
-static SETTINGS_HUB: Lazy<SettingsHub> = Lazy::new(SettingsHub::new);
+static SETTINGS_HUB: LazyLock<SettingsHub> = LazyLock::new(SettingsHub::new);

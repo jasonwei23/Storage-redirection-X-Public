@@ -118,6 +118,12 @@ private val LicenseItems =
             "https://github.com/MaterialCleaner/Media-Provider-FuseFixer",
         ),
         LicenseItem(
+            "模块核心",
+            "Fuse-Proxy",
+            "GPL-3.0",
+            "https://github.com/huniangitb/Fuse-Proxy",
+        ),
+        LicenseItem(
             "Root / WebUI",
             "KernelSU",
             "GPL 3.0 / GPL 2.0",

@@ -12,11 +12,17 @@ import org.srx.manager.root.RootShell
 import org.srx.manager.root.isSafePackageName
 import org.srx.manager.root.shellQuote
 
+/** 诊断日志包导出结果。fallbackPath 非空表示公共存储不可写（存储挂载异常的典型 现场），日志包已降级保存到模块目录，需用户用 root 文件管理器或 adb 手动拷贝。 */
+data class DiagnosticExportResult(
+    val saved: Boolean,
+    val fallbackPath: String? = null,
+)
+
 /**
  * 诊断日志包导出边界。
  *
- * 这里集中处理「root 侧归档文件 → 用户目标位置」的写通道：content URI、SAF 文档树， 以及主存储树不可用时的 /data/media
- * 回退，并在导出成功后补记一条文件监控记录。 SrxRepository 只保留业务入口，不再承担写出细节。
+ * 这里集中处理「root 侧归档文件 → 用户目标位置」的写通道：content URI、SAF 文档树， 主存储树不可用时的 /data/media
+ * 回退，以及以上通道全部不可用时的模块目录降级， 并在导出成功后补记一条文件监控记录。 SrxRepository 只保留业务入口，不再承担写出细节。
  */
 internal class DiagnosticArchiveExporter(
     private val context: Context,
@@ -33,27 +39,11 @@ internal class DiagnosticArchiveExporter(
     const val DefaultArchiveFileName = "storage-redirect-x-logs.tar.gz"
   }
 
-  suspend fun exportToUri(
-      uri: Uri,
-      onProgress: ((DiagnosticArchiveProgress) -> Unit)? = null,
-  ): Boolean =
-      withContext(Dispatchers.IO) {
-        val archivePath = fileStore.createDiagnosticArchive(onProgress) ?: return@withContext false
-        try {
-          onProgress?.invoke(DiagnosticArchiveProgress(99, "copy", "正在写入目标文件"))
-          val ok = copyRootFileToUri(archivePath, uri)
-          if (ok) onProgress?.invoke(DiagnosticArchiveProgress(100, "done", "日志包已保存"))
-          ok
-        } finally {
-          fileStore.removeFile(archivePath)
-        }
-      }
-
   suspend fun exportToDirectory(
       directoryUri: Uri,
       fileName: String,
       onProgress: ((DiagnosticArchiveProgress) -> Unit)? = null,
-  ): Boolean =
+  ): DiagnosticExportResult =
       withContext(Dispatchers.IO) {
         val safeName =
             fileName.replace(Regex("[\\\\/:*?\"<>|\\u0000-\\u001f]"), "_").ifBlank {
@@ -61,7 +51,9 @@ internal class DiagnosticArchiveExporter(
             }
         val monitorTargetPath =
             resolvePrimaryTreePublicStorageDirectory(directoryUri)?.let { joinPath(it, safeName) }
-        val archivePath = fileStore.createDiagnosticArchive(onProgress) ?: return@withContext false
+        val archivePath =
+            fileStore.createDiagnosticArchive(onProgress)
+                ?: return@withContext DiagnosticExportResult(false)
         try {
           onProgress?.invoke(DiagnosticArchiveProgress(99, "copy", "正在写入目标文件"))
           val ok =
@@ -70,12 +62,36 @@ internal class DiagnosticArchiveExporter(
           if (ok) {
             onProgress?.invoke(DiagnosticArchiveProgress(100, "done", "日志包已保存"))
             recordAppExportMonitor(monitorTargetPath, "diagnostic")
+            DiagnosticExportResult(true)
+          } else {
+            exportToModuleDirectory(archivePath, safeName, onProgress)
           }
-          ok
         } finally {
           fileStore.removeFile(archivePath)
         }
       }
+
+  /** 公共存储全通道失败后的降级：日志包留在模块目录（root 直连路径，不经 FUSE 视图）。 */
+  private suspend fun exportToModuleDirectory(
+      archivePath: String,
+      fileName: String,
+      onProgress: ((DiagnosticArchiveProgress) -> Unit)?,
+  ): DiagnosticExportResult {
+    val safeName =
+        fileName.replace(Regex("[\\\\/:*?\"<>|\\u0000-\\u001f]"), "_").ifBlank {
+          DefaultArchiveFileName
+        }
+    val targetPath = "$ModuleDir/$safeName"
+    val command =
+        "cp ${shellQuote(archivePath)} ${shellQuote(targetPath)} && chmod 0644 ${shellQuote(targetPath)} && [ -s ${shellQuote(targetPath)} ]"
+    val ok = shell.exec(command).isSuccess
+    if (ok) {
+      onProgress?.invoke(
+          DiagnosticArchiveProgress(100, "done", "目标存储不可写，日志包已保存到模块目录"),
+      )
+    }
+    return DiagnosticExportResult(ok, if (ok) targetPath else null)
+  }
 
   private fun exportViaDocumentTree(
       archivePath: String,
@@ -176,8 +192,8 @@ internal class DiagnosticArchiveExporter(
     val command =
         "mkdir -p ${shellQuote(LogsDir)} && " +
             "ts=\$(date '+%Y-%m-%d %H:%M:%S' 2>/dev/null || toybox date '+%Y-%m-%d %H:%M:%S' 2>/dev/null); " +
-            "printf '%s|%s|%s|OPEN|%s|ret=0|errno=0|identify_method=caller|identify_reliability=high|op=provider_open|op_filter=provider_open:write|source=%s|export_kind=%s\\n' " +
-            "\"\${ts:-unknown}\" ${shellQuote(packageName)} ${shellQuote(packageName)} ${shellQuote(path)} ${shellQuote(source)} ${shellQuote(exportKind)} >> ${shellQuote(FileMonitorLogPath)}; " +
+            "printf '%s|%s|%s|OPEN|%s|field_encoding=percent|ret=0|errno=0|identify_method=caller|identify_reliability=high|op=provider_open|op_filter=provider_open:write|source=%s|export_kind=%s\\n' " +
+            "\"\${ts:-unknown}\" ${shellQuote(packageName)} ${shellQuote(packageName)} ${shellQuote(encodeMonitorLogField(path))} ${shellQuote(source)} ${shellQuote(exportKind)} >> ${shellQuote(FileMonitorLogPath)}; " +
             "chmod 666 ${shellQuote(FileMonitorLogPath)} 2>/dev/null || true"
     runCatching { shell.exec(command, timeoutMs = 10_000L) }
   }

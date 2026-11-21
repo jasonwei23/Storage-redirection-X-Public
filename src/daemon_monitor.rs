@@ -15,8 +15,9 @@ use events::{
     should_skip_public_root_event_identity,
 };
 use roots::{
-    build_private_owner_repair_roots, build_public_owner_repair_root, build_watch_roots,
-    dedup_roots, is_under_any_root, select_watch_start, should_descend_into_child,
+    build_private_category_owner_roots, build_private_owner_repair_roots,
+    build_public_owner_repair_root, build_watch_roots, dedup_roots, is_self_nested_redirect_path,
+    is_under_any_root, map_record_from_path, select_watch_start, should_descend_into_child,
     should_record_display_path, sort_roots_by_monitor_priority,
 };
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -25,8 +26,12 @@ const DUPLICATE_EVENT_WINDOW_MS: i64 = 1500;
 const MISSING_ROOT_RETRY_MS: i64 = 1000;
 const MAX_RECENT_EVENTS: usize = 512;
 const DEFAULT_MAX_WATCHES: usize = 8192;
-/// 防止设备把 inotify 配额调得过大后，监视器一次性递归展开整个共享存储。
-const MAX_WATCHES_CEILING: usize = 32768;
+/// 运行期监视上限的绝对封顶：即使内核配额被调得很大，也不允许监视器一次性
+/// 递归展开整个共享存储（防止单应用/全盘写入风暴把 daemon 拖死）。
+const MAX_WATCHES_CEILING: usize = 131072;
+/// 内核配额中允许监视器占用的比例上限，其余留给系统其它 inotify 用户。
+const MAX_WATCHES_KERNEL_SHARE_NUM: usize = 3;
+const MAX_WATCHES_KERNEL_SHARE_DEN: usize = 4;
 /// 单轮 `drain_events` 最多处理的事件数。
 ///
 /// 事件掩码包含 `IN_MODIFY`，持续写入会按写调用产生事件。若一直读到 EAGAIN 才返回，
@@ -47,27 +52,71 @@ const MAX_PRE_RESET_DRAIN_ROUNDS: usize = 4;
 /// 会反复触发全扫，反而延长处理时间、加剧溢出。
 const OVERFLOW_RESYNC_MIN_INTERVAL_MS: i64 = 30_000;
 const MAX_PUBLIC_OWNER_REPAIR_DIRS: usize = 32768;
-/// 公共 owner 修复不安装 inotify watch，使用有界周期扫描覆盖运行期间新建的目录。
-const PUBLIC_OWNER_REPAIR_INTERVAL_MS: i64 = 1000;
 
-/// 死监视条目对账周期。inotify 队列溢出会丢弃 IN_IGNORED/IN_DELETE 事件，
-/// `watch_nodes` 中对应条目从此无人删除；内核复用 wd 后新目录的节点又推进
-/// 同一个 Vec，条目逐代堆积（ishtar 实测：繁忙设备 1.5 小时积到每 wd 平均
-/// ~12 个节点，监视树内存 121MB，而全新树只需 15MB）。按分钟级对账即可把
-/// 滞留控制在一个小窗口内。
-const PRUNE_DEAD_WATCHES_INTERVAL_MS: i64 = 60_000;
-/// 公共 owner 修复扫描在目录数没有变化时的记录间隔（扫描每 1 秒一轮，约 5 分钟）。
+/// 死条目对账的**重试**窗口（不是周期）。
+///
+/// 漂移的根因只有一个：inotify 队列溢出会丢弃 `IN_IGNORED`/`IN_DELETE` 事件，
+/// `watch_nodes` 里对应条目从此无人删除；内核复用 wd 后新目录的节点又推进同一个
+/// Vec，条目逐代堆积（真机实测：繁忙设备 1.5 小时积到每 wd 平均 ~12 个节点，
+/// 监视树内存 121MB，而全新树只需 15MB）。
+///
+/// 也就是说「溢出」本身就是漂移的充分条件，而它也是**一个可观测的事件**。因此对账
+/// 不再按固定周期跑（那是每 60 秒读一次最长可达 1 MB 的 `fdinfo`、解析数万行白工），
+/// 改由溢出事件打标记触发；本常量只限制对账**失败后**的重试频率。
+const DRIFT_PRUNE_RETRY_MS: i64 = 60_000;
+/// 公共 owner 修复扫描在目录数没有变化时的记录间隔（建树与事件驱动轮次，约 5 分钟）。
 const PUBLIC_OWNER_REPAIR_LOG_HEARTBEAT: u64 = 300;
+/// 创建/写入观察事件的延迟裁决窗口：请求行（hook→socket→日志线程登记 hint）
+/// 晚于 inotify 事件到达是固有顺序，窗口内等 hint 落位后再裁决是否抑制。
+/// 只影响台账时序（至多数百毫秒），不影响文件系统路径。
+const OBSERVATION_PARK_WINDOW_MS: i64 = 250;
+/// 待裁决观察事件队列上限；风暴期超过上限时放弃延迟，按原行为立即发射。
+const MAX_PENDING_OBSERVATIONS: usize = 4096;
 /// 递归展开监视树时最多访问的目录数，与 [`MAX_PUBLIC_OWNER_REPAIR_DIRS`] 对齐。
 const MAX_EXISTING_TREE_REPAIR_DIRS: usize = 32768;
 const PUBLIC_OWNER_EXISTING_WATCH_DEPTH: usize = 2;
 
+/// 内核 inotify 配额（`/proc/sys/fs/inotify/max_user_watches`）的读取缓存时长。
+///
+/// 该值只在系统属性被改写时才变，而 `reconfigure` 每一轮都要问一次；此前每次重建
+/// 都读一遍 `/proc`，在写入风暴（每轮事件都要重建判定）时被按事件批次放大。带 TTL
+/// 的缓存让稳态下每分钟只读一次。
+const MAX_WATCHES_CACHE_TTL_MS: i64 = 60_000;
+static MAX_WATCHES_CACHE_MS: std::sync::atomic::AtomicI64 =
+    std::sync::atomic::AtomicI64::new(i64::MIN / 2);
+static MAX_WATCHES_CACHED: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(DEFAULT_MAX_WATCHES);
+
 fn runtime_max_watches() -> usize {
+    let now_ms = paths::monotonic_ms();
+    if now_ms.saturating_sub(MAX_WATCHES_CACHE_MS.load(std::sync::atomic::Ordering::Relaxed))
+        < MAX_WATCHES_CACHE_TTL_MS
+    {
+        return MAX_WATCHES_CACHED.load(std::sync::atomic::Ordering::Relaxed);
+    }
+    let value = compute_runtime_max_watches();
+    MAX_WATCHES_CACHED.store(value, std::sync::atomic::Ordering::Relaxed);
+    MAX_WATCHES_CACHE_MS.store(now_ms, std::sync::atomic::Ordering::Relaxed);
+    value
+}
+
+fn compute_runtime_max_watches() -> usize {
     std::fs::read_to_string("/proc/sys/fs/inotify/max_user_watches")
         .ok()
         .and_then(|value| value.trim().parse::<usize>().ok())
         .filter(|limit| *limit > 0)
-        .map(|limit| limit.min(MAX_WATCHES_CEILING))
+        .map(|limit| {
+            // 预算取「内核配额的 3/4」与「绝对封顶」中较小者，且不低于固定下限：
+            // 真机实测内核配额 78938 而旧上限 32768 被顶死，监视树每轮重建都在
+            // 容量受限状态下反复展开（每次全树展开都要穿过 FUSE 视图，是 CPU
+            // 突发的稳定来源）；按配额比例放宽后树可以一次建完，不再周期性重试。
+            let proportional = limit * MAX_WATCHES_KERNEL_SHARE_NUM / MAX_WATCHES_KERNEL_SHARE_DEN;
+            // clamp 的上下界都不得高于内核配额（clamp 要求 min<=max）：配额异常小
+            // （低于默认下限）时收敛到配额本身。
+            let floor = DEFAULT_MAX_WATCHES.min(limit);
+            let ceiling = limit.max(floor);
+            proportional.min(MAX_WATCHES_CEILING).clamp(floor, ceiling)
+        })
         .unwrap_or(DEFAULT_MAX_WATCHES)
 }
 
@@ -94,7 +143,7 @@ fn read_live_watch_fds(fd: i32) -> Option<HashSet<i32>> {
         let Some(rest) = line.strip_prefix("inotify wd:") else {
             continue;
         };
-        let number = rest.trim().split_whitespace().next().unwrap_or("");
+        let number = rest.split_whitespace().next().unwrap_or("");
         if let Ok(wd) = number.parse::<i32>() {
             live.insert(wd);
         }
@@ -121,16 +170,18 @@ fn repair_monitored_backend_owner_for_watchers_dir(
     }
 }
 
+/// watcher 集合驻留表类型：按集合内容驻留，同一棵子树内所有目录的 watcher
+/// 集合与根完全一致，全树每个不同的根只存一份 Arc。
+type WatcherInternTable = std::sync::Mutex<
+    std::collections::HashMap<Vec<WatchWatcher>, std::sync::Arc<Vec<WatchWatcher>>>,
+>;
+
 /// watcher 集合驻留表：同一棵子树内所有目录的 watcher 集合与根完全一致，
 /// 按集合内容驻留后全树每个不同的根只存一份 Arc。直接 Arc::make_mut 做合并
 /// 会因「子树共享着同一份 Arc」在每次合并时深拷贝整个集合，25036 个目录各自
-/// 持有 ~20 项的副本（ishtar 实测 30MB），驻留才是正确的共享方式。
+/// 持有 ~20 项的副本（真机实测 30MB），驻留才是正确的共享方式。
 fn intern_watchers(set: Vec<WatchWatcher>) -> std::sync::Arc<Vec<WatchWatcher>> {
-    static INTERN: std::sync::OnceLock<
-        std::sync::Mutex<
-            std::collections::HashMap<Vec<WatchWatcher>, std::sync::Arc<Vec<WatchWatcher>>>,
-        >,
-    > = std::sync::OnceLock::new();
+    static INTERN: std::sync::OnceLock<WatcherInternTable> = std::sync::OnceLock::new();
     let mut table = INTERN
         .get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
         .lock()
@@ -167,7 +218,7 @@ fn intern_shared(value: &str) -> std::sync::Arc<str> {
 ///
 /// 同一物理目录（同一 wd）会被多个应用的监视根各自展开：模板配置让若干应用
 /// 共享 Download/DCIM 等公共目录，旧结构按 (包,目录) 各建一个节点并各自克隆
-/// 一份目录路径串，节点与字符串按共享包数成倍膨胀（ishtar 实测 ~6.6 倍，
+/// 一份目录路径串，节点与字符串按共享包数成倍膨胀（真机实测 ~6.6 倍，
 /// 监视树内存 121MB）。合并后每目录一个节点，包级信息收进 watchers。
 #[derive(Clone, PartialEq, Eq, Hash)]
 struct WatchWatcher {
@@ -188,7 +239,7 @@ struct WatchNode {
     backend_dir: String,
     display_dir: String,
     /// 共享的 watcher 集合：同一棵子树内所有目录的 watcher 集合与根完全一致，
-    /// Arc 共享让子节点继承退化为指针拷贝（ishtar 实测：25036 个目录若各自
+    /// Arc 共享让子节点继承退化为指针拷贝（真机实测：25036 个目录若各自
     /// 克隆 ~20 项 watcher 列表要 30MB，共享后整棵树每根只存一份）。
     watchers: std::sync::Arc<Vec<WatchWatcher>>,
 }
@@ -212,20 +263,37 @@ pub struct RegularAppMonitor {
     needs_rebuild: bool,
     /// inotify 队列溢出后待执行的一次全量补偿扫描。
     overflow_resync: bool,
+    /// 是否已完成 daemon 启动后的首次全量建树。private_owner 根的逐文件
+    /// owner 修复只在该首次建树与溢出补偿时执行：历史遗留 owner 修过一次
+    /// 即可，后续配置变更重建再走一遍是纯浪费（auto_enable 场景每个新应用
+    /// 都写配置触发全量重建，逐文件 lstat 让监视线程持续 100% 单核）。
+    first_build_done: bool,
     last_rebuild_ms: i64,
     /// `inotify_add_watch` 非预期 errno 的累计次数，用于按 2 的幂限频告警。
     add_watch_error_count: u32,
+    /// 是否观测到「可能造成账本漂移」的队列溢出（对账的唯一触发条件）。
+    drift_suspected: bool,
     /// 上次登记溢出补偿全量扫描的时间，用于限流。
     last_overflow_resync_ms: i64,
     /// 配置未变化而直接沿用现有监视树的次数，用于限频输出排查日志。
     unchanged_reconfigure_count: u32,
-    last_public_owner_repair_ms: i64,
     /// 上次死监视条目对账时间，用于节流。
     last_prune_dead_ms: i64,
     /// 各公共 owner 根上次扫描到的目录数，用于只在覆盖范围变化时记录扫描摘要。
     public_owner_repair_log_dirs: HashMap<String, usize>,
     /// 公共 owner 修复扫描的记录次数，用于按心跳间隔补充摘要。
     public_owner_repair_log_count: u64,
+    /// 延迟裁决中的创建/写入观察事件：等待请求 hint 落位后再决定是否抑制。
+    pending_observations: Vec<ParkedObservation>,
+}
+
+/// 延迟裁决中的观察事件快照。
+struct ParkedObservation {
+    wd: i32,
+    display_path: String,
+    backend_path: String,
+    mask: u32,
+    parked_at_ms: i64,
 }
 
 impl RegularAppMonitor {
@@ -243,14 +311,16 @@ impl RegularAppMonitor {
             capacity_limited: false,
             needs_rebuild: true,
             overflow_resync: false,
+            first_build_done: false,
             last_rebuild_ms: 0,
             add_watch_error_count: 0,
+            drift_suspected: false,
             last_overflow_resync_ms: 0,
             unchanged_reconfigure_count: 0,
-            last_public_owner_repair_ms: 0,
             last_prune_dead_ms: 0,
             public_owner_repair_log_dirs: HashMap::new(),
             public_owner_repair_log_count: 0,
+            pending_observations: Vec::new(),
         }
     }
 
@@ -260,8 +330,21 @@ impl RegularAppMonitor {
             && paths::monotonic_ms().saturating_sub(self.last_rebuild_ms) >= MISSING_ROOT_RETRY_MS
     }
 
-    pub fn configured_version(&self) -> u64 {
-        self.config_version
+    /// 返回最近一项监视维护工作的绝对单调截止时间。
+    /// 缺失根重试 1 秒截止；已停车的观察事件按自身 250ms 截止。
+    pub fn next_wakeup_deadline_ms(&self) -> Option<i64> {
+        let missing_deadline = (!self.capacity_limited && self.missing_roots > 0)
+            .then(|| self.last_rebuild_ms.saturating_add(MISSING_ROOT_RETRY_MS));
+        let observation_deadline = self
+            .pending_observations
+            .iter()
+            .map(|item| item.parked_at_ms.saturating_add(OBSERVATION_PARK_WINDOW_MS))
+            .min();
+        match (missing_deadline, observation_deadline) {
+            (Some(missing), Some(observation)) => Some(missing.min(observation)),
+            (Some(deadline), None) | (None, Some(deadline)) => Some(deadline),
+            (None, None) => None,
+        }
     }
 
     /// 返回监视器 inotify fd，供 daemon 事件循环阻塞等待文件事件。
@@ -276,7 +359,9 @@ impl RegularAppMonitor {
             if self.should_retry_missing_roots() {
                 self.retry_missing_watch_roots();
             }
-            self.repair_public_owner_roots_if_due();
+            // 公共 owner 的 1 秒周期扫描已移除（2026-10-21 用户拍板）：建树时的
+            // 一次性全树扫描 + inotify 事件驱动修复（含 missing 重试与溢出补偿）
+            // 已覆盖新建目录与属主回退，周期性全树遍历只剩 I/O 开销。
             self.prune_dead_watches_if_due();
             // 排查用：按 2 的幂限频记录一次「配置未变化、沿用现有监视树」。
             // 汇总日志缺失时需要区分两种情形：reconfigure 每轮都在走这条捷径
@@ -341,6 +426,9 @@ impl RegularAppMonitor {
                 roots.extend(build_watch_roots(spec));
             }
         }
+        // 类别级私有属主 watch 与应用配置无关：只要存储用户目录存在就登记，
+        // 覆盖未开启重定向/未配置应用的属主异常发现。
+        roots.extend(build_private_category_owner_roots());
         dedup_roots(&mut roots);
         sort_roots_by_monitor_priority(&mut roots);
         self.public_owner_roots = roots
@@ -372,18 +460,20 @@ impl RegularAppMonitor {
 
         // 溢出补偿扫描需要对全部来源重新执行 owner 修复，不能只覆盖 private_owner。
         let overflow_resync = std::mem::take(&mut self.overflow_resync);
+        // replace 返回旧状态：只有旧值为 false 才是首次建树。
+        let first_build = !std::mem::replace(&mut self.first_build_done, true);
         if !self.capacity_limited {
             for node in expansion_roots {
                 let repair_existing_files = overflow_resync
-                    || node
-                        .watchers
-                        .iter()
-                        .any(|watcher| watcher.source == "private_owner");
+                    || (first_build
+                        && node
+                            .watchers
+                            .iter()
+                            .any(|watcher| watcher.source == "private_owner"));
                 let recurse_existing_tree = overflow_resync
-                    || node
-                        .watchers
-                        .iter()
-                        .any(|watcher| watcher.source != "public_owner");
+                    || node.watchers.iter().any(|watcher| {
+                        !matches!(watcher.source, "public_owner" | "private_category_owner")
+                    });
                 self.expand_watch_tree_from(node, repair_existing_files, recurse_existing_tree);
                 if self.capacity_limited {
                     break;
@@ -404,7 +494,6 @@ impl RegularAppMonitor {
             }
         }
         self.missing_watch_roots = missing_watch_roots;
-        self.last_public_owner_repair_ms = paths::monotonic_ms();
 
         log::info!(
             "daemon monitor roots={} applied={} missing={} watches={} capacity_limited={} version={:x}",
@@ -418,10 +507,10 @@ impl RegularAppMonitor {
     }
 
     fn retry_missing_watch_roots(&mut self) {
-        self.last_rebuild_ms = paths::monotonic_ms();
         if self.missing_watch_roots.is_empty() || self.capacity_limited {
             return;
         }
+        self.last_rebuild_ms = paths::monotonic_ms();
         if !self.ensure_fd() {
             self.needs_rebuild = true;
             return;
@@ -430,14 +519,12 @@ impl RegularAppMonitor {
         let previous_missing = self.missing_watch_roots.len();
         let mut still_missing = Vec::new();
         let mut applied_roots = 0usize;
-        let mut repaired_public_root = false;
         let mut expansion_roots = Vec::new();
         let mut roots = std::mem::take(&mut self.missing_watch_roots).into_iter();
         while let Some(root) = roots.next() {
             if root.source == "public_owner" {
                 if self.repair_public_owner_root(&root) {
                     applied_roots = applied_roots.saturating_add(1);
-                    repaired_public_root = true;
                 } else {
                     still_missing.push(root);
                 }
@@ -459,14 +546,14 @@ impl RegularAppMonitor {
 
         if !self.capacity_limited {
             for node in expansion_roots {
-                let repair_existing_files = node
-                    .watchers
-                    .iter()
-                    .any(|watcher| watcher.source == "private_owner");
-                let recurse_existing_tree = node
-                    .watchers
-                    .iter()
-                    .any(|watcher| watcher.source != "public_owner");
+                let repair_existing_files = !self.first_build_done
+                    && node
+                        .watchers
+                        .iter()
+                        .any(|watcher| watcher.source == "private_owner");
+                let recurse_existing_tree = node.watchers.iter().any(|watcher| {
+                    !matches!(watcher.source, "public_owner" | "private_category_owner")
+                });
                 self.expand_watch_tree_from(node, repair_existing_files, recurse_existing_tree);
                 if self.capacity_limited {
                     break;
@@ -475,9 +562,6 @@ impl RegularAppMonitor {
         }
         self.missing_roots = still_missing.len();
         self.missing_watch_roots = still_missing;
-        if repaired_public_root {
-            self.last_public_owner_repair_ms = paths::monotonic_ms();
-        }
         if applied_roots > 0 || self.missing_roots != previous_missing {
             log::info!(
                 "daemon monitor retry missing previous={} applied={} remaining={} watches={} capacity_limited={} version={:x}",
@@ -500,6 +584,9 @@ impl RegularAppMonitor {
             return false;
         }
 
+        // 上一轮停顿期间到期的延迟裁决事件先发射，再读新事件。
+        self.flush_pending_observations();
+
         // inotify_event 需要 4 字节对齐；内核保证每个事件总长度是 sizeof(int) 的倍数，
         // 因此缓冲区起始 4 字节对齐后，后续每个事件也满足对齐要求。
         let mut buffer = inotify::InotifyBuf::<{ 16 * 1024 }>::new();
@@ -511,6 +598,7 @@ impl RegularAppMonitor {
                     "daemon monitor drain budget reached n={}, resume next round",
                     handled
                 );
+                self.flush_pending_observations();
                 return true;
             }
             let n = inotify::read_into(self.fd, &mut buffer.0);
@@ -535,6 +623,7 @@ impl RegularAppMonitor {
                 handled = handled.saturating_add(1);
             });
         }
+        self.flush_pending_observations();
         false
     }
 
@@ -610,6 +699,9 @@ impl RegularAppMonitor {
                 roots.extend(build_watch_roots(spec));
             }
         }
+        // 与全量 reconfigure 相同：类别级属主 watch 独立于应用配置，增量重建也要补上
+        //（inotify_add_watch 幂等复用已有 wd，重复登记零成本）。
+        roots.extend(build_private_category_owner_roots());
         dedup_roots(&mut roots);
         sort_roots_by_monitor_priority(&mut roots);
 
@@ -631,14 +723,14 @@ impl RegularAppMonitor {
         }
         if !self.capacity_limited {
             for node in expansion_roots {
-                let repair_existing_files = node
-                    .watchers
-                    .iter()
-                    .any(|watcher| watcher.source == "private_owner");
-                let recurse_existing_tree = node
-                    .watchers
-                    .iter()
-                    .any(|watcher| watcher.source != "public_owner");
+                let repair_existing_files = !self.first_build_done
+                    && node
+                        .watchers
+                        .iter()
+                        .any(|watcher| watcher.source == "private_owner");
+                let recurse_existing_tree = node.watchers.iter().any(|watcher| {
+                    !matches!(watcher.source, "public_owner" | "private_category_owner")
+                });
                 self.expand_watch_tree_from(node, repair_existing_files, recurse_existing_tree);
                 if self.capacity_limited {
                     break;
@@ -670,17 +762,8 @@ impl RegularAppMonitor {
         self.public_owner_roots.clear();
         self.missing_roots = 0;
         self.capacity_limited = false;
-        self.last_public_owner_repair_ms = 0;
         self.public_owner_repair_log_dirs.clear();
         self.public_owner_repair_log_count = 0;
-    }
-
-    fn add_watch_tree(&mut self, root: &WatchRoot) -> bool {
-        let Some(node) = self.add_watch_root(root) else {
-            return false;
-        };
-        self.expand_watch_tree_from(node, true, true);
-        true
     }
 
     fn repair_public_owner_root(&mut self, root: &WatchRoot) -> bool {
@@ -707,37 +790,27 @@ impl RegularAppMonitor {
         true
     }
 
-    fn repair_public_owner_roots_if_due(&mut self) {
-        if self.public_owner_roots.is_empty() {
-            return;
-        }
-        let now = paths::monotonic_ms();
-        if now.saturating_sub(self.last_public_owner_repair_ms) < PUBLIC_OWNER_REPAIR_INTERVAL_MS {
-            return;
-        }
-        self.last_public_owner_repair_ms = now;
-        for root in self.public_owner_roots.clone() {
-            self.repair_public_owner_root(&root);
-        }
-    }
-
     /// 按节流周期对账内核 live wd 集合，剪除已死亡的监视条目。
     fn prune_dead_watches_if_due(&mut self) {
-        if self.watch_nodes.is_empty() {
+        if !self.drift_suspected || self.watch_nodes.is_empty() {
             return;
         }
         let now = paths::monotonic_ms();
-        if now.saturating_sub(self.last_prune_dead_ms) < PRUNE_DEAD_WATCHES_INTERVAL_MS {
+        if now.saturating_sub(self.last_prune_dead_ms) < DRIFT_PRUNE_RETRY_MS {
             return;
         }
         self.last_prune_dead_ms = now;
-        let removed = self.prune_dead_watches();
-        if removed > 0 {
-            log::info!(
-                "daemon monitor pruned dead watches removed={} remaining={}",
-                removed,
-                self.watch_nodes.len()
-            );
+        // fdinfo 不可读时 `prune_dead_watches` 返回 None：本轮放弃对账，保留漂移标记
+        // 等下个重试窗口，绝不误删账本。
+        if let Some(removed) = self.prune_dead_watches() {
+            self.drift_suspected = false;
+            if removed > 0 {
+                log::info!(
+                    "daemon monitor pruned dead watches removed={} remaining={}",
+                    removed,
+                    self.watch_nodes.len()
+                );
+            }
         }
     }
 
@@ -748,26 +821,24 @@ impl RegularAppMonitor {
     /// 代堆积。以 `/proc/self/fdinfo/<fd>` 的内核侧 wd 清单为准删除不在册的
     /// 条目——该清单就是内核的真实 watch 表，任何丢失事件造成的漂移都会在
     /// 这里现形。fdinfo 读取失败时跳过本轮（不能因对账失败误删全部条目）。
-    fn prune_dead_watches(&mut self) -> usize {
+    fn prune_dead_watches(&mut self) -> Option<usize> {
         if self.fd < 0 || self.watch_nodes.is_empty() {
-            return 0;
+            return Some(0);
         }
-        let Some(live) = read_live_watch_fds(self.fd) else {
-            return 0;
-        };
+        let live = read_live_watch_fds(self.fd)?;
         // 防呆：对账清单为空说明 fdinfo 读取或解析异常（此时内核明明还有
         // watch），绝不能把整张表清掉；宁可推迟到下一轮。
         if live.is_empty() {
-            return 0;
+            return None;
         }
         let before = self.watch_nodes.len();
         // 清单规模与账本严重不符同样视为读取异常：正常情况下两者只差本次
         // 剪除目标（丢失事件造成的漂移），不会差一个数量级。
         if live.len() * 4 < before {
-            return 0;
+            return None;
         }
         self.watch_nodes.retain(|wd, _| live.contains(wd));
-        before - self.watch_nodes.len()
+        Some(before - self.watch_nodes.len())
     }
 
     fn add_watch_root(&mut self, root: &WatchRoot) -> Option<WatchNode> {
@@ -862,7 +933,22 @@ impl RegularAppMonitor {
                         watcher.record_display_root.as_ref(),
                         &child_display_dir,
                     )
-                }) {
+                }) || is_self_nested_redirect_path(&child_backend_dir)
+                {
+                    // 类别级属主 watch 不下钻，但登记/重建时的存量包目录仍要做
+                    // 属主异常检查——这是它「登记即普查」语义的一半（另一半是
+                    // 运行期 IN_ATTRIB/CREATE 事件）。
+                    if node
+                        .watchers
+                        .iter()
+                        .any(|watcher| watcher.source == "private_category_owner")
+                    {
+                        repair_monitored_backend_owner_for_watchers_dir(
+                            &node.watchers,
+                            &child_display_dir,
+                            &child_backend_dir,
+                        );
+                    }
                     continue;
                 }
                 if self.watch_nodes.len() >= self.max_watches {
@@ -894,6 +980,14 @@ impl RegularAppMonitor {
     }
 
     fn repair_existing_public_tree(&mut self, root: &WatchNode) {
+        // CE 未解锁窗口内 /data/media 已挂载但目录名是 fscrypt 密文，无法从名字
+        // 识别 Android/{data,media,obb} 私有树——此时执行公共归一会把解锁后属于
+        // 应用私有树的全部目录 chown 成 media_rw（2026-10-19 用户 A17 设备 5857
+        // 条乱码路径 fix 实证，重启后私有目录属主变 1023 的根因）。密钥就绪前
+        // 直接跳过本轮，解锁后下一轮（1s 周期）自动恢复。
+        if !crate::daemon::media_ce_storage_ready() {
+            return;
+        }
         let mut stack = vec![root.clone()];
         let mut repaired = 0usize;
         let mut scanned_entries = 0usize;
@@ -1076,6 +1170,9 @@ impl RegularAppMonitor {
     fn handle_event(&mut self, event: &Event<'_>) {
         let mask = event.mask;
         if inotify::is_queue_overflow(mask) {
+            // 溢出会丢掉 `IN_IGNORED`，账本可能与内核真实 watch 表不一致——这是死条目
+            // 对账的唯一触发条件（正常路径在事件里就地删除）。
+            self.drift_suspected = true;
             // 溢出说明内核已经丢弃了数量未知的事件，只重建监视集无法补回这批事件对应的
             // owner 修复与路径记录，因此需要一次全量补偿扫描。
             self.needs_rebuild = true;
@@ -1116,102 +1213,253 @@ impl RegularAppMonitor {
         if !inotify::is_safe_event_name(&name) {
             return;
         }
+        // 模块自身的探测文件（passthrough 端到端探针、宿主端点探测名）由模块内部
+        // 创建并在毫秒级窗口内回收，不属于任何应用行为；观察侧记录它们只会把模块
+        // 自身动作写进用户监视日志（2026-10-24 用户反馈 .srx_passthrough_probe 污染）。
+        // 新增落盘探针时必须同步登记到这里。
+        if matches!(
+            name.as_str(),
+            ".srx_passthrough_probe" | ".srx_endpoint_probe"
+        ) {
+            return;
+        }
 
         let Some(nodes) = self.watch_nodes.get(&event.wd).cloned() else {
             return;
         };
         let is_dir = inotify::is_dir(mask);
         for node in nodes {
-            for watcher in node.watchers.iter() {
-                let event_paths = MonitorEventPaths::from_node(&node, watcher, &name);
+            // 节点级事件路径：display/backend 与 watcher 无关，每事件只算一次。
+            let display_path = paths::normalize(&paths::join(&node.display_dir, &name));
+            let backend_path = paths::join(&node.backend_dir, &name);
 
-                repair_monitored_backend_owner(
-                    watcher.source,
-                    &watcher.package_name,
-                    &node.display_dir,
-                    &node.backend_dir,
-                );
-                repair_monitored_backend_owner(
-                    watcher.source,
-                    &watcher.package_name,
-                    &event_paths.display_path,
-                    &event_paths.backend_path,
-                );
-
-                if is_dir && inotify::is_created_or_moved_to(mask) {
-                    if !should_descend_into_child(
-                        watcher.source,
-                        watcher.record_display_root.as_ref(),
-                        &event_paths.display_path,
-                    ) {
+            // owner 修复按 (source, 作用域包) 去重：修复决策只取决于 source 与
+            // redirect_root 的包名，同一目录上多个同源 watcher 的修复目标完全
+            // 一致——高频事件下逐 watcher 重复 lstat 是监视线程 CPU 阵发的主要
+            // 来源之一（真机 perf 采样确认）。
+            // IN_MODIFY 只代表内容写入，跳过重复 owner 检查；文件监视记录仍照常处理。
+            if inotify::is_owner_repair_event(mask) {
+                let mut repaired: Vec<(&'static str, &str)> = Vec::new();
+                for watcher in node.watchers.iter() {
+                    let scope_package = if watcher.source == "redirect_root" {
+                        watcher.package_name.as_ref()
+                    } else {
+                        ""
+                    };
+                    if repaired.iter().any(|(source, package)| {
+                        *source == watcher.source && *package == scope_package
+                    }) {
                         continue;
                     }
-                    let child = WatchRoot {
-                        package_name: watcher.package_name.to_string(),
-                        backend_root: event_paths.backend_path.clone(),
-                        display_root: event_paths.display_path.clone(),
-                        record_display_root: watcher.record_display_root.to_string(),
-                        record_from_root: watcher.record_from_root.to_string(),
-                        excluded_roots: watcher.excluded_roots.as_ref().to_vec(),
-                        source: watcher.source,
-                    };
-                    let _ = self.add_watch_tree(&child);
+                    repaired.push((watcher.source, scope_package));
+                    repair_monitored_backend_owner(
+                        watcher.source,
+                        &watcher.package_name,
+                        &node.display_dir,
+                        &node.backend_dir,
+                    );
+                    repair_monitored_backend_owner(
+                        watcher.source,
+                        &watcher.package_name,
+                        &display_path,
+                        &backend_path,
+                    );
                 }
-
-                if watcher.source == "public_owner" || watcher.source == "private_owner" {
-                    continue;
-                }
-
-                let operation_name = monitor_operation_from_mask(mask);
-                if !should_record_display_path(
-                    &event_paths.display_path,
-                    &watcher.record_display_root,
-                ) || should_filter_display_path(&event_paths.display_path, operation_name)
-                    || is_under_any_root(&event_paths.display_path, &watcher.excluded_roots)
-                {
-                    continue;
-                }
-                let identity = resolve_monitor_identity(
-                    &watcher.package_name,
-                    &event_paths.display_path,
-                    &event_paths.backend_path,
-                    watcher.source,
-                );
-                if should_skip_ambiguous_allowed_real_path_event(
-                    &identity,
-                    watcher.source,
-                    &event_paths.display_path,
-                    &watcher.package_name,
-                ) || should_skip_ambiguous_read_only_path_event(
-                    &identity,
-                    watcher.source,
-                    &watcher.package_name,
-                ) || should_skip_public_root_event_identity(
-                    &identity,
-                    watcher.source,
-                    &watcher.package_name,
-                ) {
-                    continue;
-                }
-                if self.should_skip_duplicate(
-                    &identity.package_name,
-                    &event_paths.display_path,
-                    &event_paths.from_path,
-                    operation_name,
-                    mask,
-                ) {
-                    continue;
-                }
-                emit_monitor_event(
-                    &identity,
-                    &event_paths,
-                    &watcher.package_name,
-                    watcher.source,
-                    mask,
-                    operation_name,
-                );
             }
+
+            // 目录创建/移入：合并登记新子树并一次性展开。
+            // 此前按 watcher 逐个走 add_watch_tree 且 repair_existing_files=true，
+            // 应用启动的建目录风暴下同一子树被重走 N 次、每个新文件都 lstat 修复，
+            // 监视线程持续 ~112% 单核数十秒。运行期新建子树的文件由应用自身写入、
+            // owner 天然正确；历史遗留 owner 交给全量重配置与溢出补偿扫描兜底。
+            if is_dir
+                && inotify::is_created_or_moved_to(mask)
+                && node.watchers.iter().any(|watcher| {
+                    should_descend_into_child(
+                        watcher.source,
+                        watcher.record_display_root.as_ref(),
+                        &display_path,
+                    )
+                })
+            {
+                let child = WatchNode {
+                    backend_dir: backend_path.clone(),
+                    display_dir: display_path.clone(),
+                    watchers: std::sync::Arc::clone(&node.watchers),
+                };
+                if self.add_watch_node(&child) {
+                    self.expand_watch_tree_from(child, false, true);
+                }
+            }
+
+            // 请求台账已记录的写入不再发观察记录：MediaProvider 请求侧
+            // （event_role=request）与 daemon inotify 观察侧（event_role=observation）
+            // 会对同一次创建/写入各写一条记录，管理器监视列表里同一文件因此出现
+            // 两条未合并的条目。命中近期请求记录的创建与写入观察事件直接跳过；
+            // 重命名/删除/属性事件不涉及该重复形态，保持原行为。
+            //
+            // 未命中的创建/写入事件不立即发射：请求行经 hook→socket→日志线程
+            // 登记 hint，而 inotify 事件在 open 过程中就已入队，事件先于 hint 是
+            // 固有顺序（真机实测首批 CREATE 必漏）。延迟 PARK_WINDOW 再裁决，
+            // hint 落位后即被抑制；窗口只影响台账时序，不影响文件系统路径。
+            let is_create_or_modify =
+                inotify::is_created_or_moved_to(mask) || inotify::is_modify(mask);
+            let request_record_recent = is_create_or_modify && {
+                let user_id = paths::extract_user_id_from_storage_path(&display_path);
+                user_id >= 0
+                    && crate::monitor::has_recent_public_path_request(&display_path, user_id)
+            };
+            let operation_name = monitor_operation_from_mask(mask);
+            if is_create_or_modify {
+                if request_record_recent {
+                    continue;
+                }
+                if self.pending_observations.len() < MAX_PENDING_OBSERVATIONS {
+                    self.pending_observations.push(ParkedObservation {
+                        wd: event.wd,
+                        display_path: display_path.clone(),
+                        backend_path: backend_path.clone(),
+                        mask,
+                        parked_at_ms: paths::monotonic_ms(),
+                    });
+                    continue;
+                }
+                // 队列满：放弃延迟，按原行为立即发射。
+            }
+            self.emit_observation_event(
+                &node.watchers,
+                &display_path,
+                &backend_path,
+                mask,
+                operation_name,
+            );
         }
+    }
+
+    /// 对一组 watcher 发射一条观察记录（含逐 watcher 过滤与去重）。
+    fn emit_observation_event(
+        &mut self,
+        watchers: &std::sync::Arc<Vec<WatchWatcher>>,
+        display_path: &str,
+        backend_path: &str,
+        mask: u32,
+        operation_name: &str,
+    ) {
+        for watcher in watchers.iter() {
+            if watcher.source == "public_owner" || watcher.source == "private_owner" {
+                continue;
+            }
+            if !should_record_display_path(display_path, &watcher.record_display_root)
+                || should_filter_display_path(display_path, operation_name)
+                || is_under_any_root(display_path, &watcher.excluded_roots)
+            {
+                continue;
+            }
+            let identity = resolve_monitor_identity(
+                &watcher.package_name,
+                display_path,
+                backend_path,
+                watcher.source,
+            );
+            if should_skip_ambiguous_allowed_real_path_event(
+                &identity,
+                watcher.source,
+                display_path,
+                &watcher.package_name,
+            ) || should_skip_ambiguous_read_only_path_event(
+                &identity,
+                watcher.source,
+                &watcher.package_name,
+            ) || should_skip_public_root_event_identity(
+                &identity,
+                watcher.source,
+                &watcher.package_name,
+            ) {
+                continue;
+            }
+            let from_path = map_record_from_path(
+                display_path,
+                &watcher.record_display_root,
+                &watcher.record_from_root,
+            );
+            if self.should_skip_duplicate(
+                &identity.package_name,
+                display_path,
+                &from_path,
+                operation_name,
+                mask,
+            ) {
+                continue;
+            }
+            let event_paths = MonitorEventPaths {
+                backend_path: backend_path.to_string(),
+                display_path: display_path.to_string(),
+                from_path,
+            };
+            emit_monitor_event(
+                &identity,
+                &event_paths,
+                &watcher.package_name,
+                watcher.source,
+                mask,
+                operation_name,
+            );
+        }
+    }
+
+    /// 发射已到延迟裁决期的观察事件：重新查询请求 hint（此时大概率已落位），
+    /// 仍未命中才真正发射。watcher 集合按 wd 现取，节点在窗口内被重建/剪除
+    /// 时事件直接丢弃（重建自带的补偿扫描会兜住归属，不值得为瞬时事件保留
+    /// 陈旧 watcher）。
+    fn flush_pending_observations(&mut self) {
+        if self.pending_observations.is_empty() {
+            return;
+        }
+        let now_ms = paths::monotonic_ms();
+        let pending = std::mem::take(&mut self.pending_observations);
+        for item in pending {
+            if now_ms.saturating_sub(item.parked_at_ms) < OBSERVATION_PARK_WINDOW_MS {
+                self.pending_observations.push(item);
+                continue;
+            }
+            let user_id = paths::extract_user_id_from_storage_path(&item.display_path);
+            if user_id >= 0
+                && crate::monitor::has_recent_public_path_request(&item.display_path, user_id)
+            {
+                continue;
+            }
+            let watchers = self.watch_nodes.get(&item.wd).and_then(|nodes| {
+                nodes
+                    .iter()
+                    .find(|node| node.backend_dir == item.backend_path)
+                    .map(|node| std::sync::Arc::clone(&node.watchers))
+            });
+            let Some(watchers) = watchers else {
+                continue;
+            };
+            let operation_name = monitor_operation_from_mask(item.mask);
+            self.emit_observation_event(
+                &watchers,
+                &item.display_path,
+                &item.backend_path,
+                item.mask,
+                operation_name,
+            );
+        }
+    }
+
+    /// 最近一次待裁决观察到期所剩毫秒；仅供旧调用者/诊断，不包含 missing-root 重试。
+    /// 新等待逻辑应使用 `next_wakeup_deadline_ms` 合并所有真实截止点。
+    pub fn pending_flush_delay_ms(&self) -> Option<u64> {
+        let now_ms = paths::monotonic_ms();
+        self.pending_observations
+            .iter()
+            .map(|item| {
+                OBSERVATION_PARK_WINDOW_MS.saturating_sub(now_ms.saturating_sub(item.parked_at_ms))
+            })
+            .filter(|remaining| *remaining > 0)
+            .min()
+            .map(|remaining| remaining as u64)
     }
 
     fn should_skip_duplicate(
@@ -1236,15 +1484,25 @@ impl RegularAppMonitor {
 
         let event_key = format!("{}|{}|{}|{}", package_name, operation_name, path, from_path);
         if inotify::is_modify(mask) {
-            if self
-                .recent_event_ms
-                .insert(event_key.clone(), now_ms)
-                .is_none()
-            {
-                self.recent_event_order.push_back(event_key);
+            // IN_MODIFY 随每个写入块逐次触发，持续下载会在同一文件上产生大量
+            // 事件；按 (包名, 操作, 路径) 节流：窗口内跳过，窗口过期后重记一条，
+            // 长下载仍保留活动痕迹且不刷屏。窗口从上次「记账」时刻起算而非上次
+            // 事件时刻，避免连续写入把窗口无限顺延、整段写入只留首条记录。
+            match self.recent_event_ms.get_mut(&event_key) {
+                Some(last_ms) => {
+                    if now_ms.saturating_sub(*last_ms) < DUPLICATE_EVENT_WINDOW_MS {
+                        return true;
+                    }
+                    *last_ms = now_ms;
+                    return false;
+                }
+                None => {
+                    self.recent_event_ms.insert(event_key.clone(), now_ms);
+                    self.recent_event_order.push_back(event_key);
+                    self.trim_recent_events();
+                    return false;
+                }
             }
-            self.trim_recent_events();
-            return false;
         }
         if let Some(last_ms) = self.recent_event_ms.get_mut(&event_key) {
             if now_ms.saturating_sub(*last_ms) < DUPLICATE_EVENT_WINDOW_MS {

@@ -4,30 +4,35 @@ mod source_hint;
 mod stack_owner;
 mod thread_hint;
 
-pub(crate) use download_owner::infer_download_owner_package_by_path;
+pub(crate) use download_owner::caller_uid_shares_download_group;
+pub(crate) use download_owner::infer_download_owner_identity_by_path;
 #[cfg(target_os = "android")]
 // quality-allow(lint-suppression): Android 平台的公共路径归属 re-export 由 Android hook 路径消费。
 #[allow(unused_imports)]
 pub(crate) use source_hint::infer_public_path_package_name;
+// quality-allow(lint-suppression): has_recent_public_path_request 仅由 bin 侧
+// daemon_monitor 消费，lib 视角未使用（源码被 bin #[path] 再编译的两侧差异）。
+#[allow(unused_imports)]
 pub(crate) use source_hint::{
-    infer_recent_path_caller_identity, remember_private_path_caller_hint,
-    remember_private_path_caller_hint_in_memory, remember_private_path_caller_uid_hint_in_memory,
-    remember_private_path_owner_hint, remember_public_path_caller_hint,
-    remember_saf_path_caller_hint,
+    has_recent_public_path_request, infer_recent_path_caller_identity,
+    remember_private_path_caller_hint, remember_private_path_caller_hint_in_memory,
+    remember_private_path_caller_uid_hint_in_memory, remember_private_path_owner_hint,
+    remember_public_path_caller_hint, remember_saf_path_caller_hint,
 };
 pub(crate) use stack_owner::infer_caller_package_by_stack;
 
 use crate::config::SettingsHub;
+use crate::hook::{InterceptHub, is_caller_attribution_stopped};
+use crate::platform::log_fields::encode;
 use crate::platform::paths::monotonic_ms;
 use crate::platform::{self, paths};
 use crate::redirect::{policy, writer, writer::ANDROID_APP_UID_START};
 use libc::{time, tm};
-use once_cell::sync::Lazy;
 use stack_owner::infer_package_from_java_stack;
 use std::borrow::Cow;
 use std::collections::{HashMap, VecDeque};
 use std::sync::{
-    Mutex,
+    LazyLock, Mutex,
     atomic::{AtomicBool, Ordering},
 };
 use thread_hint::infer_component_from_thread_name;
@@ -60,7 +65,11 @@ pub enum OpKind {
 struct AuditState {
     package_name: String,
     uid: i32,
+    /// 组内含代写者时保存成员列表，用于诊断与 UID 校验，不代表单一调用方。
     shared_uid_packages: String,
+    /// 任意 >=2 包的共享 UID 组（含不含代写者）：只用于组内区分
+    /// （线程名 / Java 栈帧），不参与兜底写组串。
+    multi_package_group: String,
     caller_package: String,
     caller_package_updated_ms: i64,
     recent_event_ms: HashMap<String, i64>,
@@ -95,6 +104,7 @@ struct CallerResolveSnapshot {
     package_name: String,
     uid: i32,
     shared_uid_packages: String,
+    multi_package_group: String,
     caller_package: String,
     caller_package_updated_ms: i64,
 }
@@ -105,6 +115,7 @@ impl CallerResolveSnapshot {
             package_name: state.package_name.clone(),
             uid: state.uid,
             shared_uid_packages: state.shared_uid_packages.clone(),
+            multi_package_group: state.multi_package_group.clone(),
             caller_package: state.caller_package.clone(),
             caller_package_updated_ms: state.caller_package_updated_ms,
         }
@@ -117,6 +128,7 @@ impl AuditState {
             package_name: String::new(),
             uid: -1,
             shared_uid_packages: String::new(),
+            multi_package_group: String::new(),
             caller_package: String::new(),
             caller_package_updated_ms: -1,
             recent_event_ms: HashMap::new(),
@@ -155,15 +167,47 @@ impl AuditTrail {
         } else {
             state.shared_uid_packages.clear();
         }
-
-        if !state.shared_uid_packages.is_empty() {
-            log::info!(
-                "monitor init pkg={} shared_uid={}",
-                state.package_name,
-                state.shared_uid_packages
-            );
+        // 任意 >=2 包的组都参与组内区分（线程名 / Java 栈帧）：这两条是「证据」而非
+        // 「兜底」，不该被「组内是否含代写者」这个与重定向相关的条件卡住。
+        // 实测（HyperOS 2026-11-05）：uid 1000 有 53 个包、1001 有 17 个包，
+        // 全都不含 MediaProvider，改造前这些组的记录只能靠 uid 反查，多包即放弃。
+        state.multi_package_group = if uid >= 0 {
+            policy::get_shared_uid_packages_string(uid)
         } else {
-            log::info!("monitor init pkg={}", state.package_name);
+            String::new()
+        };
+
+        // 组串只在「含代写者的组」时完整打印：任意多包组可能是几十个包（真机实测
+        // uid 1000 有 53 个），整串写进日志会把一行撑到上千字符，反而看不出重点。
+        let message = if !state.shared_uid_packages.is_empty() {
+            format!(
+                "monitor init pkg={} shared_uid={}",
+                state.package_name, state.shared_uid_packages
+            )
+        } else if !state.multi_package_group.is_empty() {
+            let members = package_group_members(&state.multi_package_group);
+            let sample = members
+                .iter()
+                .take(3)
+                .copied()
+                .collect::<Vec<_>>()
+                .join(",");
+            format!(
+                "monitor init pkg={} multi_pkg_group_count={} sample={}",
+                state.package_name,
+                members.len(),
+                sample
+            )
+        } else {
+            format!("monitor init pkg={}", state.package_name)
+        };
+        // 这一行是「该进程的监视为什么开/没开成什么样」的唯一凭据，且它发生在
+        // verbose 开关生效之前（配置还没读完），info 会被门禁吞掉；系统链路的
+        // 进程因此改用 Warn，保证无 verbose 的现场也能事后复盘。
+        if is_diagnostic_monitor_identity(&state.package_name, &state.shared_uid_packages, uid) {
+            log::warn!("{message}");
+        } else {
+            log::info!("{message}");
         }
         true
     }
@@ -179,15 +223,22 @@ impl AuditTrail {
         self.record_recent_path_caller(path, caller_uid, "", "query_access", "medium");
     }
 
-    pub fn record_provider_open_path(&self, path: &str, caller_uid: i32, caller_package: &str) {
-        if caller_uid < ANDROID_APP_UID_START {
+    pub fn record_provider_open_path(
+        &self,
+        path: &str,
+        caller_uid: i32,
+        caller_pid: i32,
+        caller_package: &str,
+    ) {
+        if caller_uid < 0 || crate::hook::is_caller_attribution_stopped() {
             return;
         }
         let normalized = normalize_storage_path_locked(path);
         if normalized.is_empty() {
             return;
         }
-        let Some(package_name) = resolve_recent_path_caller_package(caller_uid, caller_package)
+        let caller_package = resolve_system_caller_package(caller_uid, caller_pid, caller_package);
+        let Some(package_name) = resolve_recent_path_caller_package(caller_uid, &caller_package)
         else {
             return;
         };
@@ -226,12 +277,13 @@ impl AuditTrail {
         &self,
         path: &str,
         caller_uid: i32,
+        caller_pid: i32,
         caller_package: &str,
     ) -> bool {
         if !self.is_enabled() || !SettingsHub::instance().is_file_monitor_enabled() {
             return false;
         }
-        if caller_uid < ANDROID_APP_UID_START {
+        if caller_uid < 0 || crate::hook::is_caller_attribution_stopped() {
             return false;
         }
         let normalized = normalize_storage_path_locked(path);
@@ -241,10 +293,15 @@ impl AuditTrail {
         {
             return false;
         }
-        let Some(package_name) = resolve_recent_path_caller_package(caller_uid, caller_package)
+        let caller_package = resolve_system_caller_package(caller_uid, caller_pid, caller_package);
+        let Some(package_name) = resolve_recent_path_caller_package(caller_uid, &caller_package)
         else {
             return false;
         };
+        // 系统 uid 私有路径强制静音（与 record_operation_result 同一门控）。
+        if should_force_filter_system_private_record(&normalized, &package_name) {
+            return false;
+        }
         let correlation_id = source_hint::remember_public_path_caller_hint_with_op_filter(
             &normalized,
             &package_name,
@@ -257,26 +314,19 @@ impl AuditTrail {
         if correlation_id.is_empty() {
             return false;
         }
-        let mut state = self.state.lock().unwrap_or_else(|err| err.into_inner());
-        remember_query_access_locked(
-            &mut state,
-            normalized.clone(),
-            package_name.clone(),
-            caller_uid,
-            "provider_mkdir",
-            "high",
-        );
-        drop(state);
-        let line = format!(
-            "{}|{}|{}|MKDIR|{}|ret=0|errno=0|identify_method=provider_mkdir|identify_reliability=high|event_role=request|correlation_id={}|op=mkdir|op_filter=mkdir|source=media_provider_java|caller_uid={}",
-            build_timestamp_locked(),
-            self.package_name(),
-            package_name,
-            normalized,
-            correlation_id,
-            caller_uid
-        );
-        append_line_locked(&line);
+        // 此回调发生在 Java 执行 mkdir/mkdirs 之前，只登记调用方 hint，不能据此
+        // 生成 ret=0 的操作记录。实际结果由后续 native/FUSE 请求路径按返回值登记。
+        {
+            let mut state = self.state.lock().unwrap_or_else(|err| err.into_inner());
+            remember_query_access_locked(
+                &mut state,
+                normalized.clone(),
+                package_name.clone(),
+                caller_uid,
+                "provider_mkdir",
+                "high",
+            );
+        }
         true
     }
 
@@ -304,13 +354,14 @@ impl AuditTrail {
         let extra = format!(
             "op=provider_open|op_filter={op_filter}|source=media_provider_java|caller_uid={caller_uid}"
         );
+        let caller = InterceptHub::instance().record_caller_identity_with_evidence();
         self.record_operation_result(
             OpKind::Open,
             &package_name,
             &normalized,
-            result_fd,
-            0,
+            (result_fd, 0),
             &extra,
+            (caller.0, caller.1, caller.2.as_ref()),
         );
         true
     }
@@ -346,16 +397,22 @@ impl AuditTrail {
             "high",
             op_filter,
         );
-        let line = format!(
-            "{}|{}|{}|OPEN|{}|ret=0|errno=0|identify_method=saf_provider|identify_reliability=high|event_role=request|correlation_id={}|op=provider_open|op_filter={}|source=saf_provider|caller_uid={}",
+        let mut line = format!(
+            "{}|{}|{}|OPEN|{}|field_encoding=percent|ret=0|errno=0|identify_method=saf_provider|identify_reliability=high|event_role=request|correlation_id={}|op=provider_open|op_filter={}|source=saf_provider",
             build_timestamp_locked(),
             self.package_name(),
             package_name,
-            normalized,
+            encode(&normalized),
             correlation_id,
-            op_filter,
-            caller_uid
+            op_filter
         );
+        if let Some(identity) =
+            crate::hook::current_request_identity().filter(|identity| identity.uid == caller_uid)
+        {
+            line.push_str(&identity.log_fields());
+        } else {
+            line.push_str(&format!("|caller_uid={caller_uid}"));
+        }
         append_line_locked(&line);
         true
     }
@@ -368,7 +425,8 @@ impl AuditTrail {
         source: &'static str,
         confidence: &'static str,
     ) -> Option<(String, String)> {
-        if !self.is_enabled() || caller_uid < 10_000 {
+        if !self.is_enabled() || caller_uid < 10_000 || crate::hook::is_caller_attribution_stopped()
+        {
             return None;
         }
         let normalized = normalize_storage_path_locked(path);
@@ -426,10 +484,15 @@ impl AuditTrail {
         kind: OpKind,
         caller_package: &str,
         path: &str,
-        result: i32,
-        error_no: i32,
+        outcome: (i32, i32),
         extra: &str,
+        caller: (
+            i32,
+            i32,
+            Option<&crate::platform::proc_identity::RequestIdentity>,
+        ),
     ) {
+        let (result, error_no) = outcome;
         if !self.is_enabled() {
             return;
         }
@@ -471,14 +534,94 @@ impl AuditTrail {
             (snapshot, query_access_identity)
         };
 
-        let source_identity = resolve_caller_info_for_path(
-            &resolve_snapshot,
-            caller_package,
-            &normalized,
-            is_mkdir_like_extra(extra),
-            should_use_recent_private_owner_hint(kind, &normalized, &operation_name),
-            query_access_identity,
-        );
+        let (caller_uid, caller_pid, captured) = caller;
+        let cross_thread = captured.is_some();
+        // 无原请求 PID 的宿主后台操作仍可使用异步路径关联；不能把宿主当作原请求者。
+        let has_request_task = caller_pid > 0 || crate::hook::is_current_caller_scope_active();
+        let request_identity = crate::hook::current_request_identity()
+            .filter(|identity| {
+                identity.uid == caller_uid && (caller_pid <= 0 || identity.pid == caller_pid)
+            })
+            .or_else(|| {
+                captured.map(|captured| {
+                    let mut identity = captured.clone();
+                    let current = crate::daemon_identity_query::query_process_identity(
+                        caller_pid, caller_uid,
+                    );
+                    identity.revalidate(current.as_ref());
+                    identity
+                })
+            })
+            .or_else(|| {
+                crate::daemon_identity_query::query_process_identity(caller_pid, caller_uid)
+            })
+            .or_else(|| {
+                (caller_uid >= 0 && (has_request_task || matches!(caller_uid, 0 | 2000))).then(
+                    || {
+                        crate::platform::proc_identity::RequestIdentity::unresolved(
+                            caller_uid, caller_pid,
+                        )
+                    },
+                )
+            });
+        let request_extra = monitor_request_extra(extra, request_identity.as_ref(), cross_thread);
+        let extra = request_extra.as_str();
+        let terminal = request_identity
+            .as_ref()
+            .is_some_and(|identity| identity.is_terminal());
+        let shared_user_id = if let Some(identity) = request_identity.as_ref()
+            && !identity.shared_user_id.is_empty()
+        {
+            identity.shared_user_id.clone()
+        } else if crate::hook::is_current_caller_scope_active() {
+            crate::hook::get_current_caller_shared_user_id()
+        } else {
+            String::new()
+        };
+        let source_identity = if let Some(identity) = request_identity
+            .as_ref()
+            .filter(|identity| identity.is_terminal())
+        {
+            let (label, method, reliability) = identity.monitor_identity();
+            SourceIdentity::new(label.to_owned(), method, reliability)
+        } else {
+            resolve_caller_info_for_path(
+                &resolve_snapshot,
+                caller_package,
+                CallerRequestIdentity {
+                    uid: caller_uid,
+                    shared_user_id: &shared_user_id,
+                    task: request_identity.as_ref(),
+                },
+                &normalized,
+                is_mkdir_like_extra(extra),
+                should_use_recent_private_owner_hint(kind, &normalized, &operation_name),
+                query_access_identity,
+            )
+        };
+
+        // 终止边界不补包名；无请求任务的异步记录仍可按唯一 UID 补齐显示。
+        let native_identity;
+        let source_identity = {
+            let (identity, native) = if terminal {
+                (source_identity, None)
+            } else {
+                refine_native_identity_with_caller_uid(source_identity, caller_uid)
+            };
+            native_identity = native;
+            identity
+        };
+        let extra: Cow<'_, str> = match &native_identity {
+            Some(basename) if request_identity.is_none() => {
+                Cow::Owned(format!("{extra}|native={basename}"))
+            }
+            _ => Cow::Borrowed(extra),
+        };
+
+        // 系统 uid 私有路径强制静音：归因完成后判定，避免淹没监视日志。
+        if should_force_filter_system_private_record(&normalized, &source_identity.package_name) {
+            return;
+        }
 
         let mut state = self.state.lock().unwrap_or_else(|err| err.into_inner());
         let event_key = build_event_key_locked(
@@ -487,8 +630,8 @@ impl AuditTrail {
             kind,
             &operation_name,
             &normalized,
-            result,
-            error_no,
+            (result, error_no),
+            request_identity.as_ref(),
         );
         if should_skip_duplicate_event_locked(&mut state, &event_key) {
             return;
@@ -513,7 +656,7 @@ impl AuditTrail {
             &operation_name,
             &normalized,
             result,
-            extra,
+            &extra,
         );
 
         // 预分配缓冲区以减少字符串重分配
@@ -538,17 +681,22 @@ impl AuditTrail {
         line.push('|');
         line.push_str(&state_snapshot.package_name);
         line.push('|');
-        line.push_str(caller_pkg);
+        line.push_str(&encode(caller_pkg));
         line.push('|');
         line.push_str(op_type_to_text(kind));
         line.push('|');
-        line.push_str(&normalized);
-        line.push_str("|ret=");
+        line.push_str(&encode(&normalized));
+        line.push_str("|field_encoding=percent|ret=");
         line.push_str(&result.to_string());
         line.push_str("|errno=");
         line.push_str(&error_no.to_string());
 
         append_source_identity_meta(&mut line, &source_identity);
+        let path_owner = paths::extract_android_private_path_owner(&normalized);
+        if !path_owner.is_empty() {
+            line.push_str("|path_owner=");
+            line.push_str(&path_owner);
+        }
         line.push_str("|event_role=request");
         if !correlation_id.is_empty() {
             line.push_str("|correlation_id=");
@@ -562,11 +710,52 @@ impl AuditTrail {
     }
 }
 
-static AUDIT_TRAIL: Lazy<AuditTrail> = Lazy::new(|| AuditTrail {
+static AUDIT_TRAIL: LazyLock<AuditTrail> = LazyLock::new(|| AuditTrail {
     is_enabled: AtomicBool::new(true),
     state: Mutex::new(AuditState::new()),
 });
 
+// 调用方、结果与归因字段只接受运行时证据，不能由附加路径字段覆盖。
+fn monitor_request_extra(
+    extra: &str,
+    identity: Option<&crate::platform::proc_identity::RequestIdentity>,
+    cross_thread: bool,
+) -> String {
+    let extra = extra
+        .split('|')
+        .filter(|field| {
+            !matches!(
+                field.split_once('=').map(|(key, _)| key),
+                Some(
+                    "caller_uid"
+                        | "caller_pid"
+                        | "caller_start_time"
+                        | "caller_context"
+                        | "caller_boundary"
+                        | "native"
+                        | "caller_evidence"
+                        | "ret"
+                        | "errno"
+                        | "identify_method"
+                        | "identify_reliability"
+                        | "event_role"
+                        | "correlation_id"
+                        | "field_encoding"
+                        | "path_owner"
+                        | "record_integrity"
+                )
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("|");
+    let mut extra = identity
+        .map(|identity| identity.with_log_fields(&extra))
+        .unwrap_or(extra);
+    if cross_thread {
+        extra.push_str("|caller_evidence=cross_thread");
+    }
+    extra
+}
 // 将 /data/media 别名统一转为 /storage/emulated 前缀
 fn normalize_storage_path_locked(path: &str) -> String {
     if path.is_empty() {
@@ -587,6 +776,34 @@ fn normalize_storage_path_locked(path: &str) -> String {
 
 fn is_filtered_media_provider_path(path: &str) -> bool {
     paths::is_filtered_media_provider_path(path)
+}
+
+/// 系统应用私有路径的强制静音门控（不受用户过滤器配置影响）。
+///
+/// 系统 uid（platform 1000 等，含 android.media 共享组）服务的私有目录读写
+/// 频次极高（日志轮转、缓存维护），一旦系统 uid 归因链打通就会把监视日志
+/// 淹没成噪声（2026-10-24 用户定案：此类记录强制过滤，普通应用的过滤仍由
+/// 用户过滤器配置决定）。判定：路径是某应用的 Android/data|media|obb 私有
+/// 子树，且归因包名解析为系统 uid 或媒体链中间组件。
+fn should_force_filter_system_private_record(
+    normalized_path: &str,
+    identity_package: &str,
+) -> bool {
+    if paths::extract_android_private_path_owner(normalized_path).is_empty() {
+        return false;
+    }
+    if identity_package.is_empty() {
+        return false;
+    }
+    if policy::is_attribution_intermediate_package(identity_package) {
+        return true;
+    }
+    let user_id = paths::extract_user_id_from_storage_path(normalized_path);
+    if user_id < 0 {
+        return false;
+    }
+    let uid = policy::get_uid_for_package_in_user(identity_package, user_id);
+    (0..ANDROID_APP_UID_START).contains(&uid)
 }
 
 fn should_filter_shared_uid_probe_event(
@@ -761,6 +978,9 @@ fn infer_monitor_redirect_backend(
     result: i32,
     extra: &str,
 ) -> Option<MonitorRedirectBackend> {
+    if matches!(identity.source, "shared_uid" | "executor") {
+        return None;
+    }
     if result < 0
         || normalized_path.is_empty()
         || extra_contains_key(extra, "backend")
@@ -865,9 +1085,13 @@ fn resolve_monitor_identity_uid(state: &MonitorStateSnapshot, package_name: &str
     if package_name.is_empty() {
         return -1;
     }
-    let mut uid = policy::get_uid_for_package(package_name);
+    let mut uid =
+        policy::get_uid_for_package_in_user(package_name, platform::user_id_from_uid(state.uid));
     if uid < ANDROID_APP_UID_START {
-        uid = policy::get_fresh_uid_for_package(package_name);
+        uid = policy::get_fresh_uid_for_package_in_user(
+            package_name,
+            platform::user_id_from_uid(state.uid),
+        );
     }
     if uid >= ANDROID_APP_UID_START {
         return uid;
@@ -898,7 +1122,7 @@ fn append_monitor_extra_kv(extra: &mut String, key: &str, value: &str) {
     }
     extra.push_str(key);
     extra.push('=');
-    extra.push_str(value);
+    extra.push_str(&encode(value));
 }
 
 fn extra_contains_key(extra: &str, key: &str) -> bool {
@@ -916,6 +1140,12 @@ pub(super) struct SourceIdentity {
     package_name: String,
     source: &'static str,
     confidence: &'static str,
+}
+
+struct CallerRequestIdentity<'a> {
+    uid: i32,
+    shared_user_id: &'a str,
+    task: Option<&'a crate::platform::proc_identity::RequestIdentity>,
 }
 
 impl SourceIdentity {
@@ -936,12 +1166,13 @@ impl SourceIdentity {
     }
 }
 
-// 结合直接信号、shared_uid 线索与近期调用方回退推断调用方包名
+// 结合直接信号与可用的进程级线索推断调用方包名
 fn resolve_caller_info_from_snapshot(
     state: &CallerResolveSnapshot,
     caller_package: &str,
     normalized_path: &str,
     is_mkdir_like: bool,
+    allow_process_inference: bool,
 ) -> SourceIdentity {
     let resolved_caller = extract_caller_package(caller_package);
     let is_intermediate_caller = is_intermediate_caller_package(&resolved_caller);
@@ -950,23 +1181,27 @@ fn resolve_caller_info_from_snapshot(
         return SourceIdentity::new(resolved_caller, "caller", "high");
     }
 
-    // 线程名识别：shared_uid 进程内区分 MTP
-    if !state.shared_uid_packages.is_empty()
-        && policy::is_shared_uid_process(state.uid)
+    // 线程名识别：组内区分 MTP 等固定线程名组件。
+    // 组内成员校验不可省：线程名只说明"这是哪类组件"，必须确认该组件确实在当前
+    // uid 组里，否则会把无关进程的线程名套到本记录上。
+    if allow_process_inference
+        && !state.multi_package_group.is_empty()
         && let Some(resolution) = infer_component_from_thread_name()
+        && group_contains_package(&state.multi_package_group, &resolution.package_name)
     {
         return resolution;
     }
 
-    // Java 栈帧回溯：shared_uid 进程内按调用栈区分具体包名
-    if !state.shared_uid_packages.is_empty()
-        && policy::is_shared_uid_process(state.uid)
-        && let Some(resolution) = infer_package_from_java_stack(&state.shared_uid_packages)
+    // Java 栈帧回溯：组内按调用栈区分具体包名（函数内部按组内包名逐帧匹配）
+    if allow_process_inference
+        && !state.multi_package_group.is_empty()
+        && let Some(resolution) = infer_package_from_java_stack(&state.multi_package_group)
     {
         return resolution;
     }
 
-    if resolved_caller.is_empty()
+    if allow_process_inference
+        && resolved_caller.is_empty()
         && should_use_recent_media_provider_caller(state, normalized_path, is_mkdir_like)
     {
         let caller_age_ms = monotonic_ms() - state.caller_package_updated_ms;
@@ -977,20 +1212,9 @@ fn resolve_caller_info_from_snapshot(
 
     if !resolved_caller.is_empty() {
         if is_intermediate_caller {
-            if !state.shared_uid_packages.is_empty() {
-                return SourceIdentity::new(
-                    state.shared_uid_packages.clone(),
-                    "shared_uid",
-                    "fallback",
-                );
-            }
             return SourceIdentity::unknown();
         }
         return SourceIdentity::new(resolved_caller, "caller", "high");
-    }
-
-    if !state.shared_uid_packages.is_empty() {
-        return SourceIdentity::new(state.shared_uid_packages.clone(), "shared_uid", "fallback");
     }
 
     SourceIdentity::unknown()
@@ -1001,8 +1225,14 @@ fn should_use_recent_media_provider_caller(
     normalized_path: &str,
     is_mkdir_like: bool,
 ) -> bool {
-    let public_mkdir_has_matching_hint = if is_mkdir_like && is_public_storage_path(normalized_path)
-    {
+    let _ = is_mkdir_like;
+    // 公共路径无法凭路径本身确定归属：仅当路径台账里最近登记的调用方与当前
+    // 时间窗口推断一致时才采信 recent_caller。系统后台经 MediaProvider 的
+    // 写入（如开机创建的 MIUI 日志目录）没有任何归属佐证，盲采时间窗口推断
+    // 会把恰好在场的无关应用写成来源（2026-10-24 真机：debug_log/powerinfo
+    // 被误归因到同时段调用 MediaProvider 的画廊应用）；mkdir 的佐证检查此前
+    // 已有，这里统一到全部操作形态。
+    let public_path_has_matching_hint = if is_public_storage_path(normalized_path) {
         let user_id = paths::extract_user_id_from_storage_path(normalized_path);
         user_id >= 0
             && infer_recent_path_caller_identity(normalized_path, user_id)
@@ -1014,7 +1244,7 @@ fn should_use_recent_media_provider_caller(
         && !state.caller_package.is_empty()
         && state.caller_package_updated_ms >= 0
         && !is_intermediate_caller_package(&state.caller_package)
-        && public_mkdir_has_matching_hint
+        && public_path_has_matching_hint
 }
 
 fn is_public_storage_path(path: &str) -> bool {
@@ -1040,25 +1270,41 @@ fn is_public_storage_path(path: &str) -> bool {
 fn resolve_caller_info_for_path(
     state: &CallerResolveSnapshot,
     caller_package: &str,
+    caller_identity: CallerRequestIdentity<'_>,
     normalized_path: &str,
     is_mkdir_like: bool,
     can_use_recent_private_owner_hint: bool,
     query_access_identity: Option<SourceIdentity>,
 ) -> SourceIdentity {
-    let private_owner = paths::extract_android_private_path_owner(normalized_path);
-    if !private_owner.is_empty() && !is_intermediate_caller_package(&private_owner) {
-        let user_id = paths::extract_user_id_from_storage_path(normalized_path);
-        source_hint::remember_private_path_owner_hint(normalized_path, &private_owner, user_id);
-        return SourceIdentity::new(private_owner, "path_owner", "high");
+    if crate::hook::is_caller_attribution_stopped() {
+        return SourceIdentity::unknown();
     }
-
-    let identity =
-        resolve_caller_info_from_snapshot(state, caller_package, normalized_path, is_mkdir_like);
+    let caller_uid = caller_identity.uid;
+    let caller_package = caller_identity
+        .task
+        .map(|task| task.package.as_str())
+        .filter(|_| caller_package.is_empty() || is_intermediate_caller_package(caller_package))
+        .unwrap_or(caller_package);
+    let identity = resolve_caller_info_from_snapshot(
+        state,
+        caller_package,
+        normalized_path,
+        is_mkdir_like,
+        !crate::hook::is_current_caller_scope_active() && caller_identity.task.is_none(),
+    );
 
     if should_prefer_direct_identity(&identity) {
         return identity;
     }
+    // 请求身份不明也不能借用另一请求的路径历史；代写进程无请求上下文时才需回查。
+    if crate::hook::is_current_caller_scope_active()
+        || caller_identity.task.is_some()
+        || (caller_uid >= 0 && !policy::is_shared_uid_process(caller_uid))
+    {
+        return shared_user_fallback(identity, caller_identity.shared_user_id);
+    }
 
+    // 私有路径标明文件归属，不证明本次操作由该包发起。
     let user_id = paths::extract_user_id_from_storage_path(normalized_path);
     if let Some(path_identity) =
         source_hint::infer_recent_path_caller_identity(normalized_path, user_id)
@@ -1095,7 +1341,7 @@ fn resolve_caller_info_for_path(
         && let Some(package_name) =
             source_hint::infer_public_path_package_name(normalized_path, user_id)
     {
-        return SourceIdentity::new(package_name, "public_path_package", "high");
+        return SourceIdentity::new(package_name, "public_path_package", "medium");
     }
 
     if can_use_recent_private_owner_hint
@@ -1106,16 +1352,35 @@ fn resolve_caller_info_for_path(
     }
 
     if user_id < 0 {
-        return identity;
+        return shared_user_fallback(identity, caller_identity.shared_user_id);
     }
 
     let inferred =
         SettingsHub::instance().resolve_monitor_package_by_path_for_user(user_id, normalized_path);
     if inferred.is_empty() {
-        return identity;
+        return shared_user_fallback(identity, caller_identity.shared_user_id);
     }
 
     SourceIdentity::new(inferred, "path_config", "medium")
+}
+
+fn shared_user_fallback(identity: SourceIdentity, shared_user_id: &str) -> SourceIdentity {
+    if identity.source == "unknown" && is_shared_user_id_value(shared_user_id) {
+        SourceIdentity::new(shared_user_id.to_string(), "shared_uid", "fallback")
+    } else {
+        identity
+    }
+}
+
+fn is_shared_user_id_value(value: &str) -> bool {
+    value.len() <= 255
+        && value.contains('.')
+        && value.split('.').all(|segment| {
+            !segment.is_empty()
+                && segment
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
+        })
 }
 
 fn remember_query_access_locked(
@@ -1175,13 +1440,36 @@ fn resolve_query_access_identity_locked(
     ))
 }
 
+/// 系统 UID 的请求包名只接受 daemon 核验结果，不以本地 cmdline 重开终止边界。
+fn resolve_system_caller_package(caller_uid: i32, caller_pid: i32, caller_package: &str) -> String {
+    if !caller_package.is_empty() || caller_uid >= ANDROID_APP_UID_START || caller_pid <= 0 {
+        return caller_package.to_string();
+    }
+    crate::daemon_identity_query::query_process_identity(caller_pid, caller_uid)
+        .filter(|identity| !identity.is_terminal())
+        .map(|identity| identity.package)
+        .unwrap_or_default()
+}
+
 fn resolve_recent_path_caller_package(caller_uid: i32, explicit_package: &str) -> Option<String> {
-    if caller_uid < 10_000 {
+    if caller_uid < 0 {
         return None;
     }
     let explicit = extract_caller_package(explicit_package);
     if !explicit.is_empty() && !is_intermediate_caller_package(&explicit) {
+        let mut packages = policy::get_packages_for_uid(caller_uid);
+        if packages.is_empty() {
+            policy::refresh_shared_uid_cache();
+            packages = policy::get_packages_for_uid(caller_uid);
+        }
+        if !packages.iter().any(|package| package == &explicit) {
+            return None;
+        }
+        // 显式包名已验证属于完整 caller UID；低 UID 的多包组也可保留这个成员。
         return Some(explicit);
+    }
+    if caller_uid < 10_000 {
+        return None;
     }
     let mut packages = policy::get_packages_for_uid(caller_uid);
     if packages.is_empty() {
@@ -1190,9 +1478,16 @@ fn resolve_recent_path_caller_package(caller_uid: i32, explicit_package: &str) -
     }
     packages.sort();
     packages.dedup();
-    packages
-        .into_iter()
-        .find(|pkg| !pkg.is_empty() && !is_intermediate_caller_package(pkg))
+    // 共享 uid 组内没有显式调用方信号时无法区分具体成员；按排序硬取某个
+    // 成员会把引擎代写误归给组内无辜包（2026-10-24 真机：android.media 组
+    // 的下载代写被误归 soundpicker 并污染路径台账）。仅单包 uid 可以安全反查。
+    if packages.len() == 1 {
+        let package = packages.remove(0);
+        if !package.is_empty() && !is_intermediate_caller_package(&package) {
+            return Some(package);
+        }
+    }
+    None
 }
 
 fn normalize_provider_open_op_filter(value: &str) -> &'static str {
@@ -1247,6 +1542,56 @@ fn should_prefer_direct_identity(identity: &SourceIdentity) -> bool {
         && !is_intermediate_caller_package(&identity.package_name)
 }
 
+/// 用 caller_uid 反查补强原生身份（无点 basename / 空来源）。
+///
+/// 返回 `(补强后的身份, 需保留为 native= 细节的原始 basename)`。仅当 uid 只
+/// 对应一个合法、非中间层、非系统代写的包名时才采信；共享 uid 组无法区分
+/// 成员，保持原样不猜（与 resolve_recent_path_caller_package 同一纪律）。
+/// 终止边界由记录入口处理；这里仅补全没有原请求任务的异步显示来源。
+fn refine_native_identity_with_caller_uid(
+    identity: SourceIdentity,
+    caller_uid: i32,
+) -> (SourceIdentity, Option<String>) {
+    let native = identity.package_name.clone();
+    let needs_refine = native.is_empty() || !native.contains('.');
+    // 低 UID 的唯一包同样可用于异步显示，多包组不选择成员。
+    if !needs_refine || caller_uid < 0 {
+        return (identity, None);
+    }
+
+    let mut packages = policy::get_packages_for_uid(caller_uid);
+    if packages.is_empty() {
+        policy::refresh_shared_uid_cache();
+        packages = policy::get_packages_for_uid(caller_uid);
+    }
+    packages.sort();
+    packages.dedup();
+    if packages.len() != 1 {
+        return (identity, None);
+    }
+    let package = packages.remove(0);
+    if !hint_file::is_valid_package_name(&package)
+        || package == native
+        || is_intermediate_caller_package(&package)
+        || policy::is_system_writer_package(&package)
+        || policy::is_overlay_or_rro_package(&package)
+    {
+        return (identity, None);
+    }
+
+    let method = if native.is_empty() {
+        "caller_uid"
+    } else {
+        "caller"
+    };
+    let keep_native = if native.is_empty() {
+        None
+    } else {
+        Some(native)
+    };
+    (SourceIdentity::new(package, method, "high"), keep_native)
+}
+
 fn extract_caller_package(caller_package: &str) -> String {
     if caller_package.is_empty() || caller_package == "-" {
         return String::new();
@@ -1267,23 +1612,51 @@ fn extract_caller_package(caller_package: &str) -> String {
 }
 
 fn is_intermediate_caller_package(package_name: &str) -> bool {
-    policy::is_media_intermediate_package(package_name)
+    policy::is_attribution_intermediate_package(package_name)
+}
+
+/// 包名是否在当前 uid 组的候选串里（逗号分隔，见
+/// `policy::get_shared_uid_packages_string`）。组内区分只认组内成员。
+fn group_contains_package(group: &str, package: &str) -> bool {
+    !package.is_empty() && group.split(',').any(|item| item == package)
+}
+
+/// 拆分组串为成员列表（去空白、丢空项）。
+fn package_group_members(group: &str) -> Vec<&str> {
+    group
+        .split(',')
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+        .collect()
+}
+
+/// 是否属于「监视初始化结论必须无条件留痕」的系统链路身份。
+///
+/// 这些进程是归因链本身（系统代写者、共享组、监视桥接、文件选择 UI）：它们的
+/// `monitor init` 一旦丢失，就只剩"记录里没有它们"这一个模糊事实，无法区分
+/// 「没启用监视」「启用了但没归因」「根本没走到这里」三种完全不同的修法。
+/// 普通应用的同一行仍走 Info，避免把每个进程启动都刷成一条告警。
+fn is_diagnostic_monitor_identity(package_name: &str, shared_uid_packages: &str, uid: i32) -> bool {
+    if !shared_uid_packages.is_empty() {
+        return true;
+    }
+    if uid >= 0 && policy::is_shared_uid_process(uid) {
+        return true;
+    }
+    package_group_members(package_name).into_iter().any(|name| {
+        policy::is_system_writer_package(name)
+            || policy::is_media_provider_package(name)
+            || policy::is_file_monitor_bridge_package(name)
+            || policy::is_file_monitor_ui_package(name)
+    })
 }
 
 // 从 key=value|... 格式中提取指定 key 的值
 fn extract_kv_value<'a>(source: &'a str, key: &str) -> Option<&'a str> {
-    let begin = source.find(key)? + key.len();
-    if begin >= source.len() {
-        return None;
-    }
-    let end = source[begin..]
-        .find('|')
-        .map(|idx| begin + idx)
-        .unwrap_or(source.len());
-    if end <= begin {
-        return None;
-    }
-    Some(&source[begin..end])
+    source
+        .split('|')
+        .find_map(|field| field.strip_prefix(key))
+        .filter(|value| !value.is_empty())
 }
 
 fn normalize_package_text(source: &str) -> String {
@@ -1299,10 +1672,13 @@ fn normalize_package_text(source: &str) -> String {
         return String::new();
     }
 
-    if !value.contains('.') {
-        return String::new();
-    }
-
+    // 无点形态不清洗为空：系统 uid 归因链（pid 表 / /proc cmdline）给出的
+    // 合法身份包括 native 二进制 basename（sh、mkdir、logd 等），daemon 侧
+    // 以 basename 作为最诚实的身份落表。此前强制要求包含 '.' 会把这些身份
+    // 在记录清洗时清空，公共路径系统 uid 写的监视记录退回 unknown
+    // （2026-10-24 真机：归因成功日志在、记录仍 unknown 的最终断点）。
+    // Java 包名照常通过；本函数仅清洗归因链产物，垃圾输入已在字符白名单
+    // 处拦截。
     value.to_string()
 }
 
@@ -1338,19 +1714,22 @@ fn build_event_key_locked(
     kind: OpKind,
     operation_name: &str,
     normalized_path: &str,
-    result: i32,
-    error_no: i32,
+    result: (i32, i32),
+    identity: Option<&crate::platform::proc_identity::RequestIdentity>,
 ) -> String {
     let operation_key = duplicate_event_operation_key(kind, operation_name);
     format!(
-        "{}|{}|{}|{}|{}|{}|{}",
+        "{}|{}|{}|{}|{}|{}|{}{}",
         state.package_name,
         source_identity.package_name,
         op_type_to_text(kind),
         operation_key,
         normalized_path,
-        result,
-        error_no
+        result.0,
+        result.1,
+        identity
+            .map(|identity| identity.log_fields())
+            .unwrap_or_default()
     )
 }
 
@@ -1435,3 +1814,75 @@ fn should_use_recent_private_owner_hint(kind: OpKind, normalized_path: &str, op:
         OpKind::Open | OpKind::Mkdir | OpKind::Mknod | OpKind::Rename
     )
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn reset_uid_cache() {
+        policy::set_shared_uid_entries_for_tests(&[
+            (10_000, &["bin.mt.plus"]),
+            (10_301, &["com.a.first", "com.b.second"]),
+        ]);
+    }
+
+    #[test]
+    fn refines_dotless_native_identity_with_caller_uid() {
+        reset_uid_cache();
+        let (identity, native) = refine_native_identity_with_caller_uid(
+            SourceIdentity::new("mtio".to_string(), "caller", "high"),
+            10_000,
+        );
+        assert_eq!(identity.package_name, "bin.mt.plus");
+        assert_eq!(identity.source, "caller");
+        assert_eq!(identity.confidence, "high");
+        assert_eq!(native.as_deref(), Some("mtio"));
+    }
+
+    #[test]
+    fn refines_empty_identity_to_caller_uid_method() {
+        reset_uid_cache();
+        let (identity, native) =
+            refine_native_identity_with_caller_uid(SourceIdentity::unknown(), 10_000);
+        assert_eq!(identity.package_name, "bin.mt.plus");
+        assert_eq!(identity.source, "caller_uid");
+        assert_eq!(native, None);
+    }
+
+    #[test]
+    fn keeps_identity_for_shared_uid_group() {
+        reset_uid_cache();
+        let (identity, native) = refine_native_identity_with_caller_uid(
+            SourceIdentity::new("mtio".to_string(), "caller", "high"),
+            10_301,
+        );
+        assert_eq!(identity.package_name, "mtio");
+        assert_eq!(native, None);
+    }
+
+    #[test]
+    fn keeps_dot_package_identity_unchanged() {
+        reset_uid_cache();
+        let (identity, native) = refine_native_identity_with_caller_uid(
+            SourceIdentity::new("com.example.app".to_string(), "caller", "high"),
+            10_000,
+        );
+        assert_eq!(identity.package_name, "com.example.app");
+        assert_eq!(native, None);
+    }
+
+    #[test]
+    fn keeps_identity_for_non_app_uid() {
+        reset_uid_cache();
+        let (identity, native) = refine_native_identity_with_caller_uid(
+            SourceIdentity::new("sh".to_string(), "caller", "high"),
+            1000,
+        );
+        assert_eq!(identity.package_name, "sh");
+        assert_eq!(native, None);
+    }
+}
+
+#[cfg(test)]
+#[path = "../tests/native-unit/monitor_identity.rs"]
+mod caller_identity_tests;

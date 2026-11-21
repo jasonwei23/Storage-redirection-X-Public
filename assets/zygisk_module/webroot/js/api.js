@@ -21,9 +21,8 @@ const MODULE_BOOT_OK = MODULE_DIR + "/.boot_ok";
 const MODULE_BOOT_VERSION = MODULE_DIR + "/.boot_module_version";
 const MODULE_PROP = MODULE_DIR + "/module.prop";
 const SRXCTL = MODULE_DIR + "/bin/srxctl";
+const SRX_DAEMON = MODULE_DIR + "/bin/srx_daemon";
 const DIAGNOSTIC_ARCHIVE_SCRIPT = MODULE_DIR + "/service.d/diagnostic_archive.sh";
-const LIST_APPS_DEX = MODULE_DIR + "/bin/list_apps.dex";
-const LIST_APPS_OUTPUT = "/data/Namespace-Proxy/list.config";
 const FILE_MONITOR_LOG = LOGS_DIR + "/file_monitor.log";
 const MONITOR_CLEAR_ACK_FILE = "/data/adb/storage.redirect.x/.file_monitor.clear.ok";
 const RUNTIME_STATS_SCHEMA = "2";
@@ -229,7 +228,7 @@ const NativeBridge = {
             finish(0, result, "");
           }
         } catch (e) {
-          cleanup();
+          // 兼容调用同样受原超时保护；这里只切换签名，不能提前清除计时器。
           try {
             const result = ksu.exec(cmd, finish);
             if (result && typeof result.then === "function") {
@@ -351,6 +350,15 @@ function srxCtlCommand(action) {
   return "/system/bin/sh " + shellQuote(SRXCTL) + " " + action;
 }
 
+/**
+ * 从 exec 失败信息中提取 srxctl 输出的重挂失败原因令牌（remount_reason=<key>）。
+ * exec 在非零退出码时只把 stderr 作为 Error message 抛出，因此令牌必须从 stderr 文本里解析。
+ */
+function extractRemountReason(text) {
+  const match = /remount_reason=([a-z0-9-]+)/.exec(String(text || ""));
+  return match ? match[1] : "";
+}
+
 function withSrxCtlFallback(action, fallback) {
   return (
     "if [ -r " +
@@ -361,6 +369,39 @@ function withSrxCtlFallback(action, fallback) {
     fallback +
     "; fi"
   );
+}
+
+/** 解析 srxctl host-status 输出为结构化状态；未知输出一律归为 unknown。 */
+function parseStorageBackendStatus(output) {
+  const text = String(output || "").trim();
+  if (text === "inactive") return { state: "inactive", pid: null, policies: null };
+  const match = /^active pid=(\d+) policies=(\d+)$/.exec(text);
+  if (match) {
+    return {
+      state: "active",
+      pid: Number(match[1]),
+      policies: Number(match[2]),
+    };
+  }
+  return { state: "unknown", pid: null, policies: null };
+}
+
+/** 解析共享宿主快照 policies 行（uid:fingerprint 列表），按 Android 用户 id 分组计数。 */
+function parseHostPolicyUserCounts(output) {
+  const line = String(output || "")
+    .split("\n")
+    .find((candidate) => candidate.startsWith("policies="));
+  if (!line) return {};
+  const body = line.slice("policies=".length).trim();
+  if (!body) return {};
+  const counts = {};
+  body.split(",").forEach((entry) => {
+    const uid = Number(entry.split(":")[0]);
+    if (!Number.isInteger(uid) || uid < 0) return;
+    const user = Math.floor(uid / 100000);
+    counts[user] = (counts[user] || 0) + 1;
+  });
+  return counts;
 }
 
 function isManagedTempPath(path) {
@@ -465,40 +506,6 @@ function diagnosticArchiveWorkerScript() {
   ].join("\n");
 }
 
-function parseDiagnosticProgress(line) {
-  const parts = String(line || "")
-    .trim()
-    .split("|");
-  if (parts.length < 3) return null;
-  const percent = Math.max(0, Math.min(100, Number.parseInt(parts[0], 10)));
-  if (!Number.isFinite(percent)) return null;
-  return {
-    percent,
-    phase: String(parts[1] || "").slice(0, 32),
-    message: parts.slice(2).join("|").slice(0, 80) || "正在导出日志",
-  };
-}
-
-function parseDiagnosticArchivePoll(stdout) {
-  let progressLine = "";
-  let doneCode = null;
-  String(stdout || "")
-    .split(/\r?\n/)
-    .forEach((line) => {
-      if (line.startsWith("__SRX_DONE__=")) {
-        const value = line.slice("__SRX_DONE__=".length).trim();
-        if (value !== "") doneCode = Number.parseInt(value, 10);
-      } else if (line.includes("|")) {
-        progressLine = line.trim();
-      }
-    });
-  return {
-    progress: parseDiagnosticProgress(progressLine),
-    progressLine,
-    doneCode: Number.isFinite(doneCode) ? doneCode : null,
-  };
-}
-
 function isSafePackageName(packageName) {
   return /^[A-Za-z0-9_.-]+$/.test(packageName || "");
 }
@@ -507,20 +514,82 @@ function isSafeUserId(userId) {
   return /^[0-9]+$/.test(String(userId || ""));
 }
 
-function parseCompatAppList(content) {
+/**
+ * 解码 `package-query … --b64` 的 base64url 回复。
+ *
+ * WebUI 取 stdout 的通道会把整段输出当 URL 解码一次（KernelSU/APatch 用
+ * `loadUrl("javascript:…")` 回传结果），清单里的 `%XX` 转义（路径的 `%2F`、中文标签的
+ * `%E7%B3%BB`）会在到达这里之前就被还原，percent 编码协议随之失效、整份清单被拒绝。
+ * base64url 只含字母数字与 `-`/`_`，解码与不解码的桥接实现都能原样送达。
+ */
+function decodePackageQueryBase64(value) {
+  const text = String(value || "")
+    .replace(/\s+/g, "")
+    .replace(/-/g, "+")
+    .replace(/_/g, "/");
+  if (!text) return "";
+  const binary = atob(text);
+  const bytes = new Uint8Array(binary.length);
+  for (let i = 0; i < binary.length; i += 1) bytes[i] = binary.charCodeAt(i);
+  return new TextDecoder("utf-8").decode(bytes);
+}
+
+function parsePackageUsers(content) {
+  const users = String(content || "")
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter((line) => /^[0-9]+$/.test(line));
+  return Array.from(new Set(users));
+}
+
+function parseSystemServerAppList(content, expectedUser) {
+  const userId = String(expectedUser);
+  if (!isSafeUserId(userId)) return null;
   const apps = [];
-  String(content || "")
-    .split("\n")
-    .forEach((line) => {
-      const text = line.trim();
-      if (!text || text.startsWith("#")) return;
-      const splitAt = text.indexOf("=");
-      const packageName = splitAt >= 0 ? text.slice(0, splitAt).trim() : text.split(/\s+/)[0];
-      const appLabel = splitAt >= 0 ? text.slice(splitAt + 1).trim() : packageName;
-      if (isSafePackageName(packageName))
-        apps.push({ packageName, appLabel: appLabel || packageName, isSystem: false });
+  const packages = new Set();
+  for (const line of String(content || "").split(/\r?\n/)) {
+    if (!line) continue;
+    const fields = line.split("\t");
+    const uid = Number(fields[1]);
+    if (
+      fields.length !== 6 ||
+      fields[0] !== userId ||
+      !/^[0-9]+$/.test(fields[1]) ||
+      !Number.isSafeInteger(uid) ||
+      uid > 2147483647 ||
+      Math.floor(uid / 100000) !== Number(userId) ||
+      (fields[2] !== "0" && fields[2] !== "1") ||
+      !isSafePackageName(fields[3]) ||
+      packages.has(fields[3]) ||
+      !/^(?:[A-Za-z0-9._~-]|%[0-9A-Fa-f]{2})*$/.test(fields[4]) ||
+      !/^(?:[A-Za-z0-9._~-]|%[0-9A-Fa-f]{2})*$/.test(fields[5])
+    ) {
+      return null;
+    }
+    let label;
+    let apkPath;
+    try {
+      label = decodeURIComponent(fields[4]);
+      apkPath = decodeURIComponent(fields[5]);
+    } catch {
+      return null;
+    }
+    if (!label || (apkPath && !apkPath.startsWith("/"))) return null;
+    packages.add(fields[3]);
+    apps.push({
+      userId,
+      uid,
+      isSystem: fields[2] === "1",
+      packageName: fields[3],
+      appLabel: label,
+      apkPath,
     });
+  }
   return apps;
+}
+
+function packageInfoCacheKey(packageName, userId) {
+  return String(userId || "0") + "\t" + packageName;
 }
 
 function normalizePackageResult(raw) {
@@ -550,6 +619,11 @@ function utf8ToBase64(value) {
     binary += String.fromCharCode.apply(null, bytes.subarray(i, i + chunkSize));
   }
   return btoa(binary);
+}
+
+/** 与 daemon 的 `--b64` 保持同一字母表（base64url），供浏览器 mock 复用。 */
+function utf8ToBase64Url(value) {
+  return utf8ToBase64(value).replace(/\+/g, "-").replace(/\//g, "_");
 }
 
 function sanitizeFileName(value, fallback) {
@@ -605,7 +679,9 @@ function normalizeMonitorFilterPathList(list) {
   const seen = new Set();
   const out = [];
   items.forEach((item) => {
-    const value = normalizeMonitorFilterPathValue(item, { allowLegacyAbsolute: true });
+    const value = normalizeMonitorFilterPathValue(item, {
+      allowLegacyAbsolute: true,
+    });
     if (!value || seen.has(value)) return;
     seen.add(value);
     out.push(value);
@@ -726,7 +802,10 @@ function manifestReleaseEntries(manifest) {
   if (manifest?.stable && hasReleaseVersion(manifest.stable))
     entries.push({ channel: "Stable", release: manifest.stable });
   if (manifest?.beta && hasReleaseVersion(manifest.beta))
-    entries.push({ channel: "Beta", release: Object.assign({ prerelease: true }, manifest.beta) });
+    entries.push({
+      channel: "Beta",
+      release: Object.assign({ prerelease: true }, manifest.beta),
+    });
   (Array.isArray(manifest?.releases) ? manifest.releases : []).forEach((release) => {
     if (!hasReleaseVersion(release)) return;
     const version = parseSemVersion(release.version || release.tag);
@@ -841,8 +920,6 @@ function formatCompactRuntimeActivationCount(raw) {
 
 const Api = {
   _packageInfo: new Map(),
-  _compatAppListCache: new Map(),
-  _compatAppListPrepared: new Set(),
   _configuredAppsCache: null,
   _configuredAppsCacheAt: 0,
   _globalConfigCache: null,
@@ -917,9 +994,9 @@ const Api = {
   },
 
   /** 以字符串形式读取文件内容 */
-  async readFile(path) {
+  async readFile(path, options) {
     try {
-      return await this.exec(shellCommand("cat", path) + " 2>/dev/null");
+      return await this.exec(shellCommand("cat", path) + " 2>/dev/null", options);
     } catch {
       return "";
     }
@@ -935,19 +1012,21 @@ const Api = {
     }
   },
 
-  /** 读取当前日志及全部轮转备份，按时间顺序合并。 */
+  /** 从当前日志与轮转备份读取最近记录，避免把全部历史传入 WebView。 */
   async readFileWithBackups(path) {
+    const lines = 1000;
     const command =
       "base=" +
       shellQuote(path) +
       '; { for f in "$base".*; do [ -f "$f" ] || continue; suffix="${f##*.}"; case "$suffix" in ' +
       "''|*[!0-9]*) continue;; esac; printf '%s\\t%s\\n' \"$suffix\" \"$f\"; done | " +
-      'sort -rn | while IFS="$(printf \'\\t\')" read -r _ f; do cat "$f"; done; cat "$base" 2>/dev/null; }';
-    try {
-      return await this.exec(command);
-    } catch {
-      return "";
-    }
+      'sort -rn | while IFS="$(printf \'\\t\')" read -r _ f; do tail -n ' +
+      lines +
+      ' "$f" 2>/dev/null; done; tail -n ' +
+      lines +
+      ' "$base" 2>/dev/null; } | tail -n ' +
+      lines;
+    return await this.exec(command, { timeoutMs: 10000 });
   },
 
   /** 将内容写入文件 */
@@ -1109,6 +1188,11 @@ const Api = {
 
   async recordModuleExportMonitor(path, kind) {
     const target = normalizePublicStoragePath(path);
+    const encodedTarget = target
+      .replace(/%/g, "%25")
+      .replace(/\|/g, "%7C")
+      .replace(/\r/g, "%0D")
+      .replace(/\n/g, "%0A");
     const exportKind = kind === "backup" ? "backup" : "diagnostic";
     const source = exportKind === "backup" ? "webui_backup" : "webui_export";
     if (!target) return false;
@@ -1122,9 +1206,9 @@ const Api = {
           MODULE_LOG_PACKAGE +
           "|" +
           MODULE_LOG_PACKAGE +
-          '|OPEN|%s|ret=0|errno=0|identify_method=module_export|identify_reliability=high|op=provider_open|op_filter=provider_open:write|source=%s|export_kind=%s\\n" ' +
+          '|OPEN|%s|field_encoding=percent|ret=0|errno=0|identify_method=module_export|identify_reliability=high|op=provider_open|op_filter=provider_open:write|source=%s|export_kind=%s\\n" ' +
           '"${ts:-unknown}" ' +
-          shellQuote(target) +
+          shellQuote(encodedTarget) +
           " " +
           shellQuote(source) +
           " " +
@@ -1251,7 +1335,7 @@ const Api = {
       'logcat -g > "$stage/logcat-buffers.txt" 2>&1 || true; ' +
       'logcat -b main,system,crash -d -t 10000 -v threadtime -s StorageRedirect:V SRX:V FileMonitorOp:I Stats:I AndroidRuntime:E DEBUG:F libc:F ActivityManager:I WindowManager:I MediaProvider:V ExternalStorage:V DocumentsUI:V Vold:V > "$stage/logcat-srx-filtered.txt" 2>&1 || true; ' +
       'logcat -b crash -d -v threadtime > "$stage/logcat-crash.txt" 2>&1 || true; ' +
-      'logcat -b main,system -d -t 8000 -v threadtime > "$stage/logcat-main-system-context.txt" 2>&1 || true; ' +
+      'logcat -b main,system -d -t 20000 -v threadtime > "$stage/logcat-main-system-context.txt" 2>&1 || true; ' +
       'logcat -b events -d -t 1500 -v threadtime > "$stage/logcat-events.txt" 2>&1 || true; ' +
       'echo "initial_capture_completed_at=$(date "+%Y-%m-%d %H:%M:%S %z" 2>/dev/null || date 2>/dev/null)" >> "$stage/state/logcat-capture.txt"; ' +
       diagnosticProgressCommand(progress, 18, "files", "正在复制模块日志和配置") +
@@ -1305,7 +1389,11 @@ const Api = {
 
   async runDiagnosticArchive(stage, archive, progress, done, runLog, pid, options) {
     // 后台执行 + 轮询进度文件
-    options?.onProgress?.({ percent: 1, phase: "start", message: "正在启动日志导出" });
+    options?.onProgress?.({
+      percent: 1,
+      phase: "start",
+      message: "正在启动日志导出",
+    });
 
     const script = DIAGNOSTIC_ARCHIVE_SCRIPT;
     const startCommand =
@@ -1394,7 +1482,11 @@ const Api = {
       }
     }
 
-    options?.onProgress?.({ percent: 99, phase: "verify", message: "正在确认日志包" });
+    options?.onProgress?.({
+      percent: 99,
+      phase: "verify",
+      message: "正在确认日志包",
+    });
     const exists = await this.exec(shellCommand("[ -s", archive) + " ] && echo 1 || echo 0", {
       timeoutMs: 10000,
     }).catch(() => "0");
@@ -1432,13 +1524,41 @@ const Api = {
     const pid = progress + ".pid";
     try {
       await this.runDiagnosticArchive(stage, tmpArchive, progress, done, runLog, pid, options);
-      options?.onProgress?.({ percent: 99, phase: "copy", message: "正在写入目标文件" });
+      options?.onProgress?.({
+        percent: 99,
+        phase: "copy",
+        message: "正在写入目标文件",
+      });
       for (const target of candidates) {
         if (await this.copyDiagnosticArchiveToPublicPath(tmpArchive, target)) {
-          options?.onProgress?.({ percent: 100, phase: "done", message: "日志包已保存" });
+          options?.onProgress?.({
+            percent: 100,
+            phase: "done",
+            message: "日志包已保存",
+          });
           await this.recordModuleExportMonitor(target, "diagnostic");
           return target;
         }
+      }
+      // Download 不可写（存储挂载异常时的典型现场）：降级把日志包留在模块目录
+      // （root 直连路径，不经 FUSE 视图），用户用 root 文件管理器或 adb 手动拷贝。
+      const fallbackTarget = MODULE_DIR + "/" + safeName;
+      const fallbackCopy = await this.exec(
+        "cp " + shellQuote(tmpArchive) + " " + shellQuote(fallbackTarget) + " && echo ok",
+        { timeoutMs: 30000 },
+      ).catch(() => "");
+      if (
+        String(fallbackCopy || "")
+          .trim()
+          .split(/\s+/)
+          .pop() === "ok"
+      ) {
+        options?.onProgress?.({
+          percent: 100,
+          phase: "done",
+          message: "Download 不可写，日志包已保存到模块目录",
+        });
+        return fallbackTarget;
       }
       throw new Error("日志包写入 Download 失败");
     } finally {
@@ -1478,11 +1598,19 @@ const Api = {
     const pid = progress + ".pid";
     try {
       await this.runDiagnosticArchive(stage, tmpArchive, progress, done, runLog, pid, options);
-      options?.onProgress?.({ percent: 99, phase: "copy", message: "正在写入目标文件" });
+      options?.onProgress?.({
+        percent: 99,
+        phase: "copy",
+        message: "正在写入目标文件",
+      });
       if (!(await this.copyDiagnosticArchiveToPublicPath(tmpArchive, target))) {
         throw new Error("日志包写入所选目录失败");
       }
-      options?.onProgress?.({ percent: 100, phase: "done", message: "日志包已保存" });
+      options?.onProgress?.({
+        percent: 100,
+        phase: "done",
+        message: "日志包已保存",
+      });
       await this.recordModuleExportMonitor(target, "diagnostic");
       return target;
     } finally {
@@ -1590,7 +1718,9 @@ const Api = {
   async readMonitorFilters(options) {
     if (options?.force) this.invalidateMonitorFiltersCache();
     if (this._monitorFiltersCache) return JSON.parse(JSON.stringify(this._monitorFiltersCache));
-    const content = await this.readFile(FILE_MONITOR_FILTERS_CONFIG);
+    const content = await this.readFile(FILE_MONITOR_FILTERS_CONFIG, {
+      timeoutMs: options?.timeoutMs,
+    });
     if (!content) {
       this._monitorFiltersCache = JSON.parse(JSON.stringify(DEFAULT_FILE_MONITOR_FILTERS));
       return JSON.parse(JSON.stringify(this._monitorFiltersCache));
@@ -1771,17 +1901,15 @@ const Api = {
     }
     try {
       const marker = "__SRX_APP_CONFIG__";
+      // 单个 awk 进程一次读完所有配置。早先逐文件 `cat` 的有 56 次 fork，
+      // 实测 1.9s 以上（输出只有 18KB），改成一条命令后降到 0.1~0.2s。
       const out = await this.exec(
-        "mkdir -p " +
-          shellQuote(APPS_DIR) +
-          "; " +
-          "for f in " +
-          shellQuote(APPS_DIR) +
-          "/*.json; do " +
-          '[ -f "$f" ] || continue; b="${f##*/}"; p="${b%.json}"; ' +
-          'printf "\\n' +
+        'awk \'FILENAME != prev { prev = FILENAME; n = FILENAME; sub(/.*\\//, "", n); ' +
+          'sub(/\\.json$/, "", n); printf "\\n' +
           marker +
-          '%s\\n" "$p"; cat "$f"; printf "\\n"; done 2>/dev/null',
+          "%s\\n\", n } { print }' " +
+          shellQuote(APPS_DIR) +
+          "/*.json 2>/dev/null",
       );
       const items = [];
       const lines = String(out || "").split("\n");
@@ -1814,107 +1942,36 @@ const Api = {
       flush();
       this._configuredAppsCache = items;
       this._configuredAppsCacheAt = now;
-      return items.map((item) => ({ packageName: item.packageName, config: item.config }));
+      return items.map((item) => ({
+        packageName: item.packageName,
+        config: item.config,
+      }));
     } catch {
       return [];
-    }
-  },
-
-  /** 列出设备上可用的 Android 用户 ID。 */
-  async listUsers() {
-    try {
-      const out = await this.exec("cmd user list 2>/dev/null || pm list users 2>/dev/null");
-      const ids = [];
-      String(out || "").replace(/UserInfo\{([0-9]+):/g, (_, id) => {
-        ids.push(id);
-        return "";
-      });
-      if (!ids.length)
-        String(out || "").replace(/\{([0-9]+):/g, (_, id) => {
-          ids.push(id);
-          return "";
-        });
-      return Array.from(new Set(ids.length ? ids : ["0"]));
-    } catch {
-      return ["0"];
     }
   },
 
   /** 获取已安装应用列表（用户应用与系统应用） */
   async getInstalledApps(userId) {
-    const safeUser = isSafeUserId(userId) ? String(userId) : "";
-    const fromKsu = this.getInstalledAppsFromKsu();
-    if (fromKsu.length) return fromKsu;
-    const fromDex = await this.getInstalledAppsFromDex(safeUser);
-    if (fromDex.length) return fromDex;
-    return await this.getInstalledAppsFromPackageManager(safeUser);
-  },
-
-  async getInstalledAppsFromPackageManager(userId) {
-    const safeUser = isSafeUserId(userId) ? String(userId) : "";
-    const userArg = safeUser ? " --user " + safeUser : "";
-    const commands = [
-      "pm list packages -f" + userArg + " 2>/dev/null",
-      "cmd package list packages -f" + userArg + " 2>/dev/null",
-    ];
-    for (const command of commands) {
-      try {
-        const out = await this.exec(command + ' | sed "s/package://" | awk -F= "{print \$2}"');
-        const packages = out.split("\n").filter(Boolean).filter(isSafePackageName);
-        if (packages.length) return packages;
-      } catch {}
-    }
-    return [];
-  },
-  async prepareCompatAppList(userId, force) {
-    if (typeof ksu !== "undefined" && ksu.listPackages) return false;
     const safeUser = isSafeUserId(userId) ? String(userId) : "0";
-    const cacheKey = safeUser || "0";
-    if (!force && this._compatAppListPrepared.has(cacheKey)) return true;
-    const apps = await this.getInstalledAppsFromDex(safeUser, { force: true });
-    if (apps.length) {
-      this._compatAppListPrepared.add(cacheKey);
-      return true;
-    }
-    return false;
+    const encoded = await this.exec(
+      shellQuote(SRX_DAEMON) + " package-query A " + safeUser + " --b64",
+    );
+    const output = decodePackageQueryBase64(encoded);
+    const apps = parseSystemServerAppList(output, safeUser);
+    if (!apps) throw new Error("Invalid PackageManager app inventory");
+    apps.forEach((app) => {
+      this._packageInfo.set(packageInfoCacheKey(app.packageName, safeUser), app);
+    });
+    return apps.map((app) => app.packageName);
   },
 
-  getInstalledAppsFromKsu() {
-    if (typeof ksu === "undefined" || !ksu.listPackages) return [];
+  async listUsers() {
     try {
-      const userRaw = normalizePackageResult(ksu.listPackages("user"));
-      const systemRaw = normalizePackageResult(ksu.listPackages("system"));
-      const rememberInfo = (item, isSystem) => {
-        const pkg = getPackageNameFromInfo(item);
-        if (!isSafePackageName(pkg)) return;
-        if (item && typeof item === "object") {
-          item.isSystem = item.isSystem ?? isSystem;
-          this._packageInfo.set(pkg, item);
-        } else {
-          this._packageInfo.set(pkg, { packageName: pkg, isSystem });
-        }
-      };
-      userRaw.forEach((item) => rememberInfo(item, false));
-      systemRaw.forEach((item) => rememberInfo(item, true));
-      [...userRaw, ...systemRaw].forEach((item) => {
-        if (item && typeof item === "object") {
-          const pkg = getPackageNameFromInfo(item);
-          if (isSafePackageName(pkg)) this._packageInfo.set(pkg, item);
-        }
-      });
-      const names = Array.from(
-        new Set(
-          [...userRaw, ...systemRaw]
-            .map((item) => {
-              return getPackageNameFromInfo(item);
-            })
-            .filter(isSafePackageName),
-        ),
-      );
-      this.populatePackageInfo(names);
-      return names;
+      const users = parsePackageUsers(await this.exec(shellQuote(SRX_DAEMON) + " package-query T"));
+      return users.length ? users : ["0"];
     } catch {
-      return [];
+      return ["0"];
     }
   },
 
@@ -1937,41 +1994,10 @@ const Api = {
     } catch {}
   },
 
-  async getInstalledAppsFromDex(userId, options) {
-    const safeUser = isSafeUserId(userId) ? String(userId) : "0";
-    const cacheKey = safeUser || "0";
-    if (!options?.force && this._compatAppListCache.has(cacheKey)) {
-      return this._compatAppListCache.get(cacheKey).slice();
-    }
-    try {
-      await this.exec(
-        "mkdir -p /data/Namespace-Proxy; if [ -f " +
-          shellQuote(LIST_APPS_DEX) +
-          " ]; then /system/bin/app_process64 -Djava.class.path=" +
-          shellQuote(LIST_APPS_DEX) +
-          " / Main --user " +
-          safeUser +
-          " > " +
-          shellQuote(LIST_APPS_OUTPUT) +
-          " 2>/dev/null; fi",
-      );
-      const out = await this.readFile(LIST_APPS_OUTPUT);
-      const apps = parseCompatAppList(out).map((item) => {
-        this._packageInfo.set(item.packageName, item);
-        return item.packageName;
-      });
-      this._compatAppListCache.set(cacheKey, apps);
-      this._compatAppListPrepared.add(cacheKey);
-      return apps.slice();
-    } catch {
-      return [];
-    }
-  },
-
   /** 获取指定软件包的应用标签 */
-  async getAppLabel(packageName) {
+  async getAppLabel(packageName, userId) {
     if (!isSafePackageName(packageName)) return packageName;
-    const cached = this._packageInfo.get(packageName);
+    const cached = this.getCachedAppInfo(packageName, userId);
     if (cached) return cached.appLabel || cached.label || cached.name || packageName;
     try {
       return await this.exec(
@@ -1986,8 +2012,12 @@ const Api = {
     }
   },
 
-  getCachedAppInfo(packageName) {
-    return this._packageInfo.get(packageName) || null;
+  getCachedAppInfo(packageName, userId) {
+    return (
+      this._packageInfo.get(packageInfoCacheKey(packageName, userId)) ||
+      this._packageInfo.get(packageName) ||
+      null
+    );
   },
 
   getAppIconSrc(packageName) {
@@ -2072,9 +2102,10 @@ const Api = {
 
   async ensureLogCollectors() {
     try {
-      if (await this.fileExists(SRXCTL)) {
-        await this.exec(srxCtlCommand("ensure-collectors"));
-      }
+      await this.exec(
+        "if [ -r " + shellQuote(SRXCTL) + " ]; then " + srxCtlCommand("ensure-collectors") + "; fi",
+        { timeoutMs: 5000 },
+      );
     } catch {}
   },
 
@@ -2344,12 +2375,37 @@ const Api = {
         timeoutMs: 30_000,
       });
       return { ok: true };
-    } catch {
-      return { ok: false };
+    } catch (error) {
+      return { ok: false, failureReason: extractRemountReason(error?.message) };
     } finally {
       try {
         await this.ensureLogCollectors();
       } catch {}
+    }
+  },
+
+  /** 读取共享宿主会话状态指示，供概览页展示；读取失败按 unknown 处理。 */
+  async readStorageBackendStatus() {
+    try {
+      const out = await this.exec(withSrxCtlFallback("host-status", "echo unknown"), {
+        timeoutMs: 10_000,
+      });
+      return parseStorageBackendStatus(out);
+    } catch {
+      return { state: "unknown", pid: null, policies: null };
+    }
+  },
+
+  /** 读取共享宿主快照，返回按用户拆分的已登记策略数；快照缺失或读取失败返回空对象。 */
+  async readHostPolicyUserCounts() {
+    try {
+      const path = shellQuote("/data/adb/modules/storage.redirect.x/tmp/fuse_host.snapshot");
+      const out = await this.exec("if [ -r " + path + " ]; then cat " + path + "; fi", {
+        timeoutMs: 10_000,
+      });
+      return parseHostPolicyUserCounts(out);
+    } catch {
+      return {};
     }
   },
 
@@ -2454,6 +2510,16 @@ const Api = {
   },
 
   async _mockExec(cmd) {
+    if (cmd.includes("package-query T")) return "0\n10\n";
+    if (cmd.includes("package-query A 10"))
+      return utf8ToBase64Url(
+        "10\t1010123\t0\tcom.example.work\tWork%20App\t%2Fdata%2Fapp%2Fwork%2Fbase.apk\n",
+      );
+    if (cmd.includes("package-query A 0"))
+      return utf8ToBase64Url(
+        "0\t10123\t0\tcom.tencent.mm\tWeChat\t%2Fdata%2Fapp%2Fwechat%2Fbase.apk\n" +
+          "0\t1000\t1\tcom.android.settings\tSettings\t%2Fsystem%2Fpriv-app%2FSettings%2Fbase.apk\n",
+      );
     if (cmd.includes(FILE_MONITOR_LOG) && (cmd.includes(": >") || cmd.includes('echo "" >'))) {
       this._mockStore.fileMonitorLogCleared = true;
       return "";

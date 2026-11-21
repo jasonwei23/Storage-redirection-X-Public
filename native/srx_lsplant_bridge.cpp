@@ -256,10 +256,10 @@ bool ShouldForceUserspacePrivateOwnerSqlite(const std::string &path) {
   return srx_should_force_fuse_userspace_private_owner_sqlite(path.c_str());
 }
 
-void PreparePrivateOwnerSqliteSidecar(const std::string &path) {
+bool PreparePrivateOwnerSqliteSidecar(const std::string &path) {
   if (path.empty())
-    return;
-  srx_prepare_fuse_private_owner_sqlite_sidecar(path.c_str());
+    return false;
+  return srx_prepare_fuse_private_owner_sqlite_sidecar(path.c_str());
 }
 
 std::string ResolveFdPath(int fd) {
@@ -279,7 +279,12 @@ bool ShouldDisableFusePassthroughForFd(int fd, const char *source) {
   std::string path = ResolveFdPath(fd);
   if (!ShouldForceUserspacePrivateOwnerSqlite(path))
     return false;
-  PreparePrivateOwnerSqliteSidecar(path);
+  // 只有「本次确实需要 MediaProvider 用户态承担这次 IO」才清直通：毒化边车已
+  // 删除（需要 MP 重新解析路径、让应用 O_CREAT 拿到新 inode），或该入口 MP 自己
+  // 打得开。owner-only 入口 MP 打不开（它用自己的身份 open 下层文件，CapEff=0），
+  // 清直通只会把 EACCES 透传给应用，必须保持内核直通让属主身份决定 DAC。
+  if (!PreparePrivateOwnerSqliteSidecar(path))
+    return false;
   if (ShouldLogPassthroughVerbose()) {
     uint32_t suppressed =
         g_suppressed_passthrough_logs.exchange(0, std::memory_order_relaxed);
@@ -401,8 +406,7 @@ int SrxFuseFixReplyCreate(void *req, const void *entry,
 int SrxFuseFixPassthroughEnable(void *req, unsigned int fd) {
   if (g_orig_fuse_passthrough_enable == nullptr)
     return -ENOSYS;
-  if ((g_fuse_fix_reply_open_stub != nullptr || g_fuse_fix_reply_create_stub != nullptr) &&
-      ShouldDisableFusePassthroughForFd(static_cast<int>(fd), "passthrough_enable")) {
+  if (ShouldDisableFusePassthroughForFd(static_cast<int>(fd), "passthrough_enable")) {
     return 1;
   }
   return g_orig_fuse_passthrough_enable(req, fd);
@@ -411,8 +415,7 @@ int SrxFuseFixPassthroughEnable(void *req, unsigned int fd) {
 int SrxFuseFixPassthroughOpen(void *req, int fd) {
   if (g_orig_fuse_passthrough_open == nullptr)
     return -ENOSYS;
-  if ((g_fuse_fix_reply_open_stub != nullptr || g_fuse_fix_reply_create_stub != nullptr) &&
-      ShouldDisableFusePassthroughForFd(fd, "passthrough_open")) {
+  if (ShouldDisableFusePassthroughForFd(fd, "passthrough_open")) {
     return 1;
   }
   return g_orig_fuse_passthrough_open(req, fd);

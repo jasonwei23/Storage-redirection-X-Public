@@ -27,8 +27,6 @@ import androidx.compose.foundation.lazy.itemsIndexed
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.selection.SelectionContainer
-import androidx.compose.material.icons.Icons
-import androidx.compose.material.icons.rounded.KeyboardArrowDown
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
@@ -70,6 +68,7 @@ import top.yukonga.miuix.kmp.basic.Text
 import top.yukonga.miuix.kmp.basic.rememberPullToRefreshState
 import top.yukonga.miuix.kmp.icon.MiuixIcons
 import top.yukonga.miuix.kmp.icon.extended.Delete
+import top.yukonga.miuix.kmp.icon.extended.ExpandMore
 import top.yukonga.miuix.kmp.icon.extended.File
 import top.yukonga.miuix.kmp.icon.extended.Tune
 import top.yukonga.miuix.kmp.theme.MiuixTheme
@@ -198,7 +197,7 @@ internal fun LogsScreen(
               contentType = { _, entry -> if (entry.ok) "success" else "error" },
           ) { _, entry ->
             val app =
-                if (entry.isModuleWebUiExport) null
+                if (entry.isModuleWebUiExport || !entry.hasApplicationIdentity) null
                 else
                     appsByPackage[entry.packageName]
                         ?: appsByPackage[entry.callerPackage]
@@ -275,6 +274,7 @@ private fun LogCard(
   val openTarget =
       if (
           entry.isModuleWebUiExport ||
+              !entry.hasApplicationIdentity ||
               (isFilesystemObservation && !hasAttributedCaller) ||
               isMediaProviderFallback
       ) {
@@ -421,6 +421,7 @@ private fun LogAppIdentityAction(
 }
 
 private fun LogEntry.toInstalledAppOrNull(displayName: String): InstalledApp? {
+  if (!hasApplicationIdentity) return null
   val targetPackage = packageName.takeIf(::isSafePackageName) ?: return null
   return InstalledApp(
       packageName = targetPackage,
@@ -506,6 +507,9 @@ private fun logEntrySummary(entry: LogEntry): String {
   val method = logIdentifyMethodText(entry.identifyMethod)
   val hasAttributedCaller = isAttributedFilesystemObservation(entry)
   when {
+    entry.identifyMethod == "shared_uid" -> parts += "共享 UID 组 ${entry.packageName}"
+    entry.identifyMethod == "executor" || entry.callerBoundary.isNotBlank() ->
+        parts += "执行者 ${entry.nativeIdentity.ifBlank { entry.callerPackage }}"
     hasAttributedCaller -> {
       val subject =
           if (entry.identifyMethod in setOf("provider_open", "provider_mkdir", "saf_provider"))
@@ -556,6 +560,10 @@ private fun logEntrySummary(entry: LogEntry): String {
     method.isNotBlank() -> parts += method
   }
   val reliability = logReliabilityText(entry.identifyReliability)
+  entry.callerUid?.let { parts += "UID $it" }
+  entry.callerPid?.let { parts += "PID/TID $it" }
+  if (entry.callerContext.isNotBlank()) parts += "SELinux ${entry.callerContext}"
+  if (entry.callerBoundary.isNotBlank()) parts += "追溯边界 ${entry.callerBoundary}"
   if (reliability.isNotBlank()) parts += "可靠性 $reliability"
   if (entry.observationCount > 0) {
     val observer = entry.observerPackage.takeIf { it.isNotBlank() }
@@ -587,7 +595,8 @@ private fun String.isIntermediateLogPackage(): Boolean =
         this == "com.android.externalstorage" ||
         this == "com.android.mtp" ||
         contains(".documentsui") ||
-        contains(".photopicker")
+        contains("photopicker") ||
+        contains("mediapicker")
 
 private fun logIdentifyMethodText(method: String): String =
     when (method) {
@@ -658,7 +667,7 @@ private fun PathExpandButtonSurface(expanded: Boolean, enabled: Boolean, onClick
       contentAlignment = Alignment.Center,
   ) {
     Icon(
-        imageVector = Icons.Rounded.KeyboardArrowDown,
+        imageVector = MiuixIcons.ExpandMore,
         contentDescription = if (expanded) "收起详情" else "展开详情",
         tint =
             if (enabled) MiuixTheme.colorScheme.onSurface

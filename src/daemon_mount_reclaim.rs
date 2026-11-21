@@ -13,9 +13,8 @@ use crate::platform::errno::{last as last_errno, text as errno_text};
 use crate::platform::module_paths;
 use crate::platform::paths::monotonic_ms;
 use libc::{SIGKILL, WNOHANG, waitpid};
-use once_cell::sync::Lazy;
-use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{LazyLock, Mutex};
 
 const MAX_STUCK_MOUNT_CHILDREN: usize = 2;
 /// 卡死子进程计入熔断的时长窗口。
@@ -33,8 +32,8 @@ const MAX_TOTAL_STUCK_MOUNT_CHILDREN: usize = 32;
 const MAX_TRACKED_STUCK_MOUNT_CHILDREN: usize = 64;
 const STUCK_MOUNT_SKIP_LOG_STEP: u64 = 32;
 
-static STUCK_MOUNT_CHILDREN: Lazy<Mutex<Vec<StuckMountChild>>> =
-    Lazy::new(|| Mutex::new(Vec::new()));
+static STUCK_MOUNT_CHILDREN: LazyLock<Mutex<Vec<StuckMountChild>>> =
+    LazyLock::new(|| Mutex::new(Vec::new()));
 static STUCK_MOUNT_SKIP_LOG_COUNT: AtomicU64 = AtomicU64::new(0);
 static STALE_HOST_LOG_COUNT: AtomicU64 = AtomicU64::new(0);
 
@@ -225,15 +224,16 @@ fn migrate_stale_shared_host_metadata(
     request: &MountRequest,
     current_identity: (i32, u64),
 ) -> bool {
-    let current_source = format!("srx_fuse_host[{}]", current_identity.0);
+    // 当前会话身份改按超级块判定：挂载源已原生化，源文本不再带会话标识。
+    let current_dev = crate::fuse_host::current_host_dev();
     let user_id = crate::platform::user_id_from_uid(request.uid);
     let storage_root = crate::platform::paths::storage_user_root_for_user(user_id);
     let Some(live_root) = crate::mount_identity::topmost_live_mount(request.pid, &storage_root)
     else {
         return false;
     };
-    if live_root.source != current_source
-        || !crate::fuse_host::is_current_host_source(&live_root.source)
+    if current_dev.as_deref() != Some(live_root.dev.as_str())
+        || !crate::fuse_host::is_current_host_mount(&live_root)
     {
         return false;
     }
@@ -249,12 +249,13 @@ fn migrate_stale_shared_host_metadata(
         else {
             return false;
         };
-        if live.source != current_source {
+        if current_dev.as_deref() != Some(live.dev.as_str()) {
             return false;
         }
         migrated_mounts.push(crate::mount_ledger::MountIdentity {
             mount_point: mount.mount_point.clone(),
             mount_id: live.mount_id,
+            dev: live.dev.clone(),
             source: live.source,
         });
     }
@@ -278,7 +279,7 @@ fn migrate_stale_shared_host_metadata(
         })
         .collect::<Vec<_>>()
         .join("\n");
-    let temp_path = format!("{state_path}.tmp");
+    let temp_path = crate::fuse_session::mount_state_temp_path(state_path);
     if std::fs::write(&temp_path, format!("{updated}\n")).is_err()
         || std::fs::rename(&temp_path, state_path).is_err()
     {
@@ -286,11 +287,11 @@ fn migrate_stale_shared_host_metadata(
         return false;
     }
     log::info!(
-        "daemon migrated stale shared host metadata pkg={} pid={} old_state={} current_source={} generation={}",
+        "daemon migrated stale shared host metadata pkg={} pid={} old_state={} current_dev={} generation={}",
         request.package_name,
         request.pid,
         state_path,
-        current_source,
+        current_dev.as_deref().unwrap_or(""),
         ledger.generation
     );
     true
@@ -507,27 +508,25 @@ pub(crate) fn remember_stuck_mount_child(child: i32, package_name: &str) {
 }
 
 pub(crate) fn reap_child(child: i32, nonblocking: bool) -> bool {
-    let mut status = 0;
-    let options = if nonblocking { WNOHANG } else { 0 };
-    let attempts = if nonblocking { 20 } else { 1 };
-    for attempt in 0..attempts {
-        // SAFETY: status 为本作用域独占的可变 i32，waitpid 只写这一处；child 为本次 fork 返回的 pid。
-        let ret = unsafe { waitpid(child, &mut status, options) };
-        if ret < 0 {
-            log_errno("daemon waitpid failed");
-            return true;
-        }
-        if ret > 0 {
-            return true;
-        }
-        if !nonblocking {
-            break;
-        }
-        if attempt + 1 < attempts {
-            // SAFETY: usleep 无副作用、不触碰任何 Rust 内存，仅让出 10ms 再重试回收。
-            unsafe { libc::usleep(10 * 1000) };
-        }
+    if nonblocking {
+        // 有界等待约 200ms（与改造前 20×10ms 复查同预算），由 pidfd 退出事件唤醒。
+        return match crate::platform::child_wait::wait_child_exit(child, 200) {
+            crate::platform::child_wait::ChildExit::TimedOut => {
+                log::warn!("daemon child not reaped child={}", child);
+                false
+            }
+            crate::platform::child_wait::ChildExit::Failed(errno) => {
+                log::warn!("daemon waitpid failed child={} errno={}", child, errno);
+                true
+            }
+            _ => true,
+        };
     }
-    log::warn!("daemon child not reaped child={}", child);
-    false
+    let mut status = 0;
+    // SAFETY: status 为本作用域独占的可变 i32，waitpid 只写这一处；child 为本次 fork 返回的 pid。
+    let ret = unsafe { waitpid(child, &mut status, 0) };
+    if ret < 0 {
+        log_errno("daemon waitpid failed");
+    }
+    true
 }

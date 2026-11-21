@@ -87,7 +87,11 @@ pub unsafe extern "C" fn hooked_open(pathname: *const c_char, flags: c_int, mode
         |hub| {
             hub.increment_open_calls();
             if runtime::should_resolve_caller_context(hub) {
-                super::super::caller::update_caller_package_for_current_thread(hub);
+                if super::super::monitor::has_write_intent_flags(flags) {
+                    super::super::caller::update_caller_for_mutation(hub, pathname);
+                } else {
+                    super::super::caller::update_caller_package_for_current_thread(hub);
+                }
             }
 
             handle_open_like(hub, "open", pathname, flags, true, |call_path| {
@@ -108,7 +112,11 @@ pub unsafe extern "C" fn hooked_openat(
         |hub| {
             hub.increment_openat_calls();
             if runtime::should_resolve_caller_context(hub) {
-                super::super::caller::update_caller_package_for_current_thread(hub);
+                if super::super::monitor::has_write_intent_flags(flags) {
+                    super::super::caller::update_caller_for_mutation(hub, pathname);
+                } else {
+                    super::super::caller::update_caller_package_for_current_thread(hub);
+                }
             }
 
             handle_openat_like(
@@ -123,6 +131,30 @@ pub unsafe extern "C" fn hooked_openat(
     )
 }
 
+/// 用 newfstatat(AT_SYMLINK_NOFOLLOW) 直接探测末段，避免递归进入已安装的
+/// stat/lstat hook。路径不存在时返回 false（创建语义下没有末段链接）。
+/// O_NOFOLLOW 只在末段确实是符号链接时需要保留原路径；O_PATH/O_TMPFILE
+/// 本身不改变这个判断，统一走同一入口，避免两处 handler 语义漂移。
+fn should_preserve_original_path(flags: c_int, dirfd: c_int, pathname: *const c_char) -> bool {
+    flags & libc::O_NOFOLLOW != 0 && final_component_is_symlink(dirfd, pathname)
+}
+
+fn final_component_is_symlink(dirfd: c_int, pathname: *const c_char) -> bool {
+    if pathname.is_null() {
+        return false;
+    }
+    // SAFETY: stat 是 POD；pathname 由调用方保证为 NUL 结尾。
+    let mut stat: libc::stat = unsafe { std::mem::zeroed() };
+    // fstatat 自身也在 hook 表里；当前处于 ReentryGuard 内，会直接走原函数。
+    let ret = unsafe { libc::fstatat(dirfd, pathname, &mut stat, libc::AT_SYMLINK_NOFOLLOW) };
+    ret == 0 && (stat.st_mode & libc::S_IFMT) == libc::S_IFLNK
+}
+const RESOLVE_BENEATH: u64 = 0x08;
+const RESOLVE_IN_ROOT: u64 = 0x10;
+
+fn openat2_requires_original_dirfd(resolve: u64) -> bool {
+    resolve & (RESOLVE_BENEATH | RESOLVE_IN_ROOT) != 0
+}
 pub unsafe extern "C" fn hooked_openat2(
     dirfd: c_int,
     pathname: *const c_char,
@@ -134,10 +166,28 @@ pub unsafe extern "C" fn hooked_openat2(
         |hub| {
             hub.increment_openat_calls();
             if runtime::should_resolve_caller_context(hub) {
-                super::super::caller::update_caller_package_for_current_thread(hub);
+                // SAFETY: how 非空时按 OpenHow 布局读取 flags 字段，指针有效性
+                // 由 openat2 调用方保证；空指针按无写意图处理。
+                let write_intent = !how.is_null()
+                    && unsafe {
+                        super::super::monitor::has_write_intent_flags((*how).flags as i32)
+                    };
+                if write_intent {
+                    super::super::caller::update_caller_for_mutation(hub, pathname);
+                } else {
+                    super::super::caller::update_caller_package_for_current_thread(hub);
+                }
             }
 
             if pathname.is_null() || how.is_null() {
+                return call_openat2(dirfd, pathname, how, how_size);
+            }
+            // RESOLVE_BENEATH / RESOLVE_IN_ROOT 把路径解释绑定在原 dirfd 的
+            // 根上；改写成绝对沙盒路径后无法保持这个根，只能保持原调用。
+            // 其余 RESOLVE_*（NO_XDEV/NO_SYMLINKS/NO_MAGICLINKS）是对最终
+            // 路径的约束，仍可交给内核在重定向后的路径上校验：不满足时内核
+            // 返回错误，不会变成“错误地成功打开”。
+            if openat2_requires_original_dirfd((*how).resolve) {
                 return call_openat2(dirfd, pathname, how, how_size);
             }
 
@@ -167,6 +217,11 @@ where
     F: FnMut(*const c_char) -> c_int,
 {
     if pathname.is_null() {
+        return call_original(pathname);
+    }
+    // O_NOFOLLOW 只在“末段本身是符号链接”时必须失败。先按原 dirfd 探测末段；
+    // 不是符号链接时重定向不会改变 ELOOP 语义；是符号链接时保持原调用。
+    if should_preserve_original_path(flags, AT_FDCWD, pathname) {
         return call_original(pathname);
     }
 
@@ -220,16 +275,17 @@ where
         final_path.as_ref(),
         flags,
     );
-    if should_fix_system_writer_private_owner(hub, flags) {
-        runtime::fix_system_writer_android_private_owner(final_path.as_ref(), false);
-    }
     if is_system_writer && is_sqlite_shm_sidecar_path(path_for_decision.as_ref()) {
         crate::hook::media_fuse::prepare_private_owner_sqlite_sidecar(path_for_decision.as_ref());
     }
 
     let call_target =
         OpenCallTarget::for_open(pathname, final_path.as_ref(), is_relative, is_redirected);
-    let existed_before = std::path::Path::new(final_path.as_ref()).exists();
+    // 「打开前是否已存在」只用于文件监视记录（record_open_result 在监视关闭时立即返回）。
+    // 监视关闭时不做这次 stat：它走应用视图里的 FUSE 路径，每次 open 都要付一次往返，
+    // 而原生 open 不做任何额外的存在性查询。
+    let existed_before =
+        hub.is_monitor_enabled() && std::path::Path::new(final_path.as_ref()).exists();
     let mut result = call_original(call_target.path);
     let mut error_no = runtime::errno_for_result(result);
 
@@ -251,7 +307,7 @@ where
     }
 
     if result >= 0 && is_system_writer {
-        runtime::fix_system_writer_android_private_owner(final_path.as_ref(), true);
+        runtime::fix_system_writer_android_private_owner(final_path.as_ref(), true, result);
     }
 
     finalize_open_result(
@@ -287,6 +343,10 @@ where
     F: FnMut(c_int, *const c_char) -> c_int,
 {
     if pathname.is_null() {
+        return call_original(dirfd, pathname);
+    }
+    // 同上：只有末段确实是符号链接时才必须保持原调用。
+    if should_preserve_original_path(flags, dirfd, pathname) {
         return call_original(dirfd, pathname);
     }
 
@@ -335,7 +395,11 @@ where
         should_call_with_absolute = is_relative;
     }
 
-    let existed_before = std::path::Path::new(final_path.as_ref()).exists();
+    // 「打开前是否已存在」只用于文件监视记录（record_open_result 在监视关闭时立即返回）。
+    // 监视关闭时不做这次 stat：它走应用视图里的 FUSE 路径，每次 open 都要付一次往返，
+    // 而原生 open 不做任何额外的存在性查询。
+    let existed_before =
+        hub.is_monitor_enabled() && std::path::Path::new(final_path.as_ref()).exists();
     let call_target = OpenCallTarget::for_openat(
         dirfd,
         pathname,
@@ -350,9 +414,6 @@ where
         final_path.as_ref(),
         flags,
     );
-    if should_fix_system_writer_private_owner(hub, flags) {
-        runtime::fix_system_writer_android_private_owner(final_path.as_ref(), false);
-    }
     if is_system_writer && is_sqlite_shm_sidecar_path(path_for_decision.as_ref()) {
         crate::hook::media_fuse::prepare_private_owner_sqlite_sidecar(path_for_decision.as_ref());
     }
@@ -390,7 +451,7 @@ where
     );
 
     if result >= 0 && is_system_writer {
-        runtime::fix_system_writer_android_private_owner(final_path.as_ref(), true);
+        runtime::fix_system_writer_android_private_owner(final_path.as_ref(), true, result);
     }
 
     result
@@ -427,10 +488,12 @@ impl OpenCallTarget {
     fn for_open(
         pathname: *const c_char,
         final_path: &str,
-        is_relative: bool,
+        _is_relative: bool,
         is_redirected: bool,
     ) -> Self {
-        if is_relative && !is_redirected {
+        // 未重定向时必须透传调用方原始路径：决策路径可能折叠了 `.`/`..`，
+        // 而内核在符号链接下解析这些段，改写会改变实际目标。
+        if !is_redirected {
             return Self::borrowed(AT_FDCWD, pathname);
         }
         Self::from_final_path(AT_FDCWD, pathname, final_path)
@@ -440,7 +503,7 @@ impl OpenCallTarget {
         dirfd: c_int,
         pathname: *const c_char,
         final_path: &str,
-        is_relative: bool,
+        _is_relative: bool,
         should_call_with_absolute: bool,
     ) -> Self {
         let call_dirfd = if should_call_with_absolute {
@@ -448,7 +511,8 @@ impl OpenCallTarget {
         } else {
             dirfd
         };
-        if is_relative && !should_call_with_absolute {
+        // 未重定向时保留原始 dirfd 与相对路径，避免把 dirfd 语义换成绝对路径。
+        if !should_call_with_absolute {
             return Self::borrowed(call_dirfd, pathname);
         }
         Self::from_final_path(call_dirfd, pathname, final_path)
@@ -508,12 +572,6 @@ where
         log_redirected_open_fd(op_name, from_path, final_path, flags, &fd_diag);
     }
 
-    if result >= 0 && should_fix_system_writer_private_owner(hub, flags) {
-        runtime::fix_system_writer_android_private_owner(
-            final_path,
-            has_create_intent_flags_for_owner_fix(flags),
-        );
-    }
     monitor::record_open_result(
         hub,
         monitor::OpenResultRecord {
@@ -588,7 +646,7 @@ fn should_redirect_open_operation(
     flags: c_int,
 ) -> bool {
     should_redirect_open_operation_for_mode(
-        hub.is_monitor_only(),
+        hub.effective_monitor_only(),
         hub.is_app_write_only(),
         is_system_writer,
         flags,
@@ -983,7 +1041,7 @@ pub unsafe extern "C" fn hooked_creat(pathname: *const c_char, mode: mode_t) -> 
         |hub| {
             hub.increment_open_calls();
             if runtime::should_resolve_caller_context(hub) {
-                super::super::caller::update_caller_package_for_current_thread(hub);
+                super::super::caller::update_caller_for_mutation(hub, pathname);
             }
 
             handle_open_like(hub, "creat", pathname, creat_flags, false, |call_path| {
@@ -993,15 +1051,102 @@ pub unsafe extern "C" fn hooked_creat(pathname: *const c_char, mode: mode_t) -> 
     )
 }
 
-fn should_fix_system_writer_private_owner(hub: &InterceptHub, flags: c_int) -> bool {
-    !hub.is_monitor_only()
-        && hub.with_package_name(policy::is_system_writer_package)
-        && monitor::has_write_intent_flags(flags)
-}
+#[cfg(test)]
+mod tests {
+    use super::*;
 
-fn has_create_intent_flags_for_owner_fix(flags: c_int) -> bool {
-    if flags < 0 || (flags & libc::O_PATH) != 0 {
-        return false;
+    macro_rules! test_require {
+        ($result:expr, $context:literal) => {
+            match $result {
+                Ok(value) => value,
+                Err(error) => panic!("{}: {:?}", $context, error),
+            }
+        };
     }
-    (flags & libc::O_CREAT) != 0 || (flags & libc::O_TMPFILE) == libc::O_TMPFILE
+
+    #[test]
+    fn resolve_beneath_and_in_root_keep_original_dirfd() {
+        assert!(openat2_requires_original_dirfd(RESOLVE_BENEATH));
+        assert!(openat2_requires_original_dirfd(RESOLVE_IN_ROOT));
+        assert!(openat2_requires_original_dirfd(
+            RESOLVE_BENEATH | RESOLVE_IN_ROOT
+        ));
+    }
+
+    #[test]
+    fn nofollow_only_rejects_actual_symlink() {
+        use std::os::unix::fs::symlink;
+        let base = std::env::temp_dir().join(format!(
+            "srx-nofollow-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|value| value.as_nanos())
+                .unwrap_or_default()
+        ));
+        test_require!(std::fs::create_dir_all(&base), "create base");
+        let file = base.join("file");
+        test_require!(std::fs::write(&file, b"x"), "write file");
+        let link = base.join("link");
+        test_require!(symlink(&file, &link), "symlink");
+        let file_c = test_require!(
+            std::ffi::CString::new(file.to_string_lossy().as_bytes()),
+            "file c"
+        );
+        let link_c = test_require!(
+            std::ffi::CString::new(link.to_string_lossy().as_bytes()),
+            "link c"
+        );
+        assert!(!final_component_is_symlink(AT_FDCWD, file_c.as_ptr()));
+        assert!(final_component_is_symlink(AT_FDCWD, link_c.as_ptr()));
+        let _ = std::fs::remove_dir_all(base);
+    }
+    #[test]
+    // O_PATH/O_TMPFILE 不改变 O_NOFOLLOW 的末段判定。
+    fn o_path_and_tmpfile_share_nofollow_rule() {
+        use std::os::unix::fs::symlink;
+        let base = std::env::temp_dir().join(format!(
+            "srx-o-path-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|value| value.as_nanos())
+                .unwrap_or_default()
+        ));
+        test_require!(std::fs::create_dir_all(base.join("dir")), "create dir");
+        let link = base.join("link");
+        test_require!(symlink(base.join("dir"), &link), "symlink");
+        let link_c = test_require!(
+            std::ffi::CString::new(link.to_string_lossy().as_bytes()),
+            "link c"
+        );
+        let dir_c = test_require!(
+            std::ffi::CString::new(base.join("dir").to_string_lossy().as_bytes()),
+            "dir c"
+        );
+        assert!(should_preserve_original_path(
+            libc::O_PATH | libc::O_NOFOLLOW,
+            AT_FDCWD,
+            link_c.as_ptr()
+        ));
+        assert!(!should_preserve_original_path(
+            libc::O_PATH | libc::O_NOFOLLOW,
+            AT_FDCWD,
+            dir_c.as_ptr()
+        ));
+        assert!(!should_preserve_original_path(
+            libc::O_TMPFILE | libc::O_RDWR,
+            AT_FDCWD,
+            dir_c.as_ptr()
+        ));
+        let _ = std::fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn final_path_only_resolve_flags_can_still_redirect() {
+        assert!(!openat2_requires_original_dirfd(0));
+        assert!(!openat2_requires_original_dirfd(0x01)); // NO_XDEV
+        assert!(!openat2_requires_original_dirfd(0x02)); // NO_MAGICLINKS
+        assert!(!openat2_requires_original_dirfd(0x04)); // NO_SYMLINKS
+    }
 }

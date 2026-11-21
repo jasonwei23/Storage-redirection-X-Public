@@ -5,13 +5,14 @@ import org.srx.manager.root.isSafePackageName
 internal fun parseMonitorLogEntries(
     raw: String,
     filters: FileMonitorFilters? = null,
+    callerUidResolver: (Int) -> String? = { null },
     labelResolver: (String) -> String = { it },
 ): List<LogEntry> {
   val labelCache = mutableMapOf<String, String>()
   val compiledFilters = filters?.let(::compileMonitorFilters)
   return raw.lineSequence()
       .filter { it.isNotBlank() }
-      .mapNotNull { parseMonitorLogLine(it, labelCache, labelResolver) }
+      .mapNotNull { parseMonitorLogLine(it, labelCache, labelResolver, callerUidResolver) }
       .filterNot { it.path.substringAfterLast('/').matches(TempJsLogPathRegex) }
       .filterNot { it.isMediaStorePendingIntermediateRecord() }
       .filterNot { compiledFilters != null && it.matchesMonitorFilters(compiledFilters) }
@@ -24,26 +25,34 @@ private fun parseMonitorLogLine(
     line: String,
     labelCache: MutableMap<String, String>,
     labelResolver: (String) -> String,
+    callerUidResolver: (Int) -> String?,
 ): LogEntry? {
-  val parts = line.split('|')
-  if (parts.size < 5) return null
-  val extras =
-      parts
-          .drop(5)
-          .mapNotNull {
-            val index = it.indexOf('=')
-            if (index <= 0) null else it.substring(0, index) to it.substring(index + 1)
-          }
-          .toMap()
+  val rawParts = line.split('|')
+  if (rawParts.size < 5) return null
+  val rawExtras = mutableMapOf<String, String>()
+  var ambiguous = false
+  for (field in rawParts.drop(5)) {
+    val index = field.indexOf('=')
+    if (index <= 0) continue
+    val key = field.substring(0, index)
+    if (rawExtras.containsKey(key)) ambiguous = true
+    else rawExtras[key] = field.substring(index + 1)
+  }
+  ambiguous = ambiguous || rawExtras["record_integrity"] == "ambiguous"
+  val encoded = rawExtras["field_encoding"] == "percent"
+  val parts = if (encoded) rawParts.map(::decodeMonitorLogField) else rawParts
+  val extras = if (encoded) rawExtras.mapValues { decodeMonitorLogField(it.value) } else rawExtras
   if (extras["op"] == "monitor_watch") return null
   val ret = extras["ret"]?.toIntOrNull()
-  val ok = ret?.let { it >= 0 } ?: !line.contains("error", true)
-  val resultGroup = monitorResultGroup(ok, extras)
+  val ok = !ambiguous && (ret?.let { it >= 0 } ?: !line.contains("error", true))
+  val resultGroup = if (ambiguous) "unknown:log_fields" else monitorResultGroup(ok, extras)
   val processPkg = parts.getOrNull(1).orEmpty()
-  val callerPkg = parts.getOrNull(2).orEmpty()
+  val callerPkg = if (ambiguous) "-" else parts.getOrNull(2).orEmpty()
   val watchPkg = extras["watch_package"].orEmpty()
-  val identifyMethod = extras["identify_method"].orEmpty()
-  val identifyReliability = extras["identify_reliability"].orEmpty()
+  val identifyMethod = if (ambiguous) "unknown" else extras["identify_method"].orEmpty()
+  val identifyReliability = if (ambiguous) "none" else extras["identify_reliability"].orEmpty()
+  val callerBoundary = if (ambiguous) "unverified" else extras["caller_boundary"].orEmpty()
+  val isExecutor = callerBoundary.isNotBlank() || identifyMethod == "executor"
   val rawOperation = extras["op"] ?: parts.getOrNull(3).orEmpty()
   val eventRole = inferMonitorEventRole(extras["event_role"], identifyMethod, rawOperation)
   val correlationId = extras["correlation_id"].orEmpty()
@@ -52,10 +61,34 @@ private fun parseMonitorLogLine(
   val filterOperation = extras["op_filter"] ?: extras["op"] ?: parts.getOrNull(3).orEmpty()
   val operationIntent = monitorOperationIntent(filterOperation)
   val landingPath = normalizeMonitorLogPath(parts.getOrNull(4).orEmpty())
-  val isModuleExport = isModuleExportRecord(extras, processPkg, callerPkg, watchPkg)
+  val isModuleExport = !ambiguous && isModuleExportRecord(extras, processPkg, callerPkg, watchPkg)
   val pkg =
       if (isModuleExport) ModulePackageName
+      else if (isExecutor || identifyMethod == "shared_uid") callerPkg
       else selectMonitorDisplayPackage(processPkg, callerPkg, watchPkg, identifyMethod)
+  // 无点原生身份且记录带 caller_uid 时，uid 是内核层面的发起方证据：按 uid 反查
+  // 单包名补齐显示（旧记录没有 native 侧的 caller_uid 反查补强，这里兜底）。
+  // 反查结果落到中间层或共享组（多包）时维持原身份。
+  val refinedPkg =
+      if (!isModuleExport && !isExecutor && identifyMethod != "shared_uid" && !pkg.contains('.')) {
+        extras["caller_uid"]
+            ?.toIntOrNull()
+            ?.takeIf { it >= 10_000 }
+            ?.let(callerUidResolver)
+            ?.takeIf { resolved -> resolved.contains('.') && !resolved.isIntermediateLogPackage() }
+            ?: pkg
+      } else {
+        pkg
+      }
+  // 归因不可靠、展示包又落在系统代写中间层时，不再把中间层应用当成来源。
+  // 监视记录的落盘进程是 MediaProvider / 相册选择器这类代写进程：直接显示它的
+  // 标签会让用户以为文件是那个系统应用写出来的（issue #2 反馈“显示为媒体选择工具”），
+  // 而实际调用方是当时在场、无法归因的第三方应用。这类记录统一标注来源未知，
+  // 中间层进程仍通过详情里的“进程”字段保留。
+  val unattributedIntermediateSource =
+      !isModuleExport &&
+          refinedPkg.isIntermediateLogPackage() &&
+          (identifyMethod == "unknown" || identifyReliability == "none")
   val operation =
       if (isModuleExport) "export"
       else formatMonitorLogOperationBadge(rawOperation.ifBlank { filterOperation })
@@ -64,23 +97,35 @@ private fun parseMonitorLogLine(
       timeText = parts[0].takeIf { it.length >= 16 }?.substring(11, 16) ?: "--:--",
       processPackage = processPkg,
       callerPackage = callerPkg,
-      packageName = pkg,
+      packageName = refinedPkg,
       label =
-          if (isModuleExport) ModuleDisplayLabel
-          else resolveCachedLabel(pkg, labelCache, labelResolver),
+          when {
+            ambiguous -> UnattributedSourceLabel
+            isModuleExport -> ModuleDisplayLabel
+            unattributedIntermediateSource -> UnattributedSourceLabel
+            isExecutor || identifyMethod == "shared_uid" -> refinedPkg
+            else -> resolveCachedLabel(refinedPkg, labelCache, labelResolver)
+          },
       operation = operation,
       action =
           if (isModuleExport) describeModuleExportOperation(extras)
           else describeMonitorOperation(filterOperation),
       path = landingPath,
       ok = ok,
-      errorText = if (ok) "" else describeMonitorFailure(ret, extras),
+      errorText =
+          if (ambiguous) "结果未知：日志字段冲突" else if (ok) "" else describeMonitorFailure(ret, extras),
       fromPath = extras["from"].orEmpty(),
       backendPath = extras["backend"].orEmpty(),
       landingPath = landingPath,
       watchPackage = watchPkg,
       identifyMethod = identifyMethod,
       identifyReliability = identifyReliability,
+      callerUid = extras["caller_uid"]?.toIntOrNull(),
+      callerPid = extras["caller_pid"]?.toIntOrNull(),
+      callerStartTime = extras["caller_start_time"]?.toLongOrNull(),
+      callerContext = extras["caller_context"].orEmpty(),
+      callerBoundary = callerBoundary,
+      nativeIdentity = extras["native"].orEmpty(),
       eventRole = eventRole,
       correlationId = correlationId,
       observerPackage = observerPackage,
@@ -92,13 +137,23 @@ private fun parseMonitorLogLine(
   )
 }
 
+internal fun encodeMonitorLogField(value: String): String =
+    value.replace("%", "%25").replace("|", "%7C").replace("\r", "%0D").replace("\n", "%0A")
+
+private fun decodeMonitorLogField(value: String): String =
+    value.replace("%7C", "|").replace("%0D", "\r").replace("%0A", "\n").replace("%25", "%")
+
 private fun inferMonitorEventRole(
     explicitRole: String?,
     identifyMethod: String,
     rawOperation: String,
 ): String {
   if (explicitRole == "request" || explicitRole == "observation") return explicitRole
-  if (identifyMethod == "media_provider_fallback" || identifyMethod == "daemon_inotify") {
+  if (
+      identifyMethod == "media_provider_fallback" ||
+          identifyMethod == "daemon_inotify" ||
+          rawOperation == "inotify"
+  ) {
     return "observation"
   }
   if (
@@ -128,16 +183,30 @@ private fun selectMonitorDisplayPackage(
     callerPkg: String,
     watchPkg: String,
     identifyMethod: String,
-): String =
-    listOf(
-            callerPkg.takeIf { it != processPkg && !it.isIntermediateLogPackage() },
-            watchPkg.takeIf { identifyMethod == "watch_package" && !it.isIntermediateLogPackage() },
-            callerPkg.takeIf { !it.isIntermediateLogPackage() },
-            processPkg.takeIf { !it.isIntermediateLogPackage() },
-            callerPkg,
-            processPkg,
-        )
-        .firstOrNull { isSinglePackageName(it.orEmpty()) } ?: processPkg
+): String {
+  val callerIdentity =
+      callerPkg.takeIf {
+        it != processPkg && it != "-" && it.isNotBlank() && !it.isIntermediateLogPackage()
+      }
+  return listOf(
+          callerIdentity?.takeIf { it.contains('.') },
+          watchPkg.takeIf { identifyMethod == "watch_package" && !it.isIntermediateLogPackage() },
+          callerPkg.takeIf { !it.isIntermediateLogPackage() },
+          processPkg.takeIf { !it.isIntermediateLogPackage() },
+          // 无点原生身份（如 MT 管理器 root 复制时 helper 进程的 basename mtio）：
+          // 归因链已经抓到调用方，只是身份是原生 basename。落盘进程又是媒体组件
+          // 时不能退回其标签（issue #2：.boot_ok 因此显示成“媒体选择工具”），
+          // 保留原身份展示，详情里的 caller_uid / native 字段仍可核查。
+          callerIdentity?.takeIf { processPkg.isIntermediateLogPackage() },
+          callerPkg,
+          processPkg,
+      )
+      .firstOrNull {
+        isSinglePackageName(it.orEmpty()) ||
+            // 无点原生身份仅在落盘进程为媒体组件时入选（见上方 callerIdentity 分支）。
+            it == callerIdentity && processPkg.isIntermediateLogPackage()
+      } ?: processPkg
+}
 
 private fun isSinglePackageName(value: String): Boolean =
     isSafePackageName(value) && value.contains('.')
@@ -152,7 +221,8 @@ private fun String?.isIntermediateLogPackage(): Boolean {
       value == "com.android.externalstorage" ||
       value == "com.android.mtp" ||
       value.contains(".documentsui") ||
-      value.contains(".photopicker")
+      value.contains("photopicker") ||
+      value.contains("mediapicker")
 }
 
 private fun isModuleExportRecord(
@@ -275,6 +345,14 @@ private fun List<LogEntry>.coalesceMonitorLogEntries(): List<LogEntry> {
   val groupIndices = HashMap<String, Int>()
   val ordered = mutableListOf<LogEntry>()
   for (entry in this) {
+    val correlatedIndex =
+        if (entry.correlationId.isBlank()) -1
+        else ordered.indexOfFirst { mergeCorrelatedObservation(it, entry) != null }
+    if (correlatedIndex >= 0) {
+      ordered[correlatedIndex] = mergeCorrelatedObservation(ordered[correlatedIndex], entry)!!
+      groupIndices[ordered[correlatedIndex].coalesceKey()] = correlatedIndex
+      continue
+    }
     val createWriteIndex = ordered.indexOfFirst { mergeFuseCreateWriteDuplicate(it, entry) != null }
     if (createWriteIndex >= 0) {
       ordered[createWriteIndex] = mergeFuseCreateWriteDuplicate(ordered[createWriteIndex], entry)!!
@@ -290,6 +368,7 @@ private fun List<LogEntry>.coalesceMonitorLogEntries(): List<LogEntry> {
     if (uncorrelatedIndex >= 0) {
       ordered[uncorrelatedIndex] =
           mergeUncorrelatedRequestObservation(ordered[uncorrelatedIndex], entry)!!
+      groupIndices[ordered[uncorrelatedIndex].coalesceKey()] = uncorrelatedIndex
       continue
     }
     val existingIndex = groupIndices[key]
@@ -321,7 +400,9 @@ private fun mergeFuseCreateWriteDuplicate(
     existing: LogEntry,
     candidate: LogEntry,
 ): LogEntry? {
+  if (!existing.ok || !candidate.ok) return null
   if (existing.eventRole != "request" || candidate.eventRole != "request") return null
+  if (existing.requestIdentityKey() != candidate.requestIdentityKey()) return null
   if (existing.packageName != candidate.packageName) return null
   if (existing.identifyMethod !in setOf("fuse_redirect", "fuse_monitor_only")) return null
   if (candidate.identifyMethod != existing.identifyMethod || candidate.source != existing.source) {
@@ -358,19 +439,38 @@ private fun LogEntry.coalesceKey(): String {
       else filterOperation.ifBlank { operation }.normalizedMonitorOperation()
   val correlation = correlationId.takeIf { it.isNotBlank() }
   if (correlation != null) {
-    // 相关 ID 是请求与文件系统观察之间的主键；两类记录的操作名、落点路径和结果字段
-    // 可能不同，不能再把这些字段放在相关 ID 之前，否则它们永远到不了合并逻辑。
-    return "correlation|$correlation"
+    // 请求与观察先按相关 ID 配对；未配对的不同请求仍须保留各自任务身份。
+    return "correlation|$correlation|${requestIdentityKey()}|${coalesceResultGroup()}"
   }
   return listOf(
           timestamp.take(16),
           coalescePath.replace(Regex("^/storage/emulated/\\d+/"), "/storage/emulated/*/"),
           op,
           coalesceResultGroup(),
-          "*",
+          requestIdentityKey(),
       )
       .joinToString("|")
 }
+
+private fun LogEntry.requestIdentityKey(): String =
+    if (eventRole != "request") "*"
+    else
+        listOf(
+                "request",
+                packageName,
+                callerUid,
+                callerPid,
+                callerStartTime,
+                callerContext,
+                callerBoundary,
+                nativeIdentity,
+                when (identifyMethod) {
+                  "shared_uid",
+                  "executor" -> identifyMethod
+                  else -> "app"
+                },
+            )
+            .joinToString(":")
 
 private fun LogEntry.coalescePathIdentity(): String {
   val backend = backendPath.normalizedMonitorPath()
@@ -694,3 +794,4 @@ private val DiagnosticLogArchiveRegex =
     Regex("^storage-redirect-x-logs-.+\\.tar\\.gz$", RegexOption.IGNORE_CASE)
 private const val ModulePackageName = "storage.redirect.x"
 private const val ModuleDisplayLabel = "存储重定向X"
+private const val UnattributedSourceLabel = "未知来源"

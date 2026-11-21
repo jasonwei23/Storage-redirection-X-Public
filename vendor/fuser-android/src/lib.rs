@@ -21,6 +21,7 @@ use std::path::Path;
 use std::time::Duration;
 use std::time::SystemTime;
 
+use log::debug;
 use log::warn;
 #[cfg(target_os = "macos")]
 pub use reply::ReplyXTimes;
@@ -82,6 +83,9 @@ pub use crate::session::SessionACL;
 pub use crate::session::SessionUnmounter;
 
 mod access_flags;
+/// 宿主会话活动信号（本项目补丁）：请求完成时刻、在途计数与 eventfd 唤醒，
+/// 供停摆看门狗区分「忙而慢」与「已死」。
+pub mod activity;
 mod bsd_file_flags;
 mod channel;
 mod dev_fuse;
@@ -923,11 +927,22 @@ pub trait Filesystem: Send + Sync + 'static {
         out_size: u32,
         reply: ReplyIoctl,
     ) {
-        warn!(
-            "[Not Implemented] ioctl(ino: {ino:#x?}, fh: {fh}, flags: {flags}, \
-            cmd: {cmd}, in_data.len(): {}, out_size: {out_size})",
-            in_data.len()
-        );
+        // 客户端会在 FUSE 卷上探测底层文件系统的私有 ioctl（真机实测支付宝启动时连发
+        // 二十余次 F2FS 的 0xf5 系列，cmd=0x8004f50c）。FUSE 卷不是这些文件系统，
+        // `ENOSYS` 本来就是正确答复，双方都没有后续动作；唯一产物是刷屏。前 3 条保留
+        // 原文，之后按累计次数降级为 debug。
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        static UNIMPLEMENTED_IOCTL: AtomicUsize = AtomicUsize::new(0);
+        let seen = UNIMPLEMENTED_IOCTL.fetch_add(1, Ordering::Relaxed) + 1;
+        if seen <= 3 {
+            warn!(
+                "[Not Implemented] ioctl(ino: {ino:#x?}, fh: {fh}, flags: {flags}, \
+                cmd: {cmd}, in_data.len(): {}, out_size: {out_size})",
+                in_data.len()
+            );
+        } else {
+            debug!("[Not Implemented] ioctl cmd: {cmd} (throttled count={seen})");
+        }
         reply.error(Errno::ENOSYS);
     }
 
@@ -1105,4 +1120,19 @@ pub fn spawn_mount2<'a, FS: Filesystem + Send + 'static + 'a, P: AsRef<Path>>(
 ) -> io::Result<BackgroundSession> {
     check_option_conflicts(options)?;
     Session::new(filesystem, mountpoint.as_ref(), options).and_then(session::Session::spawn)
+}
+
+/// 同 [`spawn_mount2`]，但会话循环退出时向 `exit_eventfd` 写一次计数。
+///
+/// 供需要「事件驱动地得知会话结束」的调用方使用：宿主服务循环据此不再轮询
+/// `guard.is_finished()`，空闲时可以一直阻塞在 epoll 上。
+pub fn spawn_mount2_with_exit_notify<'a, FS: Filesystem + Send + 'static + 'a, P: AsRef<Path>>(
+    filesystem: FS,
+    mountpoint: P,
+    options: &Config,
+    exit_eventfd: i32,
+) -> io::Result<BackgroundSession> {
+    check_option_conflicts(options)?;
+    Session::new(filesystem, mountpoint.as_ref(), options)
+        .and_then(|session| session.spawn_with_exit_notify(exit_eventfd))
 }

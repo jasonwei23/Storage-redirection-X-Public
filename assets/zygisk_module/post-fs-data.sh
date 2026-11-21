@@ -10,6 +10,7 @@ PACKAGE_EVENT_RECEIVER_READY_FILE="$LOGS_DIR/.package_event_receiver_ready"
 CONFIG_DIR="$MODDIR/config"
 BOOT_PENDING_FILE="$MODDIR/.boot_pending"
 BOOT_OK_FILE="$MODDIR/.boot_ok"
+BOOT_FAIL_COUNT_FILE="$MODDIR/.boot_fail_count"
 BOOT_MODULE_VERSION_FILE="$MODDIR/.boot_module_version"
 LOGS_CTX="u:object_r:shell_data_file:s0"
 RUNTIME_DISABLE_FILE="$MODDIR/.runtime_disabled"
@@ -66,8 +67,27 @@ if [ -f "$BOOT_OK_FILE" ]; then
 fi
 
 if [ -n "$last_pending" ] && [ "$last_pending" != "$boot_id" ] && [ "$last_pending" != "$last_ok" ]; then
-  touch "$MODDIR/disable"
-  exit 0
+  # 连续两次未完成启动才停用模块。
+  #
+  # 单次失败不一定是模块的问题：开机阶段上游服务未就绪、系统更新后首次启动更慢、
+  # 用户中途重启，都会让上一轮 `.boot_pending` 停在那里而 `.boot_ok` 没写。原来的
+  # 「一次就写 disable」会把这类偶发当成故障，把本来可用的设备永久停用，而且用户
+  # 只能手动去管理器里重新启用。
+  # 来源：上游 PR Kindness-Kismet/Storage-redirection-X-Public#66（贡献者 People-11）。
+  fail_count=0
+  if [ -f "$BOOT_FAIL_COUNT_FILE" ]; then
+    fail_count=$(cat "$BOOT_FAIL_COUNT_FILE" 2>/dev/null || echo 0)
+  fi
+  case "$fail_count" in
+    '' | *[!0-9]*) fail_count=0 ;;
+  esac
+  if [ "$fail_count" -ge 1 ]; then
+    touch "$MODDIR/disable"
+    rm -f "$BOOT_PENDING_FILE" "$BOOT_FAIL_COUNT_FILE"
+    exit 0
+  fi
+  echo "$((fail_count + 1))" > "$BOOT_FAIL_COUNT_FILE"
+  chmod 644 "$BOOT_FAIL_COUNT_FILE" 2>/dev/null
 fi
 
 if [ -n "$boot_id" ]; then
@@ -93,6 +113,12 @@ if command -v chcon >/dev/null 2>&1; then
   chcon -R "$LOGS_CTX" "$LOGS_DIR" 2>/dev/null
   chcon -R u:object_r:shell_data_file:s0 "$CONFIG_DIR" 2>/dev/null
 fi
+
+# system_server 经保留的模块目录 FD 创建查询端点；目录仅向 system_server 与 root 开放。
+mkdir -p "$MODDIR/tmp/package_query"
+chown 1000:1000 "$MODDIR/tmp/package_query"
+chmod 700 "$MODDIR/tmp/package_query"
+chcon u:object_r:shell_data_file:s0 "$MODDIR/tmp/package_query" 2>/dev/null
 
 # 路径映射字段重命名迁移：current_path/target_path → request_path/final_path
 MAPPING_MIGRATION_MARKER="$MODDIR/.mapping_fields_v1"

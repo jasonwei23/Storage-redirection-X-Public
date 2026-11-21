@@ -1,3 +1,12 @@
+#[path = "log_daemon/identity.rs"]
+mod identity;
+#[cfg(test)]
+#[path = "../tests/native-unit/log_reply.rs"]
+mod reply_tests;
+use identity::{
+    enrich_monitor_record_identity, monitor_sender_is_trusted, register_request_path_hint,
+    rewrite_monitor_identity,
+};
 use libc::{
     AF_UNIX, CMSG_DATA, CMSG_FIRSTHDR, EAGAIN, EINTR, EWOULDBLOCK, MSG_DONTWAIT, POLLIN,
     SCM_CREDENTIALS, SO_PASSCRED, SO_RCVBUF, SOCK_CLOEXEC, SOCK_DGRAM, SOL_SOCKET, bind, c_void,
@@ -38,21 +47,27 @@ const FLUSH_INTERVAL_MS: i32 = 2_000;
 /// 接收循环长期不返回、迟迟不执行 flush 与统计落盘。
 const MAX_DRAIN_PER_ROUND: usize = 512;
 const SOCKET_RECV_BUFFER_BYTES: libc::c_int = 512 * 1024;
-/// 单个发送方 uid 在一个限流窗口内允许写入的监控/统计记录条数。
+/// 单个发送方 uid 在一个限流窗口内允许的监控、统计和身份查询总数。
 ///
-/// 监控记录由被 hook 的应用进程和 FUSE daemon 发出，发送方是任意应用 uid，
-/// 无法按 uid 做身份校验（对比 Control 命令只允许 root）。因此改为限流：
-/// 抽象命名空间套接字没有文件权限门槛，任何能连上的进程都可写入，若不限流
-/// 就能用几 MB 垃圾把 1 MiB 上限的真实监控记录整体挤出轮转窗口。
+/// 被 hook 的应用与系统代写者都需要使用此通道，不能只允许 root；具体请求另按
+/// 内核凭据核验权限。抽象套接字没有文件权限门槛，限流避免单个 UID 的请求洪峰
+/// 占满接收处理或用几 MB 记录挤出 1 MiB 上限的监视轮转窗口。
 const MAX_RECORDS_PER_UID_WINDOW: u32 = 4096;
 /// 限流窗口长度。窗口结束后计数清零。
 const RATE_LIMIT_WINDOW_MS: i64 = 10_000;
-/// 限流表最多跟踪的发送方数量，防止伪造 uid 时表本身无界增长。
+/// 限流表最多跟踪的发送方数量，限制多 UID 请求高峰时的内存占用。
 const MAX_TRACKED_SENDERS: usize = 256;
 
 const TAG_FILE_MONITOR: &str = "FileMonitorOp";
 const TAG_STATS: &str = "Stats";
 const TAG_CONTROL: &str = "Control";
+/// MP 热重载完成回执（发送方为 MediaProvider 进程，消息仅承载 pid；request id
+/// 由本侧从请求文件读取权威值）。
+const TAG_HOT_RELOAD: &str = "HotReload";
+/// 机器可校验的低频状态事件（发送方为 daemon 自身），无条件落盘 running.log。
+const TAG_STATUS: &str = "Status";
+/// MP hook 进程请求 daemon（root）代修属主的通道标签；与 src/logging.rs 的
+/// 待代修路径队列上限：恶意/异常发送方在 per-uid 限流之外再受总量约束。
 const CONTROL_CLEAR_MONITOR: &str = "clear-monitor";
 const CONTROL_CLEAR_MONITOR_PREFIX: &str = "clear-monitor:";
 const CONTROL_FLUSH_ALL: &str = "flush-all";
@@ -67,6 +82,10 @@ static DAEMON_WAKE_EVENTFD: AtomicI32 = AtomicI32::new(-1);
 
 pub fn set_daemon_wake_eventfd(fd: i32) {
     DAEMON_WAKE_EVENTFD.store(fd, Ordering::Release);
+}
+
+pub fn wake_daemon_for_retry() {
+    wake_daemon();
 }
 
 fn wake_daemon() {
@@ -168,26 +187,195 @@ fn send_control_packet(fd: i32, command: &str) -> io::Result<()> {
     Ok(())
 }
 
+/// 日志落盘定时器：把「每 2 秒醒一次看有没有东西要刷」换成「有东西要刷才武装 2 秒定时器」。
+///
+/// 空闲时没有任何日志进来，线程就一直阻塞在 poll 上（无限等待，零唤醒）；只有真的
+/// 收到运行日志/监视记录才武装一次，到点落盘后解除武装。落盘时效与原来的周期 flush
+/// 完全一致（最多延迟 [`FLUSH_INTERVAL_MS`]），但不再在没人说话时定时醒来。
+/// timerfd 创建失败时退回旧的固定超时路径，功能不降级。
+struct FlushTimer {
+    fd: i32,
+    armed: bool,
+}
+
+impl FlushTimer {
+    fn new() -> Self {
+        // SAFETY: timerfd_create 只创建内核对象并返回描述符，不涉及借用内存。
+        let fd = unsafe {
+            libc::timerfd_create(
+                libc::CLOCK_MONOTONIC,
+                libc::TFD_NONBLOCK | libc::TFD_CLOEXEC,
+            )
+        };
+        if fd < 0 {
+            log::warn!(
+                "log flush timerfd unavailable, fallback to periodic poll errno={}",
+                io::Error::last_os_error()
+            );
+        }
+        Self { fd, armed: false }
+    }
+
+    /// 武装一次 2 秒定时器；已武装或没有 timerfd 时什么都不做。
+    ///
+    /// 返回是否已武装。`timerfd_settime` 在合法 spec 下不会失败，但一旦失败而调用方
+    /// 不知道，线程就会以无限超时睡下去、记录再也不落盘——因此返回布尔值让调用方
+    /// 可以立刻落盘兜底。
+    fn arm(&mut self) -> bool {
+        if self.fd < 0 {
+            return false;
+        }
+        if self.armed {
+            return true;
+        }
+        let spec = libc::itimerspec {
+            it_interval: libc::timespec {
+                tv_sec: 0,
+                tv_nsec: 0,
+            },
+            it_value: timespec_from_ms(FLUSH_INTERVAL_MS),
+        };
+        // SAFETY: spec 指向本栈帧上已初始化的 itimerspec，fd 由本结构体独占持有。
+        let result = unsafe { libc::timerfd_settime(self.fd, 0, &spec, std::ptr::null_mut()) };
+        if result != 0 {
+            // 真机实证：`tv_nsec` 必须 < 1e9，直接把「毫秒 × 1e6」塞进去会拿到 EINVAL。
+            // 这条告警限频，否则一次定时器失效就会把日志刷成新的热循环。
+            warn_throttled(
+                "log flush timer arm failed",
+                io::Error::last_os_error().raw_os_error().unwrap_or(0),
+            );
+            return false;
+        }
+        self.armed = true;
+        true
+    }
+
+    /// 解除武装：落盘完成，下一次有日志时重新武装。
+    fn disarm(&mut self) {
+        if self.fd < 0 || !self.armed {
+            return;
+        }
+        let spec = libc::itimerspec {
+            it_interval: libc::timespec {
+                tv_sec: 0,
+                tv_nsec: 0,
+            },
+            it_value: libc::timespec {
+                tv_sec: 0,
+                tv_nsec: 0,
+            },
+        };
+        // SAFETY: 同 arm：fd 有效、spec 指向有效初始化内存。
+        let _ = unsafe { libc::timerfd_settime(self.fd, 0, &spec, std::ptr::null_mut()) };
+        self.armed = false;
+    }
+
+    /// 读掉一次到期计数（不读的话 poll 会一直报告可读）。
+    fn consume(&mut self) {
+        if self.fd < 0 {
+            return;
+        }
+        let mut expirations: u64 = 0;
+        // SAFETY: expirations 是本栈帧上可写的 u64，timerfd 的读契约正是 8 字节计数。
+        unsafe {
+            libc::read(
+                self.fd,
+                &mut expirations as *mut u64 as *mut libc::c_void,
+                std::mem::size_of::<u64>(),
+            );
+        }
+    }
+
+    /// poll 超时：有 timerfd 时无限等待（唤醒只由套接字与定时器驱动）。
+    fn poll_timeout_ms(&self) -> libc::c_int {
+        if self.fd >= 0 { -1 } else { FLUSH_INTERVAL_MS }
+    }
+}
+
+/// 毫秒 → `timespec`。
+///
+/// `tv_nsec` 必须落在 `[0, 1e9)`：`FLUSH_INTERVAL_MS` 是 2000 毫秒，直接乘 1e6 得到
+/// 2e9 会被内核以 EINVAL 拒绝（真机实测），定时器于是永远武装不上。
+fn timespec_from_ms(ms: i32) -> libc::timespec {
+    let clamped = ms.max(0) as i64;
+    libc::timespec {
+        tv_sec: clamped / 1_000,
+        tv_nsec: (clamped % 1_000) * 1_000_000,
+    }
+}
+
+/// 限频告警：同一类失败最多每 `WARN_THROTTLE_MS` 输出一条。
+fn warn_throttled(label: &str, errno: i32) {
+    use std::sync::atomic::{AtomicI64, Ordering};
+    static LAST_MS: AtomicI64 = AtomicI64::new(i64::MIN / 2);
+    const WARN_THROTTLE_MS: i64 = 60_000;
+    let now_ms = crate::platform::paths::monotonic_ms();
+    let last_ms = LAST_MS.load(Ordering::Relaxed);
+    if now_ms.saturating_sub(last_ms) < WARN_THROTTLE_MS {
+        return;
+    }
+    if LAST_MS
+        .compare_exchange(last_ms, now_ms, Ordering::Relaxed, Ordering::Relaxed)
+        .is_err()
+    {
+        return;
+    }
+    log::warn!("{label} errno={errno}");
+}
+
 fn run(fd: i32, mut state: LogState) {
     let mut payload = [0u8; RECV_BUFFER_SIZE];
+    let mut timer = FlushTimer::new();
 
     loop {
-        let mut poll_fd = pollfd {
-            fd,
-            events: POLLIN,
-            revents: 0,
-        };
-        // SAFETY: poll_fd 在调用期间指向一个已初始化的 pollfd。
-        let ready = unsafe { poll(&mut poll_fd, 1, FLUSH_INTERVAL_MS) };
-        if ready <= 0 {
+        let mut fds = [
+            pollfd {
+                fd,
+                events: POLLIN,
+                revents: 0,
+            },
+            pollfd {
+                fd: timer.fd,
+                events: POLLIN,
+                revents: 0,
+            },
+        ];
+        // 无 timerfd 时 nfds 取 1，poll 会忽略被截断的定时器条目。
+        let nfds: libc::nfds_t = if timer.fd >= 0 { 2 } else { 1 };
+        // SAFETY: fds 是调用期间有效的已初始化 pollfd 数组，长度与 nfds 一致。
+        let ready = unsafe { poll(fds.as_mut_ptr(), nfds, timer.poll_timeout_ms()) };
+        if ready < 0 {
+            let errno = io::Error::last_os_error();
+            if errno.raw_os_error() == Some(EINTR) {
+                continue;
+            }
+            log::warn!(
+                "log daemon poll failed errno={}",
+                errno.raw_os_error().unwrap_or(0)
+            );
+            // 非 EINTR 的错误会让 poll 立刻返回，直接 continue 会变成忙循环；这里只是
+            // 故障路径的退避（正常路径永不触发），不是稳态轮询。
             state.flush_pending();
+            std::thread::sleep(std::time::Duration::from_millis(200));
+            continue;
+        }
+        // 定时器到点：落盘并解除武装。
+        if timer.fd >= 0 && (fds[1].revents & POLLIN) != 0 {
+            timer.consume();
+            timer.disarm();
+            state.flush_pending();
+        }
+        if (fds[0].revents & POLLIN) == 0 {
+            // 仅超时（无 timerfd 的降级路径）或仅定时器事件：走一次到期检查兜底。
+            state.flush_if_due();
             continue;
         }
 
         // 一次 poll 之后把内核队列里的 datagram 连续排空，否则突发写入时每轮只取一条，
         // 队列会持续堆积并被内核直接丢弃。
+        let mut buffered_record = false;
         for _ in 0..MAX_DRAIN_PER_ROUND {
-            let (size, sender_uid) = recv_with_credentials(fd, &mut payload, MSG_DONTWAIT);
+            let (size, sender, sender_addr) = recv_with_credentials(fd, &mut payload, MSG_DONTWAIT);
             if size < 0 {
                 let errno = io::Error::last_os_error().raw_os_error().unwrap_or(0);
                 if errno == EINTR {
@@ -204,16 +392,71 @@ fn run(fd: i32, mut state: LogState) {
             let Ok(packet) = std::str::from_utf8(&payload[..size as usize]) else {
                 continue;
             };
-            state.handle(packet, sender_uid);
+            // 身份询问包：就地问一次 /proc 并回包给发送方。必须在 state.handle 之前
+            // 分流；查询同样按内核发送方限流，且答复前核验跨 UID 访问权限。
+            if packet.starts_with(crate::daemon_identity_query::QUERY_PREFIX) {
+                if sender.is_some() && state.allow_from_sender(sender.map(|(uid, _)| uid)) {
+                    reply_identity_query(fd, packet, sender, sender_addr.as_ref());
+                }
+                // 查询本身不落盘，限流窗口切换产生的告警仍需按时刷新。
+                buffered_record |= state.running.pending_lines > 0;
+                continue;
+            }
+            state.handle(packet, sender);
+            // 只有真正进过 state 的记录才可能产生待落盘内容（身份询问包在上面的
+            // 分支已 continue）。武装一次定时器即可，已在武装中不重复设置。
+            buffered_record = true;
+        }
+        if buffered_record && !timer.arm() {
+            // 定时器不可用：直接落盘，绝不留下「有数据但永远不写」的状态。
+            state.flush_pending();
         }
         state.flush_if_due();
     }
 }
 
-/// 接收一条 datagram，同时提取 SCM_CREDENTIALS 中的发送方 UID。
-/// 返回 (接收字节数, 发送方 uid)；uid 仅在内核附加了合法 ucred 时为 Some。
-/// `flags` 直接传给 recvmsg；排空循环使用 MSG_DONTWAIT 避免在阻塞 socket 上卡死。
-fn recv_with_credentials(fd: i32, payload: &mut [u8], flags: libc::c_int) -> (isize, Option<u32>) {
+/// 回答一条身份询问包，回包给发送方地址。
+///
+/// 回包失败只影响那一次决策的身份解析精度（调用方按未解析回退），因此不重试、不记录
+/// 日志噪音：询问发生在每次快照未命中的写入上，失败一条就记一条会把 running.log 冲掉。
+fn reply_identity_query(
+    fd: i32,
+    packet: &str,
+    credentials: Option<(u32, i32)>,
+    sender: Option<&(libc::sockaddr_un, libc::socklen_t)>,
+) {
+    let Some((addr, addr_len)) = sender else {
+        return;
+    };
+    let Some(reply) = crate::daemon_identity_query::answer_query(packet, credentials) else {
+        return;
+    };
+    let bytes = reply.as_bytes();
+    // SAFETY: reply 与 addr 在调用期间保持有效；addr_len 由 recvmsg 填回。
+    unsafe {
+        sendto(
+            fd,
+            bytes.as_ptr() as *const c_void,
+            bytes.len(),
+            MSG_DONTWAIT,
+            addr as *const _ as *const sockaddr,
+            *addr_len,
+        );
+    }
+}
+
+/// 接收一条 datagram：返回 (字节数, 发送方 uid, 发送方地址)。
+///
+/// 发送方 uid 取自 SCM_CREDENTIALS，仅在内核附加了合法 ucred 时为 Some。发送方地址用于
+/// 「身份询问」的回包：日志包只是单向 sink，而询问包需要就地答复。`flags` 直接传给
+/// recvmsg；排空循环使用 MSG_DONTWAIT 避免在阻塞 socket 上卡死。
+type ReceivedDatagram = (
+    isize,
+    Option<(u32, i32)>,
+    Option<(libc::sockaddr_un, libc::socklen_t)>,
+);
+
+fn recv_with_credentials(fd: i32, payload: &mut [u8], flags: libc::c_int) -> ReceivedDatagram {
     // 控制消息缓冲区，用于接收 SCM_CREDENTIALS（ucred）凭据。
     // 64 字节超过 CMSG_SPACE(sizeof(ucred)) 所需的约 32 字节，留有余量。
     // repr(align(8)) 保证 cmsghdr 所需的对齐要求（64 位系统 sizeof(size_t) = 8）。
@@ -231,35 +474,45 @@ fn recv_with_credentials(fd: i32, payload: &mut [u8], flags: libc::c_int) -> (is
     msg.msg_iovlen = 1;
     msg.msg_control = cmsg_buf.0.as_mut_ptr() as *mut c_void;
     msg.msg_controllen = cmsg_buf.0.len() as _;
+    // 来源地址：询问包需要按发送方地址回包。
+    // SAFETY: sockaddr_un 是允许零初始化的普通 C 结构体。
+    let mut peer: libc::sockaddr_un = unsafe { mem::zeroed() };
+    msg.msg_name = &mut peer as *mut _ as *mut c_void;
+    msg.msg_namelen = mem::size_of::<libc::sockaddr_un>() as libc::socklen_t;
 
     // SAFETY: msg 已完整初始化，payload 有 payload.len() 字节可写空间，fd 由调用方持有。
     let size = unsafe { recvmsg(fd, &mut msg, flags) };
     if size <= 0 {
-        return (size, None);
+        return (size, None, None);
     }
+    let peer_addr = if msg.msg_namelen > 0 {
+        Some((peer, msg.msg_namelen))
+    } else {
+        None
+    };
 
     // 提取发送方 UID：查找 SOL_SOCKET / SCM_CREDENTIALS 控制消息。
     // SAFETY: CMSG_FIRSTHDR 在 msg_controllen > 0 时返回指向已初始化控制缓冲区内的指针，
     //         或在无控制消息时返回 NULL；对 NULL 的检查在下一行完成。
     let cmsg_ptr = unsafe { CMSG_FIRSTHDR(&msg) };
     if cmsg_ptr.is_null() {
-        return (size, None);
+        return (size, None, peer_addr);
     }
     // SAFETY: cmsg_ptr 非空且由 CMSG_FIRSTHDR 返回，指向已由内核初始化的 cmsghdr。
     let hdr = unsafe { &*cmsg_ptr };
     if hdr.cmsg_level != SOL_SOCKET || hdr.cmsg_type != SCM_CREDENTIALS {
-        return (size, None);
+        return (size, None, peer_addr);
     }
     // 验证 cmsg_len 足够容纳完整的 ucred，防止越界读取截断的控制消息。
     let min_len = mem::size_of::<cmsghdr>() + mem::size_of::<ucred>();
     if (hdr.cmsg_len as usize) < min_len {
-        return (size, None);
+        return (size, None, peer_addr);
     }
     // SAFETY: 已确认 cmsg_level/cmsg_type 正确且 cmsg_len 涵盖完整 ucred，
     //         CMSG_DATA 返回紧跟 cmsghdr 之后、由内核写入的 ucred 起始地址，
     //         该地址在 cmsg_buf 生命周期内始终有效。
     let creds = unsafe { &*(CMSG_DATA(cmsg_ptr) as *const ucred) };
-    (size, Some(creds.uid as u32))
+    (size, Some((creds.uid as u32, creds.pid)), peer_addr)
 }
 
 fn bind_log_socket() -> io::Result<i32> {
@@ -371,7 +624,7 @@ impl LogState {
         };
         let now_ms = crate::platform::paths::monotonic_ms();
 
-        // 表满时清理已过窗口的条目，避免伪造 uid 让表无界增长。
+        // 表满时只回收过期项，不能通过新 UID 挤掉其它发送方尚有效的配额。
         if self.sender_quotas.len() >= MAX_TRACKED_SENDERS && !self.sender_quotas.contains_key(&uid)
         {
             self.sender_quotas.retain(|_, quota| {
@@ -410,15 +663,39 @@ impl LogState {
         true
     }
 
-    fn handle(&mut self, packet: &str, sender_uid: Option<u32>) {
+    fn handle(&mut self, packet: &str, sender: Option<(u32, i32)>) {
+        let sender_uid = sender.map(|(uid, _)| uid);
         let Some((level, tag, message)) = parse_packet(packet) else {
             return;
         };
         match tag {
-            // 监控与统计的发送方是任意应用 uid，无法做身份校验，改为按发送方限流。
+            // 监控按内核发送方凭据核验来源，并与统计一起按 UID 限流。
             TAG_FILE_MONITOR => {
                 if self.allow_from_sender(sender_uid) {
-                    self.monitor.append(message);
+                    // 先按 caller_pid 补强身份，再落盘与登记 hint：两者必须用同一份
+                    // 内容，否则台账里的调用方会与记录里的身份不一致。
+                    let trusted = monitor_sender_is_trusted(message, sender);
+                    let enriched = if trusted {
+                        enrich_monitor_record_identity(message)
+                    } else {
+                        let (uid, pid) = sender
+                            .map(|(uid, pid)| (uid as i32, pid))
+                            .unwrap_or((-1, -1));
+                        let identity =
+                            crate::platform::proc_identity::RequestIdentity::unresolved(uid, pid);
+                        Some(rewrite_monitor_identity(
+                            message,
+                            "-",
+                            "unknown",
+                            "none",
+                            Some(&identity),
+                        ))
+                    };
+                    let line = enriched.as_deref().unwrap_or(message);
+                    self.monitor.append(line);
+                    if trusted {
+                        register_request_path_hint(line);
+                    }
                 }
             }
             TAG_STATS => {
@@ -438,12 +715,20 @@ impl LogState {
                     ));
                 }
             }
+            TAG_HOT_RELOAD => {
+                self.handle_hot_reload(message);
+            }
+            TAG_STATUS => {
+                self.running
+                    .append(&format_running_line("I", TAG_STATUS, message));
+            }
             _ => {
-                // 残留发送方（如尚未重启的宿主进程）在全局 verbose 关闭后仍可能
-                // 以 Debug/Verbose 级别发送运行日志包；在接收侧按 daemon 当前配置
-                // 二次过滤，避免单个陈旧 emitter 把逐操作日志风暴维持到下一次
-                // 宿主换代。Warn/Error 与监控、统计、控制通道不受影响。
-                if matches!(level, "D" | "V") && !crate::logging::is_debug_logging_enabled() {
+                // 残留发送方（如尚未重启的宿主进程、仍在运行的应用注入侧）在全局
+                // verbose 关闭后仍可能按旧判定发送 Info/Debug/Verbose 级运行日志；
+                // 在接收侧只保留 Warn/Error，其余按 daemon 当前配置二次过滤，避免
+                // 单个陈旧 emitter 把逐操作日志继续写到下一次宿主换代。监控、统计、
+                // 控制、热重载与状态通道有独立分支，不受此门禁影响。
+                if !matches!(level, "W" | "E") && !crate::logging::is_debug_logging_enabled() {
                     return;
                 }
                 self.running
@@ -502,10 +787,47 @@ impl LogState {
                     && let Ok(mut slot) = policy_register_request_slot().lock()
                 {
                     *slot = Some(token);
+                    // 必须唤醒主循环：应用刚启动、companion 的宿主视图等待预算只有秒级，
+                    // 若只入队不唤醒，token 要等下一个无关事件（配置写入/宿主事件/周期
+                    // reconcile 唤醒点）才被取走，真机实测可积压 13-28s——期间应用要么
+                    // 被测试流杀掉（token 永远落在 process gone），要么在裸屏障上撞出
+                    // ENOENT。与上方 reconcile-running 分支的唤醒语义保持一致。
+                    wake_daemon();
                 }
             }
             _ => {}
         }
+    }
+
+    /// 处理 MP 热重载完成回执：无条件落盘完成行，并代写 ack 回执文件。
+    ///
+    /// MP 进程（mediaprovider 域）对模块目录（shell_data_file）无读写权限——
+    /// 请求文件读不到、ack 写不出——因此 request id 由本侧以 root 身份从请求
+    /// 文件读取权威值，ack 亦由本侧落盘。完成行不受 verbose 门禁：它是低频的
+    /// 一次性状态事件，且是 srxctl 等待循环（running.log 计数比对）的唯一判据。
+    fn handle_hot_reload(&mut self, message: &str) {
+        let pid = message
+            .split_whitespace()
+            .find_map(|item| item.strip_prefix("pid="))
+            .unwrap_or("unknown");
+        let request_id = fs::read_to_string(
+            crate::platform::module_paths::MEDIA_PROVIDER_HOT_RELOAD_REQUEST_FILE,
+        )
+        .ok()
+        .and_then(|text| {
+            text.split_whitespace()
+                .find_map(|item| item.strip_prefix("request=").map(str::to_string))
+        })
+        .unwrap_or_else(|| "signal".to_string());
+        self.running.append(&format_running_line(
+            "I",
+            TAG_HOT_RELOAD,
+            &format!(
+                "media provider hot reload completed request={} pid={}",
+                request_id, pid
+            ),
+        ));
+        write_hot_reload_ack(pid, &request_id);
     }
 
     fn clear_monitor(&mut self, token: Option<&str>) {
@@ -738,6 +1060,37 @@ fn parse_packet(packet: &str) -> Option<(&str, &str, &str)> {
     let tag = parts.next()?;
     let message = parts.next()?;
     (!level.is_empty() && !tag.is_empty() && !message.is_empty()).then_some((level, tag, message))
+}
+
+/// 代 MP 写热重载 ack 回执（MP 域对模块目录无写权限，必须由 root 侧落盘）。
+/// 原子写（tmp+rename）保持与旧 MP 侧实现相同的 torn-write 语义。
+fn write_hot_reload_ack(pid: &str, request_id: &str) {
+    let path = Path::new(crate::platform::module_paths::MEDIA_PROVIDER_HOT_RELOAD_ACK_FILE);
+    let Some(parent) = path.parent() else {
+        return;
+    };
+    if fs::create_dir_all(parent).is_err() {
+        return;
+    }
+    let boot_id = crate::platform::read_boot_id();
+    let content = format!(
+        "stage=hot_reload_ok request={} pid={} boot_id={}\n",
+        request_id,
+        pid,
+        if boot_id.is_empty() {
+            "unknown"
+        } else {
+            &boot_id
+        }
+    );
+    let temp = path.with_extension("ack.tmp");
+    if fs::write(&temp, content).is_err() {
+        return;
+    }
+    if fs::rename(&temp, path).is_ok() {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = fs::set_permissions(path, fs::Permissions::from_mode(0o644));
+    }
 }
 
 fn format_running_line(level: &str, tag: &str, message: &str) -> String {

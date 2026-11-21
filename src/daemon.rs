@@ -10,27 +10,51 @@ use crate::daemon_mount::{
 };
 use crate::logging::Logger;
 use crate::platform;
+use crate::platform::proc_identity::read_proc_identity;
 use crate::redirect_policy as policy;
 use crate::runtime_control;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fs::{self as std_fs, File, OpenOptions};
 use std::io;
 use std::os::fd::AsRawFd;
+use std::os::unix::fs::PermissionsExt;
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
-use std::sync::{Arc, Condvar, Mutex};
+use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 /// 周期兜底 reconcile 的间隔。应用启动由 companion 主动挂载 + register-policy 定点
 /// 登记，配置变更由 inotify 监听，开机由全量预登记兜底——这些都不依赖周期轮询。
 /// 周期轮询只剩「补挂 companion 未处理的进程 / 宿主重建后重新接入 / 清理退出残留」
-/// 等补偿职责，把间隔从 3 秒放宽到 30 秒可显著降低常驻唤醒与 /proc 扫描功耗，
-/// 补偿类场景最坏多等一个周期（30 秒），不影响事件驱动主路径的即时性。
-const PERIODIC_RECONCILE_INTERVAL_MS: i64 = 30_000;
+/// 等补偿职责。
+///
+/// 这类补偿**没有可订阅的事件源**（外部 umount 不会通知任何人），因此不能做成纯事件
+/// 驱动；但它的触发条件本身极罕见（根因 MS_BIND 传播已用 MS_PRIVATE 根治），为它持续
+/// 付出高频扫描不划算。现在取 5 分钟：补偿类场景最坏多等一个周期，事件驱动主路径的即时性
+/// 完全不受影响（那部分走的仍是 inotify / pidfd / control eventfd）。
+const PERIODIC_RECONCILE_INTERVAL_MS: i64 = 300_000;
 /// 状态文件清理只防「已死进程的记录无限累积」，不参与挂载正确性；
-/// 独立节流，不随周期 reconcile 一起触发，避免空闲时每个周期都扫描状态目录和 /proc。
-const PRUNE_INTERVAL_MS: i64 = 30_000;
-const CONFIG_FINGERPRINT_FALLBACK_INTERVAL_MS: i64 = 10_000;
+/// 独立节流，不随周期 reconcile 一起触发。它每次要扫状态目录并对每条记录查一次
+/// `/proc/<pid>/stat`，而清理对象本身不参与任何正确性判定，因此取 5 分钟。
+const PRUNE_INTERVAL_MS: i64 = 300_000;
+/// 配置指纹兜底复查间隔：只在事件通道不可用时启用。
+///
+/// 稳态由 inotify 驱动，不做周期扫描；故障降级时每秒先做廉价目录/root-file stat，
+/// 只有发现变化才执行完整目录枚举。该降级仅覆盖 SELinux 拒绝 watch、fd 失效等情况。
+const CONFIG_FINGERPRINT_FALLBACK_INTERVAL_MS: i64 = 1_000;
+/// 文件监视线程的空闲等待上限。
+///
+/// 该线程的两个输入（被监视树的 inotify、配置重建请求 eventfd）都是事件源；运行开关
+/// 由主循环的模块目录 watch 负责，检测到停用后 daemon 直接返回、本线程随进程结束。
+/// 因此这里只作为「事件源整体失效」时的兜底节拍，取 5 分钟。
+const FILE_MONITOR_IDLE_WAIT_MS: u64 = 300_000;
+/// 主循环空闲等待上限（运行开关目录已监听时）。
+///
+/// 此时「开关被改写」是一个事件，主循环只需要睡到下一次周期工作（周期 reconcile 5 分钟
+/// 或指纹兜底 10 分钟）的截止点；上限留 10 分钟兜住时钟异常。
+const IDLE_WAIT_WITH_SWITCH_WATCH_MS: i64 = 600_000;
+/// 主循环空闲等待上限（运行开关没有事件源时）：必须保留固定节拍探询开关文件。
+const IDLE_WAIT_WITHOUT_SWITCH_WATCH_MS: i64 = 30_000;
 /// 降级路径单轮最多连续排空的次数，避免挤占同一循环内的 reconcile。
 const FALLBACK_DRAIN_ROUNDS: usize = 4;
 /// 全量 reconcile 的单轮预算。超过后把剩余计划留给下一轮，给配置/控制事件让路。
@@ -45,7 +69,6 @@ const RECONCILE_BATCH_MAX_PLANS: usize = 1;
 /// 与控制事件本身会立即唤醒 poll；200ms 只兜"排空剩余计划"。配合周期完成判定
 /// （轮转绕回周期起点即收口），每次触发的续跑轮数有上界，排空后主循环归位休眠。
 const RECONCILE_CONTINUE_WAIT_MS: libc::c_int = 200;
-const FILE_MONITOR_SYNC_TIMEOUT_MS: i64 = 2_000;
 const INITIAL_RECONCILE_ROUNDS: usize = 3;
 const PREWARM_RECONCILE_ROUNDS: usize = 1;
 const PREWARM_MAX_REQUESTS: usize = 16;
@@ -69,6 +92,129 @@ static LAST_MEDIA_PROVIDER_PIDS: Mutex<Vec<i32>> = Mutex::new(Vec::new());
 /// SELinux 标签也未就位，沙箱目录 mkdir 会失败，冷启动应用只能回退 scoped。等
 /// MediaProvider 进程出现后补登记一次（幂等，已成功者跳过），覆盖首次失败的应用。
 static PRE_REGISTER_ALL_AFTER_MEDIA_READY: AtomicBool = AtomicBool::new(false);
+
+/// 开机全量预登记因 CE 密钥未就绪而挂起，待就绪后补跑。
+static BOOT_PRE_REGISTER_PENDING: AtomicBool = AtomicBool::new(false);
+
+/// 探测 /data/media 的用户 CE 密钥是否已就绪。
+///
+/// 开机全量预登记发生在 daemon 启动（post-fs-data/service 阶段），此时 /data/media
+/// 的用户 CE 密钥尚未安装，任何 mkdir/lookup 都返回 errno=126（Required key not
+/// available），整批预登记必然失败——真机实测是每次开机的确定性竞态。用一次 mkdir
+/// 探测代替几十次注定失败的登记：路径可达（返回成功或 EEXIST）即就绪，其余错误
+/// （ENOKEY/ENOENT 等）一律视为未就绪，交由挂起补跑与 media_ready 触发兜住。
+pub(crate) fn media_ce_storage_ready() -> bool {
+    const PROBE_DIR: &std::ffi::CStr = c"/data/media/0/Android/data";
+    // SAFETY: libc::mkdir/rmdir 只接收 NUL 结尾的合法路径常量，不借用调用方数据。
+    let rc = unsafe { libc::mkdir(PROBE_DIR.as_ptr(), 0o770) };
+    if rc == 0 {
+        // 目录本不该缺失：清掉探针，仍视为就绪（密钥已可用才会创建成功）。
+        // SAFETY: 仅传入 NUL 结尾的常量路径指针，不借用调用方数据。
+        unsafe { libc::rmdir(PROBE_DIR.as_ptr()) };
+        return true;
+    }
+    crate::platform::errno::last() == libc::EEXIST
+}
+
+/// 预登记失败重试条目。
+struct PendingPolicyRetry {
+    package_name: String,
+    uid: i32,
+    attempts: u32,
+}
+
+/// 预登记失败重试队列。
+///
+/// 开机全量预登记可能在 FBE 密钥未就绪的竞态窗口整批失败：沙箱目录 mkdir 返回
+/// errno=126（Required key not available），宿主整批拒绝策略（fuse host policy
+/// rejected + ack rejected），且此后没有任何重试——所有应用落入宿主 fail-closed
+/// deny_all，用户可见症状是所有应用视角 /storage/emulated/0 为空（真机 2026-10-13
+/// 事故）。media_ready 补登记只有一次机会，若那一刻密钥仍未就绪同样失效。失败
+/// 条目进入本队列，由周期 reconcile 逐轮限量重试；上限内成功或超限后移除。
+static PENDING_POLICY_RETRIES: Mutex<Vec<PendingPolicyRetry>> = Mutex::new(Vec::new());
+
+/// 单个应用的最大重试次数。30 秒周期下约覆盖 15 分钟的开机恢复窗口。
+const POLICY_RETRY_MAX_ATTEMPTS: u32 = 30;
+/// 每个 reconcile 周期最多重试的条目数：登记要 fork 子进程探测 media 视图并等待
+/// 宿主 ack（最坏秒级），限量保证重试不挤占同一循环内挂载计划的关键窗口（计划
+/// 本身单轮也只执行 1 个）。
+const POLICY_RETRY_PER_CYCLE: usize = 2;
+
+/// 把预登记失败的应用加入重试队列（按 uid 去重）。
+fn enqueue_policy_retry(package_name: &str, uid: i32) {
+    if uid < ANDROID_APP_UID_START {
+        return;
+    }
+    let mut queue = PENDING_POLICY_RETRIES
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if queue.iter().any(|entry| entry.uid == uid) {
+        return;
+    }
+    queue.push(PendingPolicyRetry {
+        package_name: package_name.to_string(),
+        uid,
+        attempts: 0,
+    });
+}
+
+/// 在 reconcile 周期内限量重试预登记失败的应用。
+///
+/// 复用与开机全量预登记完全相同的 build_request + pre_register_host_policy 路径；
+/// 幂等由指纹表保证，成功（含已登记）即出队，持续失败计满上限后放弃并告警。
+fn drain_pending_policy_retries(config_version: u64) {
+    let snapshot = SettingsHub::instance().get_daemon_reconcile_config_snapshot();
+    let mut retried = 0usize;
+    let mut queue = PENDING_POLICY_RETRIES
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let mut index = 0usize;
+    while index < queue.len() && retried < POLICY_RETRY_PER_CYCLE {
+        let (package_name, uid, attempts) = {
+            let entry = &mut queue[index];
+            entry.attempts += 1;
+            (entry.package_name.clone(), entry.uid, entry.attempts)
+        };
+        let proc = AppProcess {
+            pid: 0,
+            uid,
+            package_name,
+            is_uninterruptible: false,
+        };
+        let request = build_request(&proc, config_version, &snapshot);
+        if request.operation != MountOperation::Reload {
+            // 配置已不再产生 Reload 请求（应用被移除或关闭重定向）：无需重试，出队。
+            queue.remove(index);
+            continue;
+        }
+        retried += 1;
+        match crate::daemon_mount::pre_register_host_policy(&request) {
+            crate::daemon_mount::PreRegisterOutcome::Registered
+            | crate::daemon_mount::PreRegisterOutcome::AlreadyRegistered => {
+                log::info!(
+                    "policy retry registered uid={} pkg={} attempts={}",
+                    uid,
+                    request.package_name,
+                    attempts
+                );
+                queue.remove(index);
+            }
+            crate::daemon_mount::PreRegisterOutcome::NotApplicable => {
+                if attempts >= POLICY_RETRY_MAX_ATTEMPTS {
+                    log::warn!(
+                        "policy retry exhausted uid={} pkg={} attempts={}",
+                        uid,
+                        request.package_name,
+                        attempts
+                    );
+                    queue.remove(index);
+                } else {
+                    index += 1;
+                }
+            }
+        }
+    }
+}
 
 /// 周期 reconcile 摘要的记录状态。
 ///
@@ -111,25 +257,15 @@ fn should_log_reconcile_summary(
 
 /// daemon 主循环与文件监视线程之间的配置同步状态。
 ///
-/// 早期实现让双方各自以 10ms 步长轮询原子计数，既浪费唤醒又让重建请求最多白等一个
-/// 轮询周期。这里改成原子计数负责传值、条件变量负责唤醒：进度由监视线程通知等待方，
-/// 重建请求由等待方通知监视线程，两侧都不再忙等。
+/// 重建请求是异步排队的：主循环登记待处理清单后经 eventfd 唤醒监视线程即返回，
+/// 不等待监视线程回执（早期的进度条件变量与同步等待方已随之移除）。
 struct FileMonitorSync {
-    configured_version: AtomicU64,
-    requested_rebuild: AtomicU64,
-    completed_rebuild: AtomicU64,
     /// 待处理的包级增量刷新请求。
     ///
     /// 监视树构成只取决于配置（每应用的监视根清单），与挂载状态无关；配置变化
     /// 时只需对变化的包做增量重建，其余包的 watch 原地保留。`None` 表示仅唤醒
     /// 线程（排空事件 + 缺失根重试），不需要触碰监视树。
     pending_packages: Mutex<Option<Vec<String>>>,
-    /// 仅用于配合下面两个条件变量，不承载业务数据。
-    signal_lock: Mutex<()>,
-    /// 监视线程完成一轮配置同步后唤醒等待方。
-    progress_signal: Condvar,
-    /// 兼容同步等待方的请求通知；事件线程主要依赖下面的 eventfd。
-    request_signal: Condvar,
     /// eventfd 是监视线程的事件源，避免为重建请求周期性超时唤醒。
     request_event_fd: i32,
 }
@@ -144,21 +280,8 @@ impl Drop for FileMonitorSync {
 }
 
 impl FileMonitorSync {
-    fn lock_signal(&self) -> std::sync::MutexGuard<'_, ()> {
-        self.signal_lock
-            .lock()
-            .unwrap_or_else(|error| error.into_inner())
-    }
-
-    /// 通知等待方本轮配置同步已经推进。
-    fn notify_progress(&self) {
-        let _guard = self.lock_signal();
-        self.progress_signal.notify_all();
-    }
-
     /// 登记重建请求后唤醒监视线程。
     fn notify_request(&self) {
-        let _guard = self.lock_signal();
         if self.request_event_fd >= 0 {
             let value = 1u64.to_ne_bytes();
             // SAFETY: eventfd 接受固定 8 字节计数值；fd 由 FileMonitorSync 持有至 daemon 结束。
@@ -170,7 +293,6 @@ impl FileMonitorSync {
                 );
             }
         }
-        self.request_signal.notify_all();
     }
 
     /// 登记待处理的包级增量刷新清单；`None`/空清单表示仅唤醒线程。
@@ -190,43 +312,6 @@ impl FileMonitorSync {
             .ok()
             .and_then(|mut slot| slot.take())
             .filter(|packages| !packages.is_empty())
-    }
-
-    /// 等待监视线程推进一轮，最多等待 `timeout`。
-    ///
-    /// 通知方在持有 `signal_lock` 时才发出通知，因此这里必须先拿锁再复检原子计数，
-    /// 否则会漏掉在检查与等待之间发生的唤醒。
-    fn wait_progress_until(&self, deadline: Instant, is_done: impl Fn() -> bool) -> bool {
-        let mut guard = self.lock_signal();
-        loop {
-            if is_done() {
-                return true;
-            }
-            let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
-                return false;
-            };
-            let (next_guard, _) = self
-                .progress_signal
-                .wait_timeout(guard, remaining)
-                .unwrap_or_else(|error| error.into_inner());
-            guard = next_guard;
-        }
-    }
-
-    /// 等待新的重建请求，最多等待 `timeout`。
-    ///
-    /// 超时返回也要继续下一轮，监视线程仍需按轮询周期 drain 事件。
-    fn wait_new_request(&self, timeout: Duration) {
-        let guard = self.lock_signal();
-        if self.requested_rebuild.load(Ordering::Acquire)
-            > self.completed_rebuild.load(Ordering::Acquire)
-        {
-            return;
-        }
-        let _ = self
-            .request_signal
-            .wait_timeout(guard, timeout)
-            .unwrap_or_else(|error| error.into_inner());
     }
 }
 
@@ -277,9 +362,22 @@ fn plan_batch_mode_tag(mode: &ReconcileMode) -> u8 {
 #[derive(Default)]
 struct ReconcileCursor {
     last_attempted: Option<ReconcilePlanIdentity>,
-    /// 本触发周期首个尝试的计划身份：轮转绕回该位置即判定周期已排空，
-    /// 让未完成批次收口，避免永续 ~1Hz 续跑轮询。
+    /// 本触发周期首个尝试的计划身份。
+    ///
+    /// 仅供诊断与旧收口判据兜底保留；真正的收口判定已改由下面的
+    /// `cycle_attempted`（回到已尝试过的计划即排空）承担。
     cycle_head: Option<ReconcilePlanIdentity>,
+    /// 本周期内已被尝试执行的计划身份集合。
+    ///
+    /// 轮转回到已尝试过的计划，说明本轮触发要处理的计划都已尝试过一次，周期应当收口。
+    /// 判定点还要求本轮没有任何计划被批次限流延后（`deferred == 0`）——被延后的计划
+    /// 从未尝试过，绕回命中时它们仍待处理，此时收口等于把工作推给下一个触发周期。
+    /// 只比对「周期头位置」的旧判据（`next_index <= head_index`）在周期头不在计划数组
+    /// 末尾时永远不成立：绕回后执行周期头得到 `head+1`，恒大于 `head_index`，周期永不
+    /// 收口，`pending_full_reconcile` 恒为真，主循环退化为 200ms 永续续跑。真机实测
+    /// 表现为全部已挂载应用每 2~3 秒被卸载重建一次（20 秒 64 次重挂、45 分钟零次
+    /// `cycle drained`）。改为「回到已尝试集合即收口」后判定与轮转位置无关。
+    cycle_attempted: HashSet<ReconcilePlanIdentity>,
     /// 本周期内已被监督判定拒绝注入的计划。
     ///
     /// 监督拒绝（skip_superseded / refuse_poisoned 等）是账本状态型结论，
@@ -294,7 +392,7 @@ struct ReconcileCursor {
     /// 续跑轮复用的计划批次。
     ///
     /// 批次上限为 1 的周期要经历多轮 200ms 续跑；若续跑每轮都全量扫 /proc
-    /// 并重建全部计划，一个 N 计划的周期就是 N 次全量枚举（ishtar 实测：
+    /// 并重建全部计划，一个 N 计划的周期就是 N 次全量枚举（真机实测：
     /// 每 30s 周期 10~15 轮 × 全量扫描，rchar ~39MB/burst，scudo 滞留
     /// 112MB，RSS 162MB）。缓存随周期收口清空；签名不匹配（模式/配置/
     /// 触发范围变化）或宿主换代时重建。
@@ -346,7 +444,20 @@ impl ReconcileCursor {
         if self.cycle_head.is_none() {
             self.cycle_head = Some(identity.clone());
         }
+        self.cycle_attempted.insert(identity.clone());
         self.last_attempted = Some(identity);
+    }
+
+    /// 本周期是否已尝试过该计划。
+    fn attempted_in_cycle(&self, plan: &ReconcilePlan) -> bool {
+        self.cycle_attempted.contains(&plan.identity())
+    }
+
+    /// 结束本周期：清空周期头、已尝试集合与拒绝集合。
+    fn close_cycle(&mut self) {
+        self.cycle_head = None;
+        self.cycle_attempted.clear();
+        self.cycle_refused.clear();
     }
 }
 
@@ -380,6 +491,105 @@ impl DaemonInstanceLock {
         }
         Err(error)
     }
+}
+
+/// daemon 自写 pid 文件：保证 watchdog 拉起的新实例也持有准确 pid，避免
+/// srxctl/WebUI 按 service.sh 遗留 pid 停止时误杀或漏杀。
+/// 写失败只告警：pid 文件消费方（srxctl/WebUI）都带 pidof 兜底。
+fn write_daemon_pid_file() {
+    let path = std::path::Path::new(crate::platform::module_paths::DAEMON_PID_FILE);
+    if let Some(parent) = path.parent() {
+        let _ = std_fs::create_dir_all(parent);
+    }
+    match std::fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(true)
+        .open(path)
+    {
+        Ok(mut file) => {
+            use std::io::Write as _;
+            let _ = std::io::Write::write_fmt(&mut file, format_args!("{}\n", std::process::id()));
+            let _ = file.flush();
+            drop(file);
+            let _ =
+                std_fs::set_permissions(path, std::os::unix::fs::PermissionsExt::from_mode(0o600));
+        }
+        Err(error) => log::warn!("daemon pid file write failed error={}", error),
+    }
+}
+
+/// 清掉旧版本遗留的 per-app scoped FUSE 会话，返回清理数量。
+///
+/// scoped 会话已退役：当前版本不会再 fork `srx_fuse`（唯一 FUSE 载体是共享宿主
+/// `srx_fuse_host`，它不跟随应用生命周期）。但旧版本在真机上留下过上千个常驻会话
+/// （issue #4：把 pid 号与线程数顶满后 framework 反复重启），升级设备若不走完整重启，
+/// 这些进程仍会留在各自的旧应用命名空间里，且不受任何账本约束——它们是那个命名空间的
+/// 自持引用，永远不会自己退出。因此这里做**一次性**迁移清理。
+///
+/// 判据只有一条：`comm=srx_fuse`。共享宿主是 `srx_fuse_host`、看门狗是 `srx_watchdog`，
+/// 都不会被误伤。
+fn retire_legacy_scoped_sessions() -> usize {
+    const LEGACY_SCOPED_COMM: &str = "srx_fuse";
+    let Ok(entries) = std::fs::read_dir("/proc") else {
+        return 0;
+    };
+    let mut retired = 0usize;
+    for entry in entries.flatten() {
+        let Some(pid) = entry
+            .file_name()
+            .to_str()
+            .and_then(|value| value.parse::<i32>().ok())
+        else {
+            continue;
+        };
+        if pid <= 1 {
+            continue;
+        }
+        let Ok(comm) = std::fs::read_to_string(format!("/proc/{pid}/comm")) else {
+            continue;
+        };
+        if comm.trim() != LEGACY_SCOPED_COMM {
+            continue;
+        }
+        // SAFETY: pid 来自 /proc 且进程名与已退役的模块会话名精确匹配；SIGKILL 只作用于
+        // 这个确认属于旧版本模块的进程。
+        if unsafe { libc::kill(pid, libc::SIGKILL) } == 0 {
+            retired += 1;
+            log::warn!(
+                "daemon retired legacy scoped fuse session pid={} reason=scoped_backend_removed",
+                pid
+            );
+        }
+    }
+    if retired > 0 {
+        log::warn!("daemon legacy scoped fuse sessions retired total={retired}");
+    }
+    // SIGKILL 对 D 态进程可能延迟生效：短暂等待后复查，仍存活说明清理被内核阻塞。
+    // 留痕而不是静默返回，下一次 daemon 启动会再次尝试。
+    std::thread::sleep(std::time::Duration::from_millis(100));
+    let survivors = std::fs::read_dir("/proc")
+        .map(|entries| {
+            entries
+                .flatten()
+                .filter(|entry| {
+                    entry
+                        .file_name()
+                        .to_str()
+                        .and_then(|value| value.parse::<i32>().ok())
+                        .is_some_and(|pid| {
+                            pid > 1
+                                && std::fs::read_to_string(format!("/proc/{pid}/comm"))
+                                    .is_ok_and(|comm| comm.trim() == LEGACY_SCOPED_COMM)
+                        })
+                })
+                .count()
+        })
+        .unwrap_or(0);
+    if survivors > 0 {
+        log::warn!("daemon legacy scoped fuse sessions survived retire count={survivors}");
+    }
+    retired
 }
 
 /// 安装 daemon 主进程的 panic 钩子。
@@ -432,7 +642,14 @@ pub fn main_entry() -> i32 {
         log::error!("private log writer start failed error={}", error);
         return 1;
     }
+    // 尽早孵化自守护看门狗（pidfd 事件驱动）：之后任何路径的退出/崩溃都能被
+    // 立即感知并按退避拉起，取代 service.sh 的 20 秒 pidof 轮询看门狗。
+    crate::daemon_watchdog::spawn_self_watchdog();
+    write_daemon_pid_file();
     log::info!("daemon start");
+
+    // legacy scoped 会话清理不依赖运行开关：即使模块停用，历史泄漏的 srx_fuse 仍会占用 pid 与线程预算，启动阶段能清就清。
+    let legacy_scoped_retired = retire_legacy_scoped_sessions();
 
     if !runtime_control::is_module_runtime_enabled() {
         cleanup_all_mount_states();
@@ -447,21 +664,71 @@ pub fn main_entry() -> i32 {
     }
     crate::fuse_redirect::config::refresh_fuse_capability_snapshot("daemon_start");
     policy::refresh_shared_uid_cache();
+    // 一次性存量属主迁移（ci.49 前版本误 chown 的私有树残留）：线程内自行等待
+    // CE 就绪并受完成标记门控，已迁移设备仅多一条 skip 日志。
+    crate::owner_migration::spawn_once();
     let config_watch_fd = watcher::init(crate::platform::module_paths::CONFIG_DIR);
     if config_watch_fd < 0 {
         log::warn!("daemon config watcher unavailable, using fingerprint polling");
     }
+    // 运行开关（WebUI 写的标记文件）没有 IPC 通道，唯一的事件源就是模块目录本身。
+    // 加上这个 watch 之后，主循环不再需要任何固定节拍去「看一眼开关」。
+    let runtime_switch_watched =
+        watcher::add_wakeup_watch(crate::platform::module_paths::MODULE_DIR);
+    crate::runtime_control::set_disable_watch_active(runtime_switch_watched);
+    if !runtime_switch_watched {
+        log::warn!("runtime switch watch unavailable, keep periodic fallback");
+    }
 
-    // 建立共享宿主 FUSE 会话。失败只记录并继续，不影响主循环与既有 scoped 路径；
-    // 后续 reconcile 会在宿主子进程死亡后按需恢复，而不是继续使用失效句柄。
+    // 建立共享宿主 FUSE 会话。它是**唯一**的 FUSE 载体：失败只记录并继续，应用照常
+    // 拿到 namespace bind 视图；后续 reconcile 会在宿主子进程死亡后按需恢复，而不是
+    // 继续使用失效句柄。
+    //
+    // 接入被显式关闭时连宿主都不建立（见 `ensure_global` 的闸门说明）：这条路径必须
+    // 单独说清楚，否则日志会把「被开关关掉」和「建立失败」混成同一句 unavailable，
+    // 现场无法判断到底是能力缺失还是自己关的。
     if !crate::fuse_host::ensure_global() {
-        log::warn!("fuse host session unavailable, scoped path remains active");
-    } else {
+        if crate::fuse_host::host_attach_enabled() {
+            log::warn!("fuse host session unavailable, namespace bind remains active");
+        } else {
+            log::warn!(
+                "fuse host disabled by switch env=SRT_FUSE_HOST_ATTACH, namespace bind remains active"
+            );
+        }
+    } else if media_ce_storage_ready() {
         // 宿主就绪后立即全量预登记所有已配置应用：让应用冷启动时无需等待 reconcile
         // 轮询到该进程，就能从宿主快照确认 uid 并接入共享会话，避免 scoped 竞态与
         // 启动窗口。宿主未就绪时跳过（此时预登记必然失败，逐个触发等待反而拖慢启动）。
         pre_register_all_configured_apps(config, config.config_version());
+    } else {
+        // CE 密钥未就绪的竞态窗口：整批登记必然失败（errno=126），跳过本次全量并
+        // 挂起，待密钥就绪后由 reconcile 补跑，避免几十次注定失败的 fork 与拒绝日志。
+        BOOT_PRE_REGISTER_PENDING.store(true, Ordering::Release);
+        log::warn!("boot pre-register deferred: media CE key not ready");
     }
+
+    // 外部 abort 兜底监控（独立线程）：宿主内停摆看门狗的探测链路自身可能被冻结
+    // 拖死（2026-10-29 真机实证），daemon 作为不服务 FUSE 的独立进程保留最后一道
+    // 解冻能力。线程自门控：无宿主心跳时空转，有硬证据才动手。
+    crate::fuse_host::spawn_external_abort_monitor();
+
+    // 一次性迁移：清掉旧版本遗留的 per-app scoped 会话。
+    //
+    // scoped 会话形态已退役（见 `fuse_session::attach_shared_host_sessions` 的文档）。
+    // 升级后进程表里仍可能出现上一代的 `srx_fuse`：它们是应用命名空间的自持引用，既不会
+    // 自己退出，也不受任何账本约束——正是 issue #4 那批常驻进程的来源。这是针对历史残留
+    // 的一次性清理，不是周期性收割；当前版本不会再产生这类进程。
+    // 一条可长期检索的能力结论：设备节点、宿主会话、能力快照与本次清理量。
+    // 现场只要贴这一行，就能判断「这台设备/这个配置下 FUSE 视图到底能不能用」。
+    log::info!(
+        "fuse backend startup dev_fuse={} host_session={} capability={} legacy_scoped_retired={}",
+        crate::fuse_redirect::config::fuse_device_present(),
+        crate::fuse_host::read_host_session_view().is_some(),
+        crate::fuse_redirect::config::fuse_capability_as_str(
+            crate::fuse_redirect::config::fuse_capability()
+        ),
+        legacy_scoped_retired
+    );
 
     let mut last_version = 0;
     let mut last_fingerprint_check_ms = crate::platform::paths::monotonic_ms();
@@ -473,17 +740,46 @@ pub fn main_entry() -> i32 {
     // SAFETY: eventfd 只创建内核对象并返回 fd，不接触调用方内存；标志位均为合法常量。
     let control_wake_fd = unsafe { libc::eventfd(0, libc::EFD_CLOEXEC | libc::EFD_NONBLOCK) };
     crate::log_daemon::set_daemon_wake_eventfd(control_wake_fd);
+    crate::mount::own_private_pending::set_daemon_wake_eventfd(control_wake_fd);
     let file_monitor_sync = start_file_monitor_thread();
     let mut fallback_file_monitor = file_monitor_sync.is_none().then(RegularAppMonitor::new);
+    spawn_system_pid_scanner();
     loop {
+        // legacy scoped 会话清理不依赖运行开关：即使模块停用，历史泄漏的 srx_fuse 仍会占用 pid 与线程预算，启动阶段能清就清。
+
         if !runtime_control::is_module_runtime_enabled() {
             cleanup_all_mount_states();
             log::info!("daemon stop reason=runtime_disabled");
             return 0;
         }
+        // 挂起的开机全量预登记：CE 密钥就绪后立即补跑。放在 should_reconcile 判定
+        // 之外，配合挂起态下 1 秒的 poll 上限，密钥就绪后 ~1 秒内完成补登记；
+        // 幂等由指纹表保证，未挂起时本块零开销。
+        if BOOT_PRE_REGISTER_PENDING.load(Ordering::Acquire) && media_ce_storage_ready() {
+            BOOT_PRE_REGISTER_PENDING.store(false, Ordering::Release);
+            log::warn!("boot pre-register resumed: media CE key ready");
+            pre_register_all_configured_apps(config, config.config_version());
+        }
         let before = config.config_version();
         let (did_reload, changed_packages, full_change) =
             reload_config_for_daemon(config, &mut last_fingerprint_check_ms);
+        // 自有私有目录恢复的重试排期。冷启动首轮挂载可能跑在应用视图覆盖层就位之前，
+        // 那一轮恢复会被跳过；周期 reconcile 只处理 missing 挂载，不会回头重挂已挂好的
+        // 应用，于是「跳过」会变成永久状态（自有私有目录长期留在直连层 → 两层页缓存
+        // 分裂 → SQLite `-shm` 跨不过去 → WAL 回滚空主库）。这里按退避把待重试的包名
+        // 并进本轮增量 reconcile（对该包等同一次配置变更 → 重新挂载 → 恢复幂等重试）。
+        let mut changed_packages = changed_packages;
+        let own_private_retry = crate::mount::own_private_pending::take_due_packages();
+        let own_private_retry_due = !own_private_retry.is_empty();
+        if own_private_retry_due {
+            changed_packages = Some(match changed_packages.take() {
+                Some(mut packages) => {
+                    packages.extend(own_private_retry);
+                    packages
+                }
+                None => own_private_retry,
+            });
+        }
         let current = config.config_version();
         let control_reconcile = crate::log_daemon::take_reconcile_request();
         let policy_register = crate::log_daemon::take_policy_register_request();
@@ -499,6 +795,7 @@ pub fn main_entry() -> i32 {
             || current != last_version
             || current != before
             || control_reconcile.is_some()
+            || own_private_retry_due
             || pending_full_reconcile
             || periodic_reconcile;
         if let Some(file_monitor) = fallback_file_monitor.as_mut() {
@@ -559,10 +856,15 @@ pub fn main_entry() -> i32 {
                         mounts_changed
                     );
                 } else {
-                    log::info!(
-                        "running app remount completed request={} applied={}",
-                        request,
-                        mounts_changed
+                    // 完成行是 srxctl 等待循环的唯一判据（running.log 计数比对），
+                    // 走 Status 专用标签避开 verbose 门禁，保证任何日志档位下可观测。
+                    crate::logging::write_log(
+                        crate::logging::Level::Info,
+                        crate::logging::STATUS_LOG_TAG,
+                        &format!(
+                            "running app remount completed request={} applied={}",
+                            request, mounts_changed
+                        ),
                     );
                 }
             }
@@ -603,11 +905,29 @@ pub fn main_entry() -> i32 {
             }
         }
         round = round.saturating_add(1);
+        // 下一次**必须**醒来的时刻：只由真正要做周期工作的两件事决定（周期 reconcile
+        // 与指纹兜底）。此外的唤醒全部来自事件：配置目录、运行开关目录、宿主 pidfd、
+        // 控制 eventfd。因此这里可以按截止点睡，而不是按固定节拍空转。
+        let next_periodic_ms = last_periodic_reconcile_ms
+            .saturating_add(PERIODIC_RECONCILE_INTERVAL_MS)
+            .min(last_fingerprint_check_ms.saturating_add(CONFIG_FINGERPRINT_FALLBACK_INTERVAL_MS))
+            .min(
+                crate::mount::own_private_pending::next_due_delay_ms()
+                    .map(|delay| crate::platform::paths::monotonic_ms().saturating_add(delay))
+                    .unwrap_or(i64::MAX),
+            )
+            .min(
+                fallback_file_monitor
+                    .as_ref()
+                    .and_then(RegularAppMonitor::next_wakeup_deadline_ms)
+                    .unwrap_or(i64::MAX),
+            );
         let host_exited = wait_for_daemon_events(
             watcher::event_fd(),
             pending_full_reconcile,
             crate::fuse_host::pidfd(),
             control_wake_fd,
+            next_periodic_ms,
         );
         if host_exited {
             let cleared = crate::fuse_host::clear_if_dead_with_reason("pidfd");
@@ -620,20 +940,42 @@ pub fn main_entry() -> i32 {
     }
 }
 
-/// 阻塞等待配置事件；超时后返回主循环执行低频宿主/状态兜底。
+/// 阻塞等待事件；超时后返回主循环执行下一次周期工作。
 ///
-/// inotify fd 可读时下一轮会立即解析增量配置；watcher 不可用时退回有限超时，
-/// 保留 fingerprint fallback 和周期自愈，不会因事件源失效而永久停摆。
+/// 这里**没有固定节拍**：配置目录、运行开关目录、宿主 pidfd、控制 eventfd 都有事件源，
+/// 唯一的「时间驱动」是周期 reconcile 与指纹兜底的截止点（由调用方算出并传进来）。
+///
+/// 运行开关目录的 watch 不可用（inotify 建不起来）时，才退回固定节拍探询开关文件——
+/// 那是纯降级路径，不进稳态。
 fn wait_for_daemon_events(
     config_watch_fd: i32,
     reconcile_pending: bool,
     host_pidfd: i32,
     control_wake_fd: i32,
+    next_periodic_ms: i64,
 ) -> bool {
     let timeout_ms: libc::c_int = if reconcile_pending {
         RECONCILE_CONTINUE_WAIT_MS
+    } else if BOOT_PRE_REGISTER_PENDING.load(Ordering::Acquire) {
+        // 挂起的开机预登记等待 CE 密钥就绪：1 秒粒度轮询，密钥就绪后 ~1 秒内补跑。
+        // 挂起态只存在于开机后一两分钟，且这是内核文件系统状态，没有事件可订阅。
+        1_000
     } else {
-        30_000
+        // 只有**全部**事件源都在位时才允许长睡：缺一个就必须保留固定节拍，
+        // 否则那一类事件（宿主退出、控制请求、运行开关）要等到下一次周期工作
+        // （最长 10 分钟）才被发现。
+        let all_event_sources_ready = crate::runtime_control::disable_watch_active()
+            && config_watch_fd >= 0
+            && host_pidfd >= 0
+            && control_wake_fd >= 0;
+        let max_idle_ms = if all_event_sources_ready {
+            IDLE_WAIT_WITH_SWITCH_WATCH_MS
+        } else {
+            IDLE_WAIT_WITHOUT_SWITCH_WATCH_MS
+        };
+        next_periodic_ms
+            .saturating_sub(crate::platform::paths::monotonic_ms())
+            .clamp(1, max_idle_ms) as libc::c_int
     };
     if config_watch_fd < 0 && host_pidfd < 0 && control_wake_fd < 0 {
         if timeout_ms > 0 {
@@ -709,13 +1051,7 @@ fn start_file_monitor_thread() -> Option<Arc<FileMonitorSync>> {
     // SAFETY: eventfd 只创建内核对象并返回 fd，不接触调用方内存；标志位均为合法常量。
     let request_event_fd = unsafe { libc::eventfd(0, libc::EFD_CLOEXEC | libc::EFD_NONBLOCK) };
     let sync = Arc::new(FileMonitorSync {
-        configured_version: AtomicU64::new(0),
-        requested_rebuild: AtomicU64::new(0),
-        completed_rebuild: AtomicU64::new(0),
         pending_packages: Mutex::new(None),
-        signal_lock: Mutex::new(()),
-        progress_signal: Condvar::new(),
-        request_signal: Condvar::new(),
         request_event_fd,
     });
     let thread_sync = Arc::clone(&sync);
@@ -730,11 +1066,7 @@ fn start_file_monitor_thread() -> Option<Arc<FileMonitorSync>> {
                 // 被挂载应用此前不存在的监视根由 1 秒级缺失重试补齐，目录内新子树
                 // 由 IN_CREATE 事件动态扩展。此前挂载生效即强制全量重建，每次应用
                 // 冷启动都把 9862~24909 个目录的监视树整棵重走，真机实测产生
-                // 30~60 秒 100% 单核阵发（ishtar/duchamp 双机复现）。
-                thread_sync.completed_rebuild.store(
-                    thread_sync.requested_rebuild.load(Ordering::Acquire),
-                    Ordering::Release,
-                );
+                // 30~60 秒 100% 单核阵发（两台真机复现）。
                 let pending_packages = thread_sync.take_pending_packages();
                 match pending_packages {
                     Some(packages) if !packages.is_empty() => {
@@ -742,10 +1074,6 @@ fn start_file_monitor_thread() -> Option<Arc<FileMonitorSync>> {
                     }
                     _ => file_monitor.reconfigure(config, false),
                 }
-                thread_sync
-                    .configured_version
-                    .store(file_monitor.configured_version(), Ordering::Release);
-                thread_sync.notify_progress();
                 // 达到单轮预算时队列里仍有事件，立即进入下一轮继续排空，不等轮询间隔，
                 // 避免把"防止饿死重建"变成"事件延迟一个周期"。
                 if !file_monitor.drain_events() {
@@ -762,10 +1090,16 @@ fn start_file_monitor_thread() -> Option<Arc<FileMonitorSync>> {
 }
 
 fn wait_for_file_monitor_events(sync: &FileMonitorSync, monitor: &RegularAppMonitor) {
-    if monitor.event_fd() < 0 && sync.request_event_fd < 0 {
-        std::thread::sleep(Duration::from_secs(30));
-        return;
-    }
+    // 待裁决观察事件的到期点优先：延迟裁决最长数百毫秒，必须按截止点醒。
+    // 没有待裁决事件时，这里**没有**任何需要固定节拍的工作：inotify 与请求 eventfd
+    // 都是事件源，运行开关由主循环的目录 watch 负责（主循环检测到停用即返回，
+    // 本线程随进程退出）。因此默认超时可以放到分钟级。
+    let now_ms = crate::platform::paths::monotonic_ms();
+    let poll_timeout_ms = monitor
+        .next_wakeup_deadline_ms()
+        .map(|deadline| deadline.saturating_sub(now_ms).clamp(1, i64::MAX) as u64)
+        .unwrap_or(FILE_MONITOR_IDLE_WAIT_MS)
+        .min(FILE_MONITOR_IDLE_WAIT_MS);
     let mut fds = [
         libc::pollfd {
             fd: monitor.event_fd(),
@@ -778,10 +1112,16 @@ fn wait_for_file_monitor_events(sync: &FileMonitorSync, monitor: &RegularAppMoni
             revents: 0,
         },
     ];
-    // inotify 是主事件源，eventfd 唤醒配置重建；30 秒超时只作为 runtime disable 的兜底。
-    // SAFETY: fds 是本栈帧上的合法 pollfd 数组，poll 只在其中写入 revents；
-    // nfds_t 转换不会截断（数组长度恒为 2）。
-    let result = unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as libc::nfds_t, 30_000) };
+    // inotify 是主事件源，eventfd 唤醒配置重建；超时兜底 runtime disable 与
+    // 延迟裁决到期（有待裁决事件时压到到期点）。
+    // SAFETY: fds 是本栈帧上的合法 pollfd 数组，poll 只在其中写入 revents；nfds_t 转换由调用方保证不截断。
+    let result = unsafe {
+        libc::poll(
+            fds.as_mut_ptr(),
+            fds.len() as libc::nfds_t,
+            poll_timeout_ms as libc::c_int,
+        )
+    };
     if result < 0 && std::io::Error::last_os_error().raw_os_error() == Some(libc::EINTR) {
         return;
     }
@@ -802,7 +1142,6 @@ fn request_file_monitor_refresh(sync: &FileMonitorSync, packages: Option<Vec<Str
     // 监视树重建只影响后续文件监视，不影响当前应用挂载策略；异步排队后立即返回，
     // 避免把一次 MT 配置切换再阻塞在最多 2 秒的监视器 ACK 上。
     sync.store_pending_packages(packages);
-    sync.requested_rebuild.fetch_add(1, Ordering::AcqRel);
     sync.notify_request();
 }
 
@@ -833,7 +1172,7 @@ fn reload_config_for_daemon(
     config: &SettingsHub,
     last_fingerprint_check_ms: &mut i64,
 ) -> (bool, Option<Vec<String>>, bool) {
-    match watcher::poll_changed_with_packages() {
+    match watcher::poll_changed_unthrottled_with_packages() {
         watcher::ChangeKind::Apps(packages) => {
             *last_fingerprint_check_ms = crate::platform::paths::monotonic_ms();
             return (config.reload_force(), Some(packages), false);
@@ -895,9 +1234,7 @@ fn dump_malloc_info_if_requested() {
     // SAFETY: fopen/malloc_info/fclose 均为 bionic libc 导出的稳定接口；fp
     // 生命周期限定在本函数内，malloc_info 内部仅短暂持有分配器锁。
     unsafe {
-        let path = b"/data/local/tmp/srx-meminfo.xml\0".as_ptr() as *const libc::c_char;
-        let mode = b"w\0".as_ptr() as *const libc::c_char;
-        let fp = libc::fopen(path, mode);
+        let fp = libc::fopen(c"/data/local/tmp/srx-meminfo.xml".as_ptr(), c"w".as_ptr());
         if fp.is_null() {
             log::warn!("daemon meminfo dump fopen failed");
             let _ = std::fs::remove_file(TRIGGER);
@@ -949,7 +1286,7 @@ fn reconcile_running_apps(
         config_fingerprint: SettingsHub::instance().config_fingerprint(),
     };
     // 批次上限为 1 的周期要走多轮 200ms 续跑；若续跑每轮都全量扫 /proc 重建
-    // 全部计划，一个 N 计划的周期就是 N 次全量枚举（ishtar 实测：每 30s 周期
+    // 全部计划，一个 N 计划的周期就是 N 次全量枚举（真机实测：每 30s 周期
     // 10~15 轮 × 全量扫描，rchar ~39MB/burst，scudo 滞留 112MB）。除首轮外的
     // 续跑轮直接复用同签名的计划批次；MediaProvider 自愈、全量预登记与逐计划
     // 策略登记都在重建路径执行且自带幂等门禁，续跑轮一并跳过。周期内新出现的
@@ -1048,6 +1385,10 @@ fn reconcile_running_apps(
             pre_register_all_configured_apps(SettingsHub::instance(), config_version);
         }
 
+        // 预登记失败重试：开机/media_ready 两波全量登记在竞态窗口失败的应用，由
+        // 周期 reconcile 逐轮限量补登记（队列空时零开销）。
+        drain_pending_policy_retries(config_version);
+
         // companion 与 daemon 可能同时为同一应用发起挂载。全量路径先登记本轮 Auto 应用策略，
         // 让 companion 能从宿主快照确认 uid 后直接接入共享会话。单包增量路径由快速热更新或
         // 完整挂载流程各自完成一次策略注册，跳过这里，避免同一 MT 切换重复触碰宿主控制通道。
@@ -1095,6 +1436,7 @@ fn reconcile_running_apps(
     } else {
         0
     };
+    let mut cycle_wrapped = false;
     for offset in 0..plans.len() {
         let index = (start_index + offset) % plans.len();
         let plan = &plans[index];
@@ -1129,6 +1471,20 @@ fn reconcile_running_apps(
             skipped += 1;
             continue;
         }
+        // 轮转回到本周期已尝试过的计划：本轮触发要处理的计划都已尝试过一次，周期收口。
+        // 该判据与计划数组中的轮转位置无关，替代原先只在周期头位于数组末尾才成立的
+        // `next_index <= head_index`（详见 `cycle_attempted` 字段注释）。
+        //
+        // 必须附加「本轮没有任何计划被延后」的前提。批次限流下每轮只放行
+        // RECONCILE_BATCH_MAX_PLANS 个计划，其余全部走 deferred；此时绕回命中的
+        // 已尝试计划是上一轮放行的那一个，中间那一批只是被限流推后、从未尝试过。
+        // 只看命中与否就会在第二次绕回时误判排空，把整批未尝试的计划留到下一个
+        // 触发周期（CI 实测：planned=36 deferred=35 紧接着 cycle drained，挂载被推迟
+        // 到 30 秒兜底才补做）。带延后即说明本轮仍有未处理计划，不收口。
+        if uses_batch_cursor && deferred == 0 && cursor.attempted_in_cycle(plan) {
+            cycle_wrapped = true;
+            break;
+        }
         if !incremental_change
             && mode != ReconcileMode::Forced
             && batch_requests >= RECONCILE_BATCH_MAX_PLANS
@@ -1161,13 +1517,19 @@ fn reconcile_running_apps(
             skipped += 1;
             continue;
         }
-        match plan.request.operation {
+        let operation = plan.request.operation;
+        let had_mount_state = plan.has_mount_state;
+        match operation {
             MountOperation::Reload => {
                 if execute_mount_request(&plan.request) {
-                    if !plan.has_mount_state && has_mount_state(&plan.request) {
+                    if !had_mount_state && has_mount_state(&plan.request) {
                         crate::runtime_stats::record_runtime_activation();
                     }
                     applied += 1;
+                    // 执行成功即把计划标记为已落地：续跑轮复用同一批计划对象，
+                    // `is_mount_current` 若不更新就会保留枚举时的旧值，让同一计划在
+                    // 本周期内被反复卸载重建（真机实测单 pid 代际每 2~3 秒 +1）。
+                    plans[index].mark_settled(operation);
                 } else if uses_batch_cursor {
                     // 执行失败的计划登记进周期拒绝集合：永久性失败（如 OEM 内核
                     // 拒绝沙盒目录 mkdir，真机实测一台设备 10+ 应用全部失败）若
@@ -1179,9 +1541,11 @@ fn reconcile_running_apps(
                 }
             }
             MountOperation::Disable => {
-                if plan.has_mount_state {
+                if had_mount_state {
                     if execute_mount_request(&plan.request) {
                         disabled += 1;
+                        // 卸载成功后挂载状态已消失，同步清掉，避免续跑轮重复卸载。
+                        plans[index].mark_settled(operation);
                     } else if uses_batch_cursor {
                         cursor.cycle_refused.insert(plan.identity());
                     }
@@ -1195,11 +1559,23 @@ fn reconcile_running_apps(
     // 周期完成判定：批次限流只保证「不阻塞主循环」，不能成为永续轮询的理由。
     // 未配置或被监督拒绝的计划既不 applied 也不 current，deferred 永远不归零——
     // 此前这让 pending 长期为真，主循环以约 1Hz 每轮全量扫 /proc 无限续跑。判据：
-    // 游标轮转已绕回本周期首个尝试计划的位置（或更早），说明本轮触发要处理的
-    // 计划都已被尝试过一次，本周期收口；被拒绝的计划等下一次真实触发（配置、
-    // 宿主、控制事件或 30 秒周期兜底）再进队。执行失败的计划同样登记进拒绝集合，绕回收口后会在新周期里再得到一次尝试。
+    // 本周期内已尝试过的计划被再次命中（轮转绕回），说明本轮触发要处理的计划都已
+    // 被尝试过一次，本周期收口；被拒绝的计划等下一次真实触发（配置、宿主、控制事件
+    // 或 30 秒周期兜底）再进队。执行失败的计划同样登记进拒绝集合，绕回收口后会在
+    // 新周期里再得到一次尝试。
     let plans_len = plans.len();
-    if incomplete_from_batch {
+    if cycle_wrapped {
+        log::info!(
+            "daemon reconcile cycle drained planned={} deferred={} — rest until next event",
+            plans_len,
+            deferred
+        );
+        incomplete_from_batch = false;
+        cursor.close_cycle();
+        // 批次排空即静息：立即把突发期间滞留的分配器空闲页归还内核，
+        // 不等下一个节流窗口。
+        crate::platform::allocator::release_free_pages();
+    } else if incomplete_from_batch {
         if let Some(head) = cursor.cycle_head.clone() {
             let next_index = cursor.next_start_index(&identities);
             let head_index = cursor.position_of(&identities, &head);
@@ -1210,8 +1586,7 @@ fn reconcile_running_apps(
                     deferred
                 );
                 incomplete_from_batch = false;
-                cursor.cycle_head = None;
-                cursor.cycle_refused.clear();
+                cursor.close_cycle();
                 // 批次排空即静息：立即把突发期间滞留的分配器空闲页归还内核，
                 // 不等下一个节流窗口。
                 crate::platform::allocator::release_free_pages();
@@ -1219,8 +1594,7 @@ fn reconcile_running_apps(
         }
     } else {
         // 本轮没有任何批次限流（所有计划都已处理），周期自然结束。
-        cursor.cycle_head = None;
-        cursor.cycle_refused.clear();
+        cursor.close_cycle();
     }
     if incomplete_from_batch {
         // 周期仍在进行：把本轮计划批次放回缓存，续跑轮直接复用，不再重复
@@ -1272,7 +1646,20 @@ impl ReconcilePlan {
         } else {
             has_mount_state(&request)
         };
-        let is_mount_current = crate::daemon_mount::has_current_mount_state(&request);
+        // 无规则请求不会产生任何挂载产物，也就永远不会写下状态文件：daemon 与
+        // companion 两侧都在无规则分支短路返回（留下 state=mounted 的假账会让监督与
+        // 恢复流程误判"已在场"）。若这里仍按"状态缺失＝未落地"处理，这类应用会被每个
+        // reconcile 轮次重新执行一遍完整挂载（fork 子进程 + 清理归属验证）并计成
+        // applied：真机实测 8 分钟 308 轮、其中 278 轮 applied=1 全部来自这同一批应用，
+        // 同时刷出大量 reason=StateMissing 的重挂日志。
+        //
+        // 是否真的有事可做由账本判定：账本里还有记录说明上一次挂载没被清掉，必须走一轮
+        // 让无规则短路去清理；账本也没有才是真的无事可做。`has_mount_state` 同理保留，
+        // 状态文件在而规则已删时也要给一轮清理机会。
+        let is_noop = !has_mount_state
+            && !crate::fuse_redirect::config::mount_request_has_policy_rules(&request)
+            && crate::mount_ledger::load(&request.package_name, request.pid).is_none();
+        let is_mount_current = is_noop || crate::daemon_mount::has_current_mount_state(&request);
         let start_time_ticks = crate::platform::process_start_time_ticks(request.pid);
         Self {
             request,
@@ -1297,6 +1684,21 @@ impl ReconcilePlan {
 
     fn should_run_in_missing_only(&self) -> bool {
         self.request.operation == MountOperation::Reload && !self.has_mount_state
+    }
+
+    /// 计划已被本轮执行落地：续跑轮复用同一批计划对象，必须就地更新判定字段，
+    /// 否则枚举时的旧值会让同一计划在周期内被反复卸载重建。
+    fn mark_settled(&mut self, operation: MountOperation) {
+        match operation {
+            MountOperation::Reload => {
+                self.is_mount_current = true;
+                self.has_mount_state = true;
+            }
+            MountOperation::Disable => {
+                self.is_mount_current = false;
+                self.has_mount_state = false;
+            }
+        }
     }
 
     /// 幂等跳过：该应用的挂载已按当前配置建立，重挂只会叠加挂载层。
@@ -1407,20 +1809,375 @@ fn build_request(
     request
 }
 
-/// 读 `/data/system/packages.list` 解析包名到 uid 的映射。
+/// 名册维护周期：**只在长期没有任何人询问时**才走到的一次全量对账。
 ///
-/// 开机全量预登记需要为未运行的应用解析 uid（宿主策略按 uid 注册），packages.list
-/// 是系统维护的权威映射。找不到（应用未安装或已被卸载）时跳过，应用真正启动后仍会
-/// 由 reconcile 逐轮预登记或 companion 的 register-policy 定点登记补上。
-fn read_package_uid(package_name: &str) -> Option<i32> {
-    let content = std_fs::read_to_string("/data/system/packages.list").ok()?;
-    for line in content.lines() {
-        let mut fields = line.split_whitespace();
-        if fields.next() == Some(package_name) {
-            return fields.next().and_then(|value| value.parse::<i32>().ok());
+/// 唯一职责是兜住「表文件被外部删掉」与「噪声条目长期累积」这两种退化，因此可以放到
+/// 10 分钟级（0.0017 Hz）。刷新本身完全由需求驱动：`answer_query` 每回答一次询问就写
+/// 一次需求信号，扫描线程随即刷新一轮——有人问才刷，没人问就不动。
+const SYSTEM_PID_MAINTENANCE_INTERVAL_MS: i64 = 600_000;
+/// 需求信号的合并窗口：一次新应用冷启动会连续触发多次询问，若每次全量重建就是自找
+/// CPU 峰值，这里把窗口内的重复需求合并成一次刷新。
+const SYSTEM_PID_DEMAND_COALESCE_MS: i64 = 2_000;
+/// 新进程身份的稳定窗口：fork 之后的 exec、zygote specialize 会在这段时间内改写
+/// cmdline 与 uid，窗口内每轮重读身份，过窗口后改用缓存。
+const SYSTEM_PID_IDENTITY_SETTLE_MS: i64 = 5_000;
+/// 已稳定身份的复核周期：兜底覆盖进程运行中途 exec / setuid 的少见情形。
+const SYSTEM_PID_IDENTITY_REVALIDATE_MS: i64 = 60_000;
+
+/// pid 表扫描器对单个进程的身份缓存。
+struct ScannedProcess {
+    /// `(uid, 身份串)`；内核线程、已退出或无可读身份的进程为 None。
+    identity: Option<(i32, String)>,
+    /// 身份随时可能被改写、不能缓存：zygote 家族（含 USAP 池里预先 fork、可存活
+    /// 数分钟才被特化的 `usap64`）与有 cmdline 却解析不出身份的进程
+    /// （`<pre-initialized>`）。这类进程每轮重读，数量通常只有个位数。
+    volatile: bool,
+    first_seen_ms: i64,
+    checked_ms: i64,
+}
+
+impl ScannedProcess {
+    fn read(pid: i32, now_ms: i64) -> Self {
+        let (identity, volatile) = read_scanned_identity(pid);
+        Self {
+            identity,
+            volatile,
+            first_seen_ms: now_ms,
+            checked_ms: now_ms,
         }
     }
-    None
+
+    fn needs_recheck(&self, now_ms: i64) -> bool {
+        self.volatile
+            || now_ms.saturating_sub(self.first_seen_ms) < SYSTEM_PID_IDENTITY_SETTLE_MS
+            || now_ms.saturating_sub(self.checked_ms) >= SYSTEM_PID_IDENTITY_REVALIDATE_MS
+    }
+
+    fn recheck(&mut self, pid: i32, now_ms: i64) {
+        let (identity, volatile) = read_scanned_identity(pid);
+        self.identity = identity;
+        self.volatile = volatile;
+        self.checked_ms = now_ms;
+    }
+
+    /// 只有系统 uid 的进程进表。全部消费方（MP hook 的系统 uid FUSE 请求归因、binder
+    /// 系统调用方解析、监视记录系统调用方反查）都要求「表内 uid == 请求 uid 且 < 10000」，
+    /// 应用 uid 的行永远不会命中，登记它们只会让表与 MP 侧的重读成本翻倍。
+    fn system_identity(&self) -> Option<(i32, &str)> {
+        match &self.identity {
+            Some((uid, package)) if *uid < ANDROID_APP_UID_START => Some((*uid, package.as_str())),
+            _ => None,
+        }
+    }
+}
+
+/// 系统进程 pid 表（tmp/system_pids，「tid uid 包名」行）的增量扫描器。
+///
+/// 早期实现把「进程集合有变化」当成全量扫描的触发条件：繁忙设备上 kworker 与
+/// 短命进程几乎每 500ms 都在增减，于是每轮都对全部约 1000 个进程重读 cmdline 与
+/// status、两遍逐进程 task readdir 并重写整张表（真机实测 srx-syspid 稳态约
+/// 11% 单核）。现在按进程缓存身份，只有**系统进程名册**变化才立即重建；与表内容
+/// 无关的增减（内核线程、应用进程、启动即退出的进程）只付一次 /proc readdir。
+struct SystemPidScanner {
+    target: String,
+    staging: String,
+    processes: HashMap<i32, ScannedProcess>,
+    roster_digest: Option<u64>,
+    last_rebuild_ms: i64,
+    last_written_digest: Option<u64>,
+    last_table_len: usize,
+    last_pid: Option<i32>,
+    /// 最近一次刷新的时刻（用于合并短时间内的重复需求）。
+    last_tick_ms: i64,
+}
+
+impl SystemPidScanner {
+    fn new(target: String) -> Self {
+        let staging = format!("{}.tmp", target);
+        Self {
+            target,
+            staging,
+            processes: HashMap::new(),
+            roster_digest: None,
+            last_rebuild_ms: -1,
+            last_written_digest: None,
+            last_table_len: 0,
+            last_pid: None,
+            last_tick_ms: i64::MIN / 2,
+        }
+    }
+
+    /// 刷新一轮名册（只在「有需求」或「到维护周期」时被调用）。
+    ///
+    /// 节拍由调用方决定，这里不再自己给出间隔：空闲期这个函数根本不会被调用。
+    ///
+    /// `force_rebuild` 由「有人问过身份」置位。它必须强制重建，因为**线程增减不进
+    /// 名册指纹**：`roster_digest` 只看 (pid, uid, 包名)，而表里还要登记每个系统进程
+    /// 的全部 tid（内核 FUSE 请求头里的 pid 其实是发起线程的 tid）。若只在名册变化时
+    /// 重建，一个已有进程新建线程后表里查不到该 tid，归因就只能一直走按需询问——
+    /// 询问又会再次触发需求信号，于是「越问越不刷」。因此需求驱动的刷新一律重建；
+    /// 频率由调用方的合并窗口（[`SYSTEM_PID_DEMAND_COALESCE_MS`]）约束，最坏与旧实现
+    /// 的 2 秒固定周期同量级，但只在真有人查表时才付。
+    fn tick(&mut self, now_ms: i64, force_rebuild: bool) {
+        self.last_tick_ms = now_ms;
+        let interval_ms = SYSTEM_PID_MAINTENANCE_INTERVAL_MS;
+        let due =
+            self.last_rebuild_ms < 0 || now_ms.saturating_sub(self.last_rebuild_ms) >= interval_ms;
+        // 内核最近分配的 pid 没变 = 这段时间没有新建任何进程或线程，此时直接沿用已知
+        // pid 列表，省掉 /proc readdir（本线程最大的单项开销，真机 simpleperf 约 43%）。
+        // 进程退出不影响表的正确性：死 pid 不会再发请求，复用前必然先分配新 pid；
+        // 已退出条目在下一次 readdir 时清掉。exec / 特化不产生新 pid，由下面的逐条
+        // 复查覆盖（只读需要复查的那几个进程）。
+        let last_pid = read_last_allocated_pid();
+        let no_new_tasks = !due && last_pid.is_some() && last_pid == self.last_pid;
+        self.last_pid = last_pid;
+        let pids = if no_new_tasks {
+            let mut known: Vec<i32> = self.processes.keys().copied().collect();
+            known.sort_unstable();
+            known
+        } else {
+            let Some(pids) = list_proc_pids() else {
+                // /proc 不可读：本轮放弃，不能因此退出扫描线程（下一次需求或维护再试）。
+                return;
+            };
+            let alive: HashSet<i32> = pids.iter().copied().collect();
+            self.processes.retain(|pid, _| alive.contains(pid));
+            pids
+        };
+        for &pid in &pids {
+            match self.processes.get_mut(&pid) {
+                Some(entry) => {
+                    if entry.needs_recheck(now_ms) {
+                        entry.recheck(pid, now_ms);
+                    }
+                }
+                None => {
+                    self.processes
+                        .insert(pid, ScannedProcess::read(pid, now_ms));
+                }
+            }
+        }
+        let roster_digest = self.roster_digest(&pids);
+        let roster_changed = self.roster_digest != Some(roster_digest);
+        if roster_changed || due || force_rebuild {
+            self.roster_digest = Some(roster_digest);
+            self.last_rebuild_ms = now_ms;
+            self.rebuild(&pids);
+        }
+    }
+
+    /// 最近一次刷新的时刻。
+    fn last_tick_ms(&self) -> i64 {
+        self.last_tick_ms
+    }
+
+    /// 系统进程名册（按 pid 排序的 pid/uid/身份）的指纹，不含线程。
+    fn roster_digest(&self, pids: &[i32]) -> u64 {
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        for pid in pids {
+            if let Some((uid, package)) = self
+                .processes
+                .get(pid)
+                .and_then(ScannedProcess::system_identity)
+            {
+                std::hash::Hash::hash(&(*pid, uid, package), &mut hasher);
+            }
+        }
+        std::hash::Hasher::finish(&hasher)
+    }
+
+    /// 按缓存身份重建并原子落盘整张表（进程 pid + 其全部线程 tid）。
+    ///
+    /// 内容指纹与上次落盘相同且文件仍在时跳过写入，避免稳定期每个刷新周期都重写一份
+    /// 数百 KB 的表（真机实测 455KB/19.8k 行，早期实现每 2 秒一次 rename）。
+    fn rebuild(&mut self, pids: &[i32]) {
+        use std::fmt::Write as _;
+        let mut lines = String::with_capacity(self.last_table_len + 4096);
+        for &pid in pids {
+            let Some((uid, package)) = self
+                .processes
+                .get(&pid)
+                .and_then(ScannedProcess::system_identity)
+            else {
+                continue;
+            };
+            let _ = writeln!(lines, "{pid} {uid} {package}");
+            if let Ok(tasks) = std_fs::read_dir(format!("/proc/{pid}/task")) {
+                for task in tasks.flatten() {
+                    if let Ok(tid) = task.file_name().to_string_lossy().parse::<i32>()
+                        && tid != pid
+                    {
+                        let _ = writeln!(lines, "{tid} {uid} {package}");
+                    }
+                }
+            }
+        }
+        self.last_table_len = lines.len();
+        if lines.is_empty() {
+            return;
+        }
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        std::hash::Hash::hash(&lines, &mut hasher);
+        let digest = std::hash::Hasher::finish(&hasher);
+        let changed = self.last_written_digest != Some(digest);
+        // 内容相同且文件仍在：跳过写入。文件被清理时靠存在性检查兜底重写。
+        if !changed && std_fs::metadata(&self.target).is_ok() {
+            return;
+        }
+        if std_fs::write(&self.staging, lines.as_bytes()).is_ok()
+            && std_fs::rename(&self.staging, &self.target).is_ok()
+        {
+            let _ = std_fs::set_permissions(&self.target, std_fs::Permissions::from_mode(0o644));
+            self.last_written_digest = Some(digest);
+        }
+    }
+}
+
+/// 周期扫描 /proc 并落盘「tid uid 包名」表（tmp/system_pids）。
+///
+/// 用途：MediaProvider（mediaprovider SELinux 域）读 platform 应用（如
+/// com.xiaomi.mirror）的 `/proc/<pid>/cmdline` 被 SELinux 拒绝，系统 uid 的
+/// FUSE 请求（内核请求头带发起任务 id）在进程内无法归因出包名。daemon 以
+/// root 运行无此限制，把系统 uid 进程及其线程的身份表写给 hook 进程按任务
+/// id 反查。内核 FUSE 请求头的 pid 是发起线程的 TID（current->pid），因此每个
+/// 进程除自身 pid 外还要登记其全部线程 tid。
+///
+/// 该表不随文件监视开关停用：MediaProvider 是系统代写者，系统 uid 请求的归因
+/// 结果会写入当前调用方并参与重定向决策（见 `runtime::should_resolve_caller_context`），
+/// binder 系统调用方解析同样不看监视开关。
+///
+/// 内核没有可供 daemon 订阅的进程创建事件源（proc connector 需 `CONFIG_PROC_EVENTS`，
+/// GKI 不保证开启；`/proc` 也不产生 inotify 事件），因此这张表的**新鲜度由需求驱动**：
+/// 每回答一次身份询问就刷新一轮，没人问的时候只按 [`SYSTEM_PID_MAINTENANCE_INTERVAL_MS`]
+/// 做维护对账。表本身是缓存性质，未命中由 hook 的按需询问兜底，所以「空闲期不刷新」
+/// 不会影响任何决策正确性——这正是把兜底从「持续轮询」改成「被需要时才动」的关键。
+fn spawn_system_pid_scanner() {
+    // 需求信号：daemon 内部 eventfd，`answer_query` 每回答一次就写一字节。
+    // SAFETY: eventfd 只创建内核对象并返回 fd，标志位均为合法常量。
+    let demand_fd = unsafe { libc::eventfd(0, libc::EFD_CLOEXEC | libc::EFD_NONBLOCK) };
+    if demand_fd >= 0 {
+        crate::daemon_identity_query::set_demand_eventfd(demand_fd);
+    } else {
+        log::warn!("system pid scanner demand eventfd unavailable; periodic only");
+    }
+    let spawn_result = std::thread::Builder::new()
+        .name("srx-syspid".into())
+        .spawn(move || {
+            let target = format!(
+                "{}/tmp/system_pids",
+                crate::platform::module_paths::MODULE_DIR
+            );
+            let mut scanner = SystemPidScanner::new(target);
+            // 下一次等待的长度：默认是维护周期，需求合并窗口内则缩到窗口剩余时间。
+            let mut wait_ms = SYSTEM_PID_MAINTENANCE_INTERVAL_MS;
+            // 合并窗口内被推迟（而不是丢弃）的需求。
+            let mut demand_pending = false;
+            loop {
+                // 空闲期无限期睡在这里：唯一的唤醒源是「有人问过身份」或维护周期。
+                let woken_by_demand = wait_for_identity_demand(demand_fd, wait_ms);
+                let now_ms = crate::platform::paths::monotonic_ms();
+                if woken_by_demand {
+                    // 合并窗口：一次冷启动会连续问很多次，逐次全量重扫是自找 CPU 峰值。
+                    // 但需求**不能丢**——丢掉意味着表要等到 10 分钟维护周期才更新，期间
+                    // 每个 miss 都要走一次按需询问。所以窗口内只把它记下来，并把下一次
+                    // 等待缩到窗口剩余时间，到点补一次。
+                    let since_last = now_ms.saturating_sub(scanner.last_tick_ms());
+                    if since_last < SYSTEM_PID_DEMAND_COALESCE_MS {
+                        wait_ms = SYSTEM_PID_DEMAND_COALESCE_MS - since_last;
+                        demand_pending = true;
+                        continue;
+                    }
+                }
+                scanner.tick(now_ms, woken_by_demand || demand_pending);
+                demand_pending = false;
+                wait_ms = SYSTEM_PID_MAINTENANCE_INTERVAL_MS;
+            }
+        });
+    if let Err(error) = spawn_result {
+        log::warn!("system pid scanner spawn failed err={}", error);
+    }
+}
+
+/// 等待「有人问过身份」的需求信号，或等到维护周期。返回是否由需求信号唤醒。
+///
+/// 这个线程在空闲期**只有一处**唤醒源之外的等待：需求信号（来自 `answer_query`）与
+/// 10 分钟一次的维护周期，此外没有任何周期性动作。没有可用 eventfd 时退化为纯周期
+/// 等待，功能不受影响。
+fn wait_for_identity_demand(demand_fd: i32, timeout_ms: i64) -> bool {
+    if demand_fd < 0 {
+        thread::sleep(Duration::from_millis(timeout_ms.max(1) as u64));
+        return false;
+    }
+    let mut poll_fd = libc::pollfd {
+        fd: demand_fd,
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    let timeout = timeout_ms.clamp(1, i32::MAX as i64) as libc::c_int;
+    // SAFETY: poll_fd 指向本栈帧上已初始化的 pollfd；超时值已夹到 i32 范围。
+    let ready = unsafe { libc::poll(&mut poll_fd, 1, timeout) };
+    if ready <= 0 {
+        return false;
+    }
+    let mut value: u64 = 0;
+    // SAFETY: value 是本栈帧可写的 u64，eventfd 读契约正是 8 字节计数。
+    unsafe {
+        libc::read(
+            demand_fd,
+            &mut value as *mut u64 as *mut libc::c_void,
+            std::mem::size_of::<u64>(),
+        );
+    }
+    true
+}
+
+/// 读取扫描器使用的进程身份，并判定该身份是否可缓存（返回 `(身份, volatile)`）。
+///
+/// cmdline 为空的是内核线程（或已退出进程），身份永远为 None，可以缓存。
+fn read_scanned_identity(pid: i32) -> (Option<(i32, String)>, bool) {
+    match std_fs::read(format!("/proc/{pid}/cmdline")) {
+        Ok(cmdline) if !cmdline.is_empty() => {}
+        _ => return (None, false),
+    }
+    let identity = read_proc_identity(pid).map(|(uid, name)| {
+        // native 进程（应用 exec 出来的 shell / helper）的命令名不是包名：按内核进程组
+        // 换算成发起应用写进表里。决策侧读表命中时就直接拿到包名，不必再走同步询问；
+        // 追溯不到（组首已退出、非应用派生）保留命令名，不猜。
+        if name.contains('.') {
+            return (uid, name);
+        }
+        let launched_by =
+            crate::platform::proc_identity::resolve_launching_app_by_process_group(pid, uid);
+        (uid, launched_by.unwrap_or(name))
+    });
+    let volatile = identity
+        .as_ref()
+        .is_none_or(|(_, name)| is_pre_specialized_process_name(name));
+    (identity, volatile)
+}
+
+/// zygote 家族进程名：特化前的进程以这些名字存活，特化后才改写为真实身份。
+fn is_pre_specialized_process_name(name: &str) -> bool {
+    name.starts_with("usap") || name.ends_with("zygote") || name.ends_with("zygote64")
+}
+
+/// 内核最近分配的 pid（`/proc/loadavg` 第 5 字段），读不到返回 None。
+///
+/// 线程与进程共用 pid 空间，该值不变即说明期间没有新建任何任务。
+fn read_last_allocated_pid() -> Option<i32> {
+    let text = std_fs::read_to_string("/proc/loadavg").ok()?;
+    text.split_whitespace().nth(4)?.parse().ok()
+}
+
+/// 按 pid 升序列出 /proc 下的全部进程（含内核线程），仅一次 readdir。
+fn list_proc_pids() -> Option<Vec<i32>> {
+    let entries = std_fs::read_dir("/proc").ok()?;
+    let mut pids: Vec<i32> = entries
+        .flatten()
+        .filter_map(|entry| entry.file_name().to_string_lossy().parse().ok())
+        .collect();
+    pids.sort_unstable();
+    Some(pids)
 }
 
 /// 开机一次性预登记所有已配置应用的宿主策略。
@@ -1431,24 +2188,45 @@ fn read_package_uid(package_name: &str) -> Option<i32> {
 /// 不再因「宿主快照还没这个 uid」回退 scoped、也不再经历 scoped 挂载竞态。
 fn pre_register_all_configured_apps(config: &SettingsHub, config_version: u64) {
     let snapshot = config.get_daemon_reconcile_config_snapshot();
-    for package_name in snapshot.configured_package_names() {
-        let Some(uid) = read_package_uid(package_name) else {
-            continue;
-        };
+    let package_uids = match platform::packages::read_uids() {
+        Ok(packages) => packages,
+        Err(error) => {
+            BOOT_PRE_REGISTER_PENDING.store(true, Ordering::Release);
+            log::warn!(
+                "package query unavailable during pre-register error={}",
+                error
+            );
+            return;
+        }
+    };
+    let configured: std::collections::HashSet<String> =
+        snapshot.configured_package_names().cloned().collect();
+    for (uid, packages) in package_uids {
         if uid < ANDROID_APP_UID_START {
             continue;
         }
-        let proc = AppProcess {
-            pid: 0,
-            uid,
-            package_name: package_name.clone(),
-            is_uninterruptible: false,
-        };
-        let request = build_request(&proc, config_version, &snapshot);
-        if request.operation != MountOperation::Reload {
-            continue;
+        for package_name in packages {
+            if !configured.contains(&package_name) {
+                continue;
+            }
+            let proc = AppProcess {
+                pid: 0,
+                uid,
+                package_name: package_name.clone(),
+                is_uninterruptible: false,
+            };
+            let request = build_request(&proc, config_version, &snapshot);
+            if request.operation != MountOperation::Reload {
+                continue;
+            }
+            if crate::daemon_mount::pre_register_host_policy(&request)
+                == crate::daemon_mount::PreRegisterOutcome::NotApplicable
+            {
+                // 竞态窗口失败（典型：FBE 密钥未就绪 errno=126 整批被拒）：进重试队列，
+                // 由周期 reconcile 逐轮补登记，避免应用永久落入 deny_all 空视图。
+                enqueue_policy_retry(&request.package_name, request.uid);
+            }
         }
-        crate::daemon_mount::pre_register_host_policy(&request);
     }
 }
 
@@ -1465,16 +2243,33 @@ fn register_policy_for_pid_token(token: &str, config_version: u64) {
         log::warn!("register-policy token invalid token={}", token);
         return;
     };
-    let Some(proc) = list_app_processes()
+    let proc = match list_app_processes()
         .into_iter()
         .find(|proc| proc.pid == pid && proc.package_name == package_name)
-    else {
-        log::debug!(
-            "register-policy process gone pkg={} pid={}",
-            package_name,
-            pid
-        );
-        return;
+    {
+        Some(proc) => proc,
+        None => {
+            // companion 在 specialize 早期就发 token，此时进程尚未 setArgV0，
+            // /proc/<pid>/cmdline 还是 zygote——按 cmdline 匹配必然 miss（真机实测：
+            // token 秒达时 100% 命中这条路径）。token 本身来自模块注入的可信通道，
+            // 包名与 pid 语义以 token 为准，这里只从 status 复核 uid 归属即可。
+            match read_process_status(pid) {
+                Some((uid, _)) if uid >= ANDROID_APP_UID_START => AppProcess {
+                    pid,
+                    uid,
+                    package_name: package_name.to_string(),
+                    is_uninterruptible: false,
+                },
+                _ => {
+                    log::debug!(
+                        "register-policy process gone pkg={} pid={}",
+                        package_name,
+                        pid
+                    );
+                    return;
+                }
+            }
+        }
     };
     if should_skip_process(&proc) {
         return;
@@ -1520,6 +2315,17 @@ struct AppProcess {
 
 fn list_app_processes() -> Vec<AppProcess> {
     let mut processes = Vec::new();
+    let registered = crate::mount_intent::registered_processes();
+    let package_uids = match platform::packages::read_uids() {
+        Ok(packages) => packages,
+        Err(error) => {
+            log::warn!(
+                "package query unavailable during process scan error={}",
+                error
+            );
+            return processes;
+        }
+    };
     let Ok(entries) = std_fs::read_dir("/proc") else {
         return processes;
     };
@@ -1543,7 +2349,37 @@ fn list_app_processes() -> Vec<AppProcess> {
         let Some((uid, is_uninterruptible)) = read_process_status(pid) else {
             continue;
         };
-        let Some(package_name) = read_process_package(pid) else {
+        let package_name = read_process_package(pid)
+            .filter(|package| {
+                package_uids
+                    .get(&uid)
+                    .is_some_and(|names| names.contains(package))
+            })
+            .or_else(|| {
+                let mut candidates = registered.iter().filter(|record| {
+                    record.pid == pid
+                        && record.matches(
+                            uid,
+                            platform::process_start_time_ticks(pid),
+                            if package_uids
+                                .get(&uid)
+                                .is_some_and(|names| names.contains(&record.package))
+                            {
+                                uid
+                            } else {
+                                -1
+                            },
+                        )
+                });
+                let record = candidates.next()?;
+                if candidates.next().is_some() {
+                    return None;
+                }
+                // native 进程可能在登记后 fork；重载时重新拒绝共享视图。
+                let _namespace = platform::mount_namespace::private_mount_namespace(pid)?;
+                Some(record.package.clone())
+            });
+        let Some(package_name) = package_name else {
             continue;
         };
         if uid < ANDROID_APP_UID_START && !policy::is_media_provider_package(&package_name) {

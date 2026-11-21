@@ -58,6 +58,21 @@ capture_cmd() {
   fi
 }
 
+# 有界采集：把命令输出交给调用方的重定向复用，但绝不无限等待。
+#
+# 导出的采集阶段会碰到可能被 FUSE 拖死的对象：`mount`/`df` 要扫全部挂载，
+# `ls -la /storage/emulated/0` 与 `ls -l /proc/<pid>/fd` 要对视图做路径解析。
+# 存储停摆时这些调用会停在不可中断的 dentry 查找里，整个导出卡在「正在采集存储
+# 挂载状态」直到上层 190 秒超时才失败（历史现象为此专门有一个 issue）。
+# 超时只丢这一段证据，不能让整包导出失败。
+bounded_stream() {
+  if command -v timeout >/dev/null 2>&1; then
+    timeout 8 "$@" 2>/dev/null || true
+  else
+    "$@" 2>/dev/null || true
+  fi
+}
+
 copy_file_if_exists() {
   src="$1"
   dst="$2"
@@ -223,13 +238,16 @@ collect_device_state() {
 }
 
 collect_process_state() {
+  # `ps` 用绝对路径：busybox 的 ash 会把 `ps` 解析成 busybox applet，而它不认大写
+  # `-o PID`（rc=1），三级 fallback 会一路跌到 `ps -A`，导出格式与列序全变。
+  # 详见 common.sh 里 reap_tagged_processes 上方的说明。
   {
-    ps -A -o PID,PPID,USER,NAME,ARGS 2>/dev/null ||
-      ps -A -o PID,USER,ARGS 2>/dev/null ||
-      ps -A 2>/dev/null
+    /system/bin/ps -A -o PID,PPID,USER,NAME,ARGS 2>/dev/null ||
+      /system/bin/ps -A -o PID,USER,ARGS 2>/dev/null ||
+      /system/bin/ps -A 2>/dev/null
   } > "$STATE_DIR/processes.txt" 2>&1
 
-  ps -A -o PID,NAME 2>/dev/null > "$STATE_DIR/process-names.txt" 2>/dev/null || true
+  /system/bin/ps -A -o PID,NAME 2>/dev/null > "$STATE_DIR/process-names.txt" 2>/dev/null || true
 
   {
     echo "media provider pids:"
@@ -258,7 +276,7 @@ collect_process_state() {
 collect_mount_state() {
   {
     echo "mount:"
-    mount 2>/dev/null
+    bounded_stream mount
     echo
     echo "/proc/self/mountinfo:"
     cat /proc/self/mountinfo 2>/dev/null
@@ -267,7 +285,7 @@ collect_mount_state() {
     cat /proc/mounts 2>/dev/null
     echo
     echo "df:"
-    df 2>/dev/null
+    bounded_stream df
   } > "$STATE_DIR/mounts.txt" 2>&1
 
   {
@@ -282,8 +300,8 @@ collect_mount_state() {
       /data/media \
       /data/media/0; do
       echo "## $path"
-      ls -la "$path" 2>/dev/null || true
-      ls -laZ "$path" 2>/dev/null || true
+      bounded_stream ls -la "$path"
+      bounded_stream ls -laZ "$path"
     done
   } > "$STATE_DIR/storage-paths.txt" 2>&1
 }
@@ -291,6 +309,7 @@ collect_mount_state() {
 collect_proc_for_pid() {
   pid="$1"
   label="$2"
+  collect_fds="${3:-true}"
   [ -n "$pid" ] || return 0
   [ -d "/proc/$pid" ] || return 0
   prefix="$PROC_DIR/$(safe_name "$label")_$pid"
@@ -320,9 +339,11 @@ collect_proc_for_pid() {
   grep -E ' /storage| /mnt/user| /mnt/runtime| /mnt/media_rw| /sdcard| /data/media|storage.redirect.x|fuse' \
     "/proc/$pid/mountinfo" > "$prefix-mountinfo-storage.txt" 2>/dev/null || true
 
-  {
-    ls -l "/proc/$pid/fd" 2>/dev/null | head -n 80
-  } > "$prefix-fd.txt" 2>&1
+  if [ "$collect_fds" = true ]; then
+    {
+      bounded_stream ls -l "/proc/$pid/fd" | head -n 80
+    } > "$prefix-fd.txt" 2>&1
+  fi
 
   {
     count=0
@@ -345,13 +366,26 @@ collect_relevant_proc_state() {
   [ -f "$STATE_DIR/package-candidates.txt" ] || return 0
   : > "$STATE_DIR/package-pids.txt"
   detail_count=0
-  max_detail_pids=10
+  max_detail_pids=12
+  snapshot_count=0
+  max_snapshot_pids=64
   matches="$STATE_DIR/package-pids.raw"
   sorted_matches="$STATE_DIR/package-pids.sorted"
+  configured_packages="$STATE_DIR/configured-packages.txt"
   : > "$matches"
+  : > "$configured_packages"
+  for config_path in "$APPS_CONFIG_DIR"/*.json; do
+    [ -f "$config_path" ] || continue
+    config_name=${config_path##*/}
+    printf '%s\n' "${config_name%.json}" >> "$configured_packages"
+  done
 
   awk '
-    NR == FNR {
+    FILENAME == ARGV[1] {
+      if ($1 != "") configured[$1] = 1
+      next
+    }
+    FILENAME == ARGV[2] {
       if ($1 != "") candidates[$1] = 1
       next
     }
@@ -360,11 +394,18 @@ collect_relevant_proc_state() {
       name = $2
       for (package_name in candidates) {
         if (name == package_name || index(name, package_name ":") == 1) {
-          print package_name "|" pid
+          # 优先保留已配置应用主进程的 fd，避免后台服务按包名排序占满预算。
+          priority = (name == package_name && configured[package_name]) ? 0 : 1
+          print priority "|" package_name "|" pid
         }
       }
+      # WebView 沙盒/隔离子进程不属于任何候选包名，但评论/网页图片加载失败时
+      # 它们的挂载视图正是需要观测的对象（此前 B 站日志完全缺失该进程）。
+      if (index(name, ":sandboxed_process") > 0 || index(name, ":isolated") > 0) {
+        print "1|" name "|" pid
+      }
     }
-  ' "$STATE_DIR/package-candidates.txt" "$STATE_DIR/process-names.txt" >> "$matches" 2>/dev/null || true
+  ' "$configured_packages" "$STATE_DIR/package-candidates.txt" "$STATE_DIR/process-names.txt" >> "$matches" 2>/dev/null || true
 
   for package_name in \
     com.android.providers.media.module \
@@ -373,25 +414,33 @@ collect_relevant_proc_state() {
     android.process.media \
     com.android.documentsui \
     com.google.android.documentsui \
+    com.google.android.webview \
+    com.android.webview \
     bin.mt.plus \
     com.bin.mt.plus; do
     pidof "$package_name" 2>/dev/null | tr ' ' '\n' |
-      awk -v package_name="$package_name" '$1 ~ /^[0-9]+$/ { print package_name "|" $1 }'
+      awk -v package_name="$package_name" '$1 ~ /^[0-9]+$/ { print "1|" package_name "|" $1 }'
   done >> "$matches"
 
-  sort -u "$matches" > "$sorted_matches" 2>/dev/null || true
-  while IFS='|' read -r package_name pid; do
+  sort -u "$matches" | awk -F'|' '!seen[$3]++' > "$sorted_matches" 2>/dev/null || true
+  while IFS='|' read -r priority package_name pid; do
     [ -n "$package_name" ] || continue
     [ -n "$pid" ] || continue
-    if [ "$detail_count" -ge "$max_detail_pids" ]; then
-      echo "proc detail collection capped at $max_detail_pids pids" >> "$STATE_DIR/package-pids.txt"
-      return 0
-    fi
     echo "$package_name $pid" >> "$STATE_DIR/package-pids.txt"
-    progress=$((56 + detail_count * 8 / max_detail_pids))
-    update_progress "$progress" proc "正在采集进程细节 $((detail_count + 1))/$max_detail_pids"
-    collect_proc_for_pid "$pid" "$package_name"
-    detail_count=$((detail_count + 1))
+    if [ "$snapshot_count" -ge "$max_snapshot_pids" ]; then
+      echo "snapshot skipped pid=$pid reason=limit limit=$max_snapshot_pids" >> "$STATE_DIR/package-pids.txt"
+      continue
+    fi
+    # 状态、挂载与线程不依赖 fd 路径解析；即使 fd 预算耗尽也继续保留故障现场。
+    collect_fds=false
+    if [ "$detail_count" -lt "$max_detail_pids" ]; then
+      collect_fds=true
+      detail_count=$((detail_count + 1))
+    fi
+    progress=$((56 + snapshot_count * 8 / max_snapshot_pids))
+    update_progress "$progress" proc "正在采集进程状态 $((snapshot_count + 1))/$max_snapshot_pids"
+    collect_proc_for_pid "$pid" "$package_name" "$collect_fds"
+    snapshot_count=$((snapshot_count + 1))
   done < "$sorted_matches"
 }
 
@@ -415,7 +464,7 @@ collect_dumpsys_state() {
       com.android.documentsui \
       com.google.android.documentsui; do
       echo "## dumpsys package $package_name"
-      dumpsys package "$package_name" 2>/dev/null | head -n 180
+      bounded_stream dumpsys package "$package_name" | head -n 180
       echo
     done
   } > "$STATE_DIR/dumpsys-key-packages.txt" 2>&1
@@ -430,6 +479,7 @@ collect_initial_logcat_state() {
     echo "filtered_line_limit=10000"
     echo "events_line_limit=1500"
     echo "delta_line_limit=3000"
+    echo "app_errors_line_limit=2500"
   } > "$STATE_DIR/logcat-capture.txt" 2>&1
 
   logcat -g > "$stage/logcat-buffers.txt" 2>&1 || true
@@ -438,7 +488,29 @@ collect_initial_logcat_state() {
     ActivityManager:I WindowManager:I MediaProvider:V ExternalStorage:V DocumentsUI:V Vold:V \
     > "$stage/logcat-srx-filtered.txt" 2>&1 || true
   logcat -b crash -d -v threadtime > "$stage/logcat-crash.txt" 2>&1 || true
-  logcat -b main,system -d -t 8000 -v threadtime \
+  # 应用侧图片加载失败（解码/网络缓存/WebView）只会在应用自己的日志里留痕，
+  # 且多为 Error 级。按全标签 E + 常见图片组件定向采集一份，避免排查时只有
+  # 模块侧日志、看不到调用方失败原因。抑制清单与常驻 app-error ring 保持一致
+  # （按真机实测噪声分布维护，见 debug_collectors.sh）；AndroidRuntime 故意
+  # 保留——真实崩溃信号。
+  logcat -b main,crash -d -t 6000 -v threadtime \
+    OPLUS_KEVENT_RECORD:S midasd:S statsd:S oiface:S PERFHAL-BOOSTCONFIG:S \
+    PerformanceService:S MIDASApplication:S metis_v2_FactManager:S \
+    AEC.h:S AEC.AudioxService:S AMC:S SettingsTelemetryUtils:S artd:S libEGL:S \
+    DynamicFramerate:S AppFeatureProviderUtils:S ThemeUtils:S ANDR-PWR-OPT:S \
+    Parcel:S PERFHAL-CLIENT:S LayerAvatar_masker_render:S BufferQueueProducer:S \
+    SDM:S HWUI:S SchedAssist:S CCodecBufferChannel:S NfcRegisteredServicesCache:S \
+    DeviceHalAidl:S QC2Comp:S PERFHAL-RESOURCEQS:S \
+    WeatherS_WeatherHttpDataSource:S UnionPermissionController:S \
+    NotificationBadgeManager:S LSPosedFramework:S OplusBracketLog:S \
+    OplusContextUtil:S OplusPredictiveBackController:S \
+    FastDynamicDrawable_CacheFrameProducer:S SettingsState:S \
+    ImageDecoder:V Bitmap:V chromium:V ImagePipeLine:V Glide:V Fresco:V Coil:V \
+    ImageLoader:V Skia:V SRX:V '*:E' \
+    > "$stage/logcat-app-errors.txt" 2>&1 || true
+  # 高频 OEM 日志会把 8000 行缓冲在半分钟内耗尽（实测 00:45:57 起才覆盖到），
+  # 复现后 1-2 分钟内导出时关键行已被冲掉；加大到 20000 行并放宽行宽上限。
+  logcat -b main,system -d -t 20000 -v threadtime \
     > "$stage/logcat-main-system-context.txt" 2>&1 || true
   logcat -b events -d -t 1500 -v threadtime \
     > "$stage/logcat-events.txt" 2>&1 || true
@@ -452,6 +524,22 @@ collect_logcat_delta() {
     StorageRedirect:V SRX:V FileMonitorOp:I Stats:I AndroidRuntime:E DEBUG:F libc:F \
     ActivityManager:I WindowManager:I MediaProvider:V ExternalStorage:V DocumentsUI:V Vold:V \
     2>&1 | tail -n 3000 > "$stage/logcat-export-period.txt" || true
+  # 复现窗口内的应用侧错误（图片解码失败等）同样需要留存，与模块侧日志对齐时间线。
+  logcat -b main,crash -d -T "$LOGCAT_CAPTURE_START" -v threadtime \
+    OPLUS_KEVENT_RECORD:S midasd:S statsd:S oiface:S PERFHAL-BOOSTCONFIG:S \
+    PerformanceService:S MIDASApplication:S metis_v2_FactManager:S \
+    AEC.h:S AEC.AudioxService:S AMC:S SettingsTelemetryUtils:S artd:S libEGL:S \
+    DynamicFramerate:S AppFeatureProviderUtils:S ThemeUtils:S ANDR-PWR-OPT:S \
+    Parcel:S PERFHAL-CLIENT:S LayerAvatar_masker_render:S BufferQueueProducer:S \
+    SDM:S HWUI:S SchedAssist:S CCodecBufferChannel:S NfcRegisteredServicesCache:S \
+    DeviceHalAidl:S QC2Comp:S PERFHAL-RESOURCEQS:S \
+    WeatherS_WeatherHttpDataSource:S UnionPermissionController:S \
+    NotificationBadgeManager:S LSPosedFramework:S OplusBracketLog:S \
+    OplusContextUtil:S OplusPredictiveBackController:S \
+    FastDynamicDrawable_CacheFrameProducer:S SettingsState:S \
+    ImageDecoder:V Bitmap:V chromium:V ImagePipeLine:V Glide:V Fresco:V Coil:V \
+    ImageLoader:V Skia:V SRX:V '*:E' \
+    2>&1 | tail -n 4000 > "$stage/logcat-app-errors.txt" || true
   echo "final_capture_completed_at=$(date '+%Y-%m-%d %H:%M:%S %z' 2>/dev/null || date 2>/dev/null)" \
     >> "$STATE_DIR/logcat-capture.txt"
 }
@@ -493,6 +581,10 @@ collect_diagnostic_summary() {
   [ -n "$monitor_capacity_limited" ] || monitor_capacity_limited=unknown
   media_hook_state_present=0
   [ -s "$LOGS_DIR/.media_hook_install_state" ] && media_hook_state_present=1
+  app_error_ring_present=0
+  [ -s "$LOGS_DIR/app-errors.log" ] && app_error_ring_present=1
+  app_error_window_present=0
+  [ -s "$LOGS_DIR/app-errors-window.log" ] && app_error_window_present=1
   {
     printf '{\n'
     printf '  "schema": 1,\n'
@@ -516,7 +608,9 @@ collect_diagnostic_summary() {
     printf '  "fuse_capability_reason": "%s",\n' "$fuse_capability_reason"
     printf '  "mount_intent_count": %s,\n' "$mount_intent_count"
     printf '  "monitor_capacity_limited": "%s",\n' "$monitor_capacity_limited"
-    printf '  "media_hook_state_present": %s\n' "$media_hook_state_present"
+    printf '  "media_hook_state_present": %s,\n' "$media_hook_state_present"
+    printf '  "app_error_ring_present": %s\n' "$app_error_ring_present"
+    printf '  "app_error_window_present": %s\n' "$app_error_window_present"
     printf '}\n'
   } > "$stage/diagnostic-summary.json"
 }

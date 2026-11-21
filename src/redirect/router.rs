@@ -4,10 +4,9 @@ use crate::domain::{
     sort_path_mappings_longest_request_first_case_insensitive,
 };
 use crate::platform::{self, paths};
-use once_cell::sync::Lazy;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, LazyLock, RwLock};
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum RedirectAction {
@@ -319,7 +318,7 @@ impl PathRouter {
     }
 }
 
-static PATH_ROUTER: Lazy<PathRouter> = Lazy::new(PathRouter::new);
+static PATH_ROUTER: LazyLock<PathRouter> = LazyLock::new(PathRouter::new);
 
 fn resolve_router_path_list(
     paths_in: &[String],
@@ -384,7 +383,8 @@ fn append_router_path(
     }
 
     if let Some(fallback) = paths::wildcard_policy_fallback_parent(&path, storage_root) {
-        log::warn!(
+        // 配置决定的确定性展开，每轮规划都会重复，只在 verbose 下留痕。
+        log::info!(
             "router fallback wildcard to mount parent: {} -> {}",
             path,
             fallback
