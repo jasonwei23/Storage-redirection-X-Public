@@ -297,15 +297,18 @@ class MountMetadataScopeTest(unittest.TestCase):
         drop_body = function_body(apply, "impl Drop for SystemViewAnchor {")
         self.assertIn("detach_mount_if_present(&self.root)", drop_body)
 
-    def test_auto_backend_prefers_fuse_full_view_root(self) -> None:
-        # auto 语义为 FUSE 优先：能力可用时整棵视图根由本会话接管，规则仍在策略层
-        # 逐请求判定；能力不可用时由能力门禁返回空根，挂载层回落 namespace。
+    def test_auto_backend_keeps_simple_media_mapping_on_namespace(self) -> None:
+        # 简单媒体映射在宿主能力检查之前确定挂载路径，其余规则继续使用共享宿主。
         body = function_body(
             self.fuse_config,
             "pub fn scoped_fuse_mount_roots_for_request",
         )
         self.assertIn("storage_user_root_for_user(user_id)", body)
-        self.assertIn("scoped_mount_allowed_for_scope", body)
+        self.assertLess(
+            body.index("is_single_concrete_media_mapping"),
+            body.index("scoped_mount_allowed_for_scope"),
+        )
+        self.assertIn("vec![storage_root]", body)
         self.assertNotIn("scoped_mount_roots_for_hybrid_rules", body)
 
     def test_fuse_mode_prepares_mapping_target_dirs(self) -> None:
