@@ -24,7 +24,6 @@ pub(super) fn collect_restored_read_only_excluded_children(
     read_only_paths: &[String],
     excluded_rules: &[String],
     path_mappings: &[PathMapping],
-    scoped_fuse_roots: &[String],
 ) -> Vec<String> {
     let mut restored_children: Vec<String> = Vec::new();
     for read_only_path in read_only_paths {
@@ -35,7 +34,6 @@ pub(super) fn collect_restored_read_only_excluded_children(
                     !paths::contains_wildcards(excluded)
                         && paths::is_child(excluded, read_only_path)
                         && !path_overlaps_mapping_request(excluded, path_mappings)
-                        && !is_covered_by_scoped_fuse_mount(excluded, scoped_fuse_roots)
                 })
                 .cloned(),
         );
@@ -117,25 +115,6 @@ pub(super) fn build_allowed_real_source_candidates(
     }
     candidates.push(backend_source.clone());
     candidates
-}
-
-pub(super) fn namespace_mappings_outside_scoped_fuse(
-    resolved_mappings: &[PathMapping],
-    scoped_fuse_roots: &[String],
-) -> Vec<PathMapping> {
-    if scoped_fuse_roots.is_empty() {
-        return resolved_mappings.to_vec();
-    }
-
-    resolved_mappings
-        .iter()
-        .filter(|mapping| {
-            !scoped_fuse_roots
-                .iter()
-                .any(|root| paths::is_same_or_child(&mapping.request_path, root))
-        })
-        .cloned()
-        .collect()
 }
 
 pub(super) fn is_covered_by_scoped_fuse_mount(path: &str, scoped_fuse_roots: &[String]) -> bool {

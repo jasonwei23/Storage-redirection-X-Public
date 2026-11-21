@@ -3,8 +3,7 @@ use super::apply_targets::{
     collect_restored_read_only_excluded_children, detach_mount_if_present,
     is_covered_by_scoped_fuse_mount, mountinfo_device_for_target,
     mountinfo_has_own_private_restore_layer, mountinfo_has_target, mountinfo_root_is_app_sandbox,
-    namespace_mappings_outside_scoped_fuse, path_overlaps_mapping_request,
-    path_shadows_mapping_request, read_mountinfo,
+    path_overlaps_mapping_request, path_shadows_mapping_request, read_mountinfo,
 };
 use super::map::PathMappingApplyOptions;
 use super::{MountPlanner, SystemViewClone, concrete_mount_fallback_parent};
@@ -159,7 +158,6 @@ impl MountPlanner {
         excluded_real_paths: &[String],
         read_only_paths: &[String],
         path_mappings: &[PathMapping],
-        scoped_fuse_roots: &[String],
     ) -> bool {
         let resolved_target_storage =
             self.resolve_user_path(&self.normalize_path(&self.redirect_target));
@@ -277,22 +275,17 @@ impl MountPlanner {
         self.is_storage_root_redirected = true;
 
         log::info!("android root stays redirected unless allowed explicitly");
-        self.ensure_scoped_fuse_mount_points(scoped_fuse_roots, &storage_path);
         // 自有私有目录恢复必须在放行/映射 bind **之前**执行：映射目标若落在自有
         // 目录子树下（场景 35 的 Android/data/<pkg>/... → Download/...），映射 bind
         // 要叠在恢复 bind 之上才会生效；恢复放在末尾则会反过来遮蔽先放的映射
-        // bind（CI A17 场景 35 实证：写入成功但映射目标缺失）。namespace 形态下
-        // apply 之后没有会遮蔽存储根的挂载，这里恢复即终态；宿主接管/scoped 形态
-        // 中 apply 阶段的恢复可能被随后的视图根 FUSE 遮蔽（真机 2026-10-25 实证：
-        // 同一构建时而生效时而丢失），由调用方在全部挂载动作结束后调用
-        // [`Self::restore_own_private_system_view`] 幂等补挂（same_mount_identity
-        // 判定已恢复时不再叠层）。
-        self.restore_own_private_directories(&storage_path, &data_media_root, scoped_fuse_roots);
+        // bind（CI A17 场景 35 实证：写入成功但映射目标缺失）。宿主接管成功时
+        // 调用方不进入此流程，改在接入后通过 [`Self::restore_own_private_system_view`]
+        // 补挂系统视图。
+        self.restore_own_private_directories(&storage_path, &data_media_root, &[]);
 
         let restored_allowed_paths = self.restore_allowed_real_paths(
             allowed_real_paths,
             excluded_real_paths,
-            scoped_fuse_roots,
             &real_storage_anchor,
             &data_media_root,
             &storage_path,
@@ -302,18 +295,14 @@ impl MountPlanner {
         let mapping_source_roots =
             build_mapping_source_roots(&real_storage_anchor, &data_media_root);
         let resolved_mappings = self.resolve_path_mappings(path_mappings, &storage_path);
-        let namespace_mappings =
-            namespace_mappings_outside_scoped_fuse(&resolved_mappings, scoped_fuse_roots);
         if !resolved_mappings.is_empty() {
             log::info!(
-                "map resolve in={} effective={} namespace={} scoped_fuse={}",
+                "map resolve in={} effective={}",
                 path_mappings.len(),
-                resolved_mappings.len(),
-                namespace_mappings.len(),
-                scoped_fuse_roots.len()
+                resolved_mappings.len()
             );
             if !self.apply_resolved_path_mappings(
-                &namespace_mappings,
+                &resolved_mappings,
                 &storage_path,
                 &mapping_source_roots,
                 &restored_allowed_paths,
@@ -327,14 +316,14 @@ impl MountPlanner {
             ) {
                 log::warn!(
                     "mapping: nothing applied count={} storage={}",
-                    namespace_mappings.len(),
+                    resolved_mappings.len(),
                     storage_path
                 );
             }
         }
 
         let read_only_shadowed_mappings = self.read_only_shadowed_path_mappings(
-            &namespace_mappings,
+            &resolved_mappings,
             read_only_paths,
             &storage_path,
             "readonly map restore",
@@ -345,10 +334,9 @@ impl MountPlanner {
             if !self.apply_read_only_paths(
                 read_only_paths,
                 excluded_real_paths,
-                &namespace_mappings,
+                &resolved_mappings,
                 &storage_path,
                 &mapping_source_roots,
-                scoped_fuse_roots,
             ) {
                 log::warn!(
                     "readonly: nothing applied count={} storage={}",
@@ -391,7 +379,6 @@ impl MountPlanner {
         &self,
         allowed_real_paths: &[String],
         excluded_real_paths: &[String],
-        scoped_fuse_roots: &[String],
         real_storage_anchor: &Option<String>,
         data_media_root: &str,
         storage_path: &str,
@@ -422,14 +409,6 @@ impl MountPlanner {
         }
 
         for allowed_path in effective_paths {
-            if is_covered_by_scoped_fuse_mount(&allowed_path, scoped_fuse_roots) {
-                log::info!(
-                    "skip allow mount path (handled by scoped fuse): {}",
-                    allowed_path
-                );
-                continue;
-            }
-
             let Some(relative) = paths::relative_child_path(&allowed_path, storage_path) else {
                 continue;
             };
@@ -1120,32 +1099,11 @@ impl MountPlanner {
         })
     }
 
-    fn ensure_scoped_fuse_mount_points(&self, scoped_fuse_roots: &[String], storage_path: &str) {
-        if scoped_fuse_roots.is_empty() {
-            return;
-        }
-        for root in scoped_fuse_roots {
-            if paths::eq_ignore_case(root, storage_path) {
-                continue;
-            }
-            if !paths::is_child(root, storage_path) {
-                log::warn!("skip scoped fuse mount point outside storage: {}", root);
-                continue;
-            }
-            if self.ensure_directory_exists(root, true) {
-                log::info!("scoped fuse mount point ready {}", root);
-            } else {
-                log::warn!("scoped fuse mount point mkdir failed {}", root);
-            }
-        }
-    }
-
     pub fn apply_path_mappings_only(
         &mut self,
         path_mappings: &[PathMapping],
         sandboxed_paths: &[String],
         read_only_paths: &[String],
-        scoped_fuse_roots: &[String],
     ) -> bool {
         if !self.ensure_mount_namespace_prepared() {
             log::error!("mount ns init failed");
@@ -1227,13 +1185,6 @@ impl MountPlanner {
                 let sandbox_source = paths::join(&resolved_target, relative);
                 if !self.ensure_writable_mapped_directory(&sandbox_source, self.app_uid) {
                     log::warn!("sandbox source mkdir failed: {}", sandbox_source);
-                    continue;
-                }
-                if is_covered_by_scoped_fuse_mount(&sandboxed_path, scoped_fuse_roots) {
-                    log::info!(
-                        "skip sandbox mount (handled by scoped fuse): {}",
-                        sandboxed_path
-                    );
                     continue;
                 }
                 // 目标是否存在必须用后端路径判定：视图路径的 stat 在挂载子进程里会
@@ -1319,18 +1270,14 @@ impl MountPlanner {
         let mapping_source_roots =
             build_mapping_source_roots(&real_storage_anchor, &data_media_root);
         let resolved_mappings = self.resolve_path_mappings(path_mappings, &storage_path);
-        let namespace_mappings =
-            namespace_mappings_outside_scoped_fuse(&resolved_mappings, scoped_fuse_roots);
         log::info!(
-            "map-only resolve in={} effective={} namespace={} scoped_fuse={}",
+            "map-only resolve in={} effective={}",
             path_mappings.len(),
-            resolved_mappings.len(),
-            namespace_mappings.len(),
-            scoped_fuse_roots.len()
+            resolved_mappings.len()
         );
 
         let mut is_any_applied = self.apply_resolved_path_mappings(
-            &namespace_mappings,
+            &resolved_mappings,
             &storage_path,
             &mapping_source_roots,
             &[],
@@ -1344,7 +1291,7 @@ impl MountPlanner {
         );
 
         let read_only_shadowed_mappings = self.read_only_shadowed_path_mappings(
-            &namespace_mappings,
+            &resolved_mappings,
             read_only_paths,
             &storage_path,
             "map-only readonly map restore",
@@ -1354,10 +1301,9 @@ impl MountPlanner {
             is_read_only_applied = self.apply_read_only_paths(
                 read_only_paths,
                 &[],
-                &namespace_mappings,
+                &resolved_mappings,
                 &storage_path,
                 &mapping_source_roots,
-                scoped_fuse_roots,
             );
             let is_any_restored = self.apply_resolved_path_mappings(
                 &read_only_shadowed_mappings,
@@ -1404,18 +1350,17 @@ impl MountPlanner {
         let mapping_source_roots =
             build_mapping_source_roots(&self.real_storage_anchor, &data_media_root);
         let resolved_mappings = self.resolve_path_mappings(path_mappings, &storage_path);
-        let namespace_mappings = namespace_mappings_outside_scoped_fuse(&resolved_mappings, &[]);
-        if namespace_mappings.is_empty() {
+        if resolved_mappings.is_empty() {
             log::info!("reapply map after fuse clear: no effective mappings");
             return false;
         }
         log::info!(
             "reapply map after fuse clear in={} effective={}",
             path_mappings.len(),
-            namespace_mappings.len()
+            resolved_mappings.len()
         );
         self.apply_resolved_path_mappings(
-            &namespace_mappings,
+            &resolved_mappings,
             &storage_path,
             &mapping_source_roots,
             &[],
@@ -1436,7 +1381,6 @@ impl MountPlanner {
         path_mappings: &[PathMapping],
         storage_path: &str,
         source_roots: &[String],
-        scoped_fuse_roots: &[String],
     ) -> bool {
         let data_media_root = paths::data_media_user_root_for_user(self.user_id);
         let read_only_source_roots = build_read_only_source_roots(source_roots, &data_media_root);
@@ -1462,8 +1406,6 @@ impl MountPlanner {
             &resolved_read_only_excluded_paths,
         ));
         paths::sort_dedup_paths_case_insensitive(&mut excluded_rules);
-        // scoped FUSE 已接管对应路径的只读判定时，namespace 侧不再重复挂载。
-        let mut delegated_to_scoped_fuse = false;
         let mut effective_paths: Vec<String> = Vec::with_capacity(resolved_paths.len());
         for path in resolved_paths {
             if path_shadows_mapping_request(&path, path_mappings) {
@@ -1487,17 +1429,6 @@ impl MountPlanner {
                 log::warn!("skip readonly mount (excluded conflict): {}", path);
                 continue;
             }
-            if is_covered_by_scoped_fuse_mount(&path, scoped_fuse_roots) {
-                // scoped FUSE 覆盖范围内的只读规则由 FUSE 规则层执行：FUSE 对 open-for-write、
-                // truncate、chmod、link、mkdir、rename、delete 与 W_OK 访问逐条判定 is_read_only。
-                // 此处再叠一层 namespace 只读 bind 会用 real_storage 锚点遮蔽 FUSE 视图，
-                // 命中通配父目录的真实文件会读成空或过期内容（只读规则本意只限制写入）。
-                // FUSE 启动失败时 apply_mount_namespace_fallback 会先回滚再按展开后的规则重挂，
-                // 只读强制仍然保留，因此这里不保留 namespace 备份挂载。
-                log::info!("readonly mount delegated to scoped fuse: {}", path);
-                delegated_to_scoped_fuse = true;
-                continue;
-            }
             let is_redundant = effective_paths
                 .iter()
                 .any(|kept| paths::matches(kept, &path, true));
@@ -1510,7 +1441,6 @@ impl MountPlanner {
             &effective_paths,
             &excluded_rules,
             path_mappings,
-            scoped_fuse_roots,
         );
         for excluded_child in &restored_excluded_children {
             let Some(relative) = paths::relative_child_path(excluded_child, storage_path) else {
@@ -1586,7 +1516,6 @@ impl MountPlanner {
             &mounted_read_only_paths,
             &excluded_rules,
             path_mappings,
-            scoped_fuse_roots,
         );
         for excluded_child in restored_excluded_children {
             let Some(relative) = paths::relative_child_path(&excluded_child, storage_path) else {
@@ -1635,9 +1564,7 @@ impl MountPlanner {
                 log::info!("readonly exclude restored {}", excluded_child);
             }
         }
-        // 交由 scoped FUSE 执行的只读规则同样属于"已强制"，不能按未生效处理，
-        // 否则会误报 readonly 规则放行写入。
-        is_any_mounted || delegated_to_scoped_fuse
+        is_any_mounted
     }
 
     fn resolve_read_only_exclusion_rules(

@@ -1072,11 +1072,6 @@ fn handle_child_process(request: &MountRequest, plan: &MountForkPlan, sock: c_in
             &request.path_mappings,
             &request.sandboxed_paths,
             &request.read_only_paths,
-            // 第四个参数是「由 FUSE 覆盖、规划阶段跳过 bind」的根。scoped 会话已退役，
-            // 现在只有共享宿主能提供 FUSE；宿主接入成功时根本不会走到这里（`ok = true`），
-            // 走到这里就说明本轮只有 namespace bind。因此一律传空：所有路径都由 bind 表达，
-            // 不再存在「等一个永远不会来的 FUSE 会话」的悬空根。
-            &[],
         )
     } else {
         planner.apply_sdcard_redirect(
@@ -1084,7 +1079,6 @@ fn handle_child_process(request: &MountRequest, plan: &MountForkPlan, sock: c_in
             &request.excluded_real_paths,
             &request.read_only_paths,
             &request.path_mappings,
-            &[],
         )
     };
     if ok {

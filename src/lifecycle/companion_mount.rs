@@ -1390,10 +1390,6 @@ fn handle_child_process(
             &request.path_mappings,
             &request.sandboxed_paths,
             &request.read_only_paths,
-            // 第四个参数是「由 FUSE 覆盖、规划阶段跳过 bind」的根。scoped 会话已退役，
-            // 只剩共享宿主能提供 FUSE；接入成功时不会走到这里，走到这里就是纯 bind，
-            // 因此一律传空，不留任何悬空根。
-            &[],
         )
     } else {
         mount_mgr.apply_sdcard_redirect(
@@ -1401,7 +1397,6 @@ fn handle_child_process(
             &request.excluded_real_paths,
             &request.read_only_paths,
             &request.path_mappings,
-            &[],
         )
     };
 
