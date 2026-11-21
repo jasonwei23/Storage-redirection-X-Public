@@ -1270,9 +1270,8 @@ fn handle_child_process(
     mount_mgr.prepare_mapping_target_dirs(&request.path_mappings, request.uid);
 
     let scoped_fuse_roots = plan.scoped_fuse_roots.as_slice();
-    // 残留屏障清扫（必须在挂载动作之前、setns 之后）：白名单用 barrier 集合（与
-    // execute 层挂载同源），不能用收敛后的 scoped_fuse_roots——宿主在位时后者收敛成
-    // 存储根，会把 execute 层刚挂好的屏障误判成残留拆掉（应用视图裸奔 → ENOENT）。
+    // 在目标命名空间清理残留屏障。保留屏障规划和宿主计划各自的快照，避免等待期间
+    // 能力快照变化时，用接入结果误判父进程准备的屏障。
     detach_stale_barriers_not_in(&plan.barrier_roots);
     // 必须先摘屏障再接入视图：视图根一旦落到这些路径上方，屏障就再也摘不掉了
     // （见 open_fail_closed_barrier_fds 上方注释）。这里与下面的视图接入只隔几行，
@@ -1694,38 +1693,18 @@ fn preattach_shared_host(
 
 fn scoped_fuse_mount_roots(request: &CompanionMountRequest) -> Vec<String> {
     let roots = crate::fuse_redirect::scoped_fuse_mount_roots_for_request(request);
-    // 规划根只用于「这次本来需要 FUSE 覆盖的路径有哪些」这一诊断结论，以及宿主接入
-    // 候选判定（候选要求规划根恰好是整棵存储视图根）。真正承载数据面的是共享宿主会话，
-    // 不再是 per-app scoped 会话。
-    //
-    // Auto 模式下把按目录根收敛成存储视图根：宿主会话按 uid 持有同一份规则，一个整根
-    // 会话即可表达相同语义。区别只在发现方式——companion 与 daemon 无共享内存，靠快照
-    // 等待「宿主在位 + 本 uid 已被 daemon 预登记」，等待发生在挂载应答返回之前，一次挂载
-    // 到位；快照缺失或处于失败冷却期时保持按目录规划，此时不会接入，最终按 bind 表达。
-    //
-    // 存在私有 fs 侧映射时保持按目录规划（与 daemon 侧同源判定）：宿主策略层只覆盖
-    // 存储视图，target 在视图外的映射会被宿主忽略，写入穿透到默认重定向根（真机实证：
-    // scenario 35 的 Download/X → /data/user/0/<pkg>/no_backup 在收敛路径下落到
-    // sdcard 沙盒）。这类映射只能靠 namespace bind 完整表达。
-    if crate::domain::mappings_need_namespace_mount(
-        request.uid,
-        &request.app_data_dir,
-        &request.redirect_target,
-        &request.path_mappings,
-    ) {
-        return roots;
-    }
-    if roots.is_empty()
-        || !matches!(
-            request.storage_backend_mode,
-            crate::config::StorageBackendMode::Auto
+    // 规划已经给出整根或空列表。只在可能接入宿主时等待，避免私有映射与纯 bind 空等。
+    if !roots.is_empty()
+        && request.storage_backend_mode == crate::config::StorageBackendMode::Auto
+        && !crate::domain::mappings_need_namespace_mount(
+            request.uid,
+            &request.app_data_dir,
+            &request.redirect_target,
+            &request.path_mappings,
         )
+        && crate::fuse_host::wait_for_host_session_view(request.uid, request.policy_fingerprint)
+            .is_none()
     {
-        return roots;
-    }
-    let Some(_view) =
-        crate::fuse_host::wait_for_host_session_view(request.uid, request.policy_fingerprint)
-    else {
         log::info!(
             "fuse host wait not ready roots={} mode={} pid={} pkg={}",
             roots.len(),
@@ -1733,23 +1712,8 @@ fn scoped_fuse_mount_roots(request: &CompanionMountRequest) -> Vec<String> {
             request.pid,
             request.package_name
         );
-        return roots;
-    };
-    let user_id = crate::platform::user_id_from_uid(request.uid);
-    let view_root = platform::paths::storage_user_root_for_user(user_id);
-    if roots.len() == 1
-        && platform::paths::normalize_syntax(&roots[0])
-            == platform::paths::normalize_syntax(&view_root)
-    {
-        return roots;
     }
-    log::info!(
-        "fuse host preferred collapse roots={} -> view root pid={} pkg={}",
-        roots.len(),
-        request.pid,
-        request.package_name
-    );
-    vec![view_root]
+    roots
 }
 
 /// 预接入闸门未放行时的原因归类（只用于日志与能力快照，不参与任何行为分支）。
@@ -1878,10 +1842,7 @@ impl CompanionMountForkPlan {
     fn build(request: &CompanionMountRequest) -> Self {
         let state_path = mount_state::state_file_path(request);
         let temp_state_path = crate::fuse_session::mount_state_temp_path(&state_path);
-        // barrier 集合必须与 execute 层 mount_storage_view_barriers 的挂载集合同源
-        // （scoped_fuse_mount_roots_for_request 的原始按目录结果），而不是本结构体的
-        // scoped_fuse_roots——后者在 Auto+宿主在位时会收敛成存储视图根，白名单若用它，
-        // 残留清扫会把 execute 层刚挂好的屏障拆掉（应用视图裸奔 → ENOENT）。
+        // 记录宿主等待前的屏障候选；不要用等待后的能力快照反推。
         let barrier_roots = crate::fuse_redirect::scoped_fuse_mount_roots_for_request(request);
         Self {
             scoped_fuse_roots: scoped_fuse_mount_roots(request),

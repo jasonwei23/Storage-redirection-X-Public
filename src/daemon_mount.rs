@@ -849,11 +849,13 @@ struct MountForkPlan {
 }
 
 impl MountForkPlan {
-    fn build(request: &MountRequest, parent_timeout_sec: i64) -> Self {
+    fn build(request: &MountRequest) -> Self {
+        let scoped_fuse_roots = scoped_fuse_mount_roots(request);
+        let parent_timeout_sec = parent_recv_timeout_sec(&scoped_fuse_roots);
         let state_path = state_file_path(request);
         let temp_state_path = crate::fuse_session::mount_state_temp_path(&state_path);
         Self {
-            scoped_fuse_roots: scoped_fuse_mount_roots(request),
+            scoped_fuse_roots,
             state_path,
             temp_state_path,
             overlay_targets: request_overlay_targets(request),
@@ -863,7 +865,7 @@ impl MountForkPlan {
     }
 }
 
-/// 预接入共享宿主所需的最小剩余时间（毫秒）；不足则跳过预接入走 scoped。
+/// 预接入共享宿主所需的最小剩余时间（毫秒）；不足则跳过预接入走 namespace bind。
 const PREATTACH_MIN_REMAINING_MS: i64 = 1_500;
 
 /// 预接入时给「拿到策略应答之后」预留的时间（毫秒）：接入本身、状态落账与结果回包。
@@ -886,8 +888,7 @@ fn run_mount_in_forked_child(request: &MountRequest) -> bool {
     // fork 之后的子进程只保留调用线程。此时若再做堆分配、首次初始化或获取全局锁，
     // 可能因为其它父线程在 fork 瞬间持有 malloc arena 或全局锁而永久阻塞。
     // 因此把可以提前算出的字符串与路径列表全部在父进程算好，子进程只做 setns/mount/write。
-    let parent_timeout_sec = parent_recv_timeout_sec(&scoped_fuse_mount_roots(request));
-    let plan = MountForkPlan::build(request, parent_timeout_sec);
+    let plan = MountForkPlan::build(request);
     let mut sockets = [0; 2];
     if unsafe { socketpair(AF_UNIX, SOCK_DGRAM, 0, sockets.as_mut_ptr()) } != 0 {
         log_errno("daemon socketpair failed");
@@ -908,7 +909,12 @@ fn run_mount_in_forked_child(request: &MountRequest) -> bool {
 
     if child > 0 {
         unsafe { close(sockets[1]) };
-        return handle_parent_process(child, sockets[0], parent_timeout_sec, &request.package_name);
+        return handle_parent_process(
+            child,
+            sockets[0],
+            plan.parent_timeout_sec,
+            &request.package_name,
+        );
     }
 
     unsafe { close(sockets[0]) };
@@ -1395,39 +1401,17 @@ fn shared_host_preattach_candidate(request: &MountRequest, scoped_fuse_roots: &[
 
 fn scoped_fuse_mount_roots(request: &MountRequest) -> Vec<String> {
     let roots = crate::fuse_redirect::scoped_fuse_mount_roots_for_request(request);
-    // Auto 模式的目标形态是共享宿主会话：把按目录 scoped 根收敛成存储视图根，宿主会话
-    // 按 uid 持有同一份规则，一个整根会话即可表达相同语义。收敛后的整根在
-    // `start_fuse_service_for_root` 里命中接入闸门（闸门本来就只放行存储视图根），接入
-    // 失败时该函数自己回退 scoped——含整根 scoped，与部分失败收敛路径一致。
-    //
-    // 宿主未就绪时**等待建立**而不是按旧规划挂上再事后迁移：迁移要在应用命名空间里
-    // 先卸旧 scoped 层、再挂新层，中间应用对该路径的访问会穿透到真实存储（fail-open
-    // 窗口）；等待发生在挂载应答返回之前，应用进程尚未恢复运行，一次挂载到位。
-    // 接入被显式关闭、等待超时或处于失败冷却期时保持原规划——旧数据面照常服务。
-    //
-    // 存在私有 fs 侧映射时保持按目录规划：宿主策略层只覆盖存储视图，target 在视图外
-    // 的映射会被宿主忽略，写入穿透到默认重定向根（真机实证：scenario 35 的
-    // Download/X → /data/user/0/<pkg>/no_backup 在收敛路径下落到 sdcard 沙盒）。
-    // 按目录 scoped 会话与命名空间 bind 才能完整表达这类映射。
-    if crate::domain::mappings_need_namespace_mount(
-        request.uid,
-        &request.app_data_dir,
-        &request.redirect_target,
-        &request.path_mappings,
-    ) {
-        return roots;
-    }
-    if roots.is_empty()
-        || !matches!(
-            request.storage_backend_mode,
-            crate::config::StorageBackendMode::Auto
+    // 规划已经给出整根或空列表。只在可能接入宿主时等待，避免私有映射与纯 bind 空等。
+    if !roots.is_empty()
+        && request.storage_backend_mode == crate::config::StorageBackendMode::Auto
+        && !crate::domain::mappings_need_namespace_mount(
+            request.uid,
+            &request.app_data_dir,
+            &request.redirect_target,
+            &request.path_mappings,
         )
+        && !crate::fuse_host::wait_for_host_session()
     {
-        return roots;
-    }
-    if !crate::fuse_host::wait_for_host_session() {
-        // 诊断：回落旧规划必须留下原因（开关关闭 / 等待超时 / 失败冷却），否则
-        // "宿主明明活着却规划成按目录根"这类矛盾只能靠猜。
         log::info!(
             "daemon fuse host wait not ready roots={} mode={} pid={} pkg={}",
             roots.len(),
@@ -1435,21 +1419,8 @@ fn scoped_fuse_mount_roots(request: &MountRequest) -> Vec<String> {
             request.pid,
             request.package_name
         );
-        return roots;
     }
-    let user_id = crate::platform::user_id_from_uid(request.uid);
-    let view_root = paths::storage_user_root_for_user(user_id);
-    if roots.len() == 1 && paths::normalize_syntax(&roots[0]) == paths::normalize_syntax(&view_root)
-    {
-        return roots;
-    }
-    log::info!(
-        "daemon fuse host preferred collapse roots={} -> view root pid={} pkg={}",
-        roots.len(),
-        request.pid,
-        request.package_name
-    );
-    vec![view_root]
+    roots
 }
 
 /// B2-b：把应用接入共享宿主 FUSE 会话。

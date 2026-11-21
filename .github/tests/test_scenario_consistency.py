@@ -1792,7 +1792,7 @@ class ScenarioConsistencyTest(unittest.TestCase):
         self.assertIn("if !host_attach_enabled() {", wait_fn)
         self.assertIn("LAST_HOST_WAIT_FAIL_MS", wait_fn)
         self.assertIn("fallback=scoped_planning", wait_fn)
-        # 规划层：Auto 模式先等待宿主就绪再收敛整根；等待失败的回退保持旧规划。
+        # Auto 模式在接入前有界等待宿主；根列表由共用规划函数确定。
         daemon_main = read("src/daemon.rs")
         self.assertIn("pre_register_host_policy(&plan.request)", daemon_main)
         self.assertLess(
@@ -1812,12 +1812,12 @@ class ScenarioConsistencyTest(unittest.TestCase):
         self.assertIn("HOST_POLICY_ACK_BUDGET_MAX_MS", pre_register)
         self.assertIn("request.policy_fingerprint", pre_register)
         self.assertIn("view.policy_fingerprints.get(&(request.uid as u32))", pre_register)
-        collapse = section(
+        plan = section(
             daemon_src, "fn scoped_fuse_mount_roots(", "fn try_bind_to_fuse_host("
         )
-        self.assertIn("crate::fuse_host::wait_for_host_session()", collapse)
-        self.assertIn("crate::config::StorageBackendMode::Auto", collapse)
-        self.assertIn("vec![view_root]", collapse)
+        self.assertIn("crate::fuse_host::wait_for_host_session()", plan)
+        self.assertIn("crate::config::StorageBackendMode::Auto", plan)
+        self.assertIn("scoped_fuse_mount_roots_for_request(request)", plan)
         # 不得再出现"事后迁移"：幂等判据里没有迁移分支，宿主死亡只走既有的失效重挂。
         self.assertNotIn("scoped_state_should_migrate_to_host", daemon_src)
         self.assertNotIn("take_host_ready_transition", host)
