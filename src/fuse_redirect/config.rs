@@ -321,15 +321,30 @@ pub fn scoped_fuse_mount_roots_for_request<R: MountRequestFields + ?Sized>(
     }
 
     let backend_mode = request.storage_backend_mode();
+    let user_id = crate::platform::user_id_from_uid(request.uid());
+    let storage_root = paths::storage_user_root_for_user(user_id);
+    // 全隔离加单条具体媒体目录映射可沿用旧版挂载路径，使无关的自有缓存继续走系统视图。
+    if backend_mode == StorageBackendMode::Auto
+        && request.uid() % crate::platform::ANDROID_USER_ID_OFFSET
+            >= super::policy::ANDROID_APP_UID_START
+        && !request.is_monitor_only()
+        && !request.is_mapping_mode_only()
+        && request.allowed_real_paths().is_empty()
+        && request.excluded_real_paths().is_empty()
+        && request.sandboxed_paths().is_empty()
+        && request.read_only_paths().is_empty()
+        && request.redirect_target()
+            == paths::default_redirect_target(request.package_name(), user_id)
+        && crate::domain::is_single_concrete_media_mapping(request.path_mappings(), &storage_root)
+    {
+        return Vec::new();
+    }
     if !scoped_mount_allowed_for_scope(request.package_name(), backend_mode) {
         return Vec::new();
     }
 
-    // 统一走 FUSE：`Auto` 的语义是「FUSE 优先」——能力可用就由本会话接管整棵视图根，
-    // 规则仍在策略层逐请求判定；能力不可用时由上面的能力门禁返回空根，挂载层回落
-    // namespace。`Fuse` 只是显式锁定，两者此处同构。
-    let user_id = crate::platform::user_id_from_uid(request.uid());
-    vec![paths::storage_user_root_for_user(user_id)]
+    // 其它配置仍由共享宿主逐请求处理；不可用时保留既有 namespace 回退。
+    vec![storage_root]
 }
 
 /// 检查设备是否暴露可读写的 `/dev/fuse`。

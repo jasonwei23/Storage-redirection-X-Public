@@ -19,6 +19,29 @@ impl PathMapping {
     }
 }
 
+/// 单条跨媒体目录映射可直接用 namespace bind 表达。输入是按用户归一的绝对路径。
+pub fn is_single_concrete_media_mapping(mappings: &[PathMapping], storage_root: &str) -> bool {
+    let [mapping] = mappings else {
+        return false;
+    };
+    let Some(source) = paths::relative_child_path(&mapping.request_path, storage_root) else {
+        return false;
+    };
+    let Some(target) = paths::relative_child_path(&mapping.final_path, storage_root) else {
+        return false;
+    };
+    let Some((target_root, target_subpath)) = target.split_once('/') else {
+        return false;
+    };
+    matches!(source, "DCIM" | "Pictures" | "Movies")
+        && matches!(target_root, "DCIM" | "Pictures" | "Movies")
+        && source != target_root
+        && !paths::contains_wildcards(target_subpath)
+        && !target_subpath.contains('$')
+        && !paths::has_unsafe_segments(target_subpath)
+        && target_subpath.split('/').all(|segment| !segment.is_empty())
+}
+
 pub fn sort_path_mappings_longest_request_first(mappings: &mut [PathMapping]) {
     mappings.sort_by(|a, b| {
         if a.request_path.len() != b.request_path.len() {
