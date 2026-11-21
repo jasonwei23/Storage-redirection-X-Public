@@ -4,9 +4,10 @@
 
 ## 运行方式
 
-- `auto`：**FUSE 优先**——设备存在可用 `/dev/fuse` 时，整棵存储视图根由共享宿主 FUSE
-  会话接管，映射、通配、沙盒、只读等规则全部在策略层逐请求判定；只有能力探测判定不可用
-  （或该应用自己的失败预算耗尽）时才返回空根，由挂载层回落 namespace bind。
+- `auto`：可用时优先由共享宿主 FUSE 逐请求执行规则。使用默认沙盒的全隔离应用只有一条固定媒体目录映射时，
+  若源是 `DCIM`、`Pictures`、`Movies` 之一且目标是另一媒体目录的子目录，则沿用 namespace bind，
+  使自有缓存继续使用系统视图。配置中的相对路径先归一到当前用户的共享存储；跨用户、绝对私有路径、
+  通配或附带其他规则的配置不适用此兼容路径。FUSE 能力不可用或该应用的失败预算耗尽时仍按原流程回退。
 - 用户选择面已收敛：配置里只写 `auto`，历史 `fuse` / `namespace` 值按 `auto` 处理。
 
 配置位于 `config/global.json`：
@@ -35,8 +36,7 @@
 - FUSE 请求在文件操作开始时执行策略，通配、动态文件和只读排除不依赖挂载时的目录快照。
 - 挂载请求会先写入 `tmp/mount_intent/*.intent`，再更新为 `applying`、`mounted` 或 `failed`；正式 mount state 仍只保存可清理的已生效目标。
 - 路径映射、只读和沙盒规则共用一个数据面，减少 namespace 多层 bind mount 的组合复杂度。
-- 能力探测只决定「能不能用 FUSE」：可用即接管整根视图，不可用才回落 namespace。
-- mount namespace 仍作为自动回退路径，便于跨厂商设备保持兼容。
+- mount namespace 继续承接固定媒体目录映射的兼容路径和 FUSE 不可用时的自动回退。
 
 ## 缺点
 
@@ -52,7 +52,7 @@
 当前实现的关键边界如下：
 
 - 共享宿主会话（`srx_fuse_host[<pid>]`）是**唯一**的 FUSE 数据面，为多个应用 namespace 提供共享视图，Auto 模式下应用会话默认收敛到该会话。
-- `mount namespace` 不是待删除的旧实现，而是 `auto` 后端在宿主接入不可用时的正式路径。
+- `mount namespace` 也用于符合上述条件的媒体目录映射，以及宿主接入不可用时的回退。
 - `srx_fuse_redirect` 前缀保留用于识别旧版本遗留的 scoped 层；测试、账本和诊断必须同时识别 `srx_fuse_redirect` 与 `srx_fuse_host`。
 
 ## 排查：某个应用为什么没走 FUSE
@@ -65,6 +65,7 @@ backend_effective pkg=<包名> requested=auto effective=namespace capability=ava
 ```
 
 - `selection_reason=scoped_mount_ready:view=srx_host`：已接入共享宿主，后续落点由策略层决定。
+- `selection_reason=rules_need_no_scoped_fuse_root`：规则可由 namespace bind 表达，本轮不接入共享宿主。
 - `...failed_namespace_fallback:<reason>`：接入没成功并回落 namespace。`reason` 直接说明卡在哪一步
   （闸门判定、策略登记、接入超时、宿主缺席）。
 - 只有 `unknown` 或失败信号才输出 `scoped gate diag`（含 `capability`、`budget_exhausted`、
