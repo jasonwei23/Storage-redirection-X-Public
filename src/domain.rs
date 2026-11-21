@@ -19,27 +19,34 @@ impl PathMapping {
     }
 }
 
-/// 单条跨媒体目录映射可直接用 namespace bind 表达。输入是按用户归一的绝对路径。
-pub fn is_single_concrete_media_mapping(mappings: &[PathMapping], storage_root: &str) -> bool {
-    let [mapping] = mappings else {
-        return false;
+/// 相互独立的固定共享存储映射可以直接用 namespace bind 表达。
+pub fn mappings_can_use_namespace_bind(mappings: &[PathMapping], storage_root: &str) -> bool {
+    let is_concrete_shared_path = |path: &str| {
+        paths::relative_child_path(path, storage_root).is_some_and(|relative| {
+            !paths::is_same_or_child(relative, "Android")
+                && !paths::contains_wildcards(relative)
+                && !relative.contains('$')
+                && !paths::has_unsafe_segments(relative)
+                && relative.split('/').all(|segment| !segment.is_empty())
+        })
     };
-    let Some(source) = paths::relative_child_path(&mapping.request_path, storage_root) else {
-        return false;
+    let overlaps = |left: &str, right: &str| {
+        paths::is_same_or_child(left, right) || paths::is_same_or_child(right, left)
     };
-    let Some(target) = paths::relative_child_path(&mapping.final_path, storage_root) else {
-        return false;
-    };
-    let Some((target_root, target_subpath)) = target.split_once('/') else {
-        return false;
-    };
-    matches!(source, "DCIM" | "Pictures" | "Movies")
-        && matches!(target_root, "DCIM" | "Pictures" | "Movies")
-        && source != target_root
-        && !paths::contains_wildcards(target_subpath)
-        && !target_subpath.contains('$')
-        && !paths::has_unsafe_segments(target_subpath)
-        && target_subpath.split('/').all(|segment| !segment.is_empty())
+
+    !mappings.is_empty()
+        && mappings.iter().enumerate().all(|(index, mapping)| {
+            is_concrete_shared_path(&mapping.request_path)
+                && is_concrete_shared_path(&mapping.final_path)
+                // bind 会修正目标目录属主，保护共享存储的一级目录。
+                && paths::relative_child_path(&mapping.final_path, storage_root)
+                    .is_some_and(|relative| relative.contains('/'))
+                // 同一挂载点不能遮住其他规则的入口或目标。共享同一目标无需额外挂载层。
+                && mappings.iter().enumerate().all(|(other_index, other)| {
+                    (index == other_index || !overlaps(&mapping.request_path, &other.request_path))
+                        && !overlaps(&mapping.request_path, &other.final_path)
+                })
+        })
 }
 
 pub fn sort_path_mappings_longest_request_first(mappings: &mut [PathMapping]) {

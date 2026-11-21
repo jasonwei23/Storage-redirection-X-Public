@@ -297,15 +297,15 @@ class MountMetadataScopeTest(unittest.TestCase):
         drop_body = function_body(apply, "impl Drop for SystemViewAnchor {")
         self.assertIn("detach_mount_if_present(&self.root)", drop_body)
 
-    def test_auto_backend_keeps_simple_media_mapping_on_namespace(self) -> None:
-        # 简单媒体映射在宿主能力检查之前确定挂载路径，其余规则继续使用共享宿主。
+    def test_auto_backend_keeps_independent_fixed_mappings_on_namespace(self) -> None:
+        # 固定映射在宿主能力检查之前确定挂载路径，其余规则继续使用共享宿主。
         body = function_body(
             self.fuse_config,
             "pub fn scoped_fuse_mount_roots_for_request",
         )
         self.assertIn("storage_user_root_for_user(user_id)", body)
         self.assertLess(
-            body.index("is_single_concrete_media_mapping"),
+            body.index("mappings_can_use_namespace_bind"),
             body.index("scoped_mount_allowed_for_scope"),
         )
         self.assertIn("vec![storage_root]", body)

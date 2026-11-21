@@ -323,7 +323,7 @@ pub fn scoped_fuse_mount_roots_for_request<R: MountRequestFields + ?Sized>(
     let backend_mode = request.storage_backend_mode();
     let user_id = crate::platform::user_id_from_uid(request.uid());
     let storage_root = paths::storage_user_root_for_user(user_id);
-    // 全隔离加单条具体媒体目录映射可沿用旧版挂载路径，使无关的自有缓存继续走系统视图。
+    // 固定且互不遮蔽的映射可用 bind 实现，应用自有缓存继续走系统视图。
     if backend_mode == StorageBackendMode::Auto
         && request.uid() % crate::platform::ANDROID_USER_ID_OFFSET
             >= super::policy::ANDROID_APP_UID_START
@@ -335,7 +335,7 @@ pub fn scoped_fuse_mount_roots_for_request<R: MountRequestFields + ?Sized>(
         && request.read_only_paths().is_empty()
         && request.redirect_target()
             == paths::default_redirect_target(request.package_name(), user_id)
-        && crate::domain::is_single_concrete_media_mapping(request.path_mappings(), &storage_root)
+        && crate::domain::mappings_can_use_namespace_bind(request.path_mappings(), &storage_root)
     {
         return Vec::new();
     }
