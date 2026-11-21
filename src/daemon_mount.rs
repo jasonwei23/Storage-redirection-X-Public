@@ -1165,30 +1165,6 @@ fn handle_child_process(request: &MountRequest, plan: &MountForkPlan, sock: c_in
             // 否则状态文件会记录已不存在的挂载，后续恢复流程据此误判为“仍在场”。
             mounted_targets = planner.take_mounted_targets();
         }
-        // 自有私有目录恢复放在所有存储根挂载动作之后（与 companion 路径同顺序）：
-        // 提前到 apply 阶段做会被随后的视图根 FUSE 挂载整体遮蔽。scoped 根透传给
-        // data/obb 的覆盖跳过判据，语义与失败留痕见
-        // `MountPlanner::restore_own_private_system_view`。
-        // 走到这里时存储根要么已由宿主覆盖（不会执行到本行），要么就是纯 namespace bind，
-        // 没有任何 FUSE 层压着 `Android/data|media|obb`，私有目录恢复应按「无覆盖」处理。
-        let private_skip_roots: Vec<String> = if host_covers_view {
-            vec![view_root_for_private]
-        } else {
-            Vec::new()
-        };
-        let restore_native_cache =
-            host_covers_view && crate::fuse_redirect::config::native_cache_restore_allowed(request);
-        let restored_own_private =
-            planner.restore_own_private_system_view(&private_skip_roots, restore_native_cache);
-        log::info!(
-            "own private system view restored count={} pkg={} pid={}",
-            restored_own_private,
-            request.package_name,
-            request.pid
-        );
-        // 恢复新增的缓存/媒体绑定也必须写入状态和回滚列表，否则重载关闭优化时
-        // 无法摘除旧绑定，新增的只读或监视规则会被它遮蔽。
-        mounted_targets.extend(planner.take_mounted_targets());
         if !write_mount_state(request, plan, &mounted_targets, &fuse_children) {
             // 状态写失败必须回滚本轮全部挂载：state 与账本都没有记录时，这些层没有
             // 任何归属判据，后续清理流程不知道它们存在，配置变更也无法把它们替换掉，
@@ -1208,6 +1184,24 @@ fn handle_child_process(request: &MountRequest, plan: &MountForkPlan, sock: c_in
             unsafe { close(sock) };
             return false;
         }
+        // 自有私有目录恢复放在所有存储根挂载动作之后（与 companion 路径同顺序）：
+        // 提前到 apply 阶段做会被随后的视图根 FUSE 挂载整体遮蔽。scoped 根透传给
+        // data/obb 的覆盖跳过判据，语义与失败留痕见
+        // `MountPlanner::restore_own_private_system_view`。
+        // 走到这里时存储根要么已由宿主覆盖（不会执行到本行），要么就是纯 namespace bind，
+        // 没有任何 FUSE 层压着 `Android/data|media|obb`，私有目录恢复应按「无覆盖」处理。
+        let private_skip_roots: Vec<String> = if host_covers_view {
+            vec![view_root_for_private]
+        } else {
+            Vec::new()
+        };
+        let restored_own_private = planner.restore_own_private_system_view(&private_skip_roots);
+        log::info!(
+            "own private system view restored count={} pkg={} pid={}",
+            restored_own_private,
+            request.package_name,
+            request.pid
+        );
         // 锚点用完即摘：它只是映射源与元数据换算的临时真实视图，不承载任何应用可见
         // 路径。留在应用挂载表里就是一条模块私有路径（`tmp/real_storage/<user>`），
         // 也就是 namespace 后端唯一剩下的字符串痕迹。已建立的映射层各自持有超级块与

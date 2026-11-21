@@ -228,43 +228,6 @@ pub trait MountRequestFields {
     fn is_monitor_only(&self) -> bool;
 }
 
-/// 缓存无需监视且没有复杂路径规则时，允许恢复应用自有缓存的系统视图。
-///
-/// 只接受默认沙盒和相对公共媒体目录映射，显式私有路径、通配、只读和沙盒规则
-/// 一律保留 FUSE。监视开关也参与既有策略指纹，重新开启时会重挂并收回缓存绑定。
-pub fn native_cache_restore_allowed<R: MountRequestFields + ?Sized>(request: &R) -> bool {
-    if request.uid() % crate::platform::ANDROID_USER_ID_OFFSET < 10000
-        || request.is_file_monitor_enabled()
-        || request.is_monitor_only()
-        || !request.allowed_real_paths().is_empty()
-        || !request.excluded_real_paths().is_empty()
-        || !request.sandboxed_paths().is_empty()
-        || !request.read_only_paths().is_empty()
-    {
-        return false;
-    }
-    let default_target = paths::default_redirect_target(
-        request.package_name(),
-        crate::platform::user_id_from_uid(request.uid()),
-    );
-    if request.redirect_target() != default_target {
-        return false;
-    }
-    let public_path = |path: &str| {
-        !paths::contains_wildcards(path)
-            && !path.contains('$')
-            && path.split('/').all(|part| !matches!(part, "" | "." | ".."))
-            && matches!(
-                path.split('/').next(),
-                Some("DCIM" | "Pictures" | "Movies" | "Music" | "Download" | "Documents")
-            )
-    };
-    request
-        .path_mappings()
-        .iter()
-        .all(|mapping| public_path(&mapping.request_path) && public_path(&mapping.final_path))
-}
-
 /// 按挂载请求构造 FUSE 重定向配置。
 pub fn fuse_config_from_request<R: MountRequestFields + ?Sized>(
     request: &R,
